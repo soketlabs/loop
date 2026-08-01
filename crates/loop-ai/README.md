@@ -4,11 +4,12 @@ Unified LLM API with provider collections, automatic auth resolution, token and 
 
 This crate is designed for agentic workflows: tool calling, thinking/reasoning blocks, and a uniform streaming event protocol. It is not a bare chat-completions client.
 
-## Features (phase 1)
+## Features
 
 - JSON-serializable [`Context`](crate::Context) / [`Message`](crate::Message) / [`Tool`](crate::Tool)
 - [`AssistantMessageEvent`](crate::AssistantMessageEvent) stream (`start` → text/thinking/toolcall → `done` | `error`)
 - [`Provider`](crate::Provider) + [`Models`](crate::Models) collection with auth resolution
+- **Soket** built-in provider (`https://api.tensorstudio.ai/v1`) with dynamic `GET /v1/models` refresh + models-store cache
 - OpenAI Chat Completions–compatible custom providers (Ollama, vLLM, LiteLLM, gateways, …)
 - Compat auto-detect + overrides ([`OpenAICompletionsCompat`](crate::OpenAICompletionsCompat))
 - [`transform_messages`](crate::transform_messages) for mid-session hand-off

@@ -1,0 +1,8 @@
+{
+  "name": "example-block-compact",
+  "on": "session_before_compact",
+  "action": {
+    "block": false,
+    "reason": "example hook — set block true to cancel compaction"
+  }
+}

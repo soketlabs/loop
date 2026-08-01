@@ -1,6 +1,8 @@
 //! Provider and Models collection.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -9,11 +11,50 @@ use crate::auth::{
     check_provider_auth, resolve_provider_auth, AuthCheck, CredentialStore,
     InMemoryCredentialStore, ModelAuth, ProviderAuth,
 };
+use crate::models_store::{InMemoryModelsStore, SharedModelsStore};
 use crate::stream::AssistantMessageEventStream;
 use crate::types::{
     Context, Model, ModelThinkingLevel, ProviderHeaders, SimpleStreamOptions, StreamOptions,
     ThinkingLevel,
 };
+
+/// Context passed to a provider's dynamic catalog fetcher.
+#[derive(Clone)]
+pub struct RefreshModelsContext {
+    /// Resolved API key when available.
+    pub api_key: Option<String>,
+    /// Optional persistent catalog store.
+    pub store: Option<SharedModelsStore>,
+    /// When false, only restore from cache / seed (no network).
+    pub allow_network: bool,
+    /// Force a network refresh even if a cache exists.
+    pub force: bool,
+}
+
+/// Async catalog fetcher: returns the full model list for a provider.
+pub type FetchModelsFn = Arc<
+    dyn Fn(RefreshModelsContext) -> Pin<Box<dyn Future<Output = Result<Vec<Model>, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Options controlling [`Models::refresh`].
+#[derive(Debug, Clone, Default)]
+pub struct ModelsRefreshOptions {
+    /// Allow network fetches (default true).
+    pub allow_network: Option<bool>,
+    /// Force refresh.
+    pub force: bool,
+    /// Refresh only this provider id.
+    pub provider_id: Option<String>,
+}
+
+/// Result of [`Models::refresh`].
+#[derive(Debug, Default)]
+pub struct ModelsRefreshResult {
+    /// Per-provider errors (provider kept previous catalog).
+    pub errors: HashMap<String, String>,
+}
 
 /// Uniform stream contract for a wire-API adapter.
 pub trait ApiAdapter: Send + Sync {
@@ -54,6 +95,8 @@ pub struct Provider {
     models: RwLock<Vec<Model>>,
     /// Single adapter, or per-api map.
     adapters: AdapterSet,
+    /// Optional dynamic catalog fetcher.
+    fetch_models: Option<FetchModelsFn>,
 }
 
 enum AdapterSet {
@@ -75,6 +118,27 @@ impl Provider {
     /// Replace/extend the model list (e.g. after refresh).
     pub fn set_models(&self, models: Vec<Model>) {
         *self.models.write() = models;
+    }
+
+    /// Whether this provider has a dynamic catalog fetcher.
+    pub fn is_dynamic(&self) -> bool {
+        self.fetch_models.is_some()
+    }
+
+    /// Refresh the model catalog when a fetcher is configured.
+    pub async fn refresh_models(&self, context: RefreshModelsContext) -> Result<(), String> {
+        let Some(fetch) = &self.fetch_models else {
+            return Ok(());
+        };
+        match fetch(context).await {
+            Ok(models) => {
+                if !models.is_empty() {
+                    self.set_models(models);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn adapter_for(&self, model: &Model) -> Option<SharedApiAdapter> {
@@ -157,6 +221,8 @@ pub struct CreateProviderOptions {
     pub models: Vec<Model>,
     /// API adapter(s).
     pub api: CreateProviderApi,
+    /// Optional dynamic catalog fetcher.
+    pub fetch_models: Option<FetchModelsFn>,
 }
 
 /// How adapters are attached to a provider.
@@ -187,6 +253,7 @@ pub fn create_provider(input: CreateProviderOptions) -> Provider {
         auth: input.auth,
         models: RwLock::new(input.models),
         adapters,
+        fetch_models: input.fetch_models,
     }
 }
 
@@ -194,11 +261,16 @@ pub fn create_provider(input: CreateProviderOptions) -> Provider {
 pub struct CreateModelsOptions {
     /// Credential store (defaults to in-memory).
     pub credentials: Option<Arc<dyn CredentialStore>>,
+    /// Optional persistent model catalog store.
+    pub models_store: Option<SharedModelsStore>,
 }
 
 impl Default for CreateModelsOptions {
     fn default() -> Self {
-        Self { credentials: None }
+        Self {
+            credentials: None,
+            models_store: None,
+        }
     }
 }
 
@@ -206,6 +278,7 @@ impl Default for CreateModelsOptions {
 pub struct Models {
     providers: RwLock<HashMap<String, Arc<Provider>>>,
     credentials: Arc<dyn CredentialStore>,
+    models_store: SharedModelsStore,
 }
 
 impl Models {
@@ -221,12 +294,61 @@ impl Models {
             credentials: options
                 .credentials
                 .unwrap_or_else(|| Arc::new(InMemoryCredentialStore::new())),
+            models_store: options
+                .models_store
+                .unwrap_or_else(|| Arc::new(InMemoryModelsStore::new())),
         }
     }
 
     /// Credential store handle.
     pub fn credentials(&self) -> &Arc<dyn CredentialStore> {
         &self.credentials
+    }
+
+    /// Models store handle.
+    pub fn models_store(&self) -> &SharedModelsStore {
+        &self.models_store
+    }
+
+    /// Refresh dynamic provider catalogs.
+    pub async fn refresh(&self, options: ModelsRefreshOptions) -> ModelsRefreshResult {
+        let allow_network = options.allow_network.unwrap_or(true);
+        let providers = self.get_providers();
+        let mut result = ModelsRefreshResult::default();
+
+        for provider in providers {
+            if let Some(only) = &options.provider_id {
+                if provider.id != *only {
+                    continue;
+                }
+            }
+            if !provider.is_dynamic() {
+                continue;
+            }
+
+            let api_key = resolve_provider_auth(
+                &provider.id,
+                &provider.auth,
+                self.credentials.as_ref(),
+                None,
+            )
+            .await
+            .ok()
+            .and_then(|a| a.api_key);
+
+            let ctx = RefreshModelsContext {
+                api_key,
+                store: Some(Arc::clone(&self.models_store)),
+                allow_network,
+                force: options.force,
+            };
+
+            if let Err(e) = provider.refresh_models(ctx).await {
+                result.errors.insert(provider.id.clone(), e);
+            }
+        }
+
+        result
     }
 
     /// Register or replace a provider.

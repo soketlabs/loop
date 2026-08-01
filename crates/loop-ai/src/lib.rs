@@ -44,20 +44,28 @@
 pub mod api;
 pub mod auth;
 pub mod models;
+pub mod models_store;
 pub mod providers;
 pub mod stream;
 pub mod types;
 pub mod utils;
 
-pub use api::{detect_compat, resolve_compat, transform_messages, OpenAICompletionsAdapter};
+pub use api::{
+    detect_compat, list_openai_models, map_remote_model, resolve_compat, transform_messages,
+    ListModelsError, MapRemoteModelOptions, OpenAICompletionsAdapter,
+};
 pub use auth::{
     env_api_key_auth, AuthCheck, AuthResult, Credential, CredentialStore, InMemoryCredentialStore,
     ModelAuth, ModelsError, ModelsErrorCode, ProviderAuth,
 };
 pub use models::{
     calculate_cost, clamp_thinking_level, create_provider, models_are_equal, ApiAdapter,
-    CreateModelsOptions, CreateProviderApi, CreateProviderOptions, Models, Provider,
-    SharedApiAdapter,
+    CreateModelsOptions, CreateProviderApi, CreateProviderOptions, FetchModelsFn, Models,
+    ModelsRefreshOptions, ModelsRefreshResult, Provider, RefreshModelsContext, SharedApiAdapter,
+};
+pub use models_store::{
+    FileModelsStore, InMemoryModelsStore, ModelsStore, ModelsStoreEntry, ModelsStoreError,
+    SharedModelsStore,
 };
 pub use stream::{
     create_assistant_message_event_stream, AssistantMessageEventStream,

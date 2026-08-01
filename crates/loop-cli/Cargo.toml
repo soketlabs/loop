@@ -14,3 +14,35 @@ path = "src/main.rs"
 [dependencies]
 loop-ai = { workspace = true }
 loop-agent = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+dirs = { workspace = true }
+anyhow = { workspace = true }
+pulldown-cmark = { workspace = true }
+arboard = { workspace = true }
+rhai = { workspace = true }
+rustyline = { workspace = true }
+unicode-width = { workspace = true }
+walkdir = { workspace = true }
+ignore = { workspace = true }
+tempfile = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

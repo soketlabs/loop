@@ -113,5 +113,6 @@ pub fn custom_provider(config: CustomProviderConfig) -> Provider {
         auth,
         models,
         api: CreateProviderApi::Single(Arc::new(OpenAICompletionsAdapter::new())),
+        fetch_models: None,
     })
 }

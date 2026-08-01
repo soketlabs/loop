@@ -206,6 +206,7 @@ pub fn faux_provider(script: FauxScript) -> Provider {
         auth: ProviderAuth::keyless("faux"),
         models: vec![model],
         api: CreateProviderApi::Single(Arc::new(FauxAdapter { script })),
+        fetch_models: None,
     })
 }
 

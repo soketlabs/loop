@@ -7,5 +7,39 @@ rust-version.workspace = true
 description = "Stateful agent with tool execution and event streaming"
 readme = "README.md"
 
+[features]
+default = ["sqlite", "proxy"]
+sqlite = ["dep:rusqlite"]
+proxy = ["dep:reqwest", "dep:eventsource-stream", "dep:bytes"]
+
 [dependencies]
 loop-ai = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+similar = { workspace = true }
+ignore = { workspace = true }
+regex = { workspace = true }
+base64 = { workspace = true }
+mime_guess = { workspace = true }
+walkdir = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+eventsource-stream = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+rusqlite = { workspace = true, features = ["bundled"] }
