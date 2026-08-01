@@ -139,22 +139,54 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
     ]
 }
 
-/// Autocomplete matches for a partial slash command.
+/// Autocomplete match with description (for the bottom dock).
+#[derive(Debug, Clone)]
+pub struct AutocompleteEntry {
+    /// Display name including leading `/`.
+    pub name: String,
+    /// Short description.
+    pub description: String,
+}
+
+/// Autocomplete matches for a partial slash command (names only).
 pub fn autocomplete(prefix: &str, extra: &[String]) -> Vec<String> {
+    autocomplete_entries(prefix, extra)
+        .into_iter()
+        .map(|e| e.name)
+        .collect()
+}
+
+/// Autocomplete matches with descriptions for the bottom dock.
+pub fn autocomplete_entries(prefix: &str, extra: &[String]) -> Vec<AutocompleteEntry> {
     let p = prefix.trim_start_matches('/').to_lowercase();
-    let mut out: Vec<String> = builtin_commands()
+    let mut out: Vec<AutocompleteEntry> = builtin_commands()
         .into_iter()
         .filter(|c| c.name.starts_with(&p))
-        .map(|c| format!("/{}", c.name))
+        .map(|c| AutocompleteEntry {
+            name: format!("/{}", c.name),
+            description: match c.args_hint {
+                Some(h) => format!("{h} — {}", c.description),
+                None => c.description.to_string(),
+            },
+        })
         .collect();
     for e in extra {
         let name = e.trim_start_matches('/');
         if name.to_lowercase().starts_with(&p) {
-            out.push(format!("/{name}"));
+            let label = format!("/{name}");
+            if !out.iter().any(|x| x.name == label) {
+                out.push(AutocompleteEntry {
+                    name: label,
+                    description: if name.starts_with("skill:") {
+                        "skill".into()
+                    } else {
+                        "prompt".into()
+                    },
+                });
+            }
         }
     }
-    out.sort();
-    out.dedup();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 

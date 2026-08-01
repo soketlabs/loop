@@ -1,348 +1,541 @@
-//! Ratatui widgets: scrollable chat, tool/thinking cards, editor chrome, spinner.
+//! Pi-style inline UI: transcript in terminal scrollback, footer redrawn in place.
 
+pub mod editor;
 pub mod markdown;
 
+pub use editor::InputBuffer;
+
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
+
+/// Fixed inline footer height (live + input + picker + status).
+pub const FOOTER_HEIGHT: u16 = 18;
+
+/// Max visible rows in a picker list.
+pub const PICKER_PAGE: usize = 8;
 
 /// Tool / thinking card status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardStatus {
-    /// Still running / streaming.
     Pending,
-    /// Finished ok.
     Success,
-    /// Failed.
     Error,
 }
 
 /// A chat transcript item.
 #[derive(Debug, Clone)]
 pub enum ChatItem {
-    /// User message.
-    User {
-        /// Message text.
-        text: String,
-    },
-    /// Assistant markdown/text (streams).
-    Assistant {
-        /// Accumulated text.
-        text: String,
-    },
-    /// Reasoning / thinking block.
-    Thinking {
-        /// Full thinking text.
-        text: String,
-        /// Whether the block finished streaming.
-        done: bool,
-    },
-    /// Tool execution card (keyed by tool_call_id).
+    User { text: String },
+    Assistant { text: String },
+    Thinking { text: String, done: bool },
     Tool {
-        /// Tool call id.
         id: String,
-        /// Tool name.
         name: String,
-        /// One-line summary (always shown).
         summary: String,
-        /// Detail body (args / result) shown when expanded.
         detail: String,
-        /// Status.
         status: CardStatus,
     },
-    /// Dim system notice.
-    System {
-        /// Notice text.
-        text: String,
+    System { text: String },
+}
+
+/// One row in a navigable picker (commands / models).
+#[derive(Debug, Clone)]
+pub struct PickerRow {
+    pub label: String,
+    pub description: String,
+    /// Optional trailing mark (e.g. ✓ for current model).
+    pub mark: Option<String>,
+}
+
+/// What appears under the input line.
+#[derive(Debug, Clone)]
+pub enum PickerView {
+    None,
+    Commands {
+        rows: Vec<PickerRow>,
+        selected: usize,
+    },
+    Models {
+        rows: Vec<PickerRow>,
+        selected: usize,
+        hint: String,
+    },
+    Setup {
+        provider: String,
     },
 }
 
-/// Scroll / follow-end state (pi ScrollView semantics).
-#[derive(Debug, Clone)]
-pub struct ScrollState {
-    /// When true, viewport pins to bottom as content grows.
-    pub follow_end: bool,
-    /// Absolute scroll offset from top (used when not following).
-    pub scroll_top: u16,
-}
-
-impl Default for ScrollState {
-    fn default() -> Self {
-        Self {
-            follow_end: true,
-            scroll_top: 0,
-        }
-    }
-}
-
-impl ScrollState {
-    /// Scroll up (breaks follow).
-    pub fn scroll_up(&mut self, n: u16, content_h: u16, view_h: u16) {
-        self.sync(content_h, view_h);
-        self.follow_end = false;
-        self.scroll_top = self.scroll_top.saturating_sub(n);
-    }
-
-    /// Scroll down; re-enable follow at bottom.
-    pub fn scroll_down(&mut self, n: u16, content_h: u16, view_h: u16) {
-        self.sync(content_h, view_h);
-        let max = content_h.saturating_sub(view_h);
-        self.scroll_top = (self.scroll_top.saturating_add(n)).min(max);
-        if self.scroll_top >= max {
-            self.follow_end = true;
-        }
-    }
-
-    /// Recompute offset for current sizes.
-    pub fn sync(&mut self, content_h: u16, view_h: u16) {
-        let max = content_h.saturating_sub(view_h);
-        if self.follow_end {
-            self.scroll_top = max;
-        } else {
-            self.scroll_top = self.scroll_top.min(max);
-        }
-    }
-
-    /// Effective scroll for Paragraph.
-    pub fn offset(&self, content_h: u16, view_h: u16) -> u16 {
-        let max = content_h.saturating_sub(view_h);
-        if self.follow_end {
-            max
-        } else {
-            self.scroll_top.min(max)
-        }
-    }
-}
-
-/// Braille spinner frames (pi Loader).
+/// Braille spinner frames.
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Draw options for one frame.
-pub struct DrawOpts<'a> {
-    /// Theme.
+/// Options for drawing the inline footer.
+pub struct FooterOpts<'a> {
     pub theme: &'a Theme,
-    /// Header right of brand.
-    pub header: &'a str,
-    /// Chat items.
-    pub chat: &'a [ChatItem],
-    /// Editor buffer.
+    /// Unflushed / streaming items shown above the input.
+    pub live: &'a [ChatItem],
     pub input: &'a str,
-    /// Cursor column in last line (byte-agnostic: char count in last line).
-    pub cursor_col: usize,
-    /// Status / working line (without spinner glyph).
-    pub status: &'a str,
-    /// Whether agent is working (shows spinner animation).
+    pub cursor: usize,
     pub working: bool,
-    /// Spinner frame index.
     pub spinner_frame: usize,
-    /// Slash autocomplete hints.
-    pub autocomplete: &'a [String],
-    /// Scroll state (updated for content height).
-    pub scroll: &'a mut ScrollState,
-    /// Global tool/thinking detail expand (ctrl+o).
+    pub status: &'a str,
+    pub picker: &'a PickerView,
     pub expanded: bool,
-    /// Hide thinking bodies (ctrl+t) — show "Thinking…" only.
     pub hide_thinking: bool,
-    /// Thinking level label for editor border color.
-    pub thinking_level: &'a str,
+    pub setup_mode: bool,
+    pub mask_input: bool,
+    /// Left status (e.g. `~/loop (main)`).
+    pub path_line: &'a str,
+    /// Right status (e.g. `soket/qwen3-30b · medium`).
+    pub model_line: &'a str,
 }
 
-/// Build display lines for the transcript.
-pub fn build_chat_lines(
-    chat: &[ChatItem],
+/// Whether a transcript item is finished and safe to flush into scrollback.
+pub fn item_is_committed(
+    item: &ChatItem,
+    index: usize,
+    streaming_assistant: Option<usize>,
+    streaming_thinking: Option<usize>,
+) -> bool {
+    match item {
+        ChatItem::User { .. } | ChatItem::System { .. } => true,
+        ChatItem::Assistant { .. } => streaming_assistant != Some(index),
+        ChatItem::Thinking { done, .. } => *done && streaming_thinking != Some(index),
+        ChatItem::Tool { status, .. } => !matches!(status, CardStatus::Pending),
+    }
+}
+
+/// Pi-style welcome lines for `insert_before`.
+pub fn welcome_lines(theme: &Theme, version: &str, model_label: &str, endpoint: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            format!("loop v{version}"),
+            theme.style("text").add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o details"
+                .to_string(),
+            theme.dim(),
+        )),
+        Line::from(Span::styled(
+            format!("{model_label} · {endpoint}"),
+            theme.muted(),
+        )),
+        Line::from(""),
+    ]
+}
+
+/// Format a single chat item as lines (for scrollback or live area).
+pub fn format_item_lines(
+    item: &ChatItem,
     theme: &Theme,
     expanded: bool,
     hide_thinking: bool,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
     let w = width.max(8) as usize;
-
-    for item in chat {
-        match item {
-            ChatItem::User { text } => {
+    let mut lines = Vec::new();
+    match item {
+        ChatItem::User { text } => {
+            // Encapsulated band — full-width background like Pi.
+            if text.is_empty() {
+                lines.push(padded_bg_line(theme, "userMessageBg", "userMessageText", " ", false, w));
+            } else {
+                for l in text.lines() {
+                    for part in soft_wrap(l, w.saturating_sub(2).max(1)) {
+                        lines.push(padded_bg_line(
+                            theme,
+                            "userMessageBg",
+                            "userMessageText",
+                            &format!(" {part} "),
+                            false,
+                            w,
+                        ));
+                    }
+                }
+            }
+            lines.push(Line::from(""));
+        }
+        ChatItem::Assistant { text } => {
+            if text.is_empty() {
+                return lines;
+            }
+            let rendered = markdown::render_lines(text, theme);
+            lines.extend(markdown::wrap_rendered_lines(rendered, w));
+            lines.push(Line::from(""));
+        }
+        ChatItem::Thinking { text, done } => {
+            let label = if *done { "thinking" } else { "thinking…" };
+            let bg = "toolPendingBg";
+            if hide_thinking {
                 lines.push(padded_bg_line(
                     theme,
-                    "userMessageBg",
-                    "userMessageText",
-                    " you ",
-                    true,
+                    bg,
+                    "thinkingText",
+                    &format!("  {label} "),
+                    false,
                     w,
                 ));
-                for l in text.lines() {
+            } else {
+                let summary = first_line_summary(text, 72);
+                let head = if summary.is_empty() {
+                    format!("  ✦ {label} ")
+                } else {
+                    format!("  ✦ {label} · {summary} ")
+                };
+                lines.push(padded_bg_line(theme, bg, "thinkingText", &head, true, w));
+                if expanded {
+                    for l in text.lines().take(20) {
+                        lines.push(padded_bg_line(
+                            theme,
+                            bg,
+                            "thinkingText",
+                            &format!("    {l} "),
+                            false,
+                            w,
+                        ));
+                    }
+                }
+            }
+            lines.push(Line::from(""));
+        }
+        ChatItem::Tool {
+            name,
+            summary,
+            detail,
+            status,
+            ..
+        } => {
+            let (bg, title_fg) = match status {
+                CardStatus::Pending => ("toolPendingBg", "warning"),
+                CardStatus::Success => ("toolSuccessBg", "toolTitle"),
+                CardStatus::Error => ("toolErrorBg", "error"),
+            };
+            // Summary row only by default — `$ read · README.md`
+            let head = if name == "bash" && !summary.is_empty() {
+                format!(" $ {summary} ")
+            } else if summary.is_empty() {
+                format!(" $ {name} ")
+            } else {
+                format!(" $ {name} · {summary} ")
+            };
+            lines.push(padded_bg_line(theme, bg, title_fg, &head, true, w));
+
+            if matches!(status, CardStatus::Pending) && detail.is_empty() {
+                lines.push(padded_bg_line(theme, bg, "dim", " running… ", false, w));
+            } else if expanded && !detail.is_empty() {
+                for l in detail.lines().take(48) {
                     lines.push(padded_bg_line(
                         theme,
-                        "userMessageBg",
-                        "userMessageText",
+                        bg,
+                        "toolOutput",
                         &format!(" {l} "),
                         false,
                         w,
                     ));
                 }
-                lines.push(Line::from(""));
-            }
-            ChatItem::Assistant { text } => {
-                if text.is_empty() {
-                    continue;
-                }
-                lines.push(Line::from(Span::styled(
-                    " assistant ",
-                    theme.accent().add_modifier(Modifier::BOLD),
-                )));
-                lines.extend(markdown::render_lines(text, theme));
-                lines.push(Line::from(""));
-            }
-            ChatItem::Thinking { text, done } => {
-                let label = if *done { "thinking" } else { "thinking…" };
-                let summary = first_line_summary(text, 72);
-                if hide_thinking {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {label}"),
-                        theme
-                            .style("thinkingText")
-                            .add_modifier(Modifier::ITALIC),
-                    )));
-                    lines.push(Line::from(""));
-                    continue;
-                }
-                let bg = "toolPendingBg";
-                let header = if summary.is_empty() {
-                    format!(" ✦ {label} ")
+                let n = detail.lines().count();
+                let hint = if n > 48 {
+                    " … truncated · ctrl+o to collapse "
                 } else {
-                    format!(" ✦ {label} · {summary} ")
+                    " ctrl+o to collapse "
                 };
+                lines.push(padded_bg_line(theme, bg, "dim", hint, false, w));
+            } else if !detail.is_empty() {
                 lines.push(padded_bg_line(
                     theme,
                     bg,
-                    "thinkingText",
-                    &header,
-                    true,
+                    "dim",
+                    " ctrl+o to expand ",
+                    false,
                     w,
                 ));
-                if expanded && !text.is_empty() {
-                    for l in text.lines() {
-                        lines.push(padded_bg_line(
-                            theme,
-                            bg,
-                            "thinkingText",
-                            &format!("   {l} "),
-                            false,
-                            w,
-                        ));
-                    }
-                    lines.push(padded_bg_line(
-                        theme,
-                        bg,
-                        "dim",
-                        "   ctrl+o collapse ",
-                        false,
-                        w,
-                    ));
-                } else if !text.is_empty() {
-                    lines.push(padded_bg_line(
-                        theme,
-                        bg,
-                        "dim",
-                        "   ctrl+o expand ",
-                        false,
-                        w,
-                    ));
-                }
-                lines.push(Line::from(""));
             }
-            ChatItem::Tool {
-                name,
-                summary,
-                detail,
-                status,
-                ..
-            } => {
-                let (bg, fg, mark) = match status {
-                    CardStatus::Pending => ("toolPendingBg", "warning", "◉"),
-                    CardStatus::Success => ("toolSuccessBg", "success", "✓"),
-                    CardStatus::Error => ("toolErrorBg", "error", "✗"),
-                };
-                let status_word = match status {
-                    CardStatus::Pending => "running",
-                    CardStatus::Success => "ok",
-                    CardStatus::Error => "error",
-                };
-                let head = if summary.is_empty() {
-                    format!(" {mark} {name} · {status_word} ")
-                } else {
-                    format!(" {mark} {name} · {summary} ")
-                };
-                lines.push(padded_bg_line(theme, bg, fg, &head, true, w));
-                if expanded && !detail.is_empty() {
-                    for l in detail.lines().take(40) {
-                        lines.push(padded_bg_line(
-                            theme,
-                            bg,
-                            "toolOutput",
-                            &format!("   {l} "),
-                            false,
-                            w,
-                        ));
-                    }
-                    if detail.lines().count() > 40 {
-                        lines.push(padded_bg_line(
-                            theme,
-                            bg,
-                            "dim",
-                            "   … truncated · ctrl+o ",
-                            false,
-                            w,
-                        ));
-                    } else {
-                        lines.push(padded_bg_line(
-                            theme,
-                            bg,
-                            "dim",
-                            "   ctrl+o collapse ",
-                            false,
-                            w,
-                        ));
-                    }
-                } else {
-                    lines.push(padded_bg_line(
-                        theme,
-                        bg,
-                        "dim",
-                        "   ctrl+o expand details ",
-                        false,
-                        w,
-                    ));
-                }
-                lines.push(Line::from(""));
+            lines.push(Line::from(""));
+        }
+        ChatItem::System { text } => {
+            for l in text.lines() {
+                lines.extend(wrap_plain(l, theme.dim(), w));
             }
-            ChatItem::System { text } => {
-                for l in text.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {l}"),
-                        theme.dim(),
-                    )));
-                }
-                lines.push(Line::from(""));
-            }
+            lines.push(Line::from(""));
         }
     }
     lines
 }
 
-fn first_line_summary(text: &str, max: usize) -> String {
-    let line = text.lines().next().unwrap_or("").trim();
-    if line.is_empty() {
-        return String::new();
+/// Draw lines into a buffer (used by `insert_before`).
+pub fn render_lines_to_buffer(lines: &[Line<'static>], buf: &mut Buffer) {
+    Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .render(buf.area, buf);
+}
+
+/// Draw the inline footer (live stream + input + picker + status).
+pub fn draw_footer(frame: &mut Frame, opts: FooterOpts<'_>) {
+    let area = frame.area();
+    let width = area.width.max(1);
+
+    let live_lines = {
+        let mut out = Vec::new();
+        for item in opts.live {
+            out.extend(format_item_lines(
+                item,
+                opts.theme,
+                opts.expanded,
+                opts.hide_thinking,
+                width,
+            ));
+        }
+        if opts.working && out.is_empty() {
+            let spin = SPINNER_FRAMES[opts.spinner_frame % SPINNER_FRAMES.len()];
+            out.push(Line::from(Span::styled(
+                format!(" {spin} {}", opts.status),
+                opts.theme.muted(),
+            )));
+        }
+        out
+    };
+
+    let input_body_lines = opts.input.split('\n').count().max(1) as u16;
+    let input_h = input_body_lines + 2; // top + bottom rules
+    let picker_h = picker_height(opts.picker);
+    let status_h = 2u16;
+    let used = input_h + picker_h + status_h;
+    let live_h = area.height.saturating_sub(used);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(live_h),
+            Constraint::Length(input_h),
+            Constraint::Length(picker_h),
+            Constraint::Length(status_h),
+        ])
+        .split(area);
+
+    // Live / spacer
+    if live_h > 0 {
+        let visible = if live_lines.len() as u16 > live_h {
+            let skip = live_lines.len() - live_h as usize;
+            live_lines[skip..].to_vec()
+        } else {
+            live_lines
+        };
+        frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), chunks[0]);
     }
-    let mut s: String = line.chars().take(max).collect();
-    if line.chars().count() > max {
-        s.push('…');
+
+    draw_input(frame, chunks[1], &opts);
+    draw_picker(frame, chunks[2], opts.theme, opts.picker);
+    draw_status(frame, chunks[3], &opts);
+}
+
+fn draw_input(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
+    let rule = Style::default().fg(opts.theme.get("borderAccent"));
+    // No fill behind typed text — only the top/bottom rules frame the editor.
+    let text_style = opts.theme.style("text");
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let rule_line = "─".repeat(area.width as usize);
+    frame.render_widget(
+        Paragraph::new(Span::styled(rule_line.clone(), rule)),
+        chunks[0],
+    );
+    frame.render_widget(Paragraph::new(Span::styled(rule_line, rule)), chunks[2]);
+
+    let display = if opts.mask_input {
+        "•".repeat(opts.input.chars().count())
+    } else if opts.setup_mode && opts.input.is_empty() {
+        String::new()
+    } else {
+        opts.input.to_string()
+    };
+
+    let lines = render_input_lines(&display, opts.cursor, text_style, opts.theme, area.width as usize);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[1]);
+}
+
+fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView) {
+    if area.height == 0 {
+        return;
     }
-    s
+    let lines = match picker {
+        PickerView::None => Vec::new(),
+        PickerView::Setup { provider } => vec![
+            Line::from(Span::styled(
+                format!("  paste API key for {provider} · enter save · esc quit"),
+                theme.muted(),
+            )),
+        ],
+        PickerView::Commands { rows, selected } => picker_lines(rows, *selected, theme, false),
+        PickerView::Models { rows, selected, hint } => {
+            let mut out = vec![Line::from(Span::styled(hint.clone(), theme.style("warning")))];
+            out.extend(picker_lines(rows, *selected, theme, true));
+            out
+        }
+    };
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn picker_lines(
+    rows: &[PickerRow],
+    selected: usize,
+    theme: &Theme,
+    _show_mark: bool,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    if rows.is_empty() {
+        out.push(Line::from(Span::styled("  no matches".to_string(), theme.dim())));
+        return out;
+    }
+    let page = PICKER_PAGE;
+    let start = if selected >= page {
+        selected + 1 - page
+    } else {
+        0
+    };
+    let end = (start + page).min(rows.len());
+    for (i, row) in rows.iter().enumerate().take(end).skip(start) {
+        let active = i == selected;
+        let arrow = if active { "→" } else { " " };
+        let label_style = if active {
+            theme.style("text").add_modifier(Modifier::BOLD)
+        } else {
+            theme.style("text")
+        };
+        let mut spans = vec![
+            Span::styled(format!(" {arrow} "), theme.accent()),
+            Span::styled(format!("{:<16}", truncate_width(&row.label, 16)), label_style),
+            Span::styled(format!(" {}", row.description), theme.muted()),
+        ];
+        if let Some(m) = &row.mark {
+            spans.push(Span::styled(format!(" {m}"), theme.style("success")));
+        }
+        out.push(Line::from(spans));
+    }
+    if rows.len() > page || start > 0 {
+        let page_num = selected / page + 1;
+        let pages = rows.len().div_ceil(page).max(1);
+        out.push(Line::from(Span::styled(
+            format!("  ({page_num}/{pages})"),
+            theme.dim(),
+        )));
+    } else {
+        out.push(Line::from(Span::styled(
+            format!("  ({}/{})", selected + 1, rows.len()),
+            theme.dim(),
+        )));
+    }
+    out
+}
+
+fn draw_status(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+
+    let top = Line::from(vec![
+        Span::styled(opts.path_line.to_string(), opts.theme.muted()),
+        Span::raw(" ".repeat(
+            area.width.saturating_sub(
+                (UnicodeWidthStr::width(opts.path_line) + UnicodeWidthStr::width(opts.model_line))
+                    as u16,
+            ) as usize,
+        )),
+        Span::styled(opts.model_line.to_string(), opts.theme.muted()),
+    ]);
+    let bottom = if opts.working {
+        let spin = SPINNER_FRAMES[opts.spinner_frame % SPINNER_FRAMES.len()];
+        Line::from(Span::styled(
+            format!(" {spin} {}", opts.status),
+            opts.theme.accent(),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(" {}", opts.status),
+            opts.theme.dim(),
+        ))
+    };
+    frame.render_widget(Paragraph::new(top), chunks[0]);
+    frame.render_widget(Paragraph::new(bottom), chunks[1]);
+}
+
+fn picker_height(picker: &PickerView) -> u16 {
+    match picker {
+        PickerView::None => 0,
+        PickerView::Setup { .. } => 1,
+        PickerView::Commands { rows, .. } => {
+            let n = rows.len().min(PICKER_PAGE) as u16;
+            n + 1 // page indicator
+        }
+        PickerView::Models { rows, .. } => {
+            let n = rows.len().min(PICKER_PAGE) as u16;
+            n + 2 // hint + page
+        }
+    }
+}
+
+fn render_input_lines(
+    input: &str,
+    cursor: usize,
+    text_style: Style,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    // Absolute black block (theme `cursor`, default #000000). White cell bg keeps it
+    // visible on dark terminals where a bare black glyph would disappear.
+    let caret_style = Style::default()
+        .fg(theme.get("cursor"))
+        .bg(Color::Rgb(255, 255, 255));
+    let lines: Vec<&str> = if input.is_empty() {
+        vec![""]
+    } else {
+        input.split('\n').collect()
+    };
+    let mut char_at = 0usize;
+    let mut out = Vec::new();
+    for line in &lines {
+        let chars: Vec<char> = line.chars().collect();
+        let line_len = chars.len();
+        let caret_here = cursor >= char_at && cursor <= char_at + line_len;
+        let mut spans = Vec::new();
+        if caret_here {
+            let col = cursor - char_at;
+            if col > 0 {
+                spans.push(Span::styled(chars[..col].iter().collect::<String>(), text_style));
+            }
+            // Block glyph + bg — reliable when the buffer is empty.
+            spans.push(Span::styled("█".to_string(), caret_style));
+            if col < line_len {
+                let after: String = chars[col + 1..].iter().collect();
+                if !after.is_empty() {
+                    spans.push(Span::styled(after, text_style));
+                }
+            }
+        } else if !line.is_empty() {
+            spans.push(Span::styled((*line).to_string(), text_style));
+        }
+        if spans.is_empty() {
+            spans.push(Span::styled("█".to_string(), caret_style));
+        }
+        out.push(Line::from(spans));
+        let _ = width;
+        char_at += line_len + 1;
+    }
+    out
 }
 
 fn padded_bg_line(
@@ -360,179 +553,86 @@ fn padded_bg_line(
         style = style.add_modifier(Modifier::BOLD);
     }
     let mut content = text.to_string();
-    // Pad to width so background fills the row.
-    let visual = unicode_width::UnicodeWidthStr::width(content.as_str());
+    let visual = UnicodeWidthStr::width(content.as_str());
     if visual < width {
         content.push_str(&" ".repeat(width - visual));
+    } else if visual > width {
+        content = truncate_width(&content, width);
     }
     Line::from(Span::styled(content, style))
 }
 
-/// Draw the full interactive frame.
-pub fn draw(frame: &mut Frame, opts: DrawOpts<'_>) {
-    let area = frame.area();
-    let input_lines = opts.input.lines().count().max(1) as u16;
-    let editor_h = (input_lines + 2).clamp(3, (area.height / 3).max(3));
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),          // brand header
-            Constraint::Min(4),             // chat
-            Constraint::Length(1),          // working / status
-            Constraint::Length(editor_h),   // editor
-            Constraint::Length(1),          // footer
-        ])
-        .split(area);
-
-    // Header
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" loop ", opts.theme.accent_bold()),
-            Span::styled(opts.header.to_string(), opts.theme.muted()),
-        ])),
-        chunks[0],
-    );
-
-    // Chat (measure then scroll)
-    let chat_area = chunks[1];
-    let view_h = chat_area.height.saturating_sub(1); // top border
-    let lines = build_chat_lines(
-        opts.chat,
-        opts.theme,
-        opts.expanded,
-        opts.hide_thinking,
-        chat_area.width,
-    );
-    let content_h = lines.len() as u16;
-    opts.scroll.sync(content_h, view_h);
-    let offset = opts.scroll.offset(content_h, view_h);
-
-    let chat_widget = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((offset, 0))
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(opts.theme.style("borderMuted"))
-                .title(if opts.scroll.follow_end {
-                    Span::styled(" chat ", opts.theme.dim())
-                } else {
-                    Span::styled(" chat ↑ scroll ", opts.theme.style("warning"))
-                }),
-        );
-    frame.render_widget(chat_widget, chat_area);
-
-    // Working / status dock
-    let status_spans = if opts.working {
-        let frame_ch = SPINNER_FRAMES[opts.spinner_frame % SPINNER_FRAMES.len()];
-        vec![
-            Span::styled(format!(" {frame_ch} "), opts.theme.accent()),
-            Span::styled(opts.status.to_string(), opts.theme.muted()),
-        ]
-    } else {
-        vec![Span::styled(
-            format!("  {}", opts.status),
-            opts.theme.dim(),
-        )]
-    };
-    frame.render_widget(Paragraph::new(Line::from(status_spans)), chunks[2]);
-
-    // Editor — pi-style top/bottom rules, border tinted by thinking level
-    let border_key = thinking_border_key(opts.thinking_level);
-    let mut title = if opts.autocomplete.is_empty() {
-        " message · / commands · enter send · shift+enter newline ".to_string()
-    } else {
-        format!(" {} ", opts.autocomplete.iter().take(6).cloned().collect::<Vec<_>>().join("  "))
-    };
-    if opts.input.starts_with('!') {
-        title = " bash mode ".into();
+fn first_line_summary(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return String::new();
     }
-    let editor_block = Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(opts.theme.style(border_key))
-        .title(Span::styled(title, opts.theme.dim()));
-    let inner = editor_block.inner(chunks[3]);
-    frame.render_widget(editor_block, chunks[3]);
-
-    // Show input with a reverse-video cursor on the last line
-    let display = render_input_with_cursor(opts.input, opts.cursor_col, opts.theme);
-    frame.render_widget(
-        Paragraph::new(display)
-            .style(opts.theme.style("text"))
-            .wrap(Wrap { trim: false }),
-        inner,
-    );
-
-    // Footer
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            " ctrl+o expand · ctrl+t thinking · ctrl+l model · shift+tab effort · pgup/pgdn scroll ",
-            opts.theme.dim(),
-        )),
-        chunks[4],
-    );
+    let mut s: String = line.chars().take(max).collect();
+    if line.chars().count() > max {
+        s.push('…');
+    }
+    s
 }
 
-fn thinking_border_key(level: &str) -> &'static str {
-    match level.to_lowercase().as_str() {
-        "minimal" => "thinkingMinimal",
-        "low" => "thinkingLow",
-        "medium" => "thinkingMedium",
-        "high" => "thinkingHigh",
-        "xhigh" => "thinkingXhigh",
-        "max" => "thinkingXhigh",
-        _ => "borderMuted",
-    }
+fn wrap_plain(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
+    soft_wrap(text, width.max(1))
+        .into_iter()
+        .map(|s| Line::from(Span::styled(s, style)))
+        .collect()
 }
 
-fn render_input_with_cursor(input: &str, cursor_col: usize, theme: &Theme) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    let lines: Vec<&str> = if input.is_empty() {
-        vec![""]
-    } else {
-        input.split('\n').collect()
-    };
-    let last = lines.len() - 1;
-    for (i, line) in lines.iter().enumerate() {
-        if i != last {
-            out.push(Line::from(Span::styled(
-                (*line).to_string(),
-                theme.style("text"),
-            )));
-            continue;
+fn soft_wrap(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut current_w = 0usize;
+    for word in text.split_inclusive(' ') {
+        let ww = UnicodeWidthStr::width(word);
+        if current_w > 0 && current_w + ww > width {
+            rows.push(std::mem::take(&mut current));
+            current_w = 0;
         }
-        let chars: Vec<char> = line.chars().collect();
-        let col = cursor_col.min(chars.len());
-        let mut spans = Vec::new();
-        if col > 0 {
-            let before: String = chars[..col].iter().collect();
-            spans.push(Span::styled(before, theme.style("text")));
-        }
-        let cursor_ch = chars.get(col).copied().unwrap_or(' ');
-        spans.push(Span::styled(
-            cursor_ch.to_string(),
-            Style::default()
-                .fg(theme.get("text"))
-                .bg(theme.get("accent"))
-                .add_modifier(Modifier::BOLD),
-        ));
-        if col < chars.len() {
-            let after: String = chars[col + 1..].iter().collect();
-            if !after.is_empty() {
-                spans.push(Span::styled(after, theme.style("text")));
+        if ww > width {
+            for ch in word.chars() {
+                let cw = UnicodeWidthStr::width(ch.to_string().as_str());
+                if current_w + cw > width && current_w > 0 {
+                    rows.push(std::mem::take(&mut current));
+                    current_w = 0;
+                }
+                current.push(ch);
+                current_w += cw;
             }
-        } else if cursor_ch == ' ' {
-            // already showed space cursor at EOL
+        } else {
+            current.push_str(word);
+            current_w += ww;
         }
-        out.push(Line::from(spans));
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
+
+fn truncate_width(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthStr::width(ch.to_string().as_str());
+        if w + cw > max {
+            break;
+        }
+        out.push(ch);
+        w += cw;
     }
     out
 }
 
 /// Find chat index of a tool by id.
 pub fn find_tool_index(chat: &[ChatItem], id: &str) -> Option<usize> {
-    chat.iter().position(|c| matches!(c, ChatItem::Tool { id: tid, .. } if tid == id))
+    chat.iter()
+        .position(|c| matches!(c, ChatItem::Tool { id: tid, .. } if tid == id))
 }
 
 /// Truncate tool args to a short summary.
@@ -561,25 +661,4 @@ pub fn tool_args_summary(name: &str, args: &serde_json::Value) -> String {
             t
         }
     }
-}
-
-/// Helper: centered rect.
-#[allow(dead_code)]
-pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup[1])[1]
 }

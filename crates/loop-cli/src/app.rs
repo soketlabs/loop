@@ -1,18 +1,18 @@
-//! Interactive ratatui application loop.
+//! Interactive inline CLI (Pi-style): transcript in scrollback, footer redrawn in place.
 
 use std::io::{self, Stdout};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
 use loop_agent::harness::{
@@ -20,37 +20,49 @@ use loop_agent::harness::{
     SandboxConfig, SandboxMode,
 };
 use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel};
-use loop_ai::providers::{SOKET_API_KEY_ENVS, SOKET_PROVIDER_ID};
+use loop_ai::providers::{SOKET_BASE_URL, SOKET_PROVIDER_ID};
 use loop_ai::{Credential, CredentialStore, ModelsRefreshOptions, ToolResultContent};
 
-use crate::commands::{self, CommandEffect};
+use crate::commands::{self, AutocompleteEntry, CommandEffect};
 use crate::keybindings::{hotkey_help, Action};
 use crate::runtime::Runtime;
 use crate::theme::Theme;
 use crate::tui::{
-    find_tool_index, tool_args_summary, CardStatus, ChatItem, DrawOpts, ScrollState,
+    find_tool_index, format_item_lines, item_is_committed, render_lines_to_buffer, tool_args_summary,
+    welcome_lines, CardStatus, ChatItem, FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow,
+    PickerView,
 };
 
 enum UiEvent {
     Agent(AgentEvent),
 }
 
-/// Run the interactive TUI.
+/// Run the interactive CLI (inline viewport — native terminal scrollback).
 pub async fn run(mut runtime: Runtime) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
+    );
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(FOOTER_HEIGHT),
+        },
+    )?;
+    let _ = terminal.hide_cursor();
 
     let result = run_loop(&mut terminal, &mut runtime).await;
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    // Clear the inline footer so the shell prompt lands cleanly.
+    let _ = terminal.clear();
     terminal.show_cursor()?;
     result
 }
@@ -69,18 +81,13 @@ async fn run_loop(
     });
 
     let mut chat: Vec<ChatItem> = Vec::new();
-    if !runtime.settings.quiet_startup {
-        chat.push(sys(format!(
-            "Loop by Soket AI · {}/{} · theme {} · /help",
-            runtime.settings.default_provider,
-            runtime.settings.default_model,
-            runtime.theme.name
-        )));
-    }
-
-    let mut input = String::new();
-    let mut status = String::from("ready");
-    let mut scroll = ScrollState::default();
+    let mut flushed = 0usize;
+    let mut input = InputBuffer::new();
+    let mut status: String = if runtime.needs_api_key_setup {
+        "setup · paste API key · enter save".into()
+    } else {
+        "ready".into()
+    };
     let mut clear_presses = 0u8;
     let mut last_clear = Instant::now();
     let mut last_escape = Instant::now();
@@ -88,11 +95,33 @@ async fn run_loop(
     let mut streaming_thinking: Option<usize> = None;
     let mut expand_details = false;
     let mut hide_thinking = runtime.settings.hide_thinking_block;
-    let mut pending_login: Option<String> = None;
+    let mut pending_login: Option<String> = if runtime.needs_api_key_setup {
+        Some(SOKET_PROVIDER_ID.into())
+    } else {
+        None
+    };
     let mut model_picker: Option<ModelPickerState> = None;
+    let mut ac_selected: usize = 0;
+    let mut last_ac_filter = String::new();
     let mut working = false;
     let mut spinner_frame: usize = 0;
     let mut last_spin = Instant::now();
+    let version = env!("CARGO_PKG_VERSION");
+    let path_line = path_status_line(&runtime.cwd);
+
+    // Welcome banner into terminal scrollback (above the footer).
+    {
+        let model_label = format!(
+            "{}/{}",
+            runtime.settings.default_provider, runtime.settings.default_model
+        );
+        let endpoint = endpoint_for(runtime);
+        let lines = welcome_lines(&runtime.theme, version, &model_label, &endpoint);
+        let h = lines.len() as u16;
+        terminal.insert_before(h, |buf| {
+            render_lines_to_buffer(&lines, buf);
+        })?;
+    }
 
     let tick = Duration::from_millis(33);
     let mut should_quit = false;
@@ -103,8 +132,35 @@ async fn run_loop(
             last_spin = Instant::now();
         }
 
-        let header = format_header(runtime);
-        let ac = if input.starts_with('/') && !input.contains(' ') {
+        // Flush finished transcript items into native scrollback.
+        if flushed > chat.len() {
+            flushed = chat.len();
+        }
+        flush_committed(
+            terminal,
+            &chat,
+            &mut flushed,
+            streaming_assistant,
+            streaming_thinking,
+            &runtime.theme,
+            expand_details,
+            hide_thinking,
+        )?;
+
+        let model_label = format!(
+            "{}/{}",
+            runtime.settings.default_provider, runtime.settings.default_model
+        );
+        let model_line = format!(
+            "{model_label} · {}",
+            runtime.settings.default_thinking_level
+        );
+
+        let ac_entries = if input.as_str().starts_with('/')
+            && !input.as_str().contains(' ')
+            && pending_login.is_none()
+            && model_picker.is_none()
+        {
             let mut extra: Vec<String> = runtime
                 .resources
                 .skills
@@ -112,21 +168,73 @@ async fn run_loop(
                 .map(|s| format!("skill:{}", s.name))
                 .collect();
             extra.extend(runtime.resources.prompts.iter().map(|p| p.name.clone()));
-            commands::autocomplete(&input, &extra)
+            commands::autocomplete_entries(input.as_str(), &extra)
         } else {
             Vec::new()
         };
+        if input.as_str() != last_ac_filter {
+            ac_selected = 0;
+            last_ac_filter = input.as_str().to_string();
+        }
+        if !ac_entries.is_empty() {
+            ac_selected = ac_selected.min(ac_entries.len() - 1);
+        }
 
-        let status_line = if let Some(p) = &model_picker {
-            format!(
-                "model: {}  (enter select · esc cancel)",
-                p.filtered
-                    .get(p.selected)
-                    .cloned()
-                    .unwrap_or_default()
-            )
+        let picker = if let Some(p) = &model_picker {
+            let current = format!(
+                "{}/{}",
+                runtime.settings.default_provider, runtime.settings.default_model
+            );
+            PickerView::Models {
+                rows: p
+                    .filtered
+                    .iter()
+                    .map(|id| {
+                        let (label, desc) = match id.split_once('/') {
+                            Some((prov, model)) => (model.to_string(), format!("[{prov}]")),
+                            None => (id.clone(), String::new()),
+                        };
+                        PickerRow {
+                            label,
+                            description: desc,
+                            mark: if *id == current {
+                                Some("✓".into())
+                            } else {
+                                None
+                            },
+                        }
+                    })
+                    .collect(),
+                selected: p.selected,
+                hint: "Only showing models from configured providers. Use /login to add providers."
+                    .into(),
+            }
+        } else if let Some(provider) = &pending_login {
+            PickerView::Setup {
+                provider: provider.clone(),
+            }
+        } else if !ac_entries.is_empty() {
+            PickerView::Commands {
+                rows: ac_entries
+                    .iter()
+                    .map(|e| PickerRow {
+                        label: e.name.clone(),
+                        description: e.description.clone(),
+                        mark: None,
+                    })
+                    .collect(),
+                selected: ac_selected,
+            }
+        } else {
+            PickerView::None
+        };
+
+        let status_line = if model_picker.is_some() {
+            "↑↓ select · enter confirm · esc cancel".into()
         } else if pending_login.is_some() {
-            "enter API key · esc cancel".into()
+            "setup · paste API key · enter save".into()
+        } else if !ac_entries.is_empty() {
+            "↑↓ select · tab complete · enter run".into()
         } else if working {
             let pending_tools = chat
                 .iter()
@@ -149,29 +257,31 @@ async fn run_loop(
             status.clone()
         };
 
-        let cursor_col = input.lines().last().unwrap_or("").chars().count();
-        let thinking_level = runtime.settings.default_thinking_level.clone();
+        let live: Vec<ChatItem> = chat[flushed..].to_vec();
+        let setup_mode = pending_login.is_some();
 
         terminal.draw(|f| {
-            crate::tui::draw(
+            crate::tui::draw_footer(
                 f,
-                DrawOpts {
+                FooterOpts {
                     theme: &runtime.theme,
-                    header: &header,
-                    chat: &chat,
-                    input: &input,
-                    cursor_col,
-                    status: &status_line,
+                    live: &live,
+                    input: input.as_str(),
+                    cursor: input.cursor(),
                     working,
                     spinner_frame,
-                    autocomplete: &ac,
-                    scroll: &mut scroll,
+                    status: &status_line,
+                    picker: &picker,
                     expanded: expand_details,
                     hide_thinking,
-                    thinking_level: &thinking_level,
+                    setup_mode,
+                    mask_input: setup_mode,
+                    path_line: &path_line,
+                    model_line: &model_line,
                 },
             );
         })?;
+        let _ = terminal.hide_cursor();
 
         let timed_out = !event::poll(tick)?;
         if timed_out {
@@ -188,274 +298,38 @@ async fn run_loop(
             continue;
         }
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-
-            if let Some(picker) = model_picker.as_mut() {
-                match key.code {
-                    KeyCode::Esc => {
-                        model_picker = None;
-                        status = "cancelled".into();
-                    }
-                    KeyCode::Up => {
-                        picker.selected = picker.selected.saturating_sub(1);
-                    }
-                    KeyCode::Down => {
-                        if picker.selected + 1 < picker.filtered.len() {
-                            picker.selected += 1;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if let Some(id) = picker.filtered.get(picker.selected).cloned() {
-                            if let Some((provider, model)) = id.split_once('/') {
-                                if let Some(m) = runtime.models.get_model(provider, model) {
-                                    runtime.harness.set_model(m).await;
-                                    runtime.settings.default_provider = provider.into();
-                                    runtime.settings.default_model = model.into();
-                                    let _ = runtime.settings.save_file(
-                                        &crate::config::paths::settings_path(&runtime.agent_dir),
-                                    );
-                                    chat.push(sys(format!("model → {provider}/{model}")));
-                                }
-                            }
-                        }
-                        model_picker = None;
-                    }
-                    KeyCode::Char(c) => {
-                        picker.query.push(c);
-                        picker.refilter(&runtime.models);
-                    }
-                    KeyCode::Backspace => {
-                        picker.query.pop();
-                        picker.refilter(&runtime.models);
-                    }
-                    _ => {}
+        loop {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_key(
+                        key,
+                        runtime,
+                        &mut input,
+                        &mut chat,
+                        &mut status,
+                        &mut clear_presses,
+                        &mut last_clear,
+                        &mut last_escape,
+                        &mut streaming_assistant,
+                        &mut streaming_thinking,
+                        &mut expand_details,
+                        &mut hide_thinking,
+                        &mut pending_login,
+                        &mut model_picker,
+                        &mut working,
+                        &mut should_quit,
+                        &ac_entries,
+                        &mut ac_selected,
+                    )
+                    .await?;
                 }
-                continue;
-            }
-
-            if pending_login.is_some() {
-                match key.code {
-                    KeyCode::Esc => {
-                        pending_login = None;
-                        input.clear();
-                        status = "login cancelled".into();
-                    }
-                    KeyCode::Enter => {
-                        let provider =
-                            pending_login.take().unwrap_or_else(|| SOKET_PROVIDER_ID.into());
-                        let key_val = input.trim().to_string();
-                        input.clear();
-                        if key_val.is_empty() {
-                            status = "empty key".into();
-                        } else {
-                            runtime
-                                .credentials
-                                .set(&provider, Credential::api_key(key_val));
-                            let _ = runtime
-                                .models
-                                .refresh(ModelsRefreshOptions {
-                                    allow_network: Some(true),
-                                    force: true,
-                                    provider_id: Some(provider.clone()),
-                                })
-                                .await;
-                            chat.push(sys(format!("logged in: {provider}")));
-                            status = "ready".into();
-                        }
-                    }
-                    KeyCode::Char(c) => input.push(c),
-                    KeyCode::Backspace => {
-                        input.pop();
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-
-            if let Some(action) = runtime.keybindings.resolve(key) {
-                match action {
-                    Action::Exit if input.is_empty() => {
-                        should_quit = true;
-                        continue;
-                    }
-                    Action::Clear => {
-                        if last_clear.elapsed() < Duration::from_secs(1) {
-                            clear_presses += 1;
-                        } else {
-                            clear_presses = 1;
-                        }
-                        last_clear = Instant::now();
-                        if clear_presses >= 2 {
-                            should_quit = true;
-                        } else if input.is_empty() {
-                            status = "ctrl+c again to quit".into();
-                        } else {
-                            input.clear();
-                        }
-                        continue;
-                    }
-                    Action::Interrupt => {
-                        if runtime.harness.phase()
-                            != loop_agent::harness::AgentHarnessPhase::Idle
-                        {
-                            runtime.harness.abort();
-                            working = false;
-                            status = "interrupted".into();
-                        } else if last_escape.elapsed() < Duration::from_millis(500)
-                            && runtime.settings.double_escape_action == "tree"
-                        {
-                            chat.push(sys(
-                                "session tree: use /tree (branch nav in session store)",
-                            ));
-                        }
-                        last_escape = Instant::now();
-                        continue;
-                    }
-                    Action::Submit => {
-                        let line = input.trim().to_string();
-                        input.clear();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        if line.starts_with('/') {
-                            let skill_names: Vec<_> = runtime
-                                .resources
-                                .skills
-                                .iter()
-                                .map(|s| s.name.clone())
-                                .collect();
-                            let template_names: Vec<_> = runtime
-                                .resources
-                                .prompts
-                                .iter()
-                                .map(|p| p.name.clone())
-                                .collect();
-                            if let Some(cmd) = commands::parse_command(&line) {
-                                let effect =
-                                    commands::dispatch(&cmd, &skill_names, &template_names);
-                                should_quit = apply_effect(
-                                    effect,
-                                    runtime,
-                                    &mut chat,
-                                    &mut status,
-                                    &mut pending_login,
-                                    &mut model_picker,
-                                    &mut hide_thinking,
-                                    &mut expand_details,
-                                    &mut working,
-                                )
-                                .await?;
-                            }
-                        } else {
-                            chat.push(ChatItem::User { text: line.clone() });
-                            working = true;
-                            streaming_assistant = None;
-                            streaming_thinking = None;
-                            scroll.follow_end = true;
-                            let harness = Arc::clone(&runtime.harness);
-                            tokio::spawn(async move {
-                                let _ = harness.prompt(line).await;
-                            });
-                        }
-                        continue;
-                    }
-                    Action::NewLine => {
-                        input.push('\n');
-                        continue;
-                    }
-                    Action::ModelSelect => {
-                        model_picker = Some(ModelPickerState::new(&runtime.models));
-                        continue;
-                    }
-                    Action::ModelCycleForward | Action::ModelCycleBackward => {
-                        cycle_model(
-                            runtime,
-                            action == Action::ModelCycleForward,
-                            &mut chat,
-                        )
-                        .await;
-                        continue;
-                    }
-                    Action::ThinkingCycle => {
-                        cycle_thinking(runtime, &mut chat).await;
-                        continue;
-                    }
-                    Action::ThinkingToggle => {
-                        hide_thinking = !hide_thinking;
-                        status = if hide_thinking {
-                            "thinking hidden".into()
-                        } else {
-                            "thinking visible".into()
-                        };
-                        continue;
-                    }
-                    Action::ToolsExpand => {
-                        expand_details = !expand_details;
-                        status = if expand_details {
-                            "details expanded".into()
-                        } else {
-                            "details collapsed".into()
-                        };
-                        continue;
-                    }
-                    Action::MessageCopy => {
-                        copy_last_assistant(&chat, &mut status);
-                        continue;
-                    }
-                    Action::ExternalEditor => {
-                        if let Ok(edited) = external_edit(&input) {
-                            input = edited;
-                        }
-                        continue;
-                    }
-                    Action::FollowUp => {
-                        let line = input.trim().to_string();
-                        if !line.is_empty() {
-                            runtime
-                                .harness
-                                .follow_up(AgentMessage::user_text(line.clone()));
-                            chat.push(sys(format!("queued follow-up: {line}")));
-                            input.clear();
-                        }
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-
-            match key.code {
-                KeyCode::Char(_c) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
-                KeyCode::Char(c) => input.push(c),
-                KeyCode::Backspace => {
-                    input.pop();
-                }
-                KeyCode::Up => {
-                    let h = terminal.size()?.height.saturating_sub(8);
-                    scroll.scroll_up(3, estimate_content_h(&chat), h);
-                }
-                KeyCode::Down => {
-                    let h = terminal.size()?.height.saturating_sub(8);
-                    scroll.scroll_down(3, estimate_content_h(&chat), h);
-                }
-                KeyCode::PageUp => {
-                    let h = terminal.size()?.height.saturating_sub(8);
-                    scroll.scroll_up(h.max(1), estimate_content_h(&chat), h);
-                }
-                KeyCode::PageDown => {
-                    let h = terminal.size()?.height.saturating_sub(8);
-                    scroll.scroll_down(h.max(1), estimate_content_h(&chat), h);
-                }
-                KeyCode::End => {
-                    scroll.follow_end = true;
-                }
-                KeyCode::Home => {
-                    scroll.follow_end = false;
-                    scroll.scroll_top = 0;
+                Event::Resize(_, _) => {
+                    let _ = terminal.autoresize();
                 }
                 _ => {}
+            }
+            if should_quit || !event::poll(Duration::from_millis(0))? {
+                break;
             }
         }
 
@@ -475,22 +349,473 @@ async fn run_loop(
     Ok(())
 }
 
+fn flush_committed(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    chat: &[ChatItem],
+    flushed: &mut usize,
+    streaming_assistant: Option<usize>,
+    streaming_thinking: Option<usize>,
+    theme: &Theme,
+    expanded: bool,
+    hide_thinking: bool,
+) -> io::Result<()> {
+    let width = terminal.size()?.width;
+    while *flushed < chat.len() {
+        if !item_is_committed(
+            &chat[*flushed],
+            *flushed,
+            streaming_assistant,
+            streaming_thinking,
+        ) {
+            break;
+        }
+        // Scrollback always stores the collapsed tool form; ctrl+o only affects the live footer.
+        let expand = match &chat[*flushed] {
+            ChatItem::Tool { .. } => false,
+            _ => expanded,
+        };
+        let lines = format_item_lines(&chat[*flushed], theme, expand, hide_thinking, width);
+        if !lines.is_empty() {
+            let h = lines.len() as u16;
+            terminal.insert_before(h, |buf| {
+                render_lines_to_buffer(&lines, buf);
+            })?;
+        }
+        *flushed += 1;
+    }
+    Ok(())
+}
+
+fn path_status_line(cwd: &Path) -> String {
+    let home = dirs::home_dir();
+    let display = if let Some(home) = home {
+        if let Ok(rest) = cwd.strip_prefix(&home) {
+            format!("~/{}", rest.display())
+        } else {
+            cwd.display().to_string()
+        }
+    } else {
+        cwd.display().to_string()
+    };
+    let branch = git_branch(cwd);
+    match branch {
+        Some(b) => format!("{display} ({b})"),
+        None => display,
+    }
+}
+
+fn git_branch(cwd: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() || s == "HEAD" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 fn sys(text: impl Into<String>) -> ChatItem {
     ChatItem::System { text: text.into() }
 }
 
-fn estimate_content_h(chat: &[ChatItem]) -> u16 {
-    let mut n = 0u16;
-    for item in chat {
-        n = n.saturating_add(match item {
-            ChatItem::User { text } => text.lines().count() as u16 + 2,
-            ChatItem::Assistant { text } => text.lines().count() as u16 + 2,
-            ChatItem::Thinking { text, .. } => (text.lines().count() as u16).min(6) + 3,
-            ChatItem::Tool { detail, .. } => (detail.lines().count() as u16).min(8) + 3,
-            ChatItem::System { text } => text.lines().count() as u16 + 1,
-        });
+#[allow(clippy::too_many_arguments)]
+async fn handle_key(
+    key: crossterm::event::KeyEvent,
+    runtime: &mut Runtime,
+    input: &mut InputBuffer,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    clear_presses: &mut u8,
+    last_clear: &mut Instant,
+    last_escape: &mut Instant,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
+    expand_details: &mut bool,
+    hide_thinking: &mut bool,
+    pending_login: &mut Option<String>,
+    model_picker: &mut Option<ModelPickerState>,
+    working: &mut bool,
+    should_quit: &mut bool,
+    ac_entries: &[AutocompleteEntry],
+    ac_selected: &mut usize,
+) -> anyhow::Result<()> {
+    if let Some(picker) = model_picker.as_mut() {
+        match key.code {
+            KeyCode::Esc => {
+                *model_picker = None;
+                *status = "cancelled".into();
+            }
+            KeyCode::Up => {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if picker.selected + 1 < picker.filtered.len() {
+                    picker.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(id) = picker.filtered.get(picker.selected).cloned() {
+                    if let Some((provider, model)) = id.split_once('/') {
+                        if let Some(m) = runtime.models.get_model(provider, model) {
+                            runtime.harness.set_model(m).await;
+                            runtime.settings.default_provider = provider.into();
+                            runtime.settings.default_model = model.into();
+                            let _ = runtime.settings.save_file(
+                                &crate::config::paths::settings_path(&runtime.agent_dir),
+                            );
+                            chat.push(sys(format!("model → {provider}/{model}")));
+                        }
+                    }
+                }
+                *model_picker = None;
+            }
+            KeyCode::Char(c) => {
+                picker.query.push(c);
+                picker.refilter(&runtime.models);
+            }
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.refilter(&runtime.models);
+            }
+            _ => {}
+        }
+        return Ok(());
     }
-    n
+
+    // Slash-command picker navigation (before general keybindings).
+    if !ac_entries.is_empty() {
+        match key.code {
+            KeyCode::Up => {
+                *ac_selected = ac_selected.saturating_sub(1);
+                return Ok(());
+            }
+            KeyCode::Down => {
+                if *ac_selected + 1 < ac_entries.len() {
+                    *ac_selected += 1;
+                }
+                return Ok(());
+            }
+            KeyCode::Tab => {
+                if let Some(sel) = ac_entries.get(*ac_selected) {
+                    input.set(format!("{} ", sel.name));
+                }
+                return Ok(());
+            }
+            KeyCode::Enter
+                if !key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if let Some(sel) = ac_entries.get(*ac_selected) {
+                    // Prefer the highlighted command when input is still a partial `/…`.
+                    if input.as_str().starts_with('/') && !input.as_str().contains(' ') {
+                        input.set(sel.name.clone());
+                    }
+                }
+                // Fall through to Submit via keybindings below.
+            }
+            _ => {}
+        }
+    }
+
+    if pending_login.is_some() {
+        if key.code == KeyCode::Esc
+            || matches!(
+                runtime.keybindings.resolve(key),
+                Some(Action::Interrupt | Action::Clear)
+            )
+        {
+            if runtime.needs_api_key_setup {
+                *should_quit = true;
+            } else {
+                *pending_login = None;
+                input.clear();
+                *status = "login cancelled".into();
+            }
+            return Ok(());
+        }
+        let plain_enter = key.code == KeyCode::Enter
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+            && !key.modifiers.contains(KeyModifiers::CONTROL);
+        if plain_enter {
+            let provider = pending_login
+                .take()
+                .unwrap_or_else(|| SOKET_PROVIDER_ID.into());
+            let key_val = input.as_str().trim().to_string();
+            input.clear();
+            if key_val.is_empty() {
+                *pending_login = Some(provider);
+                *status = "empty key".into();
+            } else {
+                runtime
+                    .credentials
+                    .set(&provider, Credential::api_key(key_val));
+                let _ = runtime
+                    .models
+                    .refresh(ModelsRefreshOptions {
+                        allow_network: Some(true),
+                        force: true,
+                        provider_id: Some(provider.clone()),
+                    })
+                    .await;
+                runtime.needs_api_key_setup = false;
+                chat.clear();
+                *status = "ready".into();
+            }
+            return Ok(());
+        }
+        match runtime.keybindings.resolve(key) {
+            Some(Action::DeleteBackward) => input.backspace(),
+            Some(Action::DeleteForward) => input.delete(),
+            Some(Action::MoveLeft) => input.move_left(),
+            Some(Action::MoveRight) => input.move_right(),
+            Some(Action::MoveWordLeft) => input.move_word_left(),
+            Some(Action::MoveWordRight) => input.move_word_right(),
+            Some(Action::MoveLineStart) => input.move_line_start(),
+            Some(Action::MoveLineEnd) => input.move_line_end(),
+            Some(Action::DeleteWordBackward) => input.delete_word_backward(),
+            Some(Action::DeleteToLineStart | Action::DeleteLine) => input.clear(),
+            Some(Action::NewLine) => {} // ignore newlines while pasting a key
+            _ => {
+                if let KeyCode::Char(c) = key.code {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && !key.modifiers.contains(KeyModifiers::SUPER)
+                        && c != '\n'
+                    {
+                        input.insert_char(c);
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(action) = runtime.keybindings.resolve(key) {
+        match action {
+            Action::Exit if input.is_empty() => {
+                *should_quit = true;
+                return Ok(());
+            }
+            Action::Clear => {
+                if last_clear.elapsed() < Duration::from_secs(1) {
+                    *clear_presses += 1;
+                } else {
+                    *clear_presses = 1;
+                }
+                *last_clear = Instant::now();
+                if *clear_presses >= 2 {
+                    *should_quit = true;
+                } else if input.is_empty() {
+                    *status = "ctrl+c again to quit".into();
+                } else {
+                    input.clear();
+                }
+                return Ok(());
+            }
+            Action::Interrupt => {
+                if runtime.harness.phase() != loop_agent::harness::AgentHarnessPhase::Idle {
+                    runtime.harness.abort();
+                    *working = false;
+                    *status = "interrupted".into();
+                } else if last_escape.elapsed() < Duration::from_millis(500)
+                    && runtime.settings.double_escape_action == "tree"
+                {
+                    chat.push(sys(
+                        "session tree: use /tree (branch nav in session store)",
+                    ));
+                }
+                *last_escape = Instant::now();
+                return Ok(());
+            }
+            Action::Submit => {
+                let line = input.as_str().trim().to_string();
+                input.clear();
+                if line.is_empty() {
+                    return Ok(());
+                }
+                if line.starts_with('/') {
+                    let skill_names: Vec<_> = runtime
+                        .resources
+                        .skills
+                        .iter()
+                        .map(|s| s.name.clone())
+                        .collect();
+                    let template_names: Vec<_> = runtime
+                        .resources
+                        .prompts
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect();
+                    if let Some(cmd) = commands::parse_command(&line) {
+                        let effect = commands::dispatch(&cmd, &skill_names, &template_names);
+                        *should_quit = apply_effect(
+                            effect,
+                            runtime,
+                            chat,
+                            status,
+                            pending_login,
+                            model_picker,
+                            hide_thinking,
+                            expand_details,
+                            working,
+                        )
+                        .await?;
+                    }
+                } else {
+                    chat.push(ChatItem::User { text: line.clone() });
+                    *working = true;
+                    *streaming_assistant = None;
+                    *streaming_thinking = None;
+                    let harness = Arc::clone(&runtime.harness);
+                    tokio::spawn(async move {
+                        let _ = harness.prompt(line).await;
+                    });
+                }
+                return Ok(());
+            }
+            Action::NewLine => {
+                input.insert_newline();
+                return Ok(());
+            }
+            Action::MoveLeft => {
+                input.move_left();
+                return Ok(());
+            }
+            Action::MoveRight => {
+                input.move_right();
+                return Ok(());
+            }
+            Action::MoveUp => {
+                let _ = input.move_up();
+                return Ok(());
+            }
+            Action::MoveDown => {
+                let _ = input.move_down();
+                return Ok(());
+            }
+            Action::MoveWordLeft => {
+                input.move_word_left();
+                return Ok(());
+            }
+            Action::MoveWordRight => {
+                input.move_word_right();
+                return Ok(());
+            }
+            Action::MoveLineStart => {
+                input.move_line_start();
+                return Ok(());
+            }
+            Action::MoveLineEnd => {
+                input.move_line_end();
+                return Ok(());
+            }
+            Action::DeleteBackward => {
+                input.backspace();
+                return Ok(());
+            }
+            Action::DeleteForward => {
+                input.delete();
+                return Ok(());
+            }
+            Action::DeleteWordBackward => {
+                input.delete_word_backward();
+                return Ok(());
+            }
+            Action::DeleteWordForward => {
+                input.delete_word_forward();
+                return Ok(());
+            }
+            Action::DeleteToLineStart => {
+                input.delete_to_line_start();
+                return Ok(());
+            }
+            Action::DeleteToLineEnd => {
+                input.delete_to_line_end();
+                return Ok(());
+            }
+            Action::DeleteLine => {
+                input.delete_line();
+                return Ok(());
+            }
+            Action::ModelSelect => {
+                *model_picker = Some(ModelPickerState::new(&runtime.models));
+                return Ok(());
+            }
+            Action::ModelCycleForward | Action::ModelCycleBackward => {
+                cycle_model(
+                    runtime,
+                    action == Action::ModelCycleForward,
+                    chat,
+                )
+                .await;
+                return Ok(());
+            }
+            Action::ThinkingCycle => {
+                cycle_thinking(runtime, chat).await;
+                return Ok(());
+            }
+            Action::ThinkingToggle => {
+                *hide_thinking = !*hide_thinking;
+                *status = if *hide_thinking {
+                    "thinking hidden".into()
+                } else {
+                    "thinking visible".into()
+                };
+                return Ok(());
+            }
+            Action::ToolsExpand => {
+                *expand_details = !*expand_details;
+                *status = if *expand_details {
+                    "details expanded".into()
+                } else {
+                    "details collapsed".into()
+                };
+                return Ok(());
+            }
+            Action::MessageCopy => {
+                copy_last_assistant(chat, status);
+                return Ok(());
+            }
+            Action::ExternalEditor => {
+                if let Ok(edited) = external_edit(input.as_str()) {
+                    input.set(edited);
+                }
+                return Ok(());
+            }
+            Action::FollowUp => {
+                let line = input.as_str().trim().to_string();
+                if !line.is_empty() {
+                    runtime
+                        .harness
+                        .follow_up(AgentMessage::user_text(line.clone()));
+                    chat.push(sys(format!("queued follow-up: {line}")));
+                    input.clear();
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    match key.code {
+        KeyCode::Char(_c) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+        KeyCode::Char(_c) if key.modifiers.contains(KeyModifiers::SUPER) => {}
+        KeyCode::Tab => {
+            if let Some(sel) = ac_entries.get(*ac_selected).or_else(|| ac_entries.first()) {
+                input.set(format!("{} ", sel.name));
+            }
+        }
+        KeyCode::Char(c) => input.insert_char(c),
+        _ => {}
+    }
+    Ok(())
 }
 
 struct ModelPickerState {
@@ -530,15 +855,16 @@ impl ModelPickerState {
     }
 }
 
-fn format_header(runtime: &Runtime) -> String {
-    let sandbox = match runtime.settings.sandbox.mode.as_str() {
-        "local-shell" => "sandbox:local",
-        _ => "sandbox:off",
-    };
-    format!(
-        "{}/{} · {} · {sandbox}",
-        runtime.settings.default_provider, runtime.settings.default_model, runtime.theme.name
-    )
+fn endpoint_for(runtime: &Runtime) -> String {
+    runtime
+        .models
+        .get_model(
+            &runtime.settings.default_provider,
+            &runtime.settings.default_model,
+        )
+        .map(|m| m.base_url)
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| SOKET_BASE_URL.to_string())
 }
 
 fn handle_agent_event(
@@ -879,11 +1205,7 @@ async fn apply_effect(
         CommandEffect::Login(provider) => {
             let p = provider.unwrap_or_else(|| SOKET_PROVIDER_ID.into());
             *pending_login = Some(p.clone());
-            *status = format!("paste API key for {p}");
-            chat.push(sys(format!(
-                "login {p} — paste key and press enter (env: {})",
-                SOKET_API_KEY_ENVS.join(", ")
-            )));
+            *status = format!("setup · paste API key for {p}");
         }
         CommandEffect::Logout(provider) => {
             let p = provider.unwrap_or_else(|| SOKET_PROVIDER_ID.into());

@@ -27,6 +27,22 @@ pub enum Action {
     SessionTree,
     SessionFork,
     SessionResume,
+    // Editor navigation / editing
+    MoveLeft,
+    MoveRight,
+    MoveUp,
+    MoveDown,
+    MoveWordLeft,
+    MoveWordRight,
+    MoveLineStart,
+    MoveLineEnd,
+    DeleteBackward,
+    DeleteForward,
+    DeleteWordBackward,
+    DeleteWordForward,
+    DeleteToLineStart,
+    DeleteToLineEnd,
+    DeleteLine,
 }
 
 /// Keybinding configuration.
@@ -44,6 +60,7 @@ impl Default for Keybindings {
             ("ctrl+d", Action::Exit),
             ("enter", Action::Submit),
             ("shift+enter", Action::NewLine),
+            ("ctrl+enter", Action::NewLine),
             ("ctrl+j", Action::NewLine),
             ("ctrl+l", Action::ModelSelect),
             ("ctrl+p", Action::ModelCycleForward),
@@ -55,6 +72,35 @@ impl Default for Keybindings {
             ("alt+enter", Action::FollowUp),
             ("alt+up", Action::Dequeue),
             ("ctrl+g", Action::ExternalEditor),
+            // Cursor movement
+            ("left", Action::MoveLeft),
+            ("right", Action::MoveRight),
+            ("up", Action::MoveUp),
+            ("down", Action::MoveDown),
+            ("alt+left", Action::MoveWordLeft),
+            ("alt+right", Action::MoveWordRight),
+            ("ctrl+left", Action::MoveWordLeft),
+            ("ctrl+right", Action::MoveWordRight),
+            ("home", Action::MoveLineStart),
+            ("end", Action::MoveLineEnd),
+            ("ctrl+a", Action::MoveLineStart),
+            ("ctrl+e", Action::MoveLineEnd),
+            // Deletion
+            ("backspace", Action::DeleteBackward),
+            ("delete", Action::DeleteForward),
+            ("ctrl+h", Action::DeleteBackward),
+            ("ctrl+w", Action::DeleteWordBackward),
+            ("alt+backspace", Action::DeleteWordBackward),
+            ("ctrl+backspace", Action::DeleteWordBackward),
+            ("alt+d", Action::DeleteWordForward),
+            ("alt+delete", Action::DeleteWordForward),
+            ("ctrl+u", Action::DeleteToLineStart),
+            ("ctrl+k", Action::DeleteToLineEnd),
+            // Cmd (super) bindings — macOS: cmd+backspace / cmd+delete
+            ("super+backspace", Action::DeleteToLineStart),
+            ("super+delete", Action::DeleteLine),
+            ("ctrl+shift+backspace", Action::DeleteLine),
+            ("ctrl+shift+u", Action::DeleteLine),
         ];
         for (k, a) in defaults {
             map.insert(k.to_string(), a);
@@ -91,6 +137,19 @@ impl Keybindings {
 
     /// Resolve a key event to an action.
     pub fn resolve(&self, key: KeyEvent) -> Option<Action> {
+        // Prefer Shift+Enter / Ctrl+Enter as newline even when the terminal
+        // reports odd modifier combinations.
+        if matches!(key.code, KeyCode::Enter) {
+            if key.modifiers.contains(KeyModifiers::SHIFT)
+                || key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                return Some(Action::NewLine);
+            }
+        }
+        // Some terminals emit `\n` for Shift+Enter.
+        if matches!(key.code, KeyCode::Char('\n')) {
+            return Some(Action::NewLine);
+        }
         let s = key_to_string(key)?;
         self.map.get(&s).copied()
     }
@@ -117,12 +176,33 @@ fn action_from_id(id: &str) -> Option<Action> {
         "app.session.tree" | "sessionTree" => Action::SessionTree,
         "app.session.fork" | "sessionFork" => Action::SessionFork,
         "app.session.resume" | "sessionResume" => Action::SessionResume,
+        "tui.input.moveLeft" | "moveLeft" => Action::MoveLeft,
+        "tui.input.moveRight" | "moveRight" => Action::MoveRight,
+        "tui.input.moveUp" | "moveUp" => Action::MoveUp,
+        "tui.input.moveDown" | "moveDown" => Action::MoveDown,
+        "tui.input.moveWordLeft" | "moveWordLeft" => Action::MoveWordLeft,
+        "tui.input.moveWordRight" | "moveWordRight" => Action::MoveWordRight,
+        "tui.input.moveLineStart" | "moveLineStart" => Action::MoveLineStart,
+        "tui.input.moveLineEnd" | "moveLineEnd" => Action::MoveLineEnd,
+        "tui.input.deleteBackward" | "deleteBackward" => Action::DeleteBackward,
+        "tui.input.deleteForward" | "deleteForward" => Action::DeleteForward,
+        "tui.input.deleteWordBackward" | "deleteWordBackward" => Action::DeleteWordBackward,
+        "tui.input.deleteWordForward" | "deleteWordForward" => Action::DeleteWordForward,
+        "tui.input.deleteToLineStart" | "deleteToLineStart" => Action::DeleteToLineStart,
+        "tui.input.deleteToLineEnd" | "deleteToLineEnd" => Action::DeleteToLineEnd,
+        "tui.input.deleteLine" | "deleteLine" => Action::DeleteLine,
         _ => return None,
     })
 }
 
 fn normalize_key(s: &str) -> String {
-    s.trim().to_lowercase().replace(' ', "")
+    s.trim()
+        .to_lowercase()
+        .replace(' ', "")
+        .replace("cmd+", "super+")
+        .replace("command+", "super+")
+        .replace("option+", "alt+")
+        .replace("opt+", "alt+")
 }
 
 fn key_to_string(key: KeyEvent) -> Option<String> {
@@ -136,8 +216,14 @@ fn key_to_string(key: KeyEvent) -> Option<String> {
     if key.modifiers.contains(KeyModifiers::ALT) {
         parts.push("alt");
     }
+    if key.modifiers.contains(KeyModifiers::SUPER) {
+        parts.push("super");
+    }
     let code = match key.code {
-        KeyCode::Char(c) => c.to_lowercase().to_string(),
+        KeyCode::Char(c) => {
+            // Ctrl+char often arrives as a control code; crossterm usually gives Char.
+            c.to_lowercase().to_string()
+        }
         KeyCode::Enter => "enter".into(),
         KeyCode::Esc => "escape".into(),
         KeyCode::Tab => "tab".into(),
@@ -170,12 +256,18 @@ pub fn hotkey_help() -> Vec<(&'static str, &'static str)> {
         ("ctrl+d", "Exit when input empty"),
         ("enter", "Send message"),
         ("shift+enter / ctrl+j", "New line"),
+        ("alt/ctrl+left/right", "Jump by word"),
+        ("ctrl+a / ctrl+e", "Line start / end"),
+        ("ctrl+u / ctrl+k", "Delete to line start / end"),
+        ("ctrl+w / alt+backspace", "Delete word"),
+        ("cmd/super+backspace", "Delete to line start"),
+        ("cmd/super+delete", "Delete entire line"),
         ("ctrl+l", "Select model"),
         ("ctrl+p / ctrl+shift+p", "Cycle models"),
         ("shift+tab", "Cycle thinking level"),
         ("ctrl+t", "Toggle thinking visibility"),
         ("ctrl+o", "Expand/collapse tool & thinking details"),
-        ("pgup/pgdn", "Scroll chat (end to re-stick)"),
+        ("↑↓", "Navigate / commands & model list"),
         ("ctrl+x", "Copy last assistant message"),
         ("alt+enter", "Queue follow-up"),
         ("ctrl+g", "External editor"),

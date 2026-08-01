@@ -18,8 +18,7 @@ use loop_ai::providers::{
     SOKET_DEFAULT_MODEL_ID, SOKET_PROVIDER_ID,
 };
 use loop_ai::{
-    CreateModelsOptions, Credential, CredentialStore, FileModelsStore, Models,
-    ModelsRefreshOptions,
+    CreateModelsOptions, FileModelsStore, Models, ModelsRefreshOptions,
 };
 
 use crate::config::auth::{provider_has_key, FileCredentialStore};
@@ -64,6 +63,8 @@ pub struct Runtime {
     pub trust: TrustStore,
     /// Session store path.
     pub sessions_db: PathBuf,
+    /// When true, TUI should show the first-run API key setup box.
+    pub needs_api_key_setup: bool,
 }
 
 /// CLI bootstrap flags affecting runtime.
@@ -88,30 +89,23 @@ pub struct BootstrapOpts {
     pub session_id: Option<String>,
 }
 
-/// Prompt for Soket API key on first start when missing.
+/// Ensure a Soket API key exists, or defer prompting to the TUI when interactive.
+///
+/// Returns `true` when the TUI should show the first-run setup box.
 pub fn ensure_soket_api_key(
     store: &FileCredentialStore,
     interactive: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if provider_has_key(store, SOKET_PROVIDER_ID, SOKET_API_KEY_ENVS) {
-        return Ok(());
+        return Ok(false);
     }
     if !interactive {
         bail!(
             "Soket API key not set. Set SOKET_API_KEY / TENSORSTUDIO_API_KEY / LOOP_API_KEY or run interactively to enter a key."
         );
     }
-    eprintln!("Welcome to Loop by Soket AI.");
-    eprintln!("Enter your Soket API key (https://api.tensorstudio.ai):");
-    let mut rl = DefaultEditor::new()?;
-    let key = rl.readline("API key> ")?;
-    let key = key.trim().to_string();
-    if key.is_empty() {
-        bail!("API key required to continue. Set SOKET_API_KEY or run /login later.");
-    }
-    store.set(SOKET_PROVIDER_ID, Credential::api_key(key));
-    eprintln!("Saved to {}", store.path().display());
-    Ok(())
+    // Defer to the welcome/setup UI inside the TUI.
+    Ok(true)
 }
 
 /// Build models with Soket + optional models.json customs.
@@ -264,19 +258,21 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     }
 
     let credentials = Arc::new(FileCredentialStore::open(auth_path(&agent_dir))?);
-    ensure_soket_api_key(&credentials, opts.interactive)?;
+    let needs_api_key_setup = ensure_soket_api_key(&credentials, opts.interactive)?;
 
     let models = build_models(&agent_dir, Arc::clone(&credentials))?;
-    let refresh = models
-        .refresh(ModelsRefreshOptions {
-            allow_network: Some(true),
-            force: true,
-            provider_id: Some(SOKET_PROVIDER_ID.into()),
-        })
-        .await;
-    if !refresh.errors.is_empty() {
-        for (pid, err) in &refresh.errors {
-            tracing::warn!("model refresh {pid}: {err}");
+    if !needs_api_key_setup {
+        let refresh = models
+            .refresh(ModelsRefreshOptions {
+                allow_network: Some(true),
+                force: true,
+                provider_id: Some(SOKET_PROVIDER_ID.into()),
+            })
+            .await;
+        if !refresh.errors.is_empty() {
+            for (pid, err) in &refresh.errors {
+                tracing::warn!("model refresh {pid}: {err}");
+            }
         }
     }
 
@@ -396,5 +392,6 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         project_trusted,
         trust,
         sessions_db,
+        needs_api_key_setup,
     })
 }
