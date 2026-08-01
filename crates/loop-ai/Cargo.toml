@@ -1,0 +1,31 @@
+[package]
+name = "loop-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Unified LLM API with provider collections, auth resolution, token/cost tracking, and mid-session model hand-off"
+readme = "README.md"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+bytes = { workspace = true }
+jsonschema = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
+
+[features]
+default = []

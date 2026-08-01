@@ -1,0 +1,11 @@
+[package]
+name = "loop-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Stateful agent with tool execution and event streaming"
+readme = "README.md"
+
+[dependencies]
+loop-ai = { workspace = true }
