@@ -28,13 +28,15 @@ use crate::keybindings::{hotkey_help, Action};
 use crate::runtime::Runtime;
 use crate::theme::Theme;
 use crate::tui::{
-    find_tool_index, format_item_lines, item_is_committed, render_lines_to_buffer, tool_args_summary,
-    welcome_lines, CardStatus, ChatItem, FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow,
-    PickerView,
+    find_tool_index, format_item_lines, item_has_detail, item_is_committed,
+    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, FOOTER_HEIGHT,
+    FooterOpts, InputBuffer, PickerRow, PickerView,
 };
 
 enum UiEvent {
     Agent(AgentEvent),
+    /// `/compact` finished (success message or error).
+    CompactDone(Result<String, String>),
 }
 
 /// Run the interactive CLI (inline viewport — native terminal scrollback).
@@ -84,9 +86,9 @@ async fn run_loop(
     let mut flushed = 0usize;
     let mut input = InputBuffer::new();
     let mut status: String = if runtime.needs_api_key_setup {
-        "setup · paste API key · enter save".into()
+        "setup · paste your API key · enter save".into()
     } else {
-        "ready".into()
+        "ready · /help for commands".into()
     };
     let mut clear_presses = 0u8;
     let mut last_clear = Instant::now();
@@ -110,18 +112,7 @@ async fn run_loop(
     let path_line = path_status_line(&runtime.cwd);
 
     // Welcome banner into terminal scrollback (above the footer).
-    {
-        let model_label = format!(
-            "{}/{}",
-            runtime.settings.default_provider, runtime.settings.default_model
-        );
-        let endpoint = endpoint_for(runtime);
-        let lines = welcome_lines(&runtime.theme, version, &model_label, &endpoint);
-        let h = lines.len() as u16;
-        terminal.insert_before(h, |buf| {
-            render_lines_to_buffer(&lines, buf);
-        })?;
-    }
+    print_welcome(terminal, runtime, version)?;
 
     let tick = Duration::from_millis(33);
     let mut should_quit = false;
@@ -161,13 +152,7 @@ async fn run_loop(
             && pending_login.is_none()
             && model_picker.is_none()
         {
-            let mut extra: Vec<String> = runtime
-                .resources
-                .skills
-                .iter()
-                .map(|s| format!("skill:{}", s.name))
-                .collect();
-            extra.extend(runtime.resources.prompts.iter().map(|p| p.name.clone()));
+            let extra = dynamic_command_entries(runtime);
             commands::autocomplete_entries(input.as_str(), &extra)
         } else {
             Vec::new()
@@ -232,7 +217,7 @@ async fn run_loop(
         let status_line = if model_picker.is_some() {
             "↑↓ select · enter confirm · esc cancel".into()
         } else if pending_login.is_some() {
-            "setup · paste API key · enter save".into()
+            "setup · paste your API key · enter save".into()
         } else if !ac_entries.is_empty() {
             "↑↓ select · tab complete · enter run".into()
         } else if working {
@@ -285,19 +270,18 @@ async fn run_loop(
 
         let timed_out = !event::poll(tick)?;
         if timed_out {
-            while let Ok(UiEvent::Agent(ev)) = rx.try_recv() {
-                handle_agent_event(
-                    ev,
-                    &mut chat,
-                    &mut status,
-                    &mut streaming_assistant,
-                    &mut streaming_thinking,
-                    &mut working,
-                );
-            }
+            drain_ui_events(
+                &mut rx,
+                &mut chat,
+                &mut status,
+                &mut streaming_assistant,
+                &mut streaming_thinking,
+                &mut working,
+            );
             continue;
         }
 
+        let expand_before = expand_details;
         loop {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -320,6 +304,7 @@ async fn run_loop(
                         &mut should_quit,
                         &ac_entries,
                         &mut ac_selected,
+                        &tx,
                     )
                     .await?;
                 }
@@ -333,16 +318,36 @@ async fn run_loop(
             }
         }
 
-        while let Ok(UiEvent::Agent(ev)) = rx.try_recv() {
-            handle_agent_event(
-                ev,
-                &mut chat,
-                &mut status,
-                &mut streaming_assistant,
-                &mut streaming_thinking,
-                &mut working,
-            );
+        // ctrl+o just turned expansion on: scrollback is append-only, so if the last
+        // expandable item was already flushed collapsed, re-print it expanded.
+        if expand_details && !expand_before {
+            let live_has_detail = chat[flushed.min(chat.len())..].iter().any(item_has_detail);
+            if !live_has_detail {
+                if let Some(item) = chat[..flushed.min(chat.len())]
+                    .iter()
+                    .rev()
+                    .find(|i| item_has_detail(i))
+                {
+                    let width = terminal.size()?.width;
+                    let lines =
+                        format_item_lines(item, &runtime.theme, true, hide_thinking, width);
+                    if !lines.is_empty() {
+                        terminal.insert_before(lines.len() as u16, |buf| {
+                            render_lines_to_buffer(&lines, buf);
+                        })?;
+                    }
+                }
+            }
         }
+
+        drain_ui_events(
+            &mut rx,
+            &mut chat,
+            &mut status,
+            &mut streaming_assistant,
+            &mut streaming_thinking,
+            &mut working,
+        );
     }
 
     runtime.harness.request_shutdown();
@@ -369,12 +374,8 @@ fn flush_committed(
         ) {
             break;
         }
-        // Scrollback always stores the collapsed tool form; ctrl+o only affects the live footer.
-        let expand = match &chat[*flushed] {
-            ChatItem::Tool { .. } => false,
-            _ => expanded,
-        };
-        let lines = format_item_lines(&chat[*flushed], theme, expand, hide_thinking, width);
+        // Items land in scrollback with the current ctrl+o expand state.
+        let lines = format_item_lines(&chat[*flushed], theme, expanded, hide_thinking, width);
         if !lines.is_empty() {
             let h = lines.len() as u16;
             terminal.insert_before(h, |buf| {
@@ -384,6 +385,56 @@ fn flush_committed(
         *flushed += 1;
     }
     Ok(())
+}
+
+/// Print the welcome banner + info card into terminal scrollback.
+fn print_welcome(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    runtime: &Runtime,
+    version: &str,
+) -> anyhow::Result<()> {
+    let endpoint = endpoint_for(runtime);
+    let width = terminal.size()?.width;
+    let lines = welcome_lines(
+        &runtime.theme,
+        version,
+        &runtime.settings.default_provider,
+        &runtime.settings.default_model,
+        &endpoint,
+        runtime.resources.skills.len(),
+        runtime.resources.prompts.len(),
+        runtime.needs_api_key_setup,
+        width,
+    );
+    terminal.insert_before(lines.len() as u16, |buf| {
+        render_lines_to_buffer(&lines, buf);
+    })?;
+    Ok(())
+}
+
+/// Dynamic `(name, description)` command entries for skills and prompt templates.
+fn dynamic_command_entries(runtime: &Runtime) -> Vec<(String, String)> {
+    let mut extra: Vec<(String, String)> = runtime
+        .resources
+        .skills
+        .iter()
+        .map(|s| {
+            let desc = if s.description.is_empty() {
+                "skill".to_string()
+            } else {
+                format!("skill — {}", s.description)
+            };
+            (format!("skill:{}", s.name), desc)
+        })
+        .collect();
+    extra.extend(runtime.resources.prompts.iter().map(|p| {
+        let desc = match &p.argument_hint {
+            Some(h) => format!("{h} — prompt template"),
+            None => "prompt template".to_string(),
+        };
+        (p.name.clone(), desc)
+    }));
+    extra
 }
 
 fn path_status_line(cwd: &Path) -> String {
@@ -425,7 +476,53 @@ fn sys(text: impl Into<String>) -> ChatItem {
     ChatItem::System { text: text.into() }
 }
 
+fn truncate_status(s: &str, max: usize) -> String {
+    let one_line = s.lines().next().unwrap_or(s).trim();
+    let mut out: String = one_line.chars().take(max).collect();
+    if one_line.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
+fn drain_ui_events(
+    rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
+    working: &mut bool,
+) {
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            UiEvent::Agent(ev) => {
+                handle_agent_event(
+                    ev,
+                    chat,
+                    status,
+                    streaming_assistant,
+                    streaming_thinking,
+                    working,
+                );
+            }
+            UiEvent::CompactDone(result) => {
+                *working = false;
+                match result {
+                    Ok(msg) => {
+                        chat.push(sys(msg));
+                        *status = "ready".into();
+                    }
+                    Err(e) => {
+                        chat.push(sys(format!("compact failed: {e}")));
+                        *status = "ready".into();
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn handle_key(
     key: crossterm::event::KeyEvent,
     runtime: &mut Runtime,
@@ -445,6 +542,7 @@ async fn handle_key(
     should_quit: &mut bool,
     ac_entries: &[AutocompleteEntry],
     ac_selected: &mut usize,
+    tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> anyhow::Result<()> {
     if let Some(picker) = model_picker.as_mut() {
         match key.code {
@@ -566,7 +664,10 @@ async fn handle_key(
                     .await;
                 runtime.needs_api_key_setup = false;
                 chat.clear();
-                *status = "ready".into();
+                chat.push(sys(format!(
+                    "✓ API key saved for {provider} — you're all set. Type /help for commands."
+                )));
+                *status = "ready · /help for commands".into();
             }
             return Ok(());
         }
@@ -624,6 +725,10 @@ async fn handle_key(
                     runtime.harness.abort();
                     *working = false;
                     *status = "interrupted".into();
+                } else if *working {
+                    // Clear a stuck spinner (e.g. fire-and-forget work with no AgentEnd).
+                    *working = false;
+                    *status = "ready".into();
                 } else if last_escape.elapsed() < Duration::from_millis(500)
                     && runtime.settings.double_escape_action == "tree"
                 {
@@ -665,6 +770,7 @@ async fn handle_key(
                             hide_thinking,
                             expand_details,
                             working,
+                            tx,
                         )
                         .await?;
                     }
@@ -1101,6 +1207,7 @@ async fn apply_effect(
     hide_thinking: &mut bool,
     expand_details: &mut bool,
     working: &mut bool,
+    tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> anyhow::Result<bool> {
     match effect {
         CommandEffect::Quit => return Ok(true),
@@ -1221,11 +1328,20 @@ async fn apply_effect(
         }
         CommandEffect::Compact(instructions) => {
             let harness = Arc::clone(&runtime.harness);
+            let tx = tx.clone();
             *working = true;
-            tokio::spawn(async move {
-                let _ = harness.compact(instructions.as_deref()).await;
-            });
             chat.push(sys("compacting…"));
+            tokio::spawn(async move {
+                let result = match harness.compact(instructions.as_deref()).await {
+                    Ok(r) => Ok(format!(
+                        "compacted · ~{} tokens before · {}",
+                        r.tokens_before,
+                        truncate_status(&r.summary, 80)
+                    )),
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = tx.send(UiEvent::CompactDone(result));
+            });
         }
         CommandEffect::CopyLast => copy_last_assistant(chat, status),
         CommandEffect::Hotkeys => {
@@ -1237,24 +1353,35 @@ async fn apply_effect(
             chat.push(sys(text));
         }
         CommandEffect::Help => {
-            let mut extra: Vec<String> = runtime
-                .resources
-                .skills
-                .iter()
-                .map(|s| format!("skill:{}", s.name))
-                .collect();
-            extra.extend(runtime.resources.prompts.iter().map(|p| p.name.clone()));
+            let extra = dynamic_command_entries(runtime);
             chat.push(sys(commands::help_text(&extra)));
         }
         CommandEffect::SessionInfo => {
-            chat.push(sys(format!(
-                "provider/model: {}/{}\nsessions db: {}\ntheme: {}\ntrusted: {}",
-                runtime.settings.default_provider,
-                runtime.settings.default_model,
-                runtime.sessions_db.display(),
-                runtime.theme.name,
-                runtime.project_trusted
-            )));
+            match runtime.harness.session_stats().await {
+                Ok(stats) => {
+                    let mut report =
+                        loop_agent::harness::format_session_stats(&stats);
+                    report.push_str(&format!(
+                        "\nEnvironment\n  Sessions DB: {}\n  Theme: {}\n  Trusted: {}\n  Settings model: {}/{}\n",
+                        runtime.sessions_db.display(),
+                        runtime.theme.name,
+                        runtime.project_trusted,
+                        runtime.settings.default_provider,
+                        runtime.settings.default_model,
+                    ));
+                    chat.push(sys(report));
+                }
+                Err(e) => {
+                    chat.push(sys(format!(
+                        "provider/model: {}/{}\nsessions db: {}\ntheme: {}\ntrusted: {}\n(stats error: {e})",
+                        runtime.settings.default_provider,
+                        runtime.settings.default_model,
+                        runtime.sessions_db.display(),
+                        runtime.theme.name,
+                        runtime.project_trusted
+                    )));
+                }
+            }
         }
         CommandEffect::Settings => {
             chat.push(sys(format!(
@@ -1298,6 +1425,26 @@ async fn apply_effect(
                 &runtime.settings,
             );
             chat.push(sys("reloaded models, skills, prompts, themes"));
+        }
+        CommandEffect::ListSkills => {
+            if runtime.resources.skills.is_empty() {
+                chat.push(sys(format!(
+                    "No skills loaded.\n\nAdd folders containing a SKILL.md (with YAML frontmatter: name, description) under:\n  {}/skills\n  ~/.agents/skills\n  .agents/skills or .loop/skills in trusted projects\nor list extra paths (e.g. ~/.claude/skills) under \"skills\" in settings.json,\nthen run /reload.",
+                    runtime.agent_dir.display()
+                )));
+            } else {
+                let mut text = format!("Skills ({} loaded)\n", runtime.resources.skills.len());
+                for s in &runtime.resources.skills {
+                    let desc = if s.description.is_empty() {
+                        "(no description)".to_string()
+                    } else {
+                        s.description.clone()
+                    };
+                    text.push_str(&format!("\n  /skill:{} — {}\n      {}", s.name, desc, s.path.display()));
+                }
+                text.push_str("\n\nInvoke with /skill:<name> [args] or let the model pick them up automatically.");
+                chat.push(sys(text));
+            }
         }
         CommandEffect::Resume => {
             chat.push(sys(

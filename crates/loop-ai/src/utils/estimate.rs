@@ -1,8 +1,23 @@
 //! Rough context token estimation.
 
 use crate::types::{
-    AssistantContent, Context, Message, ToolResultContent, UserContent, UserMessageContent,
+    AssistantContent, Context, Message, ToolResultContent, Usage, UserContent, UserMessageContent,
 };
+
+/// Context size implied by a usage record.
+///
+/// Prefers `total_tokens` when set; otherwise sums input/output/cache components.
+pub fn calculate_context_tokens(usage: &Usage) -> u64 {
+    if usage.total_tokens > 0 {
+        usage.total_tokens
+    } else {
+        usage
+            .input
+            .saturating_add(usage.output)
+            .saturating_add(usage.cache_read)
+            .saturating_add(usage.cache_write)
+    }
+}
 
 /// Rough estimate of tokens in a context (~4 chars/token).
 ///
@@ -98,5 +113,30 @@ mod tests {
             tools: None,
         };
         assert_eq!(estimate_context_tokens(&ctx), 3);
+    }
+
+    #[test]
+    fn calculates_context_tokens_prefers_total() {
+        let usage = Usage {
+            input: 1,
+            output: 2,
+            cache_read: 3,
+            cache_write: 4,
+            total_tokens: 99,
+            ..Usage::empty()
+        };
+        assert_eq!(calculate_context_tokens(&usage), 99);
+    }
+
+    #[test]
+    fn calculates_context_tokens_sums_when_total_zero() {
+        let usage = Usage {
+            input: 1,
+            output: 2,
+            cache_read: 3,
+            cache_write: 4,
+            ..Usage::empty()
+        };
+        assert_eq!(calculate_context_tokens(&usage), 10);
     }
 }

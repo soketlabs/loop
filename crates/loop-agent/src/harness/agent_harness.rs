@@ -373,6 +373,52 @@ impl AgentHarness {
         result
     }
 
+    /// Aggregate session / token / cost statistics for `/session`.
+    pub async fn session_stats(
+        &self,
+    ) -> Result<crate::harness::session::SessionStats, AgentHarnessError> {
+        use crate::harness::session::{compute_session_stats, SessionStatsInput};
+
+        let (meta, all_entries, branch_entries, branch_messages) = {
+            let session = self.session.lock().await;
+            let meta = session.metadata().clone();
+            let all_entries = session
+                .read_entries()
+                .await
+                .map_err(AgentHarnessError::Session)?;
+            let branch_entries = session
+                .read_branch()
+                .await
+                .map_err(AgentHarnessError::Session)?;
+            let ctx = session
+                .build_context()
+                .await
+                .map_err(AgentHarnessError::Session)?;
+            (meta, all_entries, branch_entries, ctx.messages)
+        };
+
+        let model = self.model.read().await.clone();
+        let system_prompt = self.system_prompt.read().await.clone();
+        let tools = self.tools.read().await.clone();
+        let llm_tools: Vec<loop_ai::Tool> = tools.iter().map(|t| t.to_llm_tool()).collect();
+
+        Ok(compute_session_stats(SessionStatsInput {
+            all_entries: &all_entries,
+            branch_entries: &branch_entries,
+            branch_messages: &branch_messages,
+            session_id: &meta.id,
+            session_name: meta.name.as_deref(),
+            session_path: meta.path.as_deref(),
+            cwd: meta.cwd.as_deref(),
+            created_at: meta.created_at,
+            parent_session_id: meta.parent_session_id.as_deref(),
+            model: &model,
+            system_prompt: &system_prompt,
+            tools: Some(llm_tools.as_slice()),
+            models: Some(&self.models),
+        }))
+    }
+
     async fn compact_inner(
         &self,
         settings: &CompactionSettings,

@@ -8,7 +8,7 @@ pub mod partial_json;
 pub mod validate;
 
 pub use cost::calculate_cost;
-pub use estimate::estimate_context_tokens;
+pub use estimate::{calculate_context_tokens, estimate_context_tokens};
 pub use id::{now_ms, new_id};
 pub use overflow::is_context_overflow;
 pub use partial_json::parse_streaming_json;

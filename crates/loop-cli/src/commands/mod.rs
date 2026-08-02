@@ -63,7 +63,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "session",
-            description: "Show session info",
+            description: "Show session info and token stats",
             args_hint: None,
         },
         SlashCommand {
@@ -127,6 +127,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: None,
         },
         SlashCommand {
+            name: "skills",
+            description: "List loaded skills (SKILL.md)",
+            args_hint: None,
+        },
+        SlashCommand {
             name: "quit",
             description: "Quit Loop",
             args_hint: None,
@@ -149,7 +154,7 @@ pub struct AutocompleteEntry {
 }
 
 /// Autocomplete matches for a partial slash command (names only).
-pub fn autocomplete(prefix: &str, extra: &[String]) -> Vec<String> {
+pub fn autocomplete(prefix: &str, extra: &[(String, String)]) -> Vec<String> {
     autocomplete_entries(prefix, extra)
         .into_iter()
         .map(|e| e.name)
@@ -157,7 +162,9 @@ pub fn autocomplete(prefix: &str, extra: &[String]) -> Vec<String> {
 }
 
 /// Autocomplete matches with descriptions for the bottom dock.
-pub fn autocomplete_entries(prefix: &str, extra: &[String]) -> Vec<AutocompleteEntry> {
+///
+/// `extra` holds dynamic `(name, description)` entries (skills, prompt templates).
+pub fn autocomplete_entries(prefix: &str, extra: &[(String, String)]) -> Vec<AutocompleteEntry> {
     let p = prefix.trim_start_matches('/').to_lowercase();
     let mut out: Vec<AutocompleteEntry> = builtin_commands()
         .into_iter()
@@ -170,18 +177,14 @@ pub fn autocomplete_entries(prefix: &str, extra: &[String]) -> Vec<AutocompleteE
             },
         })
         .collect();
-    for e in extra {
+    for (e, desc) in extra {
         let name = e.trim_start_matches('/');
         if name.to_lowercase().starts_with(&p) {
             let label = format!("/{name}");
             if !out.iter().any(|x| x.name == label) {
                 out.push(AutocompleteEntry {
                     name: label,
-                    description: if name.starts_with("skill:") {
-                        "skill".into()
-                    } else {
-                        "prompt".into()
-                    },
+                    description: desc.clone(),
                 });
             }
         }
@@ -251,6 +254,8 @@ pub enum CommandEffect {
     Trust(Option<String>),
     /// Reload resources.
     Reload,
+    /// List loaded skills.
+    ListSkills,
     /// Resume picker.
     Resume,
     /// Tree view.
@@ -329,6 +334,7 @@ pub fn dispatch(cmd: &ParsedCommand, skill_names: &[String], template_names: &[S
             Some(cmd.args.clone())
         }),
         "reload" => CommandEffect::Reload,
+        "skills" => CommandEffect::ListSkills,
         "resume" => CommandEffect::Resume,
         "tree" => CommandEffect::Tree,
         "name" => CommandEffect::SetName(cmd.args.clone()),
@@ -373,16 +379,20 @@ pub fn dispatch(cmd: &ParsedCommand, skill_names: &[String], template_names: &[S
 }
 
 /// Format /help text.
-pub fn help_text(extra: &[String]) -> String {
+pub fn help_text(extra: &[(String, String)]) -> String {
     let mut lines = vec!["Slash commands:".to_string()];
     for c in builtin_commands() {
         let hint = c.args_hint.unwrap_or("");
         lines.push(format!("  /{} {} — {}", c.name, hint, c.description));
     }
     if !extra.is_empty() {
-        lines.push("Extension / skill / template commands:".into());
-        for e in extra {
-            lines.push(format!("  /{e}"));
+        lines.push("Skill / prompt template commands:".into());
+        for (e, desc) in extra {
+            if desc.is_empty() {
+                lines.push(format!("  /{e}"));
+            } else {
+                lines.push(format!("  /{e} — {desc}"));
+            }
         }
     }
     lines.join("\n")

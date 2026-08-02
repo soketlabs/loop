@@ -378,6 +378,19 @@ impl Session {
     pub fn reader(&self) -> Arc<dyn SessionReader> {
         Arc::clone(&self.reader)
     }
+
+    /// Read all session entries (full tree, including compacted history).
+    pub async fn read_entries(&self) -> Result<Vec<SessionTreeEntry>, SessionError> {
+        self.reader.read_entries(None).await
+    }
+
+    /// Read the active branch path (root/compaction → leaf).
+    pub async fn read_branch(&self) -> Result<Vec<SessionTreeEntry>, SessionError> {
+        let leaf = self.reader.read_head().await?;
+        self.reader
+            .read_path_to_root_or_compaction(leaf.as_deref())
+            .await
+    }
 }
 
 /// Project entries to session context (compaction-aware).

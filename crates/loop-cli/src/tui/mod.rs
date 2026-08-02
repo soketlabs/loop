@@ -111,24 +111,142 @@ pub fn item_is_committed(
     }
 }
 
-/// Pi-style welcome lines for `insert_before`.
-pub fn welcome_lines(theme: &Theme, version: &str, model_label: &str, endpoint: &str) -> Vec<Line<'static>> {
-    vec![
+/// Block-letter banner rows (ANSI-shadow style).
+const BANNER_ROWS: [&str; 6] = [
+    "██╗      ██████╗  ██████╗ ██████╗ ",
+    "██║     ██╔═══██╗██╔═══██╗██╔══██╗",
+    "██║     ██║   ██║██║   ██║██████╔╝",
+    "██║     ██║   ██║██║   ██║██╔═══╝ ",
+    "███████╗╚██████╔╝╚██████╔╝██║     ",
+    "╚══════╝ ╚═════╝  ╚═════╝ ╚═╝     ",
+];
+
+/// Top→bottom banner gradient (periwinkle blues).
+const BANNER_GRADIENT: [(u8, u8, u8); 6] = [
+    (165, 184, 255),
+    (147, 167, 251),
+    (130, 150, 247),
+    (112, 133, 243),
+    (95, 116, 239),
+    (77, 99, 235),
+];
+
+/// Welcome screen for `insert_before`: banner, tagline, and an info card.
+#[allow(clippy::too_many_arguments)]
+pub fn welcome_lines(
+    theme: &Theme,
+    version: &str,
+    provider: &str,
+    model: &str,
+    endpoint: &str,
+    skills: usize,
+    prompts: usize,
+    needs_setup: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let w = width.max(20) as usize;
+    let mut out = Vec::new();
+    out.push(Line::from(""));
+
+    // Banner
+    if w >= BANNER_ROWS[0].chars().count() + 2 {
+        for (row, (r, g, b)) in BANNER_ROWS.iter().zip(BANNER_GRADIENT) {
+            out.push(Line::from(Span::styled(
+                (*row).to_string(),
+                Style::default()
+                    .fg(Color::Rgb(r, g, b))
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+    } else {
+        out.push(Line::from(Span::styled(
+            "LOOP".to_string(),
+            theme.accent_bold(),
+        )));
+    }
+    out.push(Line::from(""));
+    out.push(Line::from(vec![
+        Span::styled("✦ ".to_string(), theme.accent()),
+        Span::styled("Interactive Coding Agent Harness".to_string(), theme.style("text")),
+        Span::styled(" ✦".to_string(), theme.accent()),
+    ]));
+    out.push(Line::from(""));
+
+    // Info card
+    let border = theme.style("border");
+    let rows: Vec<(&str, String)> = vec![
+        ("Provider", provider.to_string()),
+        ("Model", model.to_string()),
+        ("Endpoint", endpoint.to_string()),
+    ];
+    let (dot_style, status_text) = if needs_setup {
+        (
+            theme.style("warning"),
+            "setup — paste your API key to begin".to_string(),
+        )
+    } else {
+        (
+            theme.style("success"),
+            "ready — type /help to begin".to_string(),
+        )
+    };
+    let max_inner = w.saturating_sub(2).max(24);
+    let mut inner = rows
+        .iter()
+        .map(|(_, v)| 2 + 11 + UnicodeWidthStr::width(v.as_str()) + 2)
+        .chain(std::iter::once(
+            2 + 2 + UnicodeWidthStr::width(status_text.as_str()) + 2,
+        ))
+        .max()
+        .unwrap_or(24);
+    inner = inner.clamp(24, max_inner);
+
+    let hline = |l: char, r: char| -> Line<'static> {
         Line::from(Span::styled(
-            format!("loop v{version}"),
-            theme.style("text").add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o details"
-                .to_string(),
-            theme.dim(),
-        )),
-        Line::from(Span::styled(
-            format!("{model_label} · {endpoint}"),
-            theme.muted(),
-        )),
-        Line::from(""),
-    ]
+            format!("{l}{}{r}", "─".repeat(inner)),
+            border,
+        ))
+    };
+    let pad_row = |spans: Vec<Span<'static>>| -> Line<'static> {
+        let used: usize = spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        let mut all = vec![Span::styled("│".to_string(), border)];
+        all.extend(spans);
+        if used < inner {
+            all.push(Span::raw(" ".repeat(inner - used)));
+        }
+        all.push(Span::styled("│".to_string(), border));
+        Line::from(all)
+    };
+
+    out.push(hline('╭', '╮'));
+    for (label, value) in &rows {
+        let value = truncate_width(value, inner.saturating_sub(15));
+        out.push(pad_row(vec![
+            Span::styled(format!("  {label:<11}"), theme.muted()),
+            Span::styled(value, theme.style("text").add_modifier(Modifier::BOLD)),
+        ]));
+    }
+    out.push(hline('├', '┤'));
+    out.push(pad_row(vec![
+        Span::styled("  ● ".to_string(), dot_style),
+        Span::styled(truncate_width(&status_text, inner.saturating_sub(6)), theme.style("text")),
+    ]));
+    out.push(hline('╰', '╯'));
+
+    out.push(Line::from(Span::styled(
+        format!("loop v{version} · {skills} skills · {prompts} prompts"),
+        theme.muted(),
+    )));
+    out.push(Line::from(Span::styled(
+        "enter send · shift+enter newline · / commands · ctrl+o expand details · ctrl+c quit"
+            .to_string(),
+        theme.dim(),
+    )));
+    out.push(Line::from(""));
+    out
 }
 
 /// Format a single chat item as lines (for scrollback or live area).
@@ -143,24 +261,36 @@ pub fn format_item_lines(
     let mut lines = Vec::new();
     match item {
         ChatItem::User { text } => {
-            // Encapsulated band — full-width background like Pi.
-            if text.is_empty() {
-                lines.push(padded_bg_line(theme, "userMessageBg", "userMessageText", " ", false, w));
-            } else {
-                for l in text.lines() {
-                    for part in soft_wrap(l, w.saturating_sub(2).max(1)) {
-                        lines.push(padded_bg_line(
-                            theme,
-                            "userMessageBg",
-                            "userMessageText",
-                            &format!(" {part} "),
-                            false,
-                            w,
-                        ));
-                    }
+            // Full-width band with a `❯` prompt marker.
+            lines.push(bg_spans_line(theme, "userMessageBg", vec![Span::raw("\u{00a0}")], w));
+            let mut first = true;
+            let body_w = w.saturating_sub(5).max(1);
+            for l in text.lines() {
+                for part in soft_wrap(l, body_w) {
+                    let marker = if first { "❯ " } else { "  " };
+                    first = false;
+                    lines.push(bg_spans_line(
+                        theme,
+                        "userMessageBg",
+                        vec![
+                            Span::raw(" "),
+                            Span::styled(marker.to_string(), theme.accent_bold()),
+                            Span::styled(part, theme.style("userMessageText")),
+                        ],
+                        w,
+                    ));
                 }
             }
-            lines.push(Line::from(""));
+            if first {
+                lines.push(bg_spans_line(
+                    theme,
+                    "userMessageBg",
+                    vec![Span::raw(" "), Span::styled("❯".to_string(), theme.accent_bold())],
+                    w,
+                ));
+            }
+            lines.push(bg_spans_line(theme, "userMessageBg", vec![Span::raw("\u{00a0}")], w));
+            lines.push(Line::from(" "));
         }
         ChatItem::Assistant { text } => {
             if text.is_empty() {
@@ -171,37 +301,60 @@ pub fn format_item_lines(
             lines.push(Line::from(""));
         }
         ChatItem::Thinking { text, done } => {
-            let label = if *done { "thinking" } else { "thinking…" };
-            let bg = "toolPendingBg";
+            let label = if *done { "Thinking" } else { "Thinking…" };
+            let think = theme
+                .style("thinkingText")
+                .add_modifier(Modifier::ITALIC);
             if hide_thinking {
-                lines.push(padded_bg_line(
-                    theme,
-                    bg,
-                    "thinkingText",
-                    &format!("  {label} "),
-                    false,
-                    w,
-                ));
-            } else {
-                let summary = first_line_summary(text, 72);
-                let head = if summary.is_empty() {
-                    format!("  ✦ {label} ")
-                } else {
-                    format!("  ✦ {label} · {summary} ")
-                };
-                lines.push(padded_bg_line(theme, bg, "thinkingText", &head, true, w));
-                if expanded {
-                    for l in text.lines().take(20) {
-                        lines.push(padded_bg_line(
-                            theme,
-                            bg,
-                            "thinkingText",
-                            &format!("    {l} "),
-                            false,
-                            w,
-                        ));
+                lines.push(Line::from(vec![
+                    Span::styled("✦ ".to_string(), theme.accent()),
+                    Span::styled(label.to_string(), think),
+                ]));
+            } else if expanded && !text.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("✦ ".to_string(), theme.accent()),
+                    Span::styled(label.to_string(), think.add_modifier(Modifier::BOLD)),
+                    Span::styled("  ctrl+o to collapse".to_string(), theme.dim()),
+                ]));
+                let body_w = w.saturating_sub(4).max(1);
+                let mut shown = 0usize;
+                'outer: for l in text.lines() {
+                    for part in soft_wrap(l, body_w) {
+                        if shown >= 40 {
+                            lines.push(Line::from(vec![
+                                Span::styled("  │ ".to_string(), theme.style("borderMuted")),
+                                Span::styled("…".to_string(), theme.dim()),
+                            ]));
+                            break 'outer;
+                        }
+                        lines.push(Line::from(vec![
+                            Span::styled("  │ ".to_string(), theme.style("borderMuted")),
+                            Span::styled(part, think),
+                        ]));
+                        shown += 1;
                     }
                 }
+            } else {
+                // Collapsed: one-line trace. While streaming, show the latest line.
+                let summary = if *done {
+                    line_summary(text.lines().next().unwrap_or(""), 72)
+                } else {
+                    line_summary(
+                        text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(""),
+                        72,
+                    )
+                };
+                let mut spans = vec![
+                    Span::styled("✦ ".to_string(), theme.accent()),
+                    Span::styled(label.to_string(), think),
+                ];
+                if !summary.is_empty() {
+                    spans.push(Span::styled(format!(" · {summary}"), think));
+                }
+                if *done && !text.is_empty() {
+                    spans.push(Span::styled("  ctrl+o".to_string(), theme.dim()));
+                }
+                lines.push(Line::from(spans));
             }
             lines.push(Line::from(""));
         }
@@ -212,50 +365,73 @@ pub fn format_item_lines(
             status,
             ..
         } => {
-            let (bg, title_fg) = match status {
-                CardStatus::Pending => ("toolPendingBg", "warning"),
-                CardStatus::Success => ("toolSuccessBg", "toolTitle"),
-                CardStatus::Error => ("toolErrorBg", "error"),
+            let (dot_key, bg) = match status {
+                CardStatus::Pending => ("warning", "toolPendingBg"),
+                CardStatus::Success => ("success", "toolSuccessBg"),
+                CardStatus::Error => ("error", "toolErrorBg"),
             };
-            // Summary row only by default — `$ read · README.md`
-            let head = if name == "bash" && !summary.is_empty() {
-                format!(" $ {summary} ")
+            let title = if name == "bash" && !summary.is_empty() {
+                format!("$ {summary}")
             } else if summary.is_empty() {
-                format!(" $ {name} ")
+                name.clone()
             } else {
-                format!(" $ {name} · {summary} ")
+                format!("{name} {summary}")
             };
-            lines.push(padded_bg_line(theme, bg, title_fg, &head, true, w));
-
-            if matches!(status, CardStatus::Pending) && detail.is_empty() {
-                lines.push(padded_bg_line(theme, bg, "dim", " running… ", false, w));
-            } else if expanded && !detail.is_empty() {
-                for l in detail.lines().take(48) {
-                    lines.push(padded_bg_line(
-                        theme,
-                        bg,
-                        "toolOutput",
-                        &format!(" {l} "),
-                        false,
-                        w,
+            let detail_lines = detail.lines().count();
+            let mut head = vec![
+                Span::styled(" ● ".to_string(), theme.style(dot_key)),
+                Span::styled(
+                    title,
+                    theme.style("toolTitle").add_modifier(Modifier::BOLD),
+                ),
+            ];
+            match status {
+                CardStatus::Pending => {
+                    head.push(Span::styled(" · running…".to_string(), theme.dim()));
+                }
+                _ if detail.is_empty() => {}
+                _ if expanded => {
+                    head.push(Span::styled(
+                        " · ctrl+o to collapse".to_string(),
+                        theme.dim(),
                     ));
                 }
-                let n = detail.lines().count();
-                let hint = if n > 48 {
-                    " … truncated · ctrl+o to collapse "
-                } else {
-                    " ctrl+o to collapse "
-                };
-                lines.push(padded_bg_line(theme, bg, "dim", hint, false, w));
-            } else if !detail.is_empty() {
-                lines.push(padded_bg_line(
-                    theme,
-                    bg,
-                    "dim",
-                    " ctrl+o to expand ",
-                    false,
-                    w,
-                ));
+                _ => {
+                    head.push(Span::styled(
+                        format!(
+                            " · {detail_lines} line{} · ctrl+o",
+                            if detail_lines == 1 { "" } else { "s" }
+                        ),
+                        theme.dim(),
+                    ));
+                }
+            }
+            lines.push(bg_spans_line(theme, bg, head, w));
+
+            // Body: full detail when expanded; error previews stay visible.
+            let preview = if expanded {
+                48
+            } else if matches!(status, CardStatus::Error) {
+                4
+            } else {
+                0
+            };
+            if preview > 0 && !detail.is_empty() {
+                let body_w = w.saturating_sub(5).max(1);
+                for l in detail.lines().take(preview) {
+                    lines.push(Line::from(vec![
+                        Span::styled("  │ ".to_string(), theme.style("borderMuted")),
+                        Span::styled(truncate_width(l, body_w), theme.style("toolOutput")),
+                    ]));
+                }
+                if detail_lines > preview {
+                    let hint = if expanded {
+                        format!("  … {} more lines truncated", detail_lines - preview)
+                    } else {
+                        format!("  … {} more lines · ctrl+o", detail_lines - preview)
+                    };
+                    lines.push(Line::from(Span::styled(hint, theme.dim())));
+                }
             }
             lines.push(Line::from(""));
         }
@@ -363,7 +539,21 @@ fn draw_input(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
         opts.input.to_string()
     };
 
-    let lines = render_input_lines(&display, opts.cursor, text_style, opts.theme, area.width as usize);
+    let placeholder = if !display.is_empty() {
+        ""
+    } else if opts.setup_mode {
+        " paste your API key"
+    } else {
+        " Type a message · / for commands"
+    };
+    let lines = render_input_lines(
+        &display,
+        opts.cursor,
+        text_style,
+        opts.theme,
+        placeholder,
+        area.width as usize,
+    );
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[1]);
 }
 
@@ -373,12 +563,34 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
     }
     let lines = match picker {
         PickerView::None => Vec::new(),
-        PickerView::Setup { provider } => vec![
-            Line::from(Span::styled(
-                format!("  paste API key for {provider} · enter save · esc quit"),
-                theme.muted(),
-            )),
-        ],
+        PickerView::Setup { provider } => {
+            let env_hint = if provider == "soket" {
+                "SOKET_API_KEY / TENSORSTUDIO_API_KEY / LOOP_API_KEY".to_string()
+            } else {
+                format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"))
+            };
+            vec![
+                Line::from(vec![
+                    Span::styled("  ◆ ".to_string(), theme.accent()),
+                    Span::styled(
+                        format!("Connect to {provider}"),
+                        theme.style("text").add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    "    Paste your API key and press enter — input stays hidden".to_string(),
+                    theme.muted(),
+                )),
+                Line::from(Span::styled(
+                    format!("    Tip: you can also set {env_hint} and restart"),
+                    theme.dim(),
+                )),
+                Line::from(Span::styled(
+                    "    enter save · esc quit".to_string(),
+                    theme.dim(),
+                )),
+            ]
+        }
         PickerView::Commands { rows, selected } => picker_lines(rows, *selected, theme, false),
         PickerView::Models { rows, selected, hint } => {
             let mut out = vec![Line::from(Span::styled(hint.clone(), theme.style("warning")))];
@@ -407,37 +619,43 @@ fn picker_lines(
         0
     };
     let end = (start + page).min(rows.len());
+    let label_w = rows
+        .iter()
+        .map(|r| UnicodeWidthStr::width(r.label.as_str()))
+        .max()
+        .unwrap_or(16)
+        .clamp(16, 28);
     for (i, row) in rows.iter().enumerate().take(end).skip(start) {
         let active = i == selected;
-        let arrow = if active { "→" } else { " " };
+        let arrow = if active { "❯" } else { " " };
+        let row_bg = active.then(|| theme.get("selectedBg"));
+        let with_bg = |style: Style| match row_bg {
+            Some(bg) => style.bg(bg),
+            None => style,
+        };
         let label_style = if active {
-            theme.style("text").add_modifier(Modifier::BOLD)
+            with_bg(theme.style("text").add_modifier(Modifier::BOLD))
         } else {
             theme.style("text")
         };
         let mut spans = vec![
-            Span::styled(format!(" {arrow} "), theme.accent()),
-            Span::styled(format!("{:<16}", truncate_width(&row.label, 16)), label_style),
-            Span::styled(format!(" {}", row.description), theme.muted()),
+            Span::styled(format!(" {arrow} "), with_bg(theme.accent_bold())),
+            Span::styled(
+                format!("{:<label_w$}", truncate_width(&row.label, label_w)),
+                label_style,
+            ),
+            Span::styled(format!(" {}", row.description), with_bg(theme.muted())),
         ];
         if let Some(m) = &row.mark {
-            spans.push(Span::styled(format!(" {m}"), theme.style("success")));
+            spans.push(Span::styled(format!(" {m}"), with_bg(theme.style("success"))));
         }
         out.push(Line::from(spans));
     }
-    if rows.len() > page || start > 0 {
-        let page_num = selected / page + 1;
-        let pages = rows.len().div_ceil(page).max(1);
-        out.push(Line::from(Span::styled(
-            format!("  ({page_num}/{pages})"),
-            theme.dim(),
-        )));
-    } else {
-        out.push(Line::from(Span::styled(
-            format!("  ({}/{})", selected + 1, rows.len()),
-            theme.dim(),
-        )));
+    let mut counter = format!("  {}/{}", selected + 1, rows.len());
+    if rows.len() > page {
+        counter.push_str(" · ↑↓ scroll");
     }
+    out.push(Line::from(Span::styled(counter, theme.dim())));
     out
 }
 
@@ -476,7 +694,7 @@ fn draw_status(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
 fn picker_height(picker: &PickerView) -> u16 {
     match picker {
         PickerView::None => 0,
-        PickerView::Setup { .. } => 1,
+        PickerView::Setup { .. } => 4,
         PickerView::Commands { rows, .. } => {
             let n = rows.len().min(PICKER_PAGE) as u16;
             n + 1 // page indicator
@@ -493,6 +711,7 @@ fn render_input_lines(
     cursor: usize,
     text_style: Style,
     theme: &Theme,
+    placeholder: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
     // Absolute black block (theme `cursor`, default #000000). White cell bg keeps it
@@ -507,11 +726,15 @@ fn render_input_lines(
     };
     let mut char_at = 0usize;
     let mut out = Vec::new();
-    for line in &lines {
+    for (row, line) in lines.iter().enumerate() {
         let chars: Vec<char> = line.chars().collect();
         let line_len = chars.len();
         let caret_here = cursor >= char_at && cursor <= char_at + line_len;
         let mut spans = Vec::new();
+        spans.push(Span::styled(
+            if row == 0 { "❯ " } else { "  " }.to_string(),
+            theme.accent_bold(),
+        ));
         if caret_here {
             let col = cursor - char_at;
             if col > 0 {
@@ -528,8 +751,11 @@ fn render_input_lines(
         } else if !line.is_empty() {
             spans.push(Span::styled((*line).to_string(), text_style));
         }
-        if spans.is_empty() {
+        if spans.len() == 1 {
             spans.push(Span::styled("█".to_string(), caret_style));
+        }
+        if row == 0 && input.is_empty() && !placeholder.is_empty() {
+            spans.push(Span::styled(placeholder.to_string(), theme.dim()));
         }
         out.push(Line::from(spans));
         let _ = width;
@@ -538,32 +764,8 @@ fn render_input_lines(
     out
 }
 
-fn padded_bg_line(
-    theme: &Theme,
-    bg_key: &str,
-    fg_key: &str,
-    text: &str,
-    bold: bool,
-    width: usize,
-) -> Line<'static> {
-    let mut style = Style::default()
-        .fg(theme.get(fg_key))
-        .bg(theme.get(bg_key));
-    if bold {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    let mut content = text.to_string();
-    let visual = UnicodeWidthStr::width(content.as_str());
-    if visual < width {
-        content.push_str(&" ".repeat(width - visual));
-    } else if visual > width {
-        content = truncate_width(&content, width);
-    }
-    Line::from(Span::styled(content, style))
-}
-
-fn first_line_summary(text: &str, max: usize) -> String {
-    let line = text.lines().next().unwrap_or("").trim();
+fn line_summary(line: &str, max: usize) -> String {
+    let line = line.trim();
     if line.is_empty() {
         return String::new();
     }
@@ -572,6 +774,40 @@ fn first_line_summary(text: &str, max: usize) -> String {
         s.push('…');
     }
     s
+}
+
+/// A full-width line with a background color, built from styled spans.
+fn bg_spans_line(
+    theme: &Theme,
+    bg_key: &str,
+    spans: Vec<Span<'static>>,
+    width: usize,
+) -> Line<'static> {
+    let bg = theme.get(bg_key);
+    let mut used = 0usize;
+    let mut out: Vec<Span<'static>> = spans
+        .into_iter()
+        .map(|s| {
+            used += UnicodeWidthStr::width(s.content.as_ref());
+            Span::styled(s.content.into_owned(), s.style.bg(bg))
+        })
+        .collect();
+    if used < width {
+        out.push(Span::styled(
+            " ".repeat(width - used),
+            Style::default().bg(bg),
+        ));
+    }
+    Line::from(out)
+}
+
+/// Whether an item has expandable detail (for ctrl+o).
+pub fn item_has_detail(item: &ChatItem) -> bool {
+    match item {
+        ChatItem::Tool { detail, .. } => !detail.is_empty(),
+        ChatItem::Thinking { text, .. } => !text.is_empty(),
+        _ => false,
+    }
 }
 
 fn wrap_plain(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {

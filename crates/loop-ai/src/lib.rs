@@ -73,6 +73,6 @@ pub use stream::{
 };
 pub use types::*;
 pub use utils::{
-    estimate_context_tokens, is_context_overflow, new_id, now_ms, parse_streaming_json,
-    validate_tool_arguments, validate_tool_call, ToolValidationError,
+    calculate_context_tokens, estimate_context_tokens, is_context_overflow, new_id, now_ms,
+    parse_streaming_json, validate_tool_arguments, validate_tool_call, ToolValidationError,
 };
