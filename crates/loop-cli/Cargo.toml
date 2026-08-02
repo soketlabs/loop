@@ -34,6 +34,8 @@ crossterm = { workspace = true }
 dirs = { workspace = true }
 anyhow = { workspace = true }
 pulldown-cmark = { workspace = true }
+syntect = { workspace = true }
+two-face = { workspace = true }
 arboard = { workspace = true }
 rhai = { workspace = true }
 rustyline = { workspace = true }

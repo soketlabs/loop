@@ -7,6 +7,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
 
+use super::highlight::{self, HighlightState};
+
 /// Render markdown text to styled lines suitable for a terminal.
 pub fn render_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut options = Options::empty();
@@ -19,6 +21,7 @@ pub fn render_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut style_stack = vec![theme.style("text")];
     let mut in_code_block = false;
+    let mut code_highlight: Option<HighlightState> = None;
     let mut list_depth: usize = 0;
     let mut table_row: Vec<String> = Vec::new();
 
@@ -52,19 +55,31 @@ pub fn render_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 in_code_block = true;
                 flush(&mut current, &mut lines);
                 style_stack.push(theme.style("mdCodeBlock"));
-                if let CodeBlockKind::Fenced(lang) = kind {
-                    let lang = lang.to_string();
-                    if !lang.is_empty() {
-                        current.push(Span::styled(
-                            format!("┌─ {lang}"),
-                            theme.style("mdCodeBlockBorder"),
-                        ));
-                        flush(&mut current, &mut lines);
+                let lang = match &kind {
+                    CodeBlockKind::Fenced(lang) => {
+                        let lang = lang.to_string();
+                        if !lang.is_empty() {
+                            current.push(Span::styled(
+                                format!("┌─ {lang}"),
+                                theme.style("mdCodeBlockBorder"),
+                            ));
+                            flush(&mut current, &mut lines);
+                        }
+                        if lang.is_empty() {
+                            None
+                        } else {
+                            Some(lang)
+                        }
                     }
-                }
+                    CodeBlockKind::Indented => None,
+                };
+                code_highlight = lang
+                    .as_deref()
+                    .and_then(HighlightState::from_language);
             }
             Event::End(TagEnd::CodeBlock) => {
                 in_code_block = false;
+                code_highlight = None;
                 flush(&mut current, &mut lines);
                 style_stack.pop();
             }
@@ -161,8 +176,17 @@ pub fn render_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 let style = *style_stack.last().unwrap_or(&theme.style("text"));
                 let cleaned = sanitize_terminal_text(&t);
                 if in_code_block {
+                    let fallback = theme.style("mdCodeBlock");
                     for line in cleaned.split('\n') {
-                        current.push(Span::styled(format!("  {line}"), style));
+                        let mut row = vec![Span::styled("  ".to_string(), fallback)];
+                        if let Some(state) = code_highlight.as_mut() {
+                            row.extend(highlight::highlight_line_stateful(
+                                line, state, theme, fallback,
+                            ));
+                        } else {
+                            row.push(Span::styled(line.to_string(), style));
+                        }
+                        current = row;
                         flush(&mut current, &mut lines);
                     }
                 } else {
@@ -257,34 +281,39 @@ fn strip_html_tags(s: &str) -> String {
     sanitize_terminal_text(out.trim())
 }
 
-/// Soft-wrap already-rendered lines to a terminal width (span-safe approximation).
+/// Soft-wrap already-rendered lines to a terminal width (span-safe).
 pub fn wrap_rendered_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
     if width < 8 {
         return lines;
     }
     let mut out = Vec::new();
     for line in lines {
-        let w = line.width();
-        if w <= width {
+        if line.width() <= width {
             out.push(line);
             continue;
         }
-        // Flatten and re-wrap as plain text, preserving first span style.
-        let style = line.spans.first().map(|s| s.style).unwrap_or_default();
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        let mut row = String::new();
+        let mut row: Vec<Span<'static>> = Vec::new();
         let mut row_w = 0usize;
-        for ch in text.chars() {
-            let cw = UnicodeWidthStr::width(ch.to_string().as_str()).max(1);
-            if row_w + cw > width && !row.is_empty() {
-                out.push(Line::from(Span::styled(std::mem::take(&mut row), style)));
-                row_w = 0;
+        for span in line.spans {
+            let style = span.style;
+            for ch in span.content.chars() {
+                let cw = UnicodeWidthStr::width(ch.to_string().as_str()).max(1);
+                if row_w + cw > width && !row.is_empty() {
+                    out.push(Line::from(std::mem::take(&mut row)));
+                    row_w = 0;
+                }
+                // Merge into last span when style matches to keep span count down.
+                match row.last_mut() {
+                    Some(last) if last.style == style => {
+                        last.content.to_mut().push(ch);
+                    }
+                    _ => row.push(Span::styled(ch.to_string(), style)),
+                }
+                row_w += cw;
             }
-            row.push(ch);
-            row_w += cw;
         }
         if !row.is_empty() {
-            out.push(Line::from(Span::styled(row, style)));
+            out.push(Line::from(row));
         }
     }
     out

@@ -1,6 +1,7 @@
 //! Pi-style inline UI: transcript in terminal scrollback, footer redrawn in place.
 
 pub mod editor;
+pub mod highlight;
 pub mod markdown;
 
 pub use editor::InputBuffer;
@@ -419,11 +420,15 @@ pub fn format_item_lines(
             };
             if preview > 0 && !detail.is_empty() {
                 let body_w = w.saturating_sub(5).max(1);
-                for l in detail.lines().take(preview) {
-                    lines.push(Line::from(vec![
-                        Span::styled("  │ ".to_string(), theme.style("borderMuted")),
-                        Span::styled(truncate_width(l, body_w), theme.style("toolOutput")),
-                    ]));
+                let fallback = theme.style("toolOutput");
+                let highlighted = highlight_tool_detail(name, summary, detail, theme, fallback);
+                for spans in highlighted.into_iter().take(preview) {
+                    let mut row = vec![Span::styled(
+                        "  │ ".to_string(),
+                        theme.style("borderMuted"),
+                    )];
+                    row.extend(highlight::truncate_spans(spans, body_w));
+                    lines.push(Line::from(row));
                 }
                 if detail_lines > preview {
                     let hint = if expanded {
@@ -808,6 +813,43 @@ fn wrap_plain(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
         .into_iter()
         .map(|s| Line::from(Span::styled(s, style)))
         .collect()
+}
+
+/// Highlight tool card body: file tools by path, JSON args + body after `---`, else plain.
+fn highlight_tool_detail(
+    name: &str,
+    summary: &str,
+    detail: &str,
+    theme: &Theme,
+    fallback: Style,
+) -> Vec<Vec<Span<'static>>> {
+    let path = match name {
+        "read" | "write" | "edit" if !summary.is_empty() && summary != "…" => Some(summary),
+        _ => None,
+    };
+
+    if let Some((args, body)) = detail.split_once("\n---\n") {
+        let mut lines = highlight::highlight_lines(args, Some("json"), None, theme, fallback);
+        lines.push(vec![Span::styled("---".to_string(), theme.dim())]);
+        let body_lang = if path.is_some() { None } else { Some("json") };
+        lines.extend(highlight::highlight_lines(
+            body,
+            body_lang,
+            path,
+            theme,
+            fallback,
+        ));
+        return lines;
+    }
+
+    match name {
+        "read" | "write" | "edit" => {
+            highlight::highlight_lines(detail, None, path, theme, fallback)
+        }
+        // Bash stdout stays plain — coloring ls/etc would fight the existing look.
+        "bash" => highlight::highlight_lines(detail, None, None, theme, fallback),
+        _ => highlight::highlight_lines(detail, Some("json"), None, theme, fallback),
+    }
 }
 
 fn soft_wrap(text: &str, width: usize) -> Vec<String> {
