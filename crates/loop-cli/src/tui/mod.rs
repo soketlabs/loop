@@ -86,6 +86,7 @@ pub struct FooterOpts<'a> {
     pub spinner_frame: usize,
     pub status: &'a str,
     pub picker: &'a PickerView,
+    /// Global tools/thinking expand state (pi-style single flag).
     pub expanded: bool,
     pub hide_thinking: bool,
     pub setup_mode: bool,
@@ -320,7 +321,7 @@ pub fn format_item_lines(
                 let mut shown = 0usize;
                 'outer: for l in text.lines() {
                     for part in soft_wrap(l, body_w) {
-                        if shown >= 40 {
+                        if shown >= 200 {
                             lines.push(Line::from(vec![
                                 Span::styled("  │ ".to_string(), theme.style("borderMuted")),
                                 Span::styled("…".to_string(), theme.dim()),
@@ -410,7 +411,7 @@ pub fn format_item_lines(
 
             // Body: full detail when expanded; error previews stay visible.
             let preview = if expanded {
-                48
+                200
             } else if matches!(status, CardStatus::Error) {
                 4
             } else {
@@ -801,14 +802,6 @@ fn bg_spans_line(
     Line::from(out)
 }
 
-/// Whether an item has expandable detail (for ctrl+o).
-pub fn item_has_detail(item: &ChatItem) -> bool {
-    match item {
-        ChatItem::Tool { detail, .. } => !detail.is_empty(),
-        ChatItem::Thinking { text, .. } => !text.is_empty(),
-        _ => false,
-    }
-}
 
 fn wrap_plain(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
     soft_wrap(text, width.max(1))

@@ -28,9 +28,9 @@ use crate::keybindings::{hotkey_help, Action};
 use crate::runtime::Runtime;
 use crate::theme::Theme;
 use crate::tui::{
-    find_tool_index, format_item_lines, item_has_detail, item_is_committed,
-    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, FOOTER_HEIGHT,
-    FooterOpts, InputBuffer, PickerRow, PickerView,
+    find_tool_index, format_item_lines, item_is_committed, render_lines_to_buffer,
+    tool_args_summary, welcome_lines, CardStatus, ChatItem, FOOTER_HEIGHT, FooterOpts,
+    InputBuffer, PickerRow, PickerView,
 };
 
 enum UiEvent {
@@ -49,6 +49,12 @@ pub async fn run(mut runtime: Runtime) -> anyhow::Result<()> {
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
         )
+    );
+    // Start on a clean screen (pi-style): clear and home before anchoring the viewport.
+    let _ = execute!(
+        stdout,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0)
     );
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::with_options(
@@ -95,7 +101,10 @@ async fn run_loop(
     let mut last_escape = Instant::now();
     let mut streaming_assistant: Option<usize> = None;
     let mut streaming_thinking: Option<usize> = None;
+    // Pi-style: one global expand flag; toggling clears + reprints the transcript.
     let mut expand_details = false;
+    let mut redraw_request = false;
+    let mut last_width = terminal.size()?.width;
     let mut hide_thinking = runtime.settings.hide_thinking_block;
     let mut pending_login: Option<String> = if runtime.needs_api_key_setup {
         Some(SOKET_PROVIDER_ID.into())
@@ -281,7 +290,6 @@ async fn run_loop(
             continue;
         }
 
-        let expand_before = expand_details;
         loop {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -297,6 +305,7 @@ async fn run_loop(
                         &mut streaming_assistant,
                         &mut streaming_thinking,
                         &mut expand_details,
+                        &mut redraw_request,
                         &mut hide_thinking,
                         &mut pending_login,
                         &mut model_picker,
@@ -308,8 +317,13 @@ async fn run_loop(
                     )
                     .await?;
                 }
-                Event::Resize(_, _) => {
+                Event::Resize(w, _) => {
                     let _ = terminal.autoresize();
+                    // Re-wrapping invalidates the whole transcript (pi does the same).
+                    if w != last_width {
+                        last_width = w;
+                        redraw_request = true;
+                    }
                 }
                 _ => {}
             }
@@ -318,26 +332,22 @@ async fn run_loop(
             }
         }
 
-        // ctrl+o just turned expansion on: scrollback is append-only, so if the last
-        // expandable item was already flushed collapsed, re-print it expanded.
-        if expand_details && !expand_before {
-            let live_has_detail = chat[flushed.min(chat.len())..].iter().any(item_has_detail);
-            if !live_has_detail {
-                if let Some(item) = chat[..flushed.min(chat.len())]
-                    .iter()
-                    .rev()
-                    .find(|i| item_has_detail(i))
-                {
-                    let width = terminal.size()?.width;
-                    let lines =
-                        format_item_lines(item, &runtime.theme, true, hide_thinking, width);
-                    if !lines.is_empty() {
-                        terminal.insert_before(lines.len() as u16, |buf| {
-                            render_lines_to_buffer(&lines, buf);
-                        })?;
-                    }
-                }
-            }
+        // Pi-style hard reset: clear screen + scrollback, then reprint the whole
+        // transcript with the current expand state. Native scrollback handles
+        // anything taller than the viewport.
+        if redraw_request {
+            redraw_request = false;
+            reset_and_redraw(
+                terminal,
+                runtime,
+                version,
+                &chat,
+                &mut flushed,
+                streaming_assistant,
+                streaming_thinking,
+                expand_details,
+                hide_thinking,
+            )?;
         }
 
         drain_ui_events(
@@ -354,6 +364,7 @@ async fn run_loop(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flush_committed(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     chat: &[ChatItem],
@@ -374,7 +385,8 @@ fn flush_committed(
         ) {
             break;
         }
-        // Items land in scrollback with the current ctrl+o expand state.
+        // Items land in scrollback with the current global expand state; toggling
+        // ctrl+o clears and reprints everything (see `reset_and_redraw`).
         let lines = format_item_lines(&chat[*flushed], theme, expanded, hide_thinking, width);
         if !lines.is_empty() {
             let h = lines.len() as u16;
@@ -384,6 +396,63 @@ fn flush_committed(
         }
         *flushed += 1;
     }
+    Ok(())
+}
+
+/// Pi-style hard reset: clear screen + home + clear scrollback, then reprint
+/// the welcome banner and the entire committed transcript with the current
+/// expand state. Content taller than the viewport spills into fresh native
+/// scrollback, so the user scrolls with their terminal as usual.
+#[allow(clippy::too_many_arguments)]
+fn reset_and_redraw(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    runtime: &Runtime,
+    version: &str,
+    chat: &[ChatItem],
+    flushed: &mut usize,
+    streaming_assistant: Option<usize>,
+    streaming_thinking: Option<usize>,
+    expanded: bool,
+    hide_thinking: bool,
+) -> anyhow::Result<()> {
+    use crossterm::cursor::MoveTo;
+    use crossterm::terminal::{
+        BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate,
+    };
+
+    let mut out = io::stdout();
+    // Equivalent of pi's `\x1b[2J\x1b[H\x1b[3J`: without purging scrollback the
+    // reprinted transcript would duplicate below the old copy.
+    execute!(
+        out,
+        BeginSynchronizedUpdate,
+        Clear(ClearType::All),
+        MoveTo(0, 0),
+        Clear(ClearType::Purge)
+    )?;
+
+    // Re-anchor a fresh inline viewport at the top of the now-empty screen.
+    *terminal = Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(FOOTER_HEIGHT),
+        },
+    )?;
+    let _ = terminal.hide_cursor();
+
+    print_welcome(terminal, runtime, version)?;
+    *flushed = 0;
+    flush_committed(
+        terminal,
+        chat,
+        flushed,
+        streaming_assistant,
+        streaming_thinking,
+        &runtime.theme,
+        expanded,
+        hide_thinking,
+    )?;
+    let _ = execute!(io::stdout(), EndSynchronizedUpdate);
     Ok(())
 }
 
@@ -535,6 +604,7 @@ async fn handle_key(
     streaming_assistant: &mut Option<usize>,
     streaming_thinking: &mut Option<usize>,
     expand_details: &mut bool,
+    redraw_request: &mut bool,
     hide_thinking: &mut bool,
     pending_login: &mut Option<String>,
     model_picker: &mut Option<ModelPickerState>,
@@ -768,7 +838,6 @@ async fn handle_key(
                             pending_login,
                             model_picker,
                             hide_thinking,
-                            expand_details,
                             working,
                             tx,
                         )
@@ -869,6 +938,7 @@ async fn handle_key(
             }
             Action::ThinkingToggle => {
                 *hide_thinking = !*hide_thinking;
+                *redraw_request = true;
                 *status = if *hide_thinking {
                     "thinking hidden".into()
                 } else {
@@ -878,10 +948,11 @@ async fn handle_key(
             }
             Action::ToolsExpand => {
                 *expand_details = !*expand_details;
+                *redraw_request = true;
                 *status = if *expand_details {
-                    "details expanded".into()
+                    "tool output: expanded".into()
                 } else {
-                    "details collapsed".into()
+                    "tool output: collapsed".into()
                 };
                 return Ok(());
             }
@@ -996,11 +1067,18 @@ fn handle_agent_event(
             }
         }
         AgentEvent::MessageStart { message } => {
+            // Assistant items are created lazily on the first text delta so that
+            // thinking / tool items land in true stream order.
             if message.role() == "assistant" {
-                chat.push(ChatItem::Assistant {
-                    text: String::new(),
-                });
-                *streaming_assistant = Some(chat.len() - 1);
+                *streaming_assistant = None;
+            }
+        }
+        AgentEvent::MessageEnd { .. } => {
+            *streaming_assistant = None;
+            if let Some(idx) = streaming_thinking.take() {
+                if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
+                    *done = true;
+                }
             }
         }
         AgentEvent::MessageUpdate {
@@ -1010,13 +1088,28 @@ fn handle_agent_event(
             use loop_ai::AssistantMessageEvent;
             match assistant_message_event {
                 AssistantMessageEvent::TextDelta { delta, .. } => {
-                    if let Some(idx) = *streaming_assistant {
-                        if let Some(ChatItem::Assistant { text }) = chat.get_mut(idx) {
-                            text.push_str(&delta);
+                    let idx = match *streaming_assistant {
+                        Some(idx) => idx,
+                        None => {
+                            chat.push(ChatItem::Assistant {
+                                text: String::new(),
+                            });
+                            let idx = chat.len() - 1;
+                            *streaming_assistant = Some(idx);
+                            idx
                         }
+                    };
+                    if let Some(ChatItem::Assistant { text }) = chat.get_mut(idx) {
+                        text.push_str(&delta);
                     }
                 }
+                AssistantMessageEvent::TextEnd { .. } => {
+                    // Close the segment; any later text starts a new item after
+                    // whatever thinking/tool items streamed in between.
+                    *streaming_assistant = None;
+                }
                 AssistantMessageEvent::ThinkingStart { .. } => {
+                    *streaming_assistant = None;
                     chat.push(ChatItem::Thinking {
                         text: String::new(),
                         done: false,
@@ -1038,6 +1131,7 @@ fn handle_agent_event(
                     }
                 }
                 AssistantMessageEvent::ToolcallEnd { tool_call, .. } => {
+                    *streaming_assistant = None;
                     let detail =
                         serde_json::to_string_pretty(&tool_call.arguments).unwrap_or_default();
                     let summary = tool_args_summary(&tool_call.name, &tool_call.arguments);
@@ -1205,7 +1299,6 @@ async fn apply_effect(
     pending_login: &mut Option<String>,
     model_picker: &mut Option<ModelPickerState>,
     hide_thinking: &mut bool,
-    expand_details: &mut bool,
     working: &mut bool,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> anyhow::Result<bool> {
@@ -1512,7 +1605,7 @@ async fn apply_effect(
             }
         }
     }
-    let _ = (hide_thinking, expand_details);
+    let _ = hide_thinking;
     Ok(false)
 }
 
