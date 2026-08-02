@@ -63,7 +63,8 @@ pub fn estimate_context_tokens(context: &Context) -> u64 {
     total
 }
 
-fn estimate_message_tokens(msg: &Message) -> u64 {
+/// Rough estimate of a single message's own token size (~4 chars/token).
+pub fn estimate_message_tokens(msg: &Message) -> u64 {
     match msg {
         Message::User(u) => match &u.content {
             UserMessageContent::Text(t) => estimate_text_tokens(t),

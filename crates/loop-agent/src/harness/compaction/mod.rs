@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::harness::types::CompactionError;
 use crate::types::AgentMessage;
-use loop_ai::{estimate_context_tokens, Message};
+use loop_ai::{estimate_context_tokens, estimate_message_tokens, Message};
 
 /// Default compaction settings (pi parity).
 pub const DEFAULT_RESERVE_TOKENS: u64 = 16384;
@@ -62,9 +62,29 @@ pub fn find_cut_point(messages: &[Message], keep_recent_tokens: u64) -> usize {
     }
     let mut kept = 0u64;
     for i in (0..messages.len()).rev() {
-        kept += estimate_tokens(&messages[i..=i]);
+        // Per-message estimate: `estimate_tokens` on a single-message slice would
+        // return the assistant's cumulative usage.total_tokens, not its own size.
+        kept += estimate_message_tokens(&messages[i]);
         if kept >= keep_recent_tokens {
-            return find_turn_start_index(messages, i);
+            let snap = find_turn_start_index(messages, i);
+            if snap > 0 {
+                return snap;
+            }
+            // Backward snap hit 0; look forward for a valid turn boundary
+            // so compaction doesn't treat cut=0 as "nothing to compact".
+            for j in (i + 1)..messages.len() {
+                if messages[j].role() == "user" {
+                    return j;
+                }
+            }
+            return 0;
+        }
+    }
+    // The whole history fits within keep_recent_tokens. Fall back to cutting at
+    // the start of the last user turn so an explicit compact still has effect.
+    for i in (1..messages.len()).rev() {
+        if messages[i].role() == "user" {
+            return i;
         }
     }
     0

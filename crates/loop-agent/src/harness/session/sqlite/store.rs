@@ -207,9 +207,24 @@ fn load_all(conn: &Connection, sid: &str) -> Result<Vec<SessionTreeEntry>, Sessi
 
 fn trim_path_to_root_or_compaction(entries: &[SessionTreeEntry]) -> Vec<SessionTreeEntry> {
     let mut path = Vec::new();
-    for entry in entries.iter().rev() {
+    let mut iter = entries.iter().rev();
+    while let Some(entry) = iter.next() {
         path.push(entry.clone());
-        if matches!(entry, SessionTreeEntry::Compaction { .. }) {
+        if let SessionTreeEntry::Compaction {
+            first_kept_entry_id,
+            ..
+        } = entry
+        {
+            // Include the retained tail (compaction parent back to the first
+            // kept entry) so recent context survives.
+            if let Some(first_kept) = first_kept_entry_id {
+                for kept_entry in iter.by_ref() {
+                    path.push(kept_entry.clone());
+                    if kept_entry.id() == first_kept {
+                        break;
+                    }
+                }
+            }
             break;
         }
     }

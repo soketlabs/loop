@@ -394,20 +394,27 @@ impl Session {
 }
 
 /// Project entries to session context (compaction-aware).
+///
+/// Entries before a `Compaction` entry are the retained tail recorded via
+/// `first_kept_entry_id`; the summary is inserted in front of them. Legacy
+/// compaction entries without a retained range replace all prior messages.
 pub fn default_context_from_entries(entries: &[SessionTreeEntry]) -> SessionContext {
     let mut ctx = SessionContext::default();
-    let mut start = 0usize;
-    for (i, e) in entries.iter().enumerate() {
-        if let SessionTreeEntry::Compaction { summary, timestamp, .. } = e {
-            ctx.messages.clear();
-            ctx.messages.push(crate::messages::create_compaction_summary_message(summary));
-            // keep timestamp usage quiet
-            let _ = timestamp;
-            start = i + 1;
-        }
-    }
-    for e in &entries[start..] {
+    for e in entries {
         match e {
+            SessionTreeEntry::Compaction {
+                summary,
+                first_kept_entry_id,
+                ..
+            } => {
+                if first_kept_entry_id.is_none() {
+                    ctx.messages.clear();
+                }
+                ctx.messages.insert(
+                    0,
+                    crate::messages::create_compaction_summary_message(summary),
+                );
+            }
             SessionTreeEntry::Message { message, .. } => ctx.messages.push(message.clone()),
             SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => {
                 ctx.thinking_level = *thinking_level;

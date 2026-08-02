@@ -18,7 +18,7 @@ use crate::harness::compaction::{
 use crate::harness::hooks::{HarnessHookEvent, HookRegistry};
 use crate::harness::prompt_templates::format_prompt_template_invocation;
 use crate::harness::sandbox::{Sandbox, SandboxMode, SandboxStatus};
-use crate::harness::session::types::{PendingSessionWrite, Session};
+use crate::harness::session::types::{PendingSessionWrite, Session, SessionTreeEntry};
 use crate::harness::skills::format_skill_invocation;
 use crate::harness::types::{
     AgentHarnessError, AgentHarnessPhase, AgentHarnessResources, CompactResult, ExecutionEnv,
@@ -455,7 +455,14 @@ impl AgentHarness {
             .summary
             .unwrap_or_else(|| generate_summary_fallback(&prep.to_summarize));
 
-        let first_kept_entry_id = None;
+        let branch = {
+            let session = self.session.lock().await;
+            session
+                .read_branch()
+                .await
+                .map_err(AgentHarnessError::Session)?
+        };
+        let first_kept_entry_id = first_kept_entry_id_for_cut(&branch, prep.cut_index);
 
         {
             let session = self.session.lock().await;
@@ -839,4 +846,29 @@ impl AgentHarness {
     pub async fn tool_env(&self) -> Result<Arc<dyn ExecutionEnv>, AgentHarnessError> {
         Ok(self.create_turn_state().await?.tool_env)
     }
+}
+
+/// Map a cut index in the built context messages back to the branch entry that
+/// produced that message. Mirrors the message-production order of
+/// `default_context_from_entries`.
+fn first_kept_entry_id_for_cut(entries: &[SessionTreeEntry], cut_index: usize) -> Option<String> {
+    let mut producer_ids: Vec<&str> = Vec::new();
+    for e in entries {
+        match e {
+            SessionTreeEntry::Message { .. } | SessionTreeEntry::BranchSummary { .. } => {
+                producer_ids.push(e.id());
+            }
+            SessionTreeEntry::Compaction {
+                first_kept_entry_id,
+                ..
+            } => {
+                if first_kept_entry_id.is_none() {
+                    producer_ids.clear();
+                }
+                producer_ids.insert(0, e.id());
+            }
+            _ => {}
+        }
+    }
+    producer_ids.get(cut_index).map(|s| s.to_string())
 }

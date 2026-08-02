@@ -105,7 +105,26 @@ impl SessionReader for MemoryReader {
                 break;
             };
             path.push(entry.clone());
-            if matches!(entry, SessionTreeEntry::Compaction { .. }) {
+            if let SessionTreeEntry::Compaction {
+                first_kept_entry_id,
+                ..
+            } = entry
+            {
+                // Include the retained tail (compaction parent back to the
+                // first kept entry) so recent context survives.
+                if let Some(first_kept) = first_kept_entry_id.clone() {
+                    let mut kept_cur = entry.parent_id().map(|s| s.to_string());
+                    while let Some(kid) = kept_cur {
+                        let Some(kept_entry) = by_id.get(&kid) else {
+                            break;
+                        };
+                        path.push(kept_entry.clone());
+                        if kid == first_kept {
+                            break;
+                        }
+                        kept_cur = kept_entry.parent_id().map(|s| s.to_string());
+                    }
+                }
                 break;
             }
             cur = entry.parent_id().map(|s| s.to_string());

@@ -1423,6 +1423,7 @@ async fn apply_effect(
             let harness = Arc::clone(&runtime.harness);
             let tx = tx.clone();
             *working = true;
+            chat.push(sys(" "));
             chat.push(sys("compacting…"));
             tokio::spawn(async move {
                 let result = match harness.compact(instructions.as_deref()).await {
