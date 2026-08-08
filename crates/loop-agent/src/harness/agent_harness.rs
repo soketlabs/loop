@@ -112,6 +112,8 @@ impl AgentHarness {
     /// Create a harness.
     pub fn new(options: AgentHarnessOptions) -> Self {
         let stream_fn = stream_fn_from_models(Arc::clone(&options.models));
+        let mut stream_options = SimpleStreamOptions::default();
+        stream_options.base.session_id = Some(options.session.metadata().id.clone());
         Self {
             models: options.models,
             stream_fn,
@@ -123,7 +125,7 @@ impl AgentHarness {
             active_tool_names: RwLock::new(None),
             system_prompt: RwLock::new(options.system_prompt),
             resources: RwLock::new(options.resources),
-            stream_options: RwLock::new(SimpleStreamOptions::default()),
+            stream_options: RwLock::new(stream_options),
             sandbox: RwLock::new(options.sandbox),
             phase: Mutex::new(AgentHarnessPhase::Idle),
             pending_writes: Arc::new(Mutex::new(Vec::new())),
@@ -141,6 +143,11 @@ impl AgentHarness {
             steering_mode: Mutex::new(QueueMode::OneAtATime),
             follow_up_mode: Mutex::new(QueueMode::OneAtATime),
         }
+    }
+
+    /// Current session id (also sent on provider API requests).
+    pub async fn session_id(&self) -> String {
+        self.session.lock().await.metadata().id.clone()
     }
 
     /// Current phase.
@@ -672,13 +679,19 @@ impl AgentHarness {
             all_tools
         };
 
+        let mut stream_options = self.stream_options.read().await.clone();
+        {
+            let session = self.session.lock().await;
+            stream_options.base.session_id = Some(session.metadata().id.clone());
+        }
+
         Ok(TurnSnapshot {
             messages: ctx.messages,
             system_prompt,
             model: self.model.read().await.clone(),
             thinking_level: *self.thinking_level.read().await,
             tools,
-            stream_options: self.stream_options.read().await.clone(),
+            stream_options,
             tool_env,
         })
     }

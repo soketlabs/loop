@@ -1,6 +1,6 @@
 # loop
 
-Production-grade AI harness in Rust by **Soket AI**: unified LLM API, stateful agent, and interactive coding CLI.
+Production-grade AI harness in Rust by **Soket AI** and **Abhishek**: unified LLM API, stateful agent, and interactive coding CLI.
 
 ## Crates
 

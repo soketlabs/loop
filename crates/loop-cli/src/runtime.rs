@@ -63,6 +63,8 @@ pub struct Runtime {
     pub trust: TrustStore,
     /// Session store path.
     pub sessions_db: PathBuf,
+    /// Active session id (persisted in SQLite; sent to the provider API).
+    pub session_id: String,
     /// When true, TUI should show the first-run API key setup box.
     pub needs_api_key_setup: bool,
 }
@@ -349,6 +351,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         _ => SandboxMode::Disabled,
     };
 
+    let session_id = session.metadata().id.clone();
     let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
         models: Arc::clone(&models),
         model,
@@ -392,6 +395,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         project_trusted,
         trust,
         sessions_db,
+        session_id,
         needs_api_key_setup,
     })
 }

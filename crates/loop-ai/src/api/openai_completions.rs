@@ -751,9 +751,20 @@ fn build_payload(
 
     apply_reasoning(&mut payload, model, compat, reasoning);
 
+    let mut metadata = options
+        .metadata
+        .as_ref()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<serde_json::Map<String, Value>>()
+        })
+        .unwrap_or_default();
     if let Some(session_id) = &options.session_id {
-        // Light-touch session affinity for OpenAI-style caches.
-        payload["prompt_cache_key"] = json!(session_id);
+        metadata.insert("session_id".into(), json!(session_id));
+    }
+    if !metadata.is_empty() {
+        payload["metadata"] = Value::Object(metadata);
     }
 
     Ok(payload)

@@ -470,6 +470,7 @@ fn print_welcome(
         &runtime.settings.default_provider,
         &runtime.settings.default_model,
         &endpoint,
+        &runtime.session_id,
         runtime.resources.skills.len(),
         runtime.resources.prompts.len(),
         runtime.needs_api_key_setup,

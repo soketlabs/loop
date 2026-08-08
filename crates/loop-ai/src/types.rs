@@ -717,7 +717,7 @@ pub struct StreamOptions {
     pub transport: Option<Transport>,
     /// Cache retention preference.
     pub cache_retention: Option<CacheRetention>,
-    /// Session id for prompt-cache / sticky routing.
+    /// Session id for provider sticky routing / caching.
     pub session_id: Option<String>,
     /// Extra / overriding headers (`None` value suppresses).
     pub headers: Option<ProviderHeaders>,

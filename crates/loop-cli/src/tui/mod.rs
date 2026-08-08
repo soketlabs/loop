@@ -141,6 +141,7 @@ pub fn welcome_lines(
     provider: &str,
     model: &str,
     endpoint: &str,
+    session_id: &str,
     skills: usize,
     prompts: usize,
     needs_setup: bool,
@@ -180,6 +181,7 @@ pub fn welcome_lines(
         ("Provider", provider.to_string()),
         ("Model", model.to_string()),
         ("Endpoint", endpoint.to_string()),
+        ("Session", session_id.to_string()),
     ];
     let (dot_style, status_text) = if needs_setup {
         (
