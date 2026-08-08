@@ -150,6 +150,18 @@ impl AgentHarness {
         self.session.lock().await.metadata().id.clone()
     }
 
+    /// Build agent context from the active session branch (messages, model, thinking).
+    /// Used by the CLI to restore the transcript on `--resume`.
+    pub async fn session_context(
+        &self,
+    ) -> Result<crate::harness::session::SessionContext, AgentHarnessError> {
+        let session = self.session.lock().await;
+        session
+            .build_context()
+            .await
+            .map_err(AgentHarnessError::Session)
+    }
+
     /// Abort any in-flight turn, create an empty session on the same store, and
     /// switch the harness to it. Clears steering / follow-up / pending writes.
     /// Returns the new session id.

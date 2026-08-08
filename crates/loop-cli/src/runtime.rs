@@ -10,7 +10,7 @@ use loop_agent::harness::{
     create_bash_tool, create_edit_tool, create_read_tool, create_session_repository,
     create_sqlite_session_store, create_write_tool, AgentHarness, AgentHarnessOptions,
     AgentHarnessResources, HostExecutionEnv, LocalShellSandbox, Sandbox, SandboxConfig,
-    SandboxMode, Session,
+    SandboxMode,
 };
 use loop_agent::types::AgentThinkingLevel;
 use loop_ai::providers::{
@@ -65,6 +65,8 @@ pub struct Runtime {
     pub sessions_db: PathBuf,
     /// Active session id (persisted in SQLite; sent to the provider API).
     pub session_id: String,
+    /// True when started with `--resume <id>` (transcript hydrated from store).
+    pub resumed: bool,
     /// When true, TUI should show the first-run API key setup box.
     pub needs_api_key_setup: bool,
 }
@@ -234,6 +236,18 @@ fn parse_thinking(s: &str) -> AgentThinkingLevel {
     }
 }
 
+fn thinking_label(level: AgentThinkingLevel) -> &'static str {
+    match level {
+        AgentThinkingLevel::Off => "off",
+        AgentThinkingLevel::Minimal => "minimal",
+        AgentThinkingLevel::Low => "low",
+        AgentThinkingLevel::Medium => "medium",
+        AgentThinkingLevel::High => "high",
+        AgentThinkingLevel::XHigh => "xhigh",
+        AgentThinkingLevel::Max => "max",
+    }
+}
+
 /// Bootstrap the full runtime.
 pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let agent_dir = get_agent_dir();
@@ -280,7 +294,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
 
     let provider = settings.default_provider.clone();
     let model_id = settings.default_model.clone();
-    let model = models
+    let mut model = models
         .get_model(&provider, &model_id)
         .or_else(|| models.get_model(SOKET_PROVIDER_ID, SOKET_DEFAULT_MODEL_ID))
         .or_else(|| models.get_models(None).into_iter().next())
@@ -314,18 +328,35 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let store = create_sqlite_session_store(&sessions_db)
         .map_err(|e| anyhow::anyhow!("sqlite session store: {e}"))?;
     let repo = create_session_repository(store, None);
+    let resumed = opts.session_id.is_some();
     let session = if let Some(id) = &opts.session_id {
-        let reader = repo
-            .store()
-            .load(id)
+        repo.open(id)
             .await
-            .map_err(|e| anyhow::anyhow!("load session: {e}"))?;
-        Session::new(repo.store(), reader)
+            .map_err(|e| anyhow::anyhow!("load session: {e}"))?
     } else {
         repo.create(Some(opts.cwd.to_string_lossy().into_owned()), None)
             .await
             .map_err(|e| anyhow::anyhow!("create session: {e}"))?
     };
+
+    // Restore model from the session branch when resuming (unless CLI overrides).
+    if resumed {
+        if let Ok(ctx) = session.build_context().await {
+            if opts.provider.is_none() && opts.model.is_none() {
+                if let Some((p, m)) = &ctx.model {
+                    if let Some(resolved) = models.get_model(p, m) {
+                        settings.default_provider = p.clone();
+                        settings.default_model = m.clone();
+                        model = resolved;
+                    }
+                }
+            }
+            // Thinking-level changes are recorded on the branch when present.
+            if !matches!(ctx.thinking_level, AgentThinkingLevel::Off) {
+                settings.default_thinking_level = thinking_label(ctx.thinking_level).into();
+            }
+        }
+    }
 
     let host = Arc::new(HostExecutionEnv::new(&opts.cwd));
     let tools = vec![
@@ -396,6 +427,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         trust,
         sessions_db,
         session_id,
+        resumed,
         needs_api_key_setup,
     })
 }

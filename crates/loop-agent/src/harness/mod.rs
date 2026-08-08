@@ -31,7 +31,7 @@ pub use sandbox::{
 pub use session::{
     create_in_memory_session_store, create_jsonl_session_store, create_scanning_session_search,
     create_session_repository, format_session_stats, compute_session_stats, Session,
-    SessionForkSelection, SessionRepository, SessionStats, SessionStore,
+    SessionContext, SessionForkSelection, SessionRepository, SessionStats, SessionStore,
 };
 pub use tools::{create_bash_tool, create_edit_tool, create_read_tool, create_write_tool};
 pub use types::{

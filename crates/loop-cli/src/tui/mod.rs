@@ -988,3 +988,259 @@ pub fn tool_args_summary(name: &str, args: &serde_json::Value) -> String {
         }
     }
 }
+
+fn user_message_text(u: &loop_ai::UserMessage) -> String {
+    use loop_ai::{UserContent, UserMessageContent};
+    match &u.content {
+        UserMessageContent::Text(s) => s.clone(),
+        UserMessageContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|c| match c {
+                UserContent::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    }
+}
+
+fn tool_result_text(tr: &loop_ai::ToolResultMessage) -> String {
+    use loop_ai::ToolResultContent;
+    tr.content
+        .iter()
+        .filter_map(|c| match c {
+            ToolResultContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Rebuild the TUI transcript from persisted session messages (for `--resume`).
+pub fn chat_items_from_agent_messages(
+    messages: &[loop_agent::types::AgentMessage],
+) -> Vec<ChatItem> {
+    use loop_ai::{AssistantContent, Message};
+    use loop_agent::types::{AgentMessage, CustomAgentMessage};
+
+    let mut chat = Vec::new();
+    for msg in messages {
+        match msg {
+            AgentMessage::Llm(Message::User(u)) => {
+                let text = user_message_text(u);
+                if !text.is_empty() {
+                    chat.push(ChatItem::User { text });
+                }
+            }
+            AgentMessage::Llm(Message::Assistant(a)) => {
+                for block in &a.content {
+                    match block {
+                        AssistantContent::Thinking(t) => {
+                            if !t.thinking.is_empty() {
+                                chat.push(ChatItem::Thinking {
+                                    text: t.thinking.clone(),
+                                    done: true,
+                                });
+                            }
+                        }
+                        AssistantContent::Text(t) => {
+                            if !t.text.is_empty() {
+                                chat.push(ChatItem::Assistant {
+                                    text: t.text.clone(),
+                                });
+                            }
+                        }
+                        AssistantContent::ToolCall(tc) => {
+                            let detail =
+                                serde_json::to_string_pretty(&tc.arguments).unwrap_or_default();
+                            let summary = tool_args_summary(&tc.name, &tc.arguments);
+                            chat.push(ChatItem::Tool {
+                                id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                summary,
+                                detail,
+                                status: CardStatus::Pending,
+                            });
+                        }
+                    }
+                }
+                if let Some(err) = &a.error_message {
+                    if !err.is_empty() {
+                        chat.push(ChatItem::System {
+                            text: format!("error: {err}"),
+                        });
+                    }
+                }
+            }
+            AgentMessage::Llm(Message::ToolResult(tr)) => {
+                let result_text = tool_result_text(tr);
+                let st = if tr.is_error {
+                    CardStatus::Error
+                } else {
+                    CardStatus::Success
+                };
+                if let Some(idx) = find_tool_index(&chat, &tr.tool_call_id) {
+                    if let Some(ChatItem::Tool {
+                        name,
+                        detail,
+                        status,
+                        summary,
+                        ..
+                    }) = chat.get_mut(idx)
+                    {
+                        *name = tr.tool_name.clone();
+                        *status = st;
+                        if !result_text.is_empty() {
+                            if detail.is_empty() {
+                                *detail = result_text;
+                            } else {
+                                detail.push_str("\n---\n");
+                                detail.push_str(&result_text);
+                            }
+                        }
+                        if summary.is_empty() {
+                            *summary = if tr.is_error {
+                                "error".into()
+                            } else {
+                                "done".into()
+                            };
+                        }
+                    }
+                } else {
+                    chat.push(ChatItem::Tool {
+                        id: tr.tool_call_id.clone(),
+                        name: tr.tool_name.clone(),
+                        summary: if tr.is_error {
+                            "error".into()
+                        } else {
+                            "done".into()
+                        },
+                        detail: result_text,
+                        status: st,
+                    });
+                }
+            }
+            AgentMessage::Custom(CustomAgentMessage::CompactionSummary { summary, .. }) => {
+                chat.push(ChatItem::System {
+                    text: format!("compaction summary\n{summary}"),
+                });
+            }
+            AgentMessage::Custom(CustomAgentMessage::BranchSummary { summary, .. }) => {
+                chat.push(ChatItem::System {
+                    text: format!("branch summary\n{summary}"),
+                });
+            }
+            AgentMessage::Custom(CustomAgentMessage::BashExecution {
+                command,
+                output,
+                exit_code,
+                ..
+            }) => {
+                let mut summary: String = command.chars().take(48).collect();
+                if command.chars().count() > 48 {
+                    summary.push('…');
+                }
+                let status = match exit_code {
+                    Some(0) | None => CardStatus::Success,
+                    Some(_) => CardStatus::Error,
+                };
+                chat.push(ChatItem::Tool {
+                    id: format!("bash-exec-{}", chat.len()),
+                    name: "bash".into(),
+                    summary,
+                    detail: format!("$ {command}\n{output}"),
+                    status,
+                });
+            }
+            AgentMessage::Custom(CustomAgentMessage::Custom {
+                custom_type,
+                content,
+                ..
+            }) => {
+                chat.push(ChatItem::System {
+                    text: format!("{custom_type}: {content}"),
+                });
+            }
+        }
+    }
+    chat
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loop_agent::types::AgentMessage;
+    use loop_ai::{
+        AssistantContent, AssistantMessage, Message, StopReason, TextContent, ThinkingContent,
+        ToolCall, ToolResultContent, ToolResultMessage, Usage, UserMessage, UserMessageContent,
+    };
+
+    #[test]
+    fn resume_transcript_reconstructs_user_assistant_tools() {
+        let messages = vec![
+            AgentMessage::user_text("list files"),
+            AgentMessage::assistant(AssistantMessage {
+                content: vec![
+                    AssistantContent::Thinking(ThinkingContent {
+                        thinking: "I should use bash".into(),
+                        thinking_signature: None,
+                        redacted: None,
+                    }),
+                    AssistantContent::Text(TextContent {
+                        text: "Running ls".into(),
+                        text_signature: None,
+                    }),
+                    AssistantContent::ToolCall(ToolCall {
+                        id: "call_1".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "ls"}),
+                        thought_signature: None,
+                    }),
+                ],
+                api: "openai-completions".into(),
+                provider: "test".into(),
+                model: "m".into(),
+                response_model: None,
+                response_id: None,
+                usage: Usage::empty(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                raw_stop_reason: None,
+                timestamp: 1,
+            }),
+            AgentMessage::tool_result(ToolResultMessage {
+                tool_call_id: "call_1".into(),
+                tool_name: "bash".into(),
+                content: vec![ToolResultContent::Text(TextContent {
+                    text: "a.rs\nb.rs".into(),
+                    text_signature: None,
+                })],
+                details: None,
+                usage: None,
+                added_tool_names: None,
+                is_error: false,
+                timestamp: 2,
+            }),
+            AgentMessage::Llm(Message::User(UserMessage {
+                content: UserMessageContent::Text("thanks".into()),
+                timestamp: 3,
+            })),
+        ];
+
+        let items = chat_items_from_agent_messages(&messages);
+        assert!(matches!(&items[0], ChatItem::User { text } if text == "list files"));
+        assert!(matches!(&items[1], ChatItem::Thinking { text, done: true } if text == "I should use bash"));
+        assert!(matches!(&items[2], ChatItem::Assistant { text } if text == "Running ls"));
+        assert!(matches!(
+            &items[3],
+            ChatItem::Tool {
+                id,
+                name,
+                status: CardStatus::Success,
+                detail,
+                ..
+            } if id == "call_1" && name == "bash" && detail.contains("a.rs")
+        ));
+        assert!(matches!(&items[4], ChatItem::User { text } if text == "thanks"));
+    }
+}

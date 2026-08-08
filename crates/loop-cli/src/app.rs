@@ -29,9 +29,9 @@ use crate::keybindings::{hotkey_help, Action};
 use crate::runtime::Runtime;
 use crate::theme::Theme;
 use crate::tui::{
-    find_tool_index, format_item_lines, item_is_committed, render_lines_to_buffer,
-    tool_args_summary, welcome_lines, CardStatus, ChatItem, FOOTER_HEIGHT, FooterOpts,
-    InputBuffer, PickerRow, PickerView,
+    chat_items_from_agent_messages, find_tool_index, format_item_lines, item_is_committed,
+    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, FOOTER_HEIGHT,
+    FooterOpts, InputBuffer, PickerRow, PickerView,
 };
 
 enum UiEvent {
@@ -82,13 +82,21 @@ pub async fn run(mut runtime: Runtime) -> anyhow::Result<()> {
     // Clear the inline footer so the shell prompt lands cleanly.
     let _ = terminal.clear();
     terminal.show_cursor()?;
-    result
+
+    match result {
+        Ok(Some(session_id)) => {
+            println!("You can resume this session with: loop --resume {session_id}");
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     runtime: &mut Runtime,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     let tx_agent = tx.clone();
     runtime.harness.subscribe(move |ev| {
@@ -98,11 +106,27 @@ async fn run_loop(
         }
     });
 
-    let mut chat: Vec<ChatItem> = Vec::new();
+    let mut chat: Vec<ChatItem> = match runtime.harness.session_context().await {
+        Ok(ctx) if !ctx.messages.is_empty() => chat_items_from_agent_messages(&ctx.messages),
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            tracing::warn!("failed to restore session transcript: {e}");
+            Vec::new()
+        }
+    };
     let mut flushed = 0usize;
     let mut input = InputBuffer::new();
     let mut status: String = if runtime.needs_api_key_setup {
         "setup · paste your API key · enter save".into()
+    } else if runtime.resumed {
+        if chat.is_empty() {
+            "resumed · empty session · /help for commands".into()
+        } else {
+            format!(
+                "resumed · {} messages · /help for commands",
+                chat.len()
+            )
+        }
     } else {
         "ready · /help for commands".into()
     };
@@ -394,7 +418,10 @@ async fn run_loop(
     }
 
     runtime.harness.request_shutdown();
-    Ok(())
+    let has_user_message = chat
+        .iter()
+        .any(|item| matches!(item, ChatItem::User { .. }));
+    Ok(has_user_message.then(|| runtime.session_id.clone()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1890,6 +1917,12 @@ async fn apply_effect(
             chat.push(sys(
                 "resume: restart with `loop --resume <session-id>` (picker UI forthcoming)",
             ));
+            if !runtime.session_id.is_empty() {
+                chat.push(sys(format!(
+                    "current session id: {}",
+                    runtime.session_id
+                )));
+            }
         }
         CommandEffect::Tree => {
             chat.push(sys(
