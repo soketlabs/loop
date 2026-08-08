@@ -114,6 +114,7 @@ async fn run_loop(
     // Pi-style: one global expand flag; toggling clears + reprints the transcript.
     let mut expand_details = false;
     let mut redraw_request = false;
+    let mut purge_ui_events = false;
     let mut last_width = terminal.size()?.width;
     let mut hide_thinking = runtime.settings.hide_thinking_block;
     let mut pending_login: Option<String> = if runtime.needs_api_key_setup {
@@ -325,6 +326,7 @@ async fn run_loop(
                         &mut streaming_thinking,
                         &mut expand_details,
                         &mut redraw_request,
+                        &mut purge_ui_events,
                         &mut hide_thinking,
                         &mut pending_login,
                         &mut model_picker,
@@ -350,6 +352,15 @@ async fn run_loop(
             if should_quit || !event::poll(Duration::from_millis(0))? {
                 break;
             }
+        }
+
+        // Drop events from an aborted turn so they can't repopulate a fresh session.
+        if purge_ui_events {
+            while rx.try_recv().is_ok() {}
+            purge_ui_events = false;
+            working = false;
+            streaming_assistant = None;
+            streaming_thinking = None;
         }
 
         // Pi-style hard reset: clear screen + scrollback, then reprint the whole
@@ -846,6 +857,7 @@ async fn handle_key(
     streaming_thinking: &mut Option<usize>,
     expand_details: &mut bool,
     redraw_request: &mut bool,
+    purge_ui_events: &mut bool,
     hide_thinking: &mut bool,
     pending_login: &mut Option<String>,
     model_picker: &mut Option<ModelPickerState>,
@@ -1097,6 +1109,8 @@ async fn handle_key(
                             message_queue,
                             streaming_assistant,
                             streaming_thinking,
+                            redraw_request,
+                            purge_ui_events,
                             tx,
                         )
                         .await?;
@@ -1609,6 +1623,8 @@ async fn apply_effect(
     message_queue: &mut VecDeque<QueuedMessage>,
     streaming_assistant: &mut Option<usize>,
     streaming_thinking: &mut Option<usize>,
+    redraw_request: &mut bool,
+    purge_ui_events: &mut bool,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> anyhow::Result<bool> {
     match effect {
@@ -1722,11 +1738,32 @@ async fn apply_effect(
             chat.push(sys(format!("logged out: {p}")));
         }
         CommandEffect::NewSession => {
-            chat.clear();
-            chat.push(sys(
-                "new session — UI cleared; continue chatting on the same store session",
-            ));
-            *status = "ready".into();
+            // Drop queued prompts and live stream markers before swapping sessions.
+            message_queue.clear();
+            *streaming_assistant = None;
+            *streaming_thinking = None;
+            *working = false;
+            match runtime
+                .harness
+                .start_new_session(
+                    Some(runtime.cwd.to_string_lossy().into_owned()),
+                    None,
+                )
+                .await
+            {
+                Ok(id) => {
+                    runtime.session_id = id;
+                    chat.clear();
+                    *status = "ready · new session".into();
+                    // Clear screen + scrollback and reprint welcome with the new id.
+                    *redraw_request = true;
+                    *purge_ui_events = true;
+                }
+                Err(e) => {
+                    chat.push(sys(format!("new session failed: {e}")));
+                    *status = "ready".into();
+                }
+            }
         }
         CommandEffect::Compact(instructions) => {
             let harness = Arc::clone(&runtime.harness);

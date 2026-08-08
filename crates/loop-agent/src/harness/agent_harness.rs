@@ -150,6 +150,39 @@ impl AgentHarness {
         self.session.lock().await.metadata().id.clone()
     }
 
+    /// Abort any in-flight turn, create an empty session on the same store, and
+    /// switch the harness to it. Clears steering / follow-up / pending writes.
+    /// Returns the new session id.
+    pub async fn start_new_session(
+        &self,
+        cwd: Option<String>,
+        name: Option<String>,
+    ) -> Result<String, AgentHarnessError> {
+        self.assert_not_shut_down()?;
+        self.abort();
+        self.wait_for_idle().await;
+
+        let store = self.session.lock().await.store();
+        let reader = store
+            .create(cwd, name)
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        let new_session = Session::new(store, reader);
+        let id = new_session.metadata().id.clone();
+
+        *self.session.lock().await = new_session;
+        {
+            let mut opts = self.stream_options.write().await;
+            opts.base.session_id = Some(id.clone());
+        }
+        self.steering.lock().clear();
+        self.follow_up.lock().clear();
+        self.next_turn.lock().clear();
+        self.pending_writes.lock().clear();
+
+        Ok(id)
+    }
+
     /// Current phase.
     pub fn phase(&self) -> AgentHarnessPhase {
         *self.phase.lock()
