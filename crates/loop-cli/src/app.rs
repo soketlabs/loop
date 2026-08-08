@@ -1,5 +1,6 @@
 //! Interactive inline CLI (Pi-style): transcript in scrollback, footer redrawn in place.
 
+use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::sync::Arc;
@@ -16,10 +17,10 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
 use loop_agent::harness::{
-    format_prompt_template_invocation, format_skill_invocation, LocalShellSandbox, Sandbox,
-    SandboxConfig, SandboxMode,
+    format_prompt_template_invocation, format_skill_invocation, AgentHarnessPhase, LocalShellSandbox,
+    Sandbox, SandboxConfig, SandboxMode,
 };
-use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel};
+use loop_agent::types::{AgentEvent, AgentThinkingLevel};
 use loop_ai::providers::{SOKET_BASE_URL, SOKET_PROVIDER_ID};
 use loop_ai::{Credential, CredentialStore, ModelsRefreshOptions, ToolResultContent};
 
@@ -37,6 +38,15 @@ enum UiEvent {
     Agent(AgentEvent),
     /// `/compact` finished (success message or error).
     CompactDone(Result<String, String>),
+}
+
+/// Outbound user message waiting for the agent to become idle.
+#[derive(Debug, Clone)]
+struct QueuedMessage {
+    /// Shown in the transcript (and matched to `ChatItem::Queued`).
+    display: String,
+    /// Sent to `harness.prompt`.
+    prompt: String,
 }
 
 /// Run the interactive CLI (inline viewport — native terminal scrollback).
@@ -115,6 +125,7 @@ async fn run_loop(
     let mut ac_selected: usize = 0;
     let mut last_ac_filter = String::new();
     let mut working = false;
+    let mut message_queue: VecDeque<QueuedMessage> = VecDeque::new();
     let mut spinner_frame: usize = 0;
     let mut last_spin = Instant::now();
     let version = env!("CARGO_PKG_VERSION");
@@ -242,11 +253,17 @@ async fn run_loop(
                     )
                 })
                 .count();
+            let queued = message_queue.len();
+            let mut parts = vec!["Working…".to_string()];
             if pending_tools > 0 {
-                format!("Working… · {pending_tools} tool(s)")
-            } else {
-                "Working…".into()
+                parts.push(format!("{pending_tools} tool(s)"));
             }
+            if queued > 0 {
+                parts.push(format!("{queued} queued"));
+            }
+            parts.join(" · ")
+        } else if !message_queue.is_empty() {
+            format!("{} queued · sending…", message_queue.len())
         } else {
             status.clone()
         };
@@ -280,12 +297,14 @@ async fn run_loop(
         let timed_out = !event::poll(tick)?;
         if timed_out {
             drain_ui_events(
+                runtime,
                 &mut rx,
                 &mut chat,
                 &mut status,
                 &mut streaming_assistant,
                 &mut streaming_thinking,
                 &mut working,
+                &mut message_queue,
             );
             continue;
         }
@@ -310,6 +329,7 @@ async fn run_loop(
                         &mut pending_login,
                         &mut model_picker,
                         &mut working,
+                        &mut message_queue,
                         &mut should_quit,
                         &ac_entries,
                         &mut ac_selected,
@@ -351,12 +371,14 @@ async fn run_loop(
         }
 
         drain_ui_events(
+            runtime,
             &mut rx,
             &mut chat,
             &mut status,
             &mut streaming_assistant,
             &mut streaming_thinking,
             &mut working,
+            &mut message_queue,
         );
     }
 
@@ -546,6 +568,77 @@ fn sys(text: impl Into<String>) -> ChatItem {
     ChatItem::System { text: text.into() }
 }
 
+/// Index of the first queued bubble, or `chat.len()` if none.
+/// Agent stream items must be inserted here so they stay above the queue.
+fn first_queued_index(chat: &[ChatItem]) -> usize {
+    chat.iter()
+        .position(|c| matches!(c, ChatItem::Queued { .. }))
+        .unwrap_or(chat.len())
+}
+
+fn bump_stream_index(slot: &mut Option<usize>, inserted_at: usize) {
+    if let Some(i) = slot {
+        if *i >= inserted_at {
+            *i += 1;
+        }
+    }
+}
+
+/// Push an agent/transcript item above any pending queued user messages.
+fn push_before_queued(chat: &mut Vec<ChatItem>, item: ChatItem) -> usize {
+    let idx = first_queued_index(chat);
+    chat.insert(idx, item);
+    idx
+}
+
+/// Move any queued bubbles to the end (repairs mid-stream enqueue order) and
+/// remap live streaming indices.
+fn settle_queue_at_end(
+    chat: &mut Vec<ChatItem>,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
+) {
+    if !chat
+        .iter()
+        .any(|c| matches!(c, ChatItem::Queued { .. }))
+    {
+        return;
+    }
+    // Already a clean trailing run of Queued items?
+    if let Some(first) = chat
+        .iter()
+        .position(|c| matches!(c, ChatItem::Queued { .. }))
+    {
+        if chat[first..]
+            .iter()
+            .all(|c| matches!(c, ChatItem::Queued { .. }))
+        {
+            return;
+        }
+    }
+
+    let mut queued = Vec::new();
+    let mut settled = Vec::with_capacity(chat.len());
+    let mut map = vec![None; chat.len()];
+    for (i, item) in chat.drain(..).enumerate() {
+        if matches!(item, ChatItem::Queued { .. }) {
+            queued.push(item);
+        } else {
+            map[i] = Some(settled.len());
+            settled.push(item);
+        }
+    }
+    settled.extend(queued);
+    *chat = settled;
+
+    if let Some(idx) = *streaming_assistant {
+        *streaming_assistant = map.get(idx).copied().flatten();
+    }
+    if let Some(idx) = *streaming_thinking {
+        *streaming_thinking = map.get(idx).copied().flatten();
+    }
+}
+
 fn truncate_status(s: &str, max: usize) -> String {
     let one_line = s.lines().next().unwrap_or(s).trim();
     let mut out: String = one_line.chars().take(max).collect();
@@ -557,12 +650,14 @@ fn truncate_status(s: &str, max: usize) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn drain_ui_events(
+    runtime: &Runtime,
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     streaming_assistant: &mut Option<usize>,
     streaming_thinking: &mut Option<usize>,
     working: &mut bool,
+    message_queue: &mut VecDeque<QueuedMessage>,
 ) {
     while let Ok(ev) = rx.try_recv() {
         match ev {
@@ -591,6 +686,151 @@ fn drain_ui_events(
             }
         }
     }
+    try_drain_message_queue(
+        runtime,
+        chat,
+        status,
+        streaming_assistant,
+        streaming_thinking,
+        working,
+        message_queue,
+    );
+}
+
+fn agent_is_busy(runtime: &Runtime, working: bool) -> bool {
+    working || runtime.harness.phase() != AgentHarnessPhase::Idle
+}
+
+fn enqueue_user_message(
+    chat: &mut Vec<ChatItem>,
+    message_queue: &mut VecDeque<QueuedMessage>,
+    display: String,
+    prompt: String,
+) {
+    message_queue.push_back(QueuedMessage {
+        display: display.clone(),
+        prompt,
+    });
+    chat.push(ChatItem::Queued { text: display });
+}
+
+fn flush_message_queue(chat: &mut Vec<ChatItem>, message_queue: &mut VecDeque<QueuedMessage>) {
+    message_queue.clear();
+    chat.retain(|item| !matches!(item, ChatItem::Queued { .. }));
+}
+
+fn dequeue_last_message(
+    chat: &mut Vec<ChatItem>,
+    message_queue: &mut VecDeque<QueuedMessage>,
+) -> Option<String> {
+    let item = message_queue.pop_back()?;
+    if let Some(idx) = chat.iter().rposition(|c| {
+        matches!(c, ChatItem::Queued { text: t } if *t == item.display)
+    }) {
+        chat.remove(idx);
+    }
+    Some(item.display)
+}
+
+fn start_user_turn(
+    runtime: &Runtime,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
+    working: &mut bool,
+    display: String,
+    prompt: String,
+) {
+    // Keep prior turn output above this user message.
+    settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
+
+    // Promote a matching queued bubble if this came from the outbound queue.
+    if let Some(idx) = chat.iter().position(|item| {
+        matches!(item, ChatItem::Queued { text: t } if *t == display)
+    }) {
+        chat[idx] = ChatItem::User {
+            text: display,
+        };
+    } else {
+        chat.push(ChatItem::User { text: display });
+    }
+    *working = true;
+    *streaming_assistant = None;
+    if let Some(idx) = streaming_thinking.take() {
+        if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
+            *done = true;
+        }
+    }
+    *status = "Working…".into();
+    let harness = Arc::clone(&runtime.harness);
+    tokio::spawn(async move {
+        let _ = harness.prompt(prompt).await;
+    });
+}
+
+fn try_drain_message_queue(
+    runtime: &Runtime,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
+    working: &mut bool,
+    message_queue: &mut VecDeque<QueuedMessage>,
+) {
+    // Wait until the harness is fully idle. AgentEnd clears `working` slightly
+    // before phase flips, and Esc must be able to flush the queue in between.
+    if *working
+        || runtime.harness.phase() != AgentHarnessPhase::Idle
+        || message_queue.is_empty()
+    {
+        return;
+    }
+    let Some(item) = message_queue.pop_front() else {
+        return;
+    };
+    start_user_turn(
+        runtime,
+        chat,
+        status,
+        streaming_assistant,
+        streaming_thinking,
+        working,
+        item.display,
+        item.prompt,
+    );
+}
+
+fn submit_user_text(
+    runtime: &Runtime,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
+    working: &mut bool,
+    message_queue: &mut VecDeque<QueuedMessage>,
+    text: String,
+) {
+    if agent_is_busy(runtime, *working) {
+        enqueue_user_message(chat, message_queue, text.clone(), text);
+        let n = message_queue.len();
+        *status = if n == 1 {
+            "queued · will send when ready".into()
+        } else {
+            format!("{n} messages queued")
+        };
+    } else {
+        start_user_turn(
+            runtime,
+            chat,
+            status,
+            streaming_assistant,
+            streaming_thinking,
+            working,
+            text.clone(),
+            text,
+        );
+    }
 }
 
 async fn handle_key(
@@ -610,6 +850,7 @@ async fn handle_key(
     pending_login: &mut Option<String>,
     model_picker: &mut Option<ModelPickerState>,
     working: &mut bool,
+    message_queue: &mut VecDeque<QueuedMessage>,
     should_quit: &mut bool,
     ac_entries: &[AutocompleteEntry],
     ac_selected: &mut usize,
@@ -792,14 +1033,27 @@ async fn handle_key(
                 return Ok(());
             }
             Action::Interrupt => {
-                if runtime.harness.phase() != loop_agent::harness::AgentHarnessPhase::Idle {
+                let had_work = agent_is_busy(runtime, *working);
+                let had_queue = !message_queue.is_empty();
+                if had_work {
                     runtime.harness.abort();
+                }
+                if had_queue {
+                    flush_message_queue(chat, message_queue);
+                }
+                if had_work || had_queue {
                     *working = false;
-                    *status = "interrupted".into();
-                } else if *working {
-                    // Clear a stuck spinner (e.g. fire-and-forget work with no AgentEnd).
-                    *working = false;
-                    *status = "ready".into();
+                    *streaming_assistant = None;
+                    if let Some(idx) = streaming_thinking.take() {
+                        if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
+                            *done = true;
+                        }
+                    }
+                    *status = if had_queue {
+                        "interrupted · queue cleared".into()
+                    } else {
+                        "interrupted".into()
+                    };
                 } else if last_escape.elapsed() < Duration::from_millis(500)
                     && runtime.settings.double_escape_action == "tree"
                 {
@@ -840,19 +1094,24 @@ async fn handle_key(
                             model_picker,
                             hide_thinking,
                             working,
+                            message_queue,
+                            streaming_assistant,
+                            streaming_thinking,
                             tx,
                         )
                         .await?;
                     }
                 } else {
-                    chat.push(ChatItem::User { text: line.clone() });
-                    *working = true;
-                    *streaming_assistant = None;
-                    *streaming_thinking = None;
-                    let harness = Arc::clone(&runtime.harness);
-                    tokio::spawn(async move {
-                        let _ = harness.prompt(line).await;
-                    });
+                    submit_user_text(
+                        runtime,
+                        chat,
+                        status,
+                        streaming_assistant,
+                        streaming_thinking,
+                        working,
+                        message_queue,
+                        line,
+                    );
                 }
                 return Ok(());
             }
@@ -970,11 +1229,33 @@ async fn handle_key(
             Action::FollowUp => {
                 let line = input.as_str().trim().to_string();
                 if !line.is_empty() {
-                    runtime
-                        .harness
-                        .follow_up(AgentMessage::user_text(line.clone()));
-                    chat.push(sys(format!("queued follow-up: {line}")));
                     input.clear();
+                    submit_user_text(
+                        runtime,
+                        chat,
+                        status,
+                        streaming_assistant,
+                        streaming_thinking,
+                        working,
+                        message_queue,
+                        line,
+                    );
+                }
+                return Ok(());
+            }
+            Action::Dequeue => {
+                if let Some(text) = dequeue_last_message(chat, message_queue) {
+                    let preview = truncate_status(&text, 40);
+                    *status = if message_queue.is_empty() {
+                        format!("dequeued: {preview}")
+                    } else {
+                        format!(
+                            "dequeued: {preview} · {} still queued",
+                            message_queue.len()
+                        )
+                    };
+                } else {
+                    *status = "queue empty".into();
                 }
                 return Ok(());
             }
@@ -1066,6 +1347,8 @@ fn handle_agent_event(
                     *done = true;
                 }
             }
+            // Ensure any content that landed after queued bubbles can flush.
+            settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
         }
         AgentEvent::MessageStart { message } => {
             // Assistant items are created lazily on the first text delta so that
@@ -1081,6 +1364,7 @@ fn handle_agent_event(
                     *done = true;
                 }
             }
+            settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
         }
         AgentEvent::MessageUpdate {
             assistant_message_event,
@@ -1092,10 +1376,13 @@ fn handle_agent_event(
                     let idx = match *streaming_assistant {
                         Some(idx) => idx,
                         None => {
-                            chat.push(ChatItem::Assistant {
-                                text: String::new(),
-                            });
-                            let idx = chat.len() - 1;
+                            let idx = push_before_queued(
+                                chat,
+                                ChatItem::Assistant {
+                                    text: String::new(),
+                                },
+                            );
+                            bump_stream_index(streaming_thinking, idx);
                             *streaming_assistant = Some(idx);
                             idx
                         }
@@ -1111,11 +1398,15 @@ fn handle_agent_event(
                 }
                 AssistantMessageEvent::ThinkingStart { .. } => {
                     *streaming_assistant = None;
-                    chat.push(ChatItem::Thinking {
-                        text: String::new(),
-                        done: false,
-                    });
-                    *streaming_thinking = Some(chat.len() - 1);
+                    let idx = push_before_queued(
+                        chat,
+                        ChatItem::Thinking {
+                            text: String::new(),
+                            done: false,
+                        },
+                    );
+                    bump_stream_index(streaming_thinking, idx);
+                    *streaming_thinking = Some(idx);
                 }
                 AssistantMessageEvent::ThinkingDelta { delta, .. } => {
                     if let Some(idx) = *streaming_thinking {
@@ -1138,6 +1429,8 @@ fn handle_agent_event(
                     let summary = tool_args_summary(&tool_call.name, &tool_call.arguments);
                     upsert_tool(
                         chat,
+                        streaming_assistant,
+                        streaming_thinking,
                         &tool_call.id,
                         &tool_call.name,
                         summary,
@@ -1150,7 +1443,7 @@ fn handle_agent_event(
                         .error_message
                         .clone()
                         .unwrap_or_else(|| "error".into());
-                    chat.push(sys(format!("error: {msg}")));
+                    push_before_queued(chat, sys(format!("error: {msg}")));
                     *working = false;
                     *status = "error".into();
                 }
@@ -1167,6 +1460,8 @@ fn handle_agent_event(
             let detail = serde_json::to_string_pretty(&args).unwrap_or_default();
             upsert_tool(
                 chat,
+                streaming_assistant,
+                streaming_thinking,
                 &tool_call_id,
                 &tool_name,
                 summary,
@@ -1240,17 +1535,20 @@ fn handle_agent_event(
                     }
                 }
             } else {
-                chat.push(ChatItem::Tool {
-                    id: tool_call_id,
-                    name: tool_name,
-                    summary: if is_error {
-                        "error".into()
-                    } else {
-                        "done".into()
+                push_before_queued(
+                    chat,
+                    ChatItem::Tool {
+                        id: tool_call_id,
+                        name: tool_name,
+                        summary: if is_error {
+                            "error".into()
+                        } else {
+                            "done".into()
+                        },
+                        detail: result_text,
+                        status: st,
                     },
-                    detail: result_text,
-                    status: st,
-                });
+                );
             }
         }
         _ => {}
@@ -1259,6 +1557,8 @@ fn handle_agent_event(
 
 fn upsert_tool(
     chat: &mut Vec<ChatItem>,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
     id: &str,
     name: &str,
     summary: String,
@@ -1282,13 +1582,18 @@ fn upsert_tool(
             *st = status;
         }
     } else {
-        chat.push(ChatItem::Tool {
-            id: id.to_string(),
-            name: name.to_string(),
-            summary,
-            detail,
-            status,
-        });
+        let idx = push_before_queued(
+            chat,
+            ChatItem::Tool {
+                id: id.to_string(),
+                name: name.to_string(),
+                summary,
+                detail,
+                status,
+            },
+        );
+        bump_stream_index(streaming_assistant, idx);
+        bump_stream_index(streaming_thinking, idx);
     }
 }
 
@@ -1301,6 +1606,9 @@ async fn apply_effect(
     model_picker: &mut Option<ModelPickerState>,
     hide_thinking: &mut bool,
     working: &mut bool,
+    message_queue: &mut VecDeque<QueuedMessage>,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> anyhow::Result<bool> {
     match effect {
@@ -1578,30 +1886,46 @@ async fn apply_effect(
         }
         CommandEffect::Skill { name, args } => {
             if let Some(skill) = runtime.resources.skills.iter().find(|s| s.name == name) {
-                let text = format_skill_invocation(skill, &args);
-                chat.push(ChatItem::User {
-                    text: format!("/skill:{name} {args}"),
-                });
-                *working = true;
-                let harness = Arc::clone(&runtime.harness);
-                tokio::spawn(async move {
-                    let _ = harness.prompt(text).await;
-                });
+                let prompt = format_skill_invocation(skill, &args);
+                let display = format!("/skill:{name} {args}");
+                if agent_is_busy(runtime, *working) {
+                    enqueue_user_message(chat, message_queue, display, prompt);
+                    *status = format!("{} messages queued", message_queue.len());
+                } else {
+                    start_user_turn(
+                        runtime,
+                        chat,
+                        status,
+                        streaming_assistant,
+                        streaming_thinking,
+                        working,
+                        display,
+                        prompt,
+                    );
+                }
             } else {
                 chat.push(sys(format!("skill not found: {name}")));
             }
         }
         CommandEffect::Template { name, args } => {
             if let Some(tmpl) = runtime.resources.prompts.iter().find(|p| p.name == name) {
-                let text = format_prompt_template_invocation(tmpl, &args);
-                chat.push(ChatItem::User {
-                    text: format!("/{name} {args}"),
-                });
-                *working = true;
-                let harness = Arc::clone(&runtime.harness);
-                tokio::spawn(async move {
-                    let _ = harness.prompt(text).await;
-                });
+                let prompt = format_prompt_template_invocation(tmpl, &args);
+                let display = format!("/{name} {args}");
+                if agent_is_busy(runtime, *working) {
+                    enqueue_user_message(chat, message_queue, display, prompt);
+                    *status = format!("{} messages queued", message_queue.len());
+                } else {
+                    start_user_turn(
+                        runtime,
+                        chat,
+                        status,
+                        streaming_assistant,
+                        streaming_thinking,
+                        working,
+                        display,
+                        prompt,
+                    );
+                }
             } else {
                 chat.push(sys(format!("template not found: {name}")));
             }

@@ -34,6 +34,8 @@ pub enum CardStatus {
 #[derive(Debug, Clone)]
 pub enum ChatItem {
     User { text: String },
+    /// User message waiting for the agent to become idle (not yet sent).
+    Queued { text: String },
     Assistant { text: String },
     Thinking { text: String, done: bool },
     Tool {
@@ -107,6 +109,8 @@ pub fn item_is_committed(
 ) -> bool {
     match item {
         ChatItem::User { .. } | ChatItem::System { .. } => true,
+        // Keep queued messages in the live footer so Esc can still remove them.
+        ChatItem::Queued { .. } => false,
         ChatItem::Assistant { .. } => streaming_assistant != Some(index),
         ChatItem::Thinking { done, .. } => *done && streaming_thinking != Some(index),
         ChatItem::Tool { status, .. } => !matches!(status, CardStatus::Pending),
@@ -245,12 +249,87 @@ pub fn welcome_lines(
         theme.muted(),
     )));
     out.push(Line::from(Span::styled(
-        "enter send · shift+enter newline · / commands · ctrl+o expand details · ctrl+c quit"
+        "enter send · queues while busy · esc interrupt · shift+enter newline · / commands · ctrl+o expand details · ctrl+c quit"
             .to_string(),
         theme.dim(),
     )));
     out.push(Line::from(""));
     out
+}
+
+/// Full-width user message band with a `❯` prompt marker.
+/// When `queued`, render muted with a trailing queue hint.
+fn format_user_band(
+    text: &str,
+    theme: &Theme,
+    w: usize,
+    queued: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let text_style = if queued {
+        theme.muted()
+    } else {
+        theme.style("userMessageText")
+    };
+    let marker_style = if queued {
+        theme.muted()
+    } else {
+        theme.accent_bold()
+    };
+    lines.push(bg_spans_line(
+        theme,
+        "userMessageBg",
+        vec![Span::raw("\u{00a0}")],
+        w,
+    ));
+    let mut first = true;
+    let body_w = w.saturating_sub(5).max(1);
+    for l in text.lines() {
+        for part in soft_wrap(l, body_w) {
+            let marker = if first { "❯ " } else { "  " };
+            first = false;
+            lines.push(bg_spans_line(
+                theme,
+                "userMessageBg",
+                vec![
+                    Span::raw(" "),
+                    Span::styled(marker.to_string(), marker_style),
+                    Span::styled(part, text_style),
+                ],
+                w,
+            ));
+        }
+    }
+    if first {
+        lines.push(bg_spans_line(
+            theme,
+            "userMessageBg",
+            vec![
+                Span::raw(" "),
+                Span::styled("❯".to_string(), marker_style),
+            ],
+            w,
+        ));
+    }
+    if queued {
+        lines.push(bg_spans_line(
+            theme,
+            "userMessageBg",
+            vec![
+                Span::raw(" "),
+                Span::styled("  queued".to_string(), theme.dim()),
+            ],
+            w,
+        ));
+    }
+    lines.push(bg_spans_line(
+        theme,
+        "userMessageBg",
+        vec![Span::raw("\u{00a0}")],
+        w,
+    ));
+    lines.push(Line::from(" "));
+    lines
 }
 
 /// Format a single chat item as lines (for scrollback or live area).
@@ -265,36 +344,10 @@ pub fn format_item_lines(
     let mut lines = Vec::new();
     match item {
         ChatItem::User { text } => {
-            // Full-width band with a `❯` prompt marker.
-            lines.push(bg_spans_line(theme, "userMessageBg", vec![Span::raw("\u{00a0}")], w));
-            let mut first = true;
-            let body_w = w.saturating_sub(5).max(1);
-            for l in text.lines() {
-                for part in soft_wrap(l, body_w) {
-                    let marker = if first { "❯ " } else { "  " };
-                    first = false;
-                    lines.push(bg_spans_line(
-                        theme,
-                        "userMessageBg",
-                        vec![
-                            Span::raw(" "),
-                            Span::styled(marker.to_string(), theme.accent_bold()),
-                            Span::styled(part, theme.style("userMessageText")),
-                        ],
-                        w,
-                    ));
-                }
-            }
-            if first {
-                lines.push(bg_spans_line(
-                    theme,
-                    "userMessageBg",
-                    vec![Span::raw(" "), Span::styled("❯".to_string(), theme.accent_bold())],
-                    w,
-                ));
-            }
-            lines.push(bg_spans_line(theme, "userMessageBg", vec![Span::raw("\u{00a0}")], w));
-            lines.push(Line::from(" "));
+            lines.extend(format_user_band(text, theme, w, false));
+        }
+        ChatItem::Queued { text } => {
+            lines.extend(format_user_band(text, theme, w, true));
         }
         ChatItem::Assistant { text } => {
             if text.is_empty() {

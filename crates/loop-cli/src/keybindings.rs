@@ -251,10 +251,10 @@ fn key_to_string(key: KeyEvent) -> Option<String> {
 /// Human-readable hotkey help lines.
 pub fn hotkey_help() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("escape", "Interrupt / abort"),
+        ("escape", "Interrupt / abort and clear message queue"),
         ("ctrl+c", "Clear input (twice to quit)"),
         ("ctrl+d", "Exit when input empty"),
-        ("enter", "Send message"),
+        ("enter", "Send message (queues while agent is busy)"),
         ("shift+enter / ctrl+j", "New line"),
         ("alt/ctrl+left/right", "Jump by word"),
         ("ctrl+a / ctrl+e", "Line start / end"),
@@ -269,7 +269,8 @@ pub fn hotkey_help() -> Vec<(&'static str, &'static str)> {
         ("ctrl+o", "Expand/collapse tool output & reasoning"),
         ("↑↓", "Navigate / commands & model list"),
         ("ctrl+x", "Copy last assistant message"),
-        ("alt+enter", "Queue follow-up"),
+        ("alt+enter", "Queue message while busy"),
+        ("alt+up", "Remove last queued message"),
         ("ctrl+g", "External editor"),
         ("/", "Slash commands"),
     ]
