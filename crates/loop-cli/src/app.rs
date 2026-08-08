@@ -29,9 +29,10 @@ use crate::keybindings::{hotkey_help, Action};
 use crate::runtime::Runtime;
 use crate::theme::Theme;
 use crate::tui::{
-    chat_items_from_agent_messages, find_tool_index, format_item_lines, item_is_committed,
-    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, FOOTER_HEIGHT,
-    FooterOpts, InputBuffer, PickerRow, PickerView,
+    chat_items_from_agent_messages, filter_files, find_at_mention, find_tool_index,
+    format_item_lines, insert_text, item_is_committed, list_files, render_lines_to_buffer,
+    tool_args_summary, welcome_lines, CardStatus, ChatItem, FileEntry, FOOTER_HEIGHT, FooterOpts,
+    InputBuffer, PickerRow, PickerView,
 };
 
 enum UiEvent {
@@ -150,6 +151,7 @@ async fn run_loop(
     let mut fork_picker: Option<ForkPickerState> = None;
     let mut ac_selected: usize = 0;
     let mut last_ac_filter = String::new();
+    let mut file_index: Option<Vec<FileEntry>> = None;
     let mut working = false;
     let mut message_queue: VecDeque<QueuedMessage> = VecDeque::new();
     let mut spinner_frame: usize = 0;
@@ -204,12 +206,37 @@ async fn run_loop(
         } else {
             Vec::new()
         };
-        if input.as_str() != last_ac_filter {
+        let at_mention = if ac_entries.is_empty()
+            && pending_login.is_none()
+            && model_picker.is_none()
+            && fork_picker.is_none()
+        {
+            find_at_mention(input.as_str(), input.cursor())
+        } else {
+            None
+        };
+        let file_ac_entries = if let Some(ref mention) = at_mention {
+            let index = file_index.get_or_insert_with(|| list_files(&runtime.cwd));
+            filter_files(index, &mention.query, 100)
+        } else {
+            Vec::new()
+        };
+        let ac_filter_key = if let Some(ref m) = at_mention {
+            format!("@{}", m.query)
+        } else {
+            input.as_str().to_string()
+        };
+        if ac_filter_key != last_ac_filter {
             ac_selected = 0;
-            last_ac_filter = input.as_str().to_string();
+            last_ac_filter = ac_filter_key;
         }
-        if !ac_entries.is_empty() {
-            ac_selected = ac_selected.min(ac_entries.len() - 1);
+        let picker_len = if !ac_entries.is_empty() {
+            ac_entries.len()
+        } else {
+            file_ac_entries.len()
+        };
+        if picker_len > 0 {
+            ac_selected = ac_selected.min(picker_len - 1);
         }
 
         let picker = if let Some(p) = &model_picker {
@@ -273,6 +300,18 @@ async fn run_loop(
                     .collect(),
                 selected: ac_selected,
             }
+        } else if !file_ac_entries.is_empty() {
+            PickerView::Commands {
+                rows: file_ac_entries
+                    .iter()
+                    .map(|e| PickerRow {
+                        label: e.relative.clone(),
+                        description: e.absolute.clone(),
+                        mark: None,
+                    })
+                    .collect(),
+                selected: ac_selected,
+            }
         } else {
             PickerView::None
         };
@@ -285,6 +324,8 @@ async fn run_loop(
             "setup · paste your API key · enter save".into()
         } else if !ac_entries.is_empty() {
             "↑↓ select · tab complete · enter run".into()
+        } else if !file_ac_entries.is_empty() {
+            "↑↓ select · tab complete · enter insert".into()
         } else if working {
             let pending_tools = chat
                 .iter()
@@ -379,6 +420,8 @@ async fn run_loop(
                         &mut message_queue,
                         &mut should_quit,
                         &ac_entries,
+                        &file_ac_entries,
+                        at_mention.as_ref(),
                         &mut ac_selected,
                         &tx,
                     )
@@ -914,6 +957,8 @@ async fn handle_key(
     message_queue: &mut VecDeque<QueuedMessage>,
     should_quit: &mut bool,
     ac_entries: &[AutocompleteEntry],
+    file_ac_entries: &[FileEntry],
+    at_mention: Option<&crate::tui::AtMention>,
     ac_selected: &mut usize,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> anyhow::Result<()> {
@@ -1040,6 +1085,45 @@ async fn handle_key(
                     }
                 }
                 // Fall through to Submit via keybindings below.
+            }
+            _ => {}
+        }
+    }
+
+    // `@file` mention picker — Tab/Enter insert absolute path in place of `@…`.
+    if !file_ac_entries.is_empty() {
+        match key.code {
+            KeyCode::Up => {
+                *ac_selected = ac_selected.saturating_sub(1);
+                return Ok(());
+            }
+            KeyCode::Down => {
+                if *ac_selected + 1 < file_ac_entries.len() {
+                    *ac_selected += 1;
+                }
+                return Ok(());
+            }
+            KeyCode::Tab => {
+                if let (Some(mention), Some(sel)) =
+                    (at_mention, file_ac_entries.get(*ac_selected))
+                {
+                    let text = format!("{} ", insert_text(&sel.absolute));
+                    input.replace_char_range(mention.start, mention.end, &text);
+                }
+                return Ok(());
+            }
+            KeyCode::Enter
+                if !key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if let (Some(mention), Some(sel)) =
+                    (at_mention, file_ac_entries.get(*ac_selected))
+                {
+                    let text = insert_text(&sel.absolute);
+                    input.replace_char_range(mention.start, mention.end, &text);
+                }
+                // Insert only — stay in the editor so the user can keep typing.
+                return Ok(());
             }
             _ => {}
         }
@@ -1402,6 +1486,14 @@ async fn handle_key(
         KeyCode::Tab => {
             if let Some(sel) = ac_entries.get(*ac_selected).or_else(|| ac_entries.first()) {
                 input.set(format!("{} ", sel.name));
+            } else if let (Some(mention), Some(sel)) = (
+                at_mention,
+                file_ac_entries
+                    .get(*ac_selected)
+                    .or_else(|| file_ac_entries.first()),
+            ) {
+                let text = format!("{} ", insert_text(&sel.absolute));
+                input.replace_char_range(mention.start, mention.end, &text);
             }
         }
         KeyCode::Char(c) => input.insert_char(c),

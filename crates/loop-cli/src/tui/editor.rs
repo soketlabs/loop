@@ -90,6 +90,17 @@ impl InputBuffer {
         self.cursor += s.chars().count();
     }
 
+    /// Replace the character range `[start, end)` and place the caret after the insert.
+    pub fn replace_char_range(&mut self, start: usize, end: usize, replacement: &str) {
+        let len = self.len();
+        let start = start.min(end).min(len);
+        let end = end.min(len).max(start);
+        let b0 = self.byte_index(start);
+        let b1 = self.byte_index(end);
+        self.text.replace_range(b0..b1, replacement);
+        self.cursor = start + replacement.chars().count();
+    }
+
     /// Backspace at caret.
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
@@ -337,5 +348,14 @@ mod tests {
         b.move_line_start();
         b.delete_line();
         assert_eq!(b.as_str(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn replace_char_range_at_mention() {
+        let mut b = InputBuffer::new();
+        b.insert_str("see @src/app please");
+        b.replace_char_range(4, 12, "/abs/src/app.rs");
+        assert_eq!(b.as_str(), "see /abs/src/app.rs please");
+        assert_eq!(b.cursor(), 4 + "/abs/src/app.rs".chars().count());
     }
 }

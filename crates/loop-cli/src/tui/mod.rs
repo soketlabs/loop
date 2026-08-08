@@ -1,10 +1,12 @@
 //! Pi-style inline UI: transcript in terminal scrollback, footer redrawn in place.
 
 pub mod editor;
+pub mod file_mentions;
 pub mod highlight;
 pub mod markdown;
 
 pub use editor::InputBuffer;
+pub use file_mentions::{filter_files, find_at_mention, insert_text, list_files, AtMention, FileEntry};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -605,7 +607,7 @@ fn draw_input(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
     } else if opts.setup_mode {
         " paste your API key"
     } else {
-        " Type a message · / for commands"
+        " Type a message · / for commands · @ for files"
     };
     let lines = render_input_lines(
         &display,
