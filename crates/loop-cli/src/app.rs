@@ -2397,11 +2397,8 @@ fn copy_last_assistant(chat: &[ChatItem], status: &mut String) {
         _ => None,
     });
     match text {
-        Some(t) => match arboard::Clipboard::new() {
-            Ok(mut cb) => {
-                let _ = cb.set_text(t);
-                *status = "copied".into();
-            }
+        Some(t) => match crate::clipboard::copy_text(&t) {
+            Ok(()) => *status = "copied".into(),
             Err(e) => *status = format!("clipboard: {e}"),
         },
         None => *status = "nothing to copy".into(),

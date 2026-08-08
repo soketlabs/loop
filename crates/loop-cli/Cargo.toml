@@ -37,6 +37,7 @@ pulldown-cmark = { workspace = true }
 syntect = { workspace = true }
 two-face = { workspace = true }
 arboard = { workspace = true }
+base64 = { workspace = true }
 rhai = { workspace = true }
 rustyline = { workspace = true }
 unicode-width = { workspace = true }
