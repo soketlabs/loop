@@ -93,7 +93,7 @@ async fn jsonl_fork_all() {
         .unwrap();
 
     let forked = store
-        .fork(&session.metadata().id, SessionForkSelection::All, Some("fork".into()))
+        .fork(&session.metadata().id, SessionForkSelection::All, None, Some("fork".into()))
         .await
         .unwrap();
     let entries = forked.read_entries(None).await.unwrap();

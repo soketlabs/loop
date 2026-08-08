@@ -139,3 +139,68 @@ async fn harness_resume_restores_session_context() {
     let ctx_after = harness2.session_context().await.unwrap();
     assert!(ctx_after.messages.len() > ctx.messages.len());
 }
+
+#[tokio::test]
+async fn harness_fork_through_user_message() {
+    use loop_agent::harness::SessionForkSelection;
+
+    let script = FauxScript::new();
+    script.push(FauxResponse::Text("a1".into()));
+    script.push(FauxResponse::Text("a2".into()));
+    script.push(FauxResponse::Text("forked-reply".into()));
+    let models = Arc::new(Models::new());
+    models.set_provider(faux_provider(script));
+    let model = models.get_model("faux", "faux-model").unwrap();
+
+    let store = create_in_memory_session_store();
+    let repo = create_session_repository(store, None);
+    let session = repo.create(None, Some("fork-src".into())).await.unwrap();
+    let source_id = session.metadata().id.clone();
+    let host = Arc::new(HostExecutionEnv::new(std::env::temp_dir()));
+
+    let harness = AgentHarness::new(AgentHarnessOptions {
+        models,
+        model,
+        session,
+        host_env: host,
+        tools: vec![],
+        system_prompt: "sys".into(),
+        sandbox: SandboxMode::Disabled,
+        resources: Default::default(),
+    });
+
+    harness.prompt("one").await.unwrap();
+    harness.wait_for_idle().await;
+    harness.prompt("two").await.unwrap();
+    harness.wait_for_idle().await;
+
+    let points = harness.fork_points().await.unwrap();
+    assert_eq!(points.len(), 2);
+    assert_eq!(points[0].preview, "one");
+    assert_eq!(points[1].preview, "two");
+
+    let forked_id = harness
+        .fork_session(
+            SessionForkSelection::BeforeEntry,
+            Some(&points[1].entry_id),
+            Some("forked".into()),
+        )
+        .await
+        .unwrap();
+    assert_ne!(forked_id, source_id);
+    assert_eq!(harness.session_id().await, forked_id);
+
+    let ctx = harness.session_context().await.unwrap();
+    // Before second user message: first turn (user + assistant) remains.
+    assert_eq!(ctx.messages.len(), 2);
+    assert_eq!(ctx.messages[0].role(), "user");
+    assert_eq!(ctx.messages[1].role(), "assistant");
+    assert_eq!(points[1].text, "two");
+
+    let msg = harness.prompt("two-edited").await.unwrap();
+    assert_eq!(msg.role(), "assistant");
+    harness.wait_for_idle().await;
+
+    let ctx2 = harness.session_context().await.unwrap();
+    assert!(ctx2.messages.len() >= 4);
+}

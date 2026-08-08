@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use loop_agent::harness::{
     format_prompt_template_invocation, format_skill_invocation, AgentHarnessPhase, LocalShellSandbox,
-    Sandbox, SandboxConfig, SandboxMode,
+    Sandbox, SandboxConfig, SandboxMode, SessionForkPoint, SessionForkSelection,
 };
 use loop_agent::types::{AgentEvent, AgentThinkingLevel};
 use loop_ai::providers::{SOKET_BASE_URL, SOKET_PROVIDER_ID};
@@ -147,6 +147,7 @@ async fn run_loop(
         None
     };
     let mut model_picker: Option<ModelPickerState> = None;
+    let mut fork_picker: Option<ForkPickerState> = None;
     let mut ac_selected: usize = 0;
     let mut last_ac_filter = String::new();
     let mut working = false;
@@ -196,6 +197,7 @@ async fn run_loop(
             && !input.as_str().contains(' ')
             && pending_login.is_none()
             && model_picker.is_none()
+            && fork_picker.is_none()
         {
             let extra = dynamic_command_entries(runtime);
             commands::autocomplete_entries(input.as_str(), &extra)
@@ -239,6 +241,22 @@ async fn run_loop(
                 hint: "Only showing models from configured providers. Use /login to add providers."
                     .into(),
             }
+        } else if let Some(p) = &fork_picker {
+            PickerView::Models {
+                rows: p
+                    .filtered
+                    .iter()
+                    .filter_map(|&i| p.points.get(i))
+                    .map(|pt| PickerRow {
+                        label: format!("#{}", pt.index),
+                        description: pt.preview.clone(),
+                        mark: None,
+                    })
+                    .collect(),
+                selected: p.selected,
+                hint: "Fork: edit this user message and continue (prior history kept)."
+                    .into(),
+            }
         } else if let Some(provider) = &pending_login {
             PickerView::Setup {
                 provider: provider.clone(),
@@ -261,6 +279,8 @@ async fn run_loop(
 
         let status_line = if model_picker.is_some() {
             "↑↓ select · enter confirm · esc cancel".into()
+        } else if fork_picker.is_some() {
+            "↑↓ select · enter edit · esc cancel".into()
         } else if pending_login.is_some() {
             "setup · paste your API key · enter save".into()
         } else if !ac_entries.is_empty() {
@@ -354,6 +374,7 @@ async fn run_loop(
                         &mut hide_thinking,
                         &mut pending_login,
                         &mut model_picker,
+                        &mut fork_picker,
                         &mut working,
                         &mut message_queue,
                         &mut should_quit,
@@ -888,6 +909,7 @@ async fn handle_key(
     hide_thinking: &mut bool,
     pending_login: &mut Option<String>,
     model_picker: &mut Option<ModelPickerState>,
+    fork_picker: &mut Option<ForkPickerState>,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
     should_quit: &mut bool,
@@ -932,6 +954,56 @@ async fn handle_key(
             KeyCode::Backspace => {
                 picker.query.pop();
                 picker.refilter(&runtime.models);
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if let Some(picker) = fork_picker.as_mut() {
+        match key.code {
+            KeyCode::Esc => {
+                *fork_picker = None;
+                *status = "cancelled".into();
+            }
+            KeyCode::Up => {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if picker.selected + 1 < picker.filtered.len() {
+                    picker.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let selected = picker.selected_point().cloned();
+                *fork_picker = None;
+                if let Some(point) = selected {
+                    adopt_forked_session(
+                        runtime,
+                        chat,
+                        status,
+                        working,
+                        message_queue,
+                        streaming_assistant,
+                        streaming_thinking,
+                        redraw_request,
+                        purge_ui_events,
+                        input,
+                        SessionForkSelection::BeforeEntry,
+                        Some(point.entry_id.as_str()),
+                        None,
+                        Some(point.text),
+                    )
+                    .await;
+                }
+            }
+            KeyCode::Char(c) => {
+                picker.query.push(c);
+                picker.refilter();
+            }
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.refilter();
             }
             _ => {}
         }
@@ -1093,12 +1165,25 @@ async fn handle_key(
                     } else {
                         "interrupted".into()
                     };
-                } else if last_escape.elapsed() < Duration::from_millis(500)
-                    && runtime.settings.double_escape_action == "tree"
-                {
-                    chat.push(sys(
-                        "session tree: use /tree (branch nav in session store)",
-                    ));
+                } else if last_escape.elapsed() < Duration::from_millis(500) {
+                    match runtime.settings.double_escape_action.as_str() {
+                        "tree" => {
+                            chat.push(sys(
+                                "session tree: use /tree (branch nav in session store)",
+                            ));
+                        }
+                        "fork" => {
+                            open_fork_picker(
+                                runtime,
+                                fork_picker,
+                                model_picker,
+                                chat,
+                                status,
+                            )
+                            .await;
+                        }
+                        _ => {}
+                    }
                 }
                 *last_escape = Instant::now();
                 return Ok(());
@@ -1131,6 +1216,7 @@ async fn handle_key(
                             status,
                             pending_login,
                             model_picker,
+                            fork_picker,
                             hide_thinking,
                             working,
                             message_queue,
@@ -1138,6 +1224,7 @@ async fn handle_key(
                             streaming_thinking,
                             redraw_request,
                             purge_ui_events,
+                            input,
                             tx,
                         )
                         .await?;
@@ -1221,7 +1308,12 @@ async fn handle_key(
                 return Ok(());
             }
             Action::ModelSelect => {
+                *fork_picker = None;
                 *model_picker = Some(ModelPickerState::new(&runtime.models));
+                return Ok(());
+            }
+            Action::SessionFork => {
+                open_fork_picker(runtime, fork_picker, model_picker, chat, status).await;
                 return Ok(());
             }
             Action::ModelCycleForward | Action::ModelCycleBackward => {
@@ -1351,6 +1443,134 @@ impl ModelPickerState {
             .collect();
         if self.selected >= self.filtered.len() {
             self.selected = self.filtered.len().saturating_sub(1);
+        }
+    }
+}
+
+struct ForkPickerState {
+    /// Newest-first for display.
+    points: Vec<SessionForkPoint>,
+    /// Indices into `points` after filter.
+    filtered: Vec<usize>,
+    selected: usize,
+    query: String,
+}
+
+impl ForkPickerState {
+    fn new(mut points: Vec<SessionForkPoint>) -> Self {
+        points.reverse();
+        let filtered: Vec<_> = (0..points.len()).collect();
+        Self {
+            points,
+            filtered,
+            selected: 0,
+            query: String::new(),
+        }
+    }
+
+    fn refilter(&mut self) {
+        let q = self.query.to_lowercase();
+        self.filtered = self
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                p.preview.to_lowercase().contains(&q)
+                    || format!("#{}", p.index).contains(&q)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if self.selected >= self.filtered.len() {
+            self.selected = self.filtered.len().saturating_sub(1);
+        }
+    }
+
+    fn selected_point(&self) -> Option<&SessionForkPoint> {
+        self.filtered
+            .get(self.selected)
+            .and_then(|&i| self.points.get(i))
+    }
+}
+
+async fn open_fork_picker(
+    runtime: &Runtime,
+    fork_picker: &mut Option<ForkPickerState>,
+    model_picker: &mut Option<ModelPickerState>,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+) {
+    *model_picker = None;
+    match runtime.harness.fork_points().await {
+        Ok(points) if points.is_empty() => {
+            *fork_picker = None;
+            chat.push(sys("no user messages to fork from"));
+            *status = "ready".into();
+        }
+        Ok(points) => {
+            *fork_picker = Some(ForkPickerState::new(points));
+            *status = "fork · pick a message to edit".into();
+        }
+        Err(e) => {
+            *fork_picker = None;
+            chat.push(sys(format!("fork failed: {e}")));
+            *status = "ready".into();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn adopt_forked_session(
+    runtime: &mut Runtime,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    working: &mut bool,
+    message_queue: &mut VecDeque<QueuedMessage>,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
+    redraw_request: &mut bool,
+    purge_ui_events: &mut bool,
+    input: &mut InputBuffer,
+    selection: SessionForkSelection,
+    through_entry_id: Option<&str>,
+    name: Option<String>,
+    draft: Option<String>,
+) {
+    message_queue.clear();
+    *streaming_assistant = None;
+    *streaming_thinking = None;
+    *working = false;
+    let parent_id = runtime.session_id.clone();
+    match runtime
+        .harness
+        .fork_session(selection, through_entry_id, name)
+        .await
+    {
+        Ok(id) => {
+            runtime.session_id = id.clone();
+            *chat = match runtime.harness.session_context().await {
+                Ok(ctx) => chat_items_from_agent_messages(&ctx.messages),
+                Err(e) => {
+                    tracing::warn!("failed to load forked session transcript: {e}");
+                    Vec::new()
+                }
+            };
+            if let Some(text) = draft {
+                input.set(text);
+                chat.push(sys(format!(
+                    "forked from {parent_id} → {id} · edit the message below and submit"
+                )));
+                *status = "ready · edit forked message".into();
+            } else {
+                input.clear();
+                chat.push(sys(format!("cloned from {parent_id} → {id}")));
+                *status = "ready · cloned session".into();
+            }
+            *redraw_request = true;
+            *purge_ui_events = true;
+        }
+        Err(e) => {
+            chat.push(sys(format!("fork failed: {e}")));
+            *status = "ready".into();
         }
     }
 }
@@ -1645,6 +1865,7 @@ async fn apply_effect(
     status: &mut String,
     pending_login: &mut Option<String>,
     model_picker: &mut Option<ModelPickerState>,
+    fork_picker: &mut Option<ForkPickerState>,
     hide_thinking: &mut bool,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
@@ -1652,6 +1873,7 @@ async fn apply_effect(
     streaming_thinking: &mut Option<usize>,
     redraw_request: &mut bool,
     purge_ui_events: &mut bool,
+    input: &mut InputBuffer,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> anyhow::Result<bool> {
     match effect {
@@ -1694,6 +1916,7 @@ async fn apply_effect(
             }
         }
         CommandEffect::SelectModel(None) => {
+            *fork_picker = None;
             *model_picker = Some(ModelPickerState::new(&runtime.models));
         }
         CommandEffect::SelectModel(Some(spec)) => {
@@ -1949,10 +2172,29 @@ async fn apply_effect(
                 runtime.settings.enabled_models
             )));
         }
-        CommandEffect::Fork | CommandEffect::CloneSession => {
-            chat.push(sys(
-                "fork/clone: available via session store API — full UI forthcoming",
-            ));
+        CommandEffect::Fork => {
+            open_fork_picker(runtime, fork_picker, model_picker, chat, status).await;
+        }
+        CommandEffect::CloneSession => {
+            *fork_picker = None;
+            *model_picker = None;
+            adopt_forked_session(
+                runtime,
+                chat,
+                status,
+                working,
+                message_queue,
+                streaming_assistant,
+                streaming_thinking,
+                redraw_request,
+                purge_ui_events,
+                input,
+                SessionForkSelection::All,
+                None,
+                None,
+                None,
+            )
+            .await;
         }
         CommandEffect::Skill { name, args } => {
             if let Some(skill) = runtime.resources.skills.iter().find(|s| s.name == name) {

@@ -301,10 +301,14 @@ pub trait SessionStore: Send + Sync {
     /// Delete session.
     async fn delete(&self, id: &str) -> Result<(), SessionError>;
     /// Fork session.
+    ///
+    /// When `selection` is [`SessionForkSelection::ThroughEntry`], pass the
+    /// target entry id in `through_entry_id` (inclusive).
     async fn fork(
         &self,
         source_id: &str,
         selection: super::SessionForkSelection,
+        through_entry_id: Option<&str>,
         name: Option<String>,
     ) -> Result<Arc<dyn SessionReader>, SessionError>;
 }

@@ -195,6 +195,55 @@ impl AgentHarness {
         Ok(id)
     }
 
+    /// List user-message fork points on the active branch (oldest → newest).
+    pub async fn fork_points(
+        &self,
+    ) -> Result<Vec<crate::harness::session::SessionForkPoint>, AgentHarnessError> {
+        let session = self.session.lock().await;
+        let branch = session
+            .read_branch()
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        Ok(crate::harness::session::fork_points_from_branch(&branch))
+    }
+
+    /// Abort any in-flight turn, fork the current session into a new one, and
+    /// switch the harness to it. Clears steering / follow-up / pending writes.
+    /// Returns the new session id.
+    pub async fn fork_session(
+        &self,
+        selection: crate::harness::session::SessionForkSelection,
+        through_entry_id: Option<&str>,
+        name: Option<String>,
+    ) -> Result<String, AgentHarnessError> {
+        self.assert_not_shut_down()?;
+        self.abort();
+        self.wait_for_idle().await;
+
+        let (store, source_id) = {
+            let session = self.session.lock().await;
+            (session.store(), session.metadata().id.clone())
+        };
+        let reader = store
+            .fork(&source_id, selection, through_entry_id, name)
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        let new_session = Session::new(store, reader);
+        let id = new_session.metadata().id.clone();
+
+        *self.session.lock().await = new_session;
+        {
+            let mut opts = self.stream_options.write().await;
+            opts.base.session_id = Some(id.clone());
+        }
+        self.steering.lock().clear();
+        self.follow_up.lock().clear();
+        self.next_turn.lock().clear();
+        self.pending_writes.lock().clear();
+
+        Ok(id)
+    }
+
     /// Current phase.
     pub fn phase(&self) -> AgentHarnessPhase {
         *self.phase.lock()

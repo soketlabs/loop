@@ -42,11 +42,65 @@ async fn memory_fork_all() {
         .await
         .unwrap();
     let forked = store
-        .fork(&session.metadata().id, SessionForkSelection::All, Some("f".into()))
+        .fork(&session.metadata().id, SessionForkSelection::All, None, Some("f".into()))
         .await
         .unwrap();
     let entries = forked.read_entries(None).await.unwrap();
     assert_eq!(entries.len(), 2);
+}
+
+#[tokio::test]
+async fn memory_fork_through_user_message() {
+    let store = create_in_memory_session_store();
+    let repo = create_session_repository(Arc::clone(&store), None);
+    let session = repo.create(None, None).await.unwrap();
+    let first = session
+        .append_message(AgentMessage::user_text("first"))
+        .await
+        .unwrap();
+    session
+        .append_message(AgentMessage::user_text("second"))
+        .await
+        .unwrap();
+    session
+        .append_message(AgentMessage::user_text("third"))
+        .await
+        .unwrap();
+
+    let forked = store
+        .fork(
+            &session.metadata().id,
+            SessionForkSelection::ThroughEntry,
+            Some(first.id()),
+            Some("partial".into()),
+        )
+        .await
+        .unwrap();
+    let entries = forked.read_entries(None).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        forked.metadata().parent_session_id.as_deref(),
+        Some(session.metadata().id.as_str())
+    );
+
+    let points = loop_agent::harness::fork_points_from_branch(
+        &session.read_branch().await.unwrap(),
+    );
+    assert_eq!(points.len(), 3);
+    assert_eq!(points[0].preview, "first");
+    assert_eq!(points[0].text, "first");
+    assert_eq!(points[2].preview, "third");
+
+    let before = store
+        .fork(
+            &session.metadata().id,
+            SessionForkSelection::BeforeEntry,
+            Some(first.id()),
+            Some("before".into()),
+        )
+        .await
+        .unwrap();
+    assert!(before.read_entries(None).await.unwrap().is_empty());
 }
 
 #[cfg(feature = "sqlite")]

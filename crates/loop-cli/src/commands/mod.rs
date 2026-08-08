@@ -78,7 +78,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "fork",
-            description: "Fork session from earlier message",
+            description: "Edit an earlier user message in a forked session",
             args_hint: None,
         },
         SlashCommand {

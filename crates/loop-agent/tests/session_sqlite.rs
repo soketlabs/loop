@@ -127,7 +127,7 @@ async fn sqlite_fork_still_works() {
         .await
         .unwrap();
     let forked = store
-        .fork(&session.metadata().id, SessionForkSelection::All, Some("fork".into()))
+        .fork(&session.metadata().id, SessionForkSelection::All, None, Some("fork".into()))
         .await
         .unwrap();
     let entries = forked.read_entries(None).await.unwrap();

@@ -638,12 +638,18 @@ impl SessionStore for SqliteSessionStore {
         &self,
         source_id: &str,
         selection: SessionForkSelection,
+        through_entry_id: Option<&str>,
         name: Option<String>,
     ) -> Result<Arc<dyn SessionReader>, SessionError> {
         let reader = self.load(source_id).await?;
         let leaf = reader.read_head().await?;
         let entries = reader.read_entries(None).await?;
-        let selected = entries_for_fork_selection(&entries, leaf.as_deref(), selection)?;
+        let selected = entries_for_fork_selection(
+            &entries,
+            leaf.as_deref(),
+            selection,
+            through_entry_id,
+        )?;
         let meta = reader.metadata().clone();
         let new_reader = self.create(meta.cwd.clone(), name).await?;
         for entry in selected {

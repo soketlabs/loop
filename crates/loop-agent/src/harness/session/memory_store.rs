@@ -221,6 +221,7 @@ impl SessionStore for InMemorySessionStore {
         &self,
         source_id: &str,
         selection: SessionForkSelection,
+        through_entry_id: Option<&str>,
         name: Option<String>,
     ) -> Result<Arc<dyn SessionReader>, SessionError> {
         let (cwd, parent_id, entries) = {
@@ -229,22 +230,26 @@ impl SessionStore for InMemorySessionStore {
                 .sessions
                 .get(source_id)
                 .ok_or_else(|| SessionError::NotFound(source_id.into()))?;
-            let selected =
-                entries_for_fork_selection(&src.entries, src.leaf_id.as_deref(), selection)?;
+            let selected = entries_for_fork_selection(
+                &src.entries,
+                src.leaf_id.as_deref(),
+                selection,
+                through_entry_id,
+            )?;
             (src.meta.cwd.clone(), src.meta.id.clone(), selected)
         };
         let reader = self.create(cwd, name).await?;
+        let new_id = reader.metadata().id.clone();
         {
             let mut g = self.inner.lock();
-            let id = reader.metadata().id.clone();
-            if let Some(session) = g.sessions.get_mut(&id) {
+            if let Some(session) = g.sessions.get_mut(&new_id) {
                 session.meta.parent_session_id = Some(parent_id);
                 let leaf = entries.last().map(|e| e.id().to_string());
                 session.entries = entries;
                 session.leaf_id = leaf;
             }
         }
-        Ok(reader)
+        self.load(&new_id).await
     }
 }
 

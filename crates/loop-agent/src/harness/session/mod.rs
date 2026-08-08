@@ -12,7 +12,9 @@ pub mod types;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
-pub use fork::{read_session_entries_for_fork, SessionForkSelection};
+pub use fork::{
+    fork_points_from_branch, read_session_entries_for_fork, SessionForkPoint, SessionForkSelection,
+};
 pub use jsonl_store::create_jsonl_session_store;
 pub use memory_store::create_in_memory_session_store;
 pub use repository::{create_session_repository, SessionRepository};

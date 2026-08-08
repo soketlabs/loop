@@ -691,11 +691,13 @@ impl SessionStore for JsonlSessionStore {
         &self,
         source_id: &str,
         selection: SessionForkSelection,
+        through_entry_id: Option<&str>,
         name: Option<String>,
     ) -> Result<Arc<dyn SessionReader>, SessionError> {
         self.inner.assert_open()?;
         let source_path = self.inner.resolve_path_for_id(source_id).await?;
         let source_operation_key = self.inner.operation_key_for_path(&source_path);
+        let through = through_entry_id.map(|s| s.to_string());
 
         let (cwd_encoded, cwd_meta, parent_path, entries) = self
             .inner
@@ -717,8 +719,12 @@ impl SessionStore for JsonlSessionStore {
                     .lock()
                     .get(&source_path)
                     .and_then(|c| c.leaf_id.clone());
-                let selected =
-                    entries_for_fork_selection(&doc.entries, leaf.as_deref(), selection)?;
+                let selected = entries_for_fork_selection(
+                    &doc.entries,
+                    leaf.as_deref(),
+                    selection,
+                    through.as_deref(),
+                )?;
                 let cwd_encoded = doc.meta.cwd.clone().unwrap_or_else(|| ".".into());
                 Ok((
                     cwd_encoded,
