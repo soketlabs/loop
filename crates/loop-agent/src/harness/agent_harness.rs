@@ -28,9 +28,28 @@ use crate::harness::system_prompt::format_skills_for_system_prompt;
 use crate::messages::{convert_to_llm, user_message_with_images};
 use crate::stream_fn::{stream_fn_from_models, StreamFn};
 use crate::types::{
-    AgentContext, AgentEvent, AgentEventSink, AgentLoopConfig, AgentMessage, AgentThinkingLevel,
-    AgentTool, PromptInput, QueueMode, ToolExecutionMode,
+    AfterToolCallContext, AfterToolCallResult, AgentContext, AgentEvent, AgentEventSink,
+    AgentLoopConfig, AgentMessage, AgentThinkingLevel, AgentTool, BeforeToolCallContext,
+    BeforeToolCallResult, PromptInput, QueueMode, ToolExecutionMode,
 };
+
+type BeforeToolHook = Arc<
+    dyn Fn(
+            BeforeToolCallContext,
+            Option<CancellationToken>,
+        ) -> Pin<Box<dyn Future<Output = Option<BeforeToolCallResult>> + Send>>
+        + Send
+        + Sync,
+>;
+
+type AfterToolHook = Arc<
+    dyn Fn(
+            AfterToolCallContext,
+            Option<CancellationToken>,
+        ) -> Pin<Box<dyn Future<Output = Option<AfterToolCallResult>> + Send>>
+        + Send
+        + Sync,
+>;
 use loop_ai::{ImageContent, Model, Models, SimpleStreamOptions};
 
 type Sub = Arc<dyn Fn(AgentEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -102,6 +121,8 @@ pub struct AgentHarness {
     shutdown_notify: Notify,
     compaction_settings: RwLock<CompactionSettings>,
     tool_execution: Mutex<ToolExecutionMode>,
+    before_tool_call: Mutex<Option<BeforeToolHook>>,
+    after_tool_call: Mutex<Option<AfterToolHook>>,
     #[allow(dead_code)]
     steering_mode: Mutex<QueueMode>,
     #[allow(dead_code)]
@@ -140,6 +161,8 @@ impl AgentHarness {
             shutdown_notify: Notify::new(),
             compaction_settings: RwLock::new(CompactionSettings::default()),
             tool_execution: Mutex::new(ToolExecutionMode::Parallel),
+            before_tool_call: Mutex::new(None),
+            after_tool_call: Mutex::new(None),
             steering_mode: Mutex::new(QueueMode::OneAtATime),
             follow_up_mode: Mutex::new(QueueMode::OneAtATime),
         }
@@ -327,6 +350,16 @@ impl AgentHarness {
         self.subscribers
             .lock()
             .push(Arc::new(move |e| Box::pin(handler(e))));
+    }
+
+    /// Set before-tool-call hook (optional gate / transform).
+    pub fn set_before_tool_call(&self, hook: Option<BeforeToolHook>) {
+        *self.before_tool_call.lock() = hook;
+    }
+
+    /// Set after-tool-call hook (e.g. interactive file-edit review).
+    pub fn set_after_tool_call(&self, hook: Option<AfterToolHook>) {
+        *self.after_tool_call.lock() = hook;
     }
 
     /// Register a harness hook.
@@ -861,6 +894,8 @@ impl AgentHarness {
         config.tool_execution = *self.tool_execution.lock();
         config.stream_options = snapshot.stream_options.clone();
         config.stream_options.reasoning = snapshot.thinking_level.to_reasoning();
+        config.before_tool_call = self.before_tool_call.lock().clone();
+        config.after_tool_call = self.after_tool_call.lock().clone();
 
         let steer_q = Arc::clone(&self.steering);
         let follow_q = Arc::clone(&self.follow_up);

@@ -102,6 +102,13 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                     let env = Arc::clone(&env);
                     let content = content.clone();
                     async move {
+                        let (created, previous) = match env.read_text_file(&abs).await {
+                            Ok(text) => (false, text),
+                            Err(_) => (true, String::new()),
+                        };
+                        let previous_path = write_review_snapshot(&abs, &previous)
+                            .map_err(|e| e.to_string())?;
+                        let diff = unified_diff(&previous, &content, &abs);
                         env.write_file(&abs, content.as_bytes())
                             .await
                             .map_err(|e| e.to_string())?;
@@ -110,7 +117,13 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                                 text: format!("Wrote {} bytes to {}", content.len(), abs.display()),
                                 text_signature: None,
                             })],
-                            details: json!({"path": abs, "bytes": content.len()}),
+                            details: json!({
+                                "path": abs,
+                                "bytes": content.len(),
+                                "created": created,
+                                "previousPath": previous_path,
+                                "diff": diff,
+                            }),
                             usage: None,
                             added_tool_names: None,
                             terminate: None,
@@ -161,6 +174,8 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         } else {
                             fuzzy_replace(&original, &old_text, &new_text)?
                         };
+                        let previous_path = write_review_snapshot(&abs, &original)
+                            .map_err(|e| e.to_string())?;
                         let diff = unified_diff(&original, &updated, &abs);
                         env.write_file(&abs, updated.as_bytes())
                             .await
@@ -170,7 +185,12 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                                 text: format!("Edited {}", abs.display()),
                                 text_signature: None,
                             })],
-                            details: json!({"path": abs, "diff": diff}),
+                            details: json!({
+                                "path": abs,
+                                "diff": diff,
+                                "created": false,
+                                "previousPath": previous_path,
+                            }),
                             usage: None,
                             added_tool_names: None,
                             terminate: None,
@@ -181,6 +201,20 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
             }
         },
     )
+}
+
+/// Persist pre-edit contents so the CLI can open a diff and revert on reject.
+fn write_review_snapshot(path: &Path, contents: &str) -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join("loop-file-review");
+    std::fs::create_dir_all(&dir)?;
+    let stem = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let id = loop_ai::new_id();
+    let out = dir.join(format!("{id}-{stem}.before"));
+    std::fs::write(&out, contents)?;
+    Ok(out)
 }
 
 fn fuzzy_replace(original: &str, old_text: &str, new_text: &str) -> Result<String, String> {

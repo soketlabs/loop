@@ -45,6 +45,7 @@ fn settings_defaults_soket() {
     assert_eq!(s.default_provider, "soket");
     assert_eq!(s.default_model, "qwen3-30b");
     assert_eq!(s.theme, "dark");
+    assert_eq!(s.file_edit_review, "newSession");
 }
 
 #[test]

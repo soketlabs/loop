@@ -107,6 +107,12 @@ pub struct Settings {
     /// Sandbox.
     #[serde(default)]
     pub sandbox: SandboxSettings,
+    /// When to prompt on write/edit: `newSession`, `always`, or `never`.
+    #[serde(default = "default_file_edit_review")]
+    pub file_edit_review: String,
+    /// Diff editor binary (`cursor`, `code`, or absolute path). Auto-detected when empty.
+    #[serde(default)]
+    pub diff_editor: Option<String>,
     /// Default project trust: `ask`, `always`, `never` (global only).
     #[serde(default = "default_trust")]
     pub default_project_trust: String,
@@ -133,6 +139,9 @@ fn default_ui_mode() -> String {
 fn default_trust() -> String {
     "ask".into()
 }
+fn default_file_edit_review() -> String {
+    "newSession".into()
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -153,6 +162,8 @@ impl Default for Settings {
             double_escape_action: default_double_escape(),
             ui_mode: default_ui_mode(),
             sandbox: SandboxSettings::default(),
+            file_edit_review: default_file_edit_review(),
+            diff_editor: None,
             default_project_trust: default_trust(),
         }
     }
@@ -219,6 +230,10 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
     base.double_escape_action = project.double_escape_action;
     base.ui_mode = project.ui_mode;
     base.sandbox = project.sandbox;
+    base.file_edit_review = project.file_edit_review;
+    if project.diff_editor.is_some() {
+        base.diff_editor = project.diff_editor;
+    }
     base
 }
 

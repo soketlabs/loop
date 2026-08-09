@@ -45,7 +45,7 @@ Claude skills are **opt-in** via settings:
 
 ## Slash commands (highlights)
 
-`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/new`, `/compact`, `/resume`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
+`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/new`, `/review`, `/compact`, `/resume`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
 
 ## Keybindings
 
@@ -72,6 +72,21 @@ Ship `dark` and `light`. Custom JSON themes use the same color tokens as pi. Cha
 
 `/sandbox off` — host tools  
 `/sandbox local-shell` — soft workdir isolation via `LocalShellSandbox`
+
+## File edit review
+
+On **new sessions**, `write` / `edit` tools pause for accept/reject. Loop opens Cursor or VS Code with `--diff` (before → after). Reject reverts the file and can include a reason (Tab) that is sent back to the model.
+
+```json
+{
+  "fileEditReview": "newSession",
+  "diffEditor": "cursor"
+}
+```
+
+- `fileEditReview`: `newSession` (default) · `always` · `never`
+- `diffEditor`: optional binary; otherwise auto-detects `cursor` → `code`
+- `/review [newSession|always|never]` toggles the policy
 
 ## Extensions & hooks
 

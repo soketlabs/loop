@@ -7,6 +7,7 @@ pub mod clipboard;
 pub mod commands;
 pub mod config;
 pub mod extensions;
+pub mod file_review;
 pub mod hooks_load;
 pub mod keybindings;
 pub mod resources;

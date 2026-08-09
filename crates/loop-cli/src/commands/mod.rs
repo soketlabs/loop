@@ -112,6 +112,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: None,
         },
         SlashCommand {
+            name: "review",
+            description: "File-edit review mode (accept/reject)",
+            args_hint: Some("[newSession|always|never]"),
+        },
+        SlashCommand {
             name: "compact",
             description: "Compact conversation context",
             args_hint: Some("[prompt]"),
@@ -238,6 +243,8 @@ pub enum CommandEffect {
     Logout(Option<String>),
     /// New session.
     NewSession,
+    /// File edit review policy.
+    SetFileReview(Option<String>),
     /// Compact.
     Compact(Option<String>),
     /// Copy last assistant.
@@ -318,6 +325,11 @@ pub fn dispatch(cmd: &ParsedCommand, skill_names: &[String], template_names: &[S
             Some(cmd.args.clone())
         }),
         "new" => CommandEffect::NewSession,
+        "review" => CommandEffect::SetFileReview(if cmd.args.is_empty() {
+            None
+        } else {
+            Some(cmd.args.clone())
+        }),
         "compact" => CommandEffect::Compact(if cmd.args.is_empty() {
             None
         } else {

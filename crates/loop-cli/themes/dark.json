@@ -18,7 +18,7 @@
     "toolErrorBg": "#3c2828"
   },
   "colors": {
-    "cursor": "#000000",
+    "cursor": "#555555",
     "accent": "accent",
     "border": "blue",
     "borderAccent": "cyan",

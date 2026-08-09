@@ -25,6 +25,9 @@ use loop_ai::providers::{SOKET_BASE_URL, SOKET_PROVIDER_ID};
 use loop_ai::{Credential, CredentialStore, ModelsRefreshOptions, ToolResultContent};
 
 use crate::commands::{self, AutocompleteEntry, CommandEffect};
+use crate::file_review::{
+    FileEditReviewPolicy, FileReviewBridge, FileReviewDecision, FileReviewPrompt,
+};
 use crate::keybindings::{hotkey_help, Action};
 use crate::runtime::Runtime;
 use crate::theme::Theme;
@@ -39,6 +42,38 @@ enum UiEvent {
     Agent(AgentEvent),
     /// `/compact` finished (success message or error).
     CompactDone(Result<String, String>),
+}
+
+/// Pending accept/reject prompt for a write/edit tool.
+struct ActiveFileReview {
+    path: String,
+    tool_name: String,
+    selected: usize,
+    reason: String,
+    reason_focused: bool,
+    response_tx: tokio::sync::oneshot::Sender<FileReviewDecision>,
+}
+
+impl ActiveFileReview {
+    fn from_prompt(prompt: FileReviewPrompt) -> Self {
+        Self {
+            path: prompt.display_path,
+            tool_name: prompt.tool_name,
+            selected: 0,
+            reason: String::new(),
+            reason_focused: false,
+            response_tx: prompt.response_tx,
+        }
+    }
+
+    fn into_picker(&self) -> PickerView {
+        PickerView::FileReview {
+            path: format!("{} · {}", self.tool_name, self.path),
+            selected: self.selected,
+            reason: self.reason.clone(),
+            reason_focused: self.reason_focused,
+        }
+    }
 }
 
 /// Outbound user message waiting for the agent to become idle.
@@ -107,6 +142,20 @@ async fn run_loop(
         }
     });
 
+    let review_policy = FileEditReviewPolicy::parse(&runtime.settings.file_edit_review);
+    let review_enabled = review_policy.enabled_for_session(!runtime.resumed);
+    let tool_env = runtime.harness.tool_env().await?;
+    let (bridge, mut review_rx) = FileReviewBridge::new(
+        tool_env,
+        runtime.settings.diff_editor.clone(),
+        review_enabled,
+    );
+    let bridge = Arc::new(bridge);
+    runtime
+        .harness
+        .set_after_tool_call(Some(bridge.after_tool_hook()));
+    runtime.file_review = Some(Arc::clone(&bridge));
+
     let mut chat: Vec<ChatItem> = match runtime.harness.session_context().await {
         Ok(ctx) if !ctx.messages.is_empty() => chat_items_from_agent_messages(&ctx.messages),
         Ok(_) => Vec::new(),
@@ -129,7 +178,12 @@ async fn run_loop(
             )
         }
     } else {
-        "ready · /help for commands".into()
+        let review_hint = if review_enabled {
+            " · file edits require accept/reject"
+        } else {
+            ""
+        };
+        format!("ready · /help for commands{review_hint}")
     };
     let mut clear_presses = 0u8;
     let mut last_clear = Instant::now();
@@ -149,6 +203,7 @@ async fn run_loop(
     };
     let mut model_picker: Option<ModelPickerState> = None;
     let mut fork_picker: Option<ForkPickerState> = None;
+    let mut active_file_review: Option<ActiveFileReview> = None;
     let mut ac_selected: usize = 0;
     let mut last_ac_filter = String::new();
     let mut file_index: Option<Vec<FileEntry>> = None;
@@ -200,6 +255,7 @@ async fn run_loop(
             && pending_login.is_none()
             && model_picker.is_none()
             && fork_picker.is_none()
+            && active_file_review.is_none()
         {
             let extra = dynamic_command_entries(runtime);
             commands::autocomplete_entries(input.as_str(), &extra)
@@ -210,6 +266,7 @@ async fn run_loop(
             && pending_login.is_none()
             && model_picker.is_none()
             && fork_picker.is_none()
+            && active_file_review.is_none()
         {
             find_at_mention(input.as_str(), input.cursor())
         } else {
@@ -239,7 +296,9 @@ async fn run_loop(
             ac_selected = ac_selected.min(picker_len - 1);
         }
 
-        let picker = if let Some(p) = &model_picker {
+        let picker = if let Some(review) = &active_file_review {
+            review.into_picker()
+        } else if let Some(p) = &model_picker {
             let current = format!(
                 "{}/{}",
                 runtime.settings.default_provider, runtime.settings.default_model
@@ -316,7 +375,9 @@ async fn run_loop(
             PickerView::None
         };
 
-        let status_line = if model_picker.is_some() {
+        let status_line = if active_file_review.is_some() {
+            "review file edit · opened in editor · ←→ accept/reject · tab reason · enter".into()
+        } else if model_picker.is_some() {
             "↑↓ select · enter confirm · esc cancel".into()
         } else if fork_picker.is_some() {
             "↑↓ select · enter edit · esc cancel".into()
@@ -385,6 +446,8 @@ async fn run_loop(
             drain_ui_events(
                 runtime,
                 &mut rx,
+                &mut review_rx,
+                &mut active_file_review,
                 &mut chat,
                 &mut status,
                 &mut streaming_assistant,
@@ -416,6 +479,7 @@ async fn run_loop(
                         &mut pending_login,
                         &mut model_picker,
                         &mut fork_picker,
+                        &mut active_file_review,
                         &mut working,
                         &mut message_queue,
                         &mut should_quit,
@@ -445,6 +509,12 @@ async fn run_loop(
         // Drop events from an aborted turn so they can't repopulate a fresh session.
         if purge_ui_events {
             while rx.try_recv().is_ok() {}
+            while review_rx.try_recv().is_ok() {}
+            if let Some(r) = active_file_review.take() {
+                let _ = r.response_tx.send(FileReviewDecision::Reject {
+                    reason: Some("session reset".into()),
+                });
+            }
             purge_ui_events = false;
             working = false;
             streaming_assistant = None;
@@ -472,6 +542,8 @@ async fn run_loop(
         drain_ui_events(
             runtime,
             &mut rx,
+            &mut review_rx,
+            &mut active_file_review,
             &mut chat,
             &mut status,
             &mut streaming_assistant,
@@ -754,6 +826,8 @@ fn truncate_status(s: &str, max: usize) -> String {
 fn drain_ui_events(
     runtime: &Runtime,
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+    review_rx: &mut mpsc::UnboundedReceiver<FileReviewPrompt>,
+    active_file_review: &mut Option<ActiveFileReview>,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     streaming_assistant: &mut Option<usize>,
@@ -787,6 +861,15 @@ fn drain_ui_events(
                 }
             }
         }
+    }
+    while let Ok(prompt) = review_rx.try_recv() {
+        if let Some(prev) = active_file_review.take() {
+            let _ = prev.response_tx.send(FileReviewDecision::Reject {
+                reason: Some("superseded by another review".into()),
+            });
+        }
+        *status = format!("review · {} · check editor diff", prompt.display_path);
+        *active_file_review = Some(ActiveFileReview::from_prompt(prompt));
     }
     try_drain_message_queue(
         runtime,
@@ -953,6 +1036,7 @@ async fn handle_key(
     pending_login: &mut Option<String>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
+    active_file_review: &mut Option<ActiveFileReview>,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
     should_quit: &mut bool,
@@ -962,6 +1046,77 @@ async fn handle_key(
     ac_selected: &mut usize,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> anyhow::Result<()> {
+    if let Some(review) = active_file_review.as_mut() {
+        match key.code {
+            KeyCode::Esc => {
+                if review.reason_focused {
+                    review.reason_focused = false;
+                } else if let Some(r) = active_file_review.take() {
+                    let _ = r.response_tx.send(FileReviewDecision::Reject { reason: None });
+                    chat.push(sys(format!("rejected edit · {}", r.path)));
+                    *status = "rejected · continuing".into();
+                }
+            }
+            KeyCode::Left | KeyCode::Up => {
+                review.selected = 0;
+                review.reason_focused = false;
+            }
+            KeyCode::Right | KeyCode::Down => {
+                review.selected = 1;
+            }
+            KeyCode::Tab => {
+                review.selected = 1;
+                review.reason_focused = true;
+            }
+            KeyCode::Enter => {
+                if let Some(r) = active_file_review.take() {
+                    let decision = if r.selected == 0 && !r.reason_focused {
+                        FileReviewDecision::Accept
+                    } else {
+                        let reason = r.reason.trim().to_string();
+                        FileReviewDecision::Reject {
+                            reason: (!reason.is_empty()).then_some(reason),
+                        }
+                    };
+                    match &decision {
+                        FileReviewDecision::Accept => {
+                            chat.push(sys(format!("accepted edit · {}", r.path)));
+                            *status = "accepted · continuing".into();
+                        }
+                        FileReviewDecision::Reject { reason } => {
+                            if let Some(why) = reason {
+                                chat.push(sys(format!(
+                                    "rejected edit · {} · {why}",
+                                    r.path
+                                )));
+                            } else {
+                                chat.push(sys(format!("rejected edit · {}", r.path)));
+                            }
+                            *status = "rejected · continuing".into();
+                        }
+                    }
+                    let _ = r.response_tx.send(decision);
+                }
+            }
+            KeyCode::Backspace if review.reason_focused => {
+                review.reason.pop();
+            }
+            KeyCode::Char(c) if review.reason_focused => {
+                if !c.is_control() {
+                    review.reason.push(c);
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') if !review.reason_focused => {
+                review.selected = 0;
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') if !review.reason_focused => {
+                review.selected = 1;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     if let Some(picker) = model_picker.as_mut() {
         match key.code {
             KeyCode::Esc => {
@@ -2095,8 +2250,19 @@ async fn apply_effect(
             {
                 Ok(id) => {
                     runtime.session_id = id;
+                    runtime.resumed = false;
                     chat.clear();
-                    *status = "ready · new session".into();
+                    let policy =
+                        FileEditReviewPolicy::parse(&runtime.settings.file_edit_review);
+                    let enabled = policy.enabled_for_session(true);
+                    if let Some(bridge) = &runtime.file_review {
+                        bridge.set_enabled(enabled);
+                    }
+                    *status = if enabled {
+                        "ready · new session · file edits require accept/reject".into()
+                    } else {
+                        "ready · new session".into()
+                    };
                     // Clear screen + scrollback and reprint welcome with the new id.
                     *redraw_request = true;
                     *purge_ui_events = true;
@@ -2104,6 +2270,42 @@ async fn apply_effect(
                 Err(e) => {
                     chat.push(sys(format!("new session failed: {e}")));
                     *status = "ready".into();
+                }
+            }
+        }
+        CommandEffect::SetFileReview(arg) => {
+            match arg {
+                None => {
+                    let active = runtime
+                        .file_review
+                        .as_ref()
+                        .map(|b| b.enabled())
+                        .unwrap_or(false);
+                    chat.push(sys(format!(
+                        "file edit review: {} (session active: {active})\n  /review newSession|always|never\n  settings.diffEditor: {}",
+                        runtime.settings.file_edit_review,
+                        runtime
+                            .settings
+                            .diff_editor
+                            .as_deref()
+                            .unwrap_or("(auto: cursor|code)"),
+                    )));
+                }
+                Some(raw) => {
+                    let policy = FileEditReviewPolicy::parse(&raw);
+                    runtime.settings.file_edit_review = policy.as_str().into();
+                    let enabled = policy.enabled_for_session(!runtime.resumed);
+                    if let Some(bridge) = &runtime.file_review {
+                        bridge.set_enabled(enabled);
+                    }
+                    let _ = runtime
+                        .settings
+                        .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
+                    chat.push(sys(format!(
+                        "file edit review → {} (this session: {})",
+                        policy.as_str(),
+                        if enabled { "on" } else { "off" }
+                    )));
                 }
             }
         }
@@ -2167,14 +2369,20 @@ async fn apply_effect(
         }
         CommandEffect::Settings => {
             chat.push(sys(format!(
-                "settings ({})\n  provider: {}\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  ui: {}",
+                "settings ({})\n  provider: {}\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  fileEditReview: {}\n  diffEditor: {}\n  ui: {}",
                 crate::config::paths::settings_path(&runtime.agent_dir).display(),
                 runtime.settings.default_provider,
                 runtime.settings.default_model,
                 runtime.settings.theme,
                 runtime.settings.default_thinking_level,
                 runtime.settings.sandbox.mode,
-                runtime.settings.ui_mode
+                runtime.settings.file_edit_review,
+                runtime
+                    .settings
+                    .diff_editor
+                    .as_deref()
+                    .unwrap_or("(auto)"),
+                runtime.settings.ui_mode,
             )));
         }
         CommandEffect::Trust(arg) => {
