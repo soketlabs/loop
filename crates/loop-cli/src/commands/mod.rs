@@ -281,11 +281,11 @@ pub enum CommandEffect {
     Fork,
     /// Clone.
     CloneSession,
-    /// Skill invoke.
+    /// Skill activate (does not send a prompt).
     Skill {
         /// Skill name.
         name: String,
-        /// Args.
+        /// Optional args to place in the input buffer.
         args: String,
     },
     /// Prompt template.

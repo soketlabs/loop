@@ -31,7 +31,7 @@ fn load_skill_and_format() {
     assert!(diags.is_empty(), "{diags:?}");
     assert_eq!(skills.len(), 1);
     assert_eq!(skills[0].name, "demo");
-    let formatted = format_skills_for_system_prompt(&skills);
+    let formatted = format_skills_for_system_prompt(&skills, &[]);
     assert!(formatted.contains("Use the read tool to load a skill's file"));
     assert!(formatted.contains("<available_skills>"));
     assert!(formatted.contains("<name>demo</name>"));
@@ -47,7 +47,10 @@ fn load_skill_and_format() {
         path: skill_dir.join("SKILL.md"),
         disable_model_invocation: true,
     };
-    assert!(format_skills_for_system_prompt(&[muted]).is_empty());
+    assert!(format_skills_for_system_prompt(&[muted.clone()], &[]).is_empty());
+    let forced = format_skills_for_system_prompt(&[muted], &["hidden".into()]);
+    assert!(forced.contains("<name>hidden</name>"));
+    assert!(forced.contains("<description>secret</description>"));
 
     let escaped = loop_agent::harness::Skill {
         name: "amp".into(),
@@ -56,6 +59,6 @@ fn load_skill_and_format() {
         path: skill_dir.join("SKILL.md"),
         disable_model_invocation: false,
     };
-    let xml = format_skills_for_system_prompt(&[escaped]);
+    let xml = format_skills_for_system_prompt(&[escaped], &[]);
     assert!(xml.contains("<description>A &amp; B &lt;C&gt;</description>"));
 }

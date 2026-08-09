@@ -71,6 +71,8 @@ pub struct Runtime {
     pub needs_api_key_setup: bool,
     /// Interactive tool approval bridge (set by the TUI).
     pub tool_approval: Option<std::sync::Arc<crate::tool_approval::ToolApprovalBridge>>,
+    /// Skills activated via `/skill:name` (not yet cleared; mirrored on the harness).
+    pub active_skills: Vec<String>,
 }
 
 /// CLI bootstrap flags affecting runtime.
@@ -431,5 +433,6 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         resumed,
         needs_api_key_setup,
         tool_approval: None,
+        active_skills: Vec::new(),
     })
 }

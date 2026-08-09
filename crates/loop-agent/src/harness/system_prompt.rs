@@ -2,14 +2,20 @@
 
 use crate::harness::types::Skill;
 
-/// Format skills for inclusion in a system prompt (skips disable_model_invocation).
+/// Format skills for inclusion in a system prompt.
+///
+/// Includes skills that allow model invocation, plus any names in
+/// `force_include` (user-activated via `/skill:name`, including those with
+/// `disable-model-invocation`).
 ///
 /// Matches pi's `formatSkillsForPrompt`: XML catalog with absolute paths so the
 /// model can `read` a skill's `SKILL.md` when the task matches its description.
-pub fn format_skills_for_system_prompt(skills: &[Skill]) -> String {
+pub fn format_skills_for_system_prompt(skills: &[Skill], force_include: &[String]) -> String {
     let visible: Vec<&Skill> = skills
         .iter()
-        .filter(|s| !s.disable_model_invocation)
+        .filter(|s| {
+            !s.disable_model_invocation || force_include.iter().any(|n| n == &s.name)
+        })
         .collect();
     if visible.is_empty() {
         return String::new();

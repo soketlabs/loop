@@ -17,7 +17,7 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
 use loop_agent::harness::{
-    format_prompt_template_invocation, format_skill_invocation, AgentHarnessPhase, LocalShellSandbox,
+    format_prompt_template_invocation, AgentHarnessPhase, LocalShellSandbox,
     Sandbox, SandboxConfig, SandboxMode, SessionForkPoint, SessionForkSelection,
 };
 use loop_agent::types::{AgentEvent, AgentThinkingLevel};
@@ -438,6 +438,9 @@ async fn run_loop(
             parts.join(" · ")
         } else if !message_queue.is_empty() {
             format!("{} queued · sending…", message_queue.len())
+        } else if !runtime.active_skills.is_empty() {
+            let names = runtime.active_skills.join(", ");
+            format!("skill(s) active: {names} · type your message")
         } else {
             status.clone()
         };
@@ -1850,6 +1853,7 @@ async fn adopt_forked_session(
     {
         Ok(id) => {
             runtime.session_id = id.clone();
+            runtime.active_skills.clear();
             *chat = match runtime.harness.session_context().await {
                 Ok(ctx) => chat_items_from_agent_messages(&ctx.messages),
                 Err(e) => {
@@ -2307,6 +2311,7 @@ async fn apply_effect(
                 Ok(id) => {
                     runtime.session_id = id;
                     runtime.resumed = false;
+                    runtime.active_skills.clear();
                     chat.clear();
                     let policy =
                         ApprovalPolicy::parse(&runtime.settings.file_edit_review);
@@ -2519,7 +2524,7 @@ async fn apply_effect(
                     };
                     text.push_str(&format!("\n  /skill:{} — {}\n      {}", s.name, desc, s.path.display()));
                 }
-                text.push_str("\n\nInvoke with /skill:<name> [args], or let the model read a skill's SKILL.md when the task matches.");
+                text.push_str("\n\nActivate with /skill:<name> [optional args for the input]. Skills stay active until /new; the model sees them under <available_skills> and can read SKILL.md when relevant.");
                 chat.push(sys(text));
             }
         }
@@ -2584,23 +2589,24 @@ async fn apply_effect(
             .await;
         }
         CommandEffect::Skill { name, args } => {
-            if let Some(skill) = runtime.resources.skills.iter().find(|s| s.name == name) {
-                let prompt = format_skill_invocation(skill, &args);
-                let display = format!("/skill:{name} {args}");
-                if agent_is_busy(runtime, *working) {
-                    enqueue_user_message(chat, message_queue, display, prompt);
-                    *status = format!("{} messages queued", message_queue.len());
-                } else {
-                    start_user_turn(
-                        runtime,
-                        chat,
-                        status,
-                        streaming_assistant,
-                        streaming_thinking,
-                        working,
-                        display,
-                        prompt,
-                    );
+            if runtime.harness.activate_skill(&name).await {
+                if !runtime.active_skills.iter().any(|n| n == &name) {
+                    runtime.active_skills.push(name.clone());
+                }
+                let list = runtime.active_skills.join(", ");
+                chat.push(sys(format!(
+                    "skill `{name}` is active ({list}). Type your message when ready."
+                )));
+                *status = format!("skill(s) active: {list} · type your message");
+                let args = args.trim();
+                if !args.is_empty() {
+                    let current = input.as_str();
+                    if !current.is_empty()
+                        && !current.ends_with(|c: char| c.is_whitespace())
+                    {
+                        input.insert_str(" ");
+                    }
+                    input.insert_str(args);
                 }
             } else {
                 chat.push(sys(format!("skill not found: {name}")));
