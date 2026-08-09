@@ -69,8 +69,8 @@ pub struct Runtime {
     pub resumed: bool,
     /// When true, TUI should show the first-run API key setup box.
     pub needs_api_key_setup: bool,
-    /// Interactive accept/reject bridge for write/edit (set by the TUI).
-    pub file_review: Option<std::sync::Arc<crate::file_review::FileReviewBridge>>,
+    /// Interactive tool approval bridge (set by the TUI).
+    pub tool_approval: Option<std::sync::Arc<crate::tool_approval::ToolApprovalBridge>>,
 }
 
 /// CLI bootstrap flags affecting runtime.
@@ -431,6 +431,6 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         session_id,
         resumed,
         needs_api_key_setup,
-        file_review: None,
+        tool_approval: None,
     })
 }

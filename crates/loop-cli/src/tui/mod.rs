@@ -75,11 +75,12 @@ pub enum PickerView {
     Setup {
         provider: String,
     },
-    /// Accept / reject a pending write or edit (optional reject reason).
+    /// Accept / reject a pending tool (optional reject reason).
     FileReview {
         path: String,
-        /// 0 = Accept, 1 = Reject.
+        /// 0 = Accept, 1 = Accept all (session), 2 = Reject.
         selected: usize,
+        accept_all_label: String,
         reason: String,
         reason_focused: bool,
     },
@@ -671,20 +672,21 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
         PickerView::FileReview {
             path,
             selected,
+            accept_all_label,
             reason,
             reason_focused,
         } => {
-            let accept_mark = if *selected == 0 { "❯" } else { " " };
-            let reject_mark = if *selected == 1 { "❯" } else { " " };
-            let accept_style = if *selected == 0 {
-                theme.style("success").add_modifier(Modifier::BOLD)
-            } else {
-                theme.style("text")
-            };
-            let reject_style = if *selected == 1 {
-                theme.style("error").add_modifier(Modifier::BOLD)
-            } else {
-                theme.style("text")
+            let opt = |idx: usize, label: &str, style_key: &str| {
+                let mark = if *selected == idx { "❯" } else { " " };
+                let style = if *selected == idx {
+                    theme.style(style_key).add_modifier(Modifier::BOLD)
+                } else {
+                    theme.style("text")
+                };
+                Line::from(vec![
+                    Span::styled(format!(" {mark} "), theme.accent()),
+                    Span::styled(label.to_string(), style),
+                ])
             };
             let reason_line = if *reason_focused {
                 format!("  reason › {reason}▌")
@@ -698,16 +700,12 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
                     Span::styled("  review ".to_string(), theme.accent_bold()),
                     Span::styled(path.clone(), theme.style("text").add_modifier(Modifier::BOLD)),
                 ]),
-                Line::from(vec![
-                    Span::styled(format!(" {accept_mark} "), theme.accent()),
-                    Span::styled("Accept".to_string(), accept_style),
-                    Span::raw("    "),
-                    Span::styled(format!("{reject_mark} "), theme.accent()),
-                    Span::styled("Reject".to_string(), reject_style),
-                ]),
+                opt(0, "Accept", "success"),
+                opt(1, accept_all_label, "success"),
+                opt(2, "Reject", "error"),
                 Line::from(Span::styled(reason_line, theme.muted())),
                 Line::from(Span::styled(
-                    "  ←→ choose · tab reason · enter confirm · esc reject".to_string(),
+                    "  ↑↓ choose · tab reason · enter confirm · esc reject".to_string(),
                     theme.dim(),
                 )),
             ]
@@ -810,7 +808,7 @@ fn picker_height(picker: &PickerView) -> u16 {
     match picker {
         PickerView::None => 0,
         PickerView::Setup { .. } => 4,
-        PickerView::FileReview { .. } => 4,
+        PickerView::FileReview { .. } => 6,
         PickerView::Commands { rows, .. } => {
             let n = rows.len().min(PICKER_PAGE) as u16;
             n + 1 // page indicator

@@ -113,7 +113,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "review",
-            description: "File-edit review mode (accept/reject)",
+            description: "Tool approval policy (files + bash)",
             args_hint: Some("[newSession|always|never]"),
         },
         SlashCommand {

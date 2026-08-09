@@ -32,7 +32,7 @@ pub use session::{
     create_in_memory_session_store, create_jsonl_session_store, create_scanning_session_search,
     create_session_repository, fork_points_from_branch, format_session_stats, compute_session_stats,
     Session, SessionContext, SessionForkPoint, SessionForkSelection, SessionRepository,
-    SessionStats, SessionStore,
+    SessionStats, SessionStore, SessionTreeEntry,
 };
 pub use tools::{create_bash_tool, create_edit_tool, create_read_tool, create_write_tool};
 pub use types::{

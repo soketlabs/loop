@@ -421,6 +421,38 @@ impl AgentHarness {
         self.compaction_settings.read().await.clone()
     }
 
+    /// Append a label to the session (immediate when idle, deferred during a turn).
+    pub async fn append_label(&self, label: impl Into<String>) -> Result<(), AgentHarnessError> {
+        let label = label.into();
+        if *self.phase.lock() == AgentHarnessPhase::Idle {
+            let session = self.session.lock().await;
+            session
+                .store()
+                .append_entry(
+                    &session.metadata().id,
+                    PendingSessionWrite::Label { label },
+                )
+                .await
+                .map_err(AgentHarnessError::Session)?;
+        } else {
+            self.pending_writes
+                .lock()
+                .push(PendingSessionWrite::Label { label });
+        }
+        Ok(())
+    }
+
+    /// Read all session entries (full tree).
+    pub async fn read_session_entries(
+        &self,
+    ) -> Result<Vec<SessionTreeEntry>, AgentHarnessError> {
+        let session = self.session.lock().await;
+        session
+            .read_entries()
+            .await
+            .map_err(AgentHarnessError::Session)
+    }
+
     /// Append a message to the session (immediate when idle, deferred during a turn).
     pub async fn append_message(
         &self,

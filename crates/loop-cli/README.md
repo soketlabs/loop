@@ -73,20 +73,31 @@ Ship `dark` and `light`. Custom JSON themes use the same color tokens as pi. Cha
 `/sandbox off` — host tools  
 `/sandbox local-shell` — soft workdir isolation via `LocalShellSandbox`
 
-## File edit review
+## File edit review / tool approval
 
-On **new sessions**, `write` / `edit` tools pause for accept/reject. Loop opens Cursor or VS Code with `--diff` (before → after). Reject reverts the file and can include a reason (Tab) that is sent back to the model.
+On **new sessions**, `write` / `edit` / `bash` pause for approval (per `toolPermissions`). File edits open Cursor or VS Code with `--diff`. Options:
+
+1. **Accept** — this change only  
+2. **Accept all … for this session** — remembered on the session (survives resume)  
+3. **Reject** — revert / block; **Tab** adds a reason for the model
 
 ```json
 {
   "fileEditReview": "newSession",
-  "diffEditor": "cursor"
+  "diffEditor": "cursor",
+  "toolPermissions": {
+    "write": "ask",
+    "edit": "ask",
+    "bash": "ask",
+    "read": "allow"
+  }
 }
 ```
 
-- `fileEditReview`: `newSession` (default) · `always` · `never`
-- `diffEditor`: optional binary; otherwise auto-detects `cursor` → `code`
-- `/review [newSession|always|never]` toggles the policy
+- `fileEditReview`: `newSession` (default) · `always` · `never` — when `ask` tools prompt  
+- `toolPermissions`: per-tool `ask` | `allow` | `deny` in `~/.loop/agent/settings.json`  
+- Interactive workflows are wired for `write`, `edit`, and `bash` (others can be configured for later)  
+- `/review [newSession|always|never]` toggles the ask policy
 
 ## Extensions & hooks
 

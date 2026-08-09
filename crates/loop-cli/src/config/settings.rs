@@ -1,5 +1,6 @@
 //! Global and project settings.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -107,12 +108,16 @@ pub struct Settings {
     /// Sandbox.
     #[serde(default)]
     pub sandbox: SandboxSettings,
-    /// When to prompt on write/edit: `newSession`, `always`, or `never`.
+    /// When to prompt for `ask`-mode tools: `newSession`, `always`, or `never`.
     #[serde(default = "default_file_edit_review")]
     pub file_edit_review: String,
     /// Diff editor binary (`cursor`, `code`, or absolute path). Auto-detected when empty.
     #[serde(default)]
     pub diff_editor: Option<String>,
+    /// Per-tool defaults: `ask` | `allow` | `deny` (stored in `~/.loop/agent/settings.json`).
+    /// Interactive workflows currently exist for `write`, `edit`, and `bash`.
+    #[serde(default = "default_tool_permissions_settings")]
+    pub tool_permissions: BTreeMap<String, String>,
     /// Default project trust: `ask`, `always`, `never` (global only).
     #[serde(default = "default_trust")]
     pub default_project_trust: String,
@@ -142,6 +147,9 @@ fn default_trust() -> String {
 fn default_file_edit_review() -> String {
     "newSession".into()
 }
+fn default_tool_permissions_settings() -> BTreeMap<String, String> {
+    crate::tool_approval::default_tool_permissions()
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -164,6 +172,7 @@ impl Default for Settings {
             sandbox: SandboxSettings::default(),
             file_edit_review: default_file_edit_review(),
             diff_editor: None,
+            tool_permissions: default_tool_permissions_settings(),
             default_project_trust: default_trust(),
         }
     }
@@ -233,6 +242,11 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
     base.file_edit_review = project.file_edit_review;
     if project.diff_editor.is_some() {
         base.diff_editor = project.diff_editor;
+    }
+    if !project.tool_permissions.is_empty() {
+        for (k, v) in project.tool_permissions {
+            base.tool_permissions.insert(k, v);
+        }
     }
     base
 }

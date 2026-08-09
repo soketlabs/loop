@@ -25,12 +25,13 @@ use loop_ai::providers::{SOKET_BASE_URL, SOKET_PROVIDER_ID};
 use loop_ai::{Credential, CredentialStore, ModelsRefreshOptions, ToolResultContent};
 
 use crate::commands::{self, AutocompleteEntry, CommandEffect};
-use crate::file_review::{
-    FileEditReviewPolicy, FileReviewBridge, FileReviewDecision, FileReviewPrompt,
-};
 use crate::keybindings::{hotkey_help, Action};
 use crate::runtime::Runtime;
 use crate::theme::Theme;
+use crate::tool_approval::{
+    auto_approve_from_entries, permissions_from_settings, ApprovalDecision, ApprovalKind,
+    ApprovalPolicy, ApprovalPrompt, ToolApprovalBridge, GROUP_BASH, GROUP_FILE,
+};
 use crate::tui::{
     chat_items_from_agent_messages, filter_files, find_at_mention, find_tool_index,
     format_item_lines, insert_text, item_is_committed, list_files, render_lines_to_buffer,
@@ -44,21 +45,23 @@ enum UiEvent {
     CompactDone(Result<String, String>),
 }
 
-/// Pending accept/reject prompt for a write/edit tool.
-struct ActiveFileReview {
-    path: String,
+/// Pending accept/reject prompt for a tool call.
+struct ActiveApproval {
+    kind: ApprovalKind,
     tool_name: String,
+    summary: String,
     selected: usize,
     reason: String,
     reason_focused: bool,
-    response_tx: tokio::sync::oneshot::Sender<FileReviewDecision>,
+    response_tx: tokio::sync::oneshot::Sender<ApprovalDecision>,
 }
 
-impl ActiveFileReview {
-    fn from_prompt(prompt: FileReviewPrompt) -> Self {
+impl ActiveApproval {
+    fn from_prompt(prompt: ApprovalPrompt) -> Self {
         Self {
-            path: prompt.display_path,
+            kind: prompt.kind,
             tool_name: prompt.tool_name,
+            summary: prompt.summary,
             selected: 0,
             reason: String::new(),
             reason_focused: false,
@@ -68,8 +71,9 @@ impl ActiveFileReview {
 
     fn into_picker(&self) -> PickerView {
         PickerView::FileReview {
-            path: format!("{} · {}", self.tool_name, self.path),
+            path: format!("{} · {}", self.tool_name, self.summary),
             selected: self.selected,
+            accept_all_label: self.kind.accept_all_label().into(),
             reason: self.reason.clone(),
             reason_focused: self.reason_focused,
         }
@@ -142,19 +146,42 @@ async fn run_loop(
         }
     });
 
-    let review_policy = FileEditReviewPolicy::parse(&runtime.settings.file_edit_review);
-    let review_enabled = review_policy.enabled_for_session(!runtime.resumed);
+    let review_policy = ApprovalPolicy::parse(&runtime.settings.file_edit_review);
+    let policy_active = review_policy.asks_for_session(!runtime.resumed);
     let tool_env = runtime.harness.tool_env().await?;
-    let (bridge, mut review_rx) = FileReviewBridge::new(
+    let session_grants = match runtime.harness.read_session_entries().await {
+        Ok(entries) => auto_approve_from_entries(&entries),
+        Err(e) => {
+            tracing::warn!("failed to load session tool approvals: {e}");
+            Default::default()
+        }
+    };
+    let (bridge, mut review_rx) = ToolApprovalBridge::new(
         tool_env,
         runtime.settings.diff_editor.clone(),
-        review_enabled,
+        policy_active,
+        permissions_from_settings(&runtime.settings.tool_permissions),
+        session_grants,
     );
     let bridge = Arc::new(bridge);
+    {
+        let harness = Arc::clone(&runtime.harness);
+        bridge.set_persist(Arc::new(move |label| {
+            let harness = Arc::clone(&harness);
+            Box::pin(async move {
+                if let Err(e) = harness.append_label(label).await {
+                    tracing::warn!("persist tool approval label: {e}");
+                }
+            })
+        }));
+    }
+    runtime
+        .harness
+        .set_before_tool_call(Some(bridge.before_tool_hook()));
     runtime
         .harness
         .set_after_tool_call(Some(bridge.after_tool_hook()));
-    runtime.file_review = Some(Arc::clone(&bridge));
+    runtime.tool_approval = Some(Arc::clone(&bridge));
 
     let mut chat: Vec<ChatItem> = match runtime.harness.session_context().await {
         Ok(ctx) if !ctx.messages.is_empty() => chat_items_from_agent_messages(&ctx.messages),
@@ -178,8 +205,8 @@ async fn run_loop(
             )
         }
     } else {
-        let review_hint = if review_enabled {
-            " · file edits require accept/reject"
+        let review_hint = if policy_active {
+            " · tool approval on (files + bash)"
         } else {
             ""
         };
@@ -203,7 +230,7 @@ async fn run_loop(
     };
     let mut model_picker: Option<ModelPickerState> = None;
     let mut fork_picker: Option<ForkPickerState> = None;
-    let mut active_file_review: Option<ActiveFileReview> = None;
+    let mut active_approval: Option<ActiveApproval> = None;
     let mut ac_selected: usize = 0;
     let mut last_ac_filter = String::new();
     let mut file_index: Option<Vec<FileEntry>> = None;
@@ -255,7 +282,7 @@ async fn run_loop(
             && pending_login.is_none()
             && model_picker.is_none()
             && fork_picker.is_none()
-            && active_file_review.is_none()
+            && active_approval.is_none()
         {
             let extra = dynamic_command_entries(runtime);
             commands::autocomplete_entries(input.as_str(), &extra)
@@ -266,7 +293,7 @@ async fn run_loop(
             && pending_login.is_none()
             && model_picker.is_none()
             && fork_picker.is_none()
-            && active_file_review.is_none()
+            && active_approval.is_none()
         {
             find_at_mention(input.as_str(), input.cursor())
         } else {
@@ -296,7 +323,7 @@ async fn run_loop(
             ac_selected = ac_selected.min(picker_len - 1);
         }
 
-        let picker = if let Some(review) = &active_file_review {
+        let picker = if let Some(review) = &active_approval {
             review.into_picker()
         } else if let Some(p) = &model_picker {
             let current = format!(
@@ -375,8 +402,8 @@ async fn run_loop(
             PickerView::None
         };
 
-        let status_line = if active_file_review.is_some() {
-            "review file edit · opened in editor · ←→ accept/reject · tab reason · enter".into()
+        let status_line = if active_approval.is_some() {
+            "tool approval · ↑↓ choose · tab reason · enter confirm".into()
         } else if model_picker.is_some() {
             "↑↓ select · enter confirm · esc cancel".into()
         } else if fork_picker.is_some() {
@@ -447,7 +474,7 @@ async fn run_loop(
                 runtime,
                 &mut rx,
                 &mut review_rx,
-                &mut active_file_review,
+                &mut active_approval,
                 &mut chat,
                 &mut status,
                 &mut streaming_assistant,
@@ -479,7 +506,7 @@ async fn run_loop(
                         &mut pending_login,
                         &mut model_picker,
                         &mut fork_picker,
-                        &mut active_file_review,
+                        &mut active_approval,
                         &mut working,
                         &mut message_queue,
                         &mut should_quit,
@@ -510,8 +537,8 @@ async fn run_loop(
         if purge_ui_events {
             while rx.try_recv().is_ok() {}
             while review_rx.try_recv().is_ok() {}
-            if let Some(r) = active_file_review.take() {
-                let _ = r.response_tx.send(FileReviewDecision::Reject {
+            if let Some(r) = active_approval.take() {
+                let _ = r.response_tx.send(ApprovalDecision::Reject {
                     reason: Some("session reset".into()),
                 });
             }
@@ -543,7 +570,7 @@ async fn run_loop(
             runtime,
             &mut rx,
             &mut review_rx,
-            &mut active_file_review,
+            &mut active_approval,
             &mut chat,
             &mut status,
             &mut streaming_assistant,
@@ -826,8 +853,8 @@ fn truncate_status(s: &str, max: usize) -> String {
 fn drain_ui_events(
     runtime: &Runtime,
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
-    review_rx: &mut mpsc::UnboundedReceiver<FileReviewPrompt>,
-    active_file_review: &mut Option<ActiveFileReview>,
+    review_rx: &mut mpsc::UnboundedReceiver<ApprovalPrompt>,
+    active_approval: &mut Option<ActiveApproval>,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     streaming_assistant: &mut Option<usize>,
@@ -863,13 +890,17 @@ fn drain_ui_events(
         }
     }
     while let Ok(prompt) = review_rx.try_recv() {
-        if let Some(prev) = active_file_review.take() {
-            let _ = prev.response_tx.send(FileReviewDecision::Reject {
+        if let Some(prev) = active_approval.take() {
+            let _ = prev.response_tx.send(ApprovalDecision::Reject {
                 reason: Some("superseded by another review".into()),
             });
         }
-        *status = format!("review · {} · check editor diff", prompt.display_path);
-        *active_file_review = Some(ActiveFileReview::from_prompt(prompt));
+        *status = format!(
+            "review · {} · {}",
+            prompt.kind.label(),
+            prompt.summary
+        );
+        *active_approval = Some(ActiveApproval::from_prompt(prompt));
     }
     try_drain_message_queue(
         runtime,
@@ -1036,7 +1067,7 @@ async fn handle_key(
     pending_login: &mut Option<String>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
-    active_file_review: &mut Option<ActiveFileReview>,
+    active_approval: &mut Option<ActiveApproval>,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
     should_quit: &mut bool,
@@ -1046,51 +1077,73 @@ async fn handle_key(
     ac_selected: &mut usize,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> anyhow::Result<()> {
-    if let Some(review) = active_file_review.as_mut() {
+    if let Some(review) = active_approval.as_mut() {
         match key.code {
             KeyCode::Esc => {
                 if review.reason_focused {
                     review.reason_focused = false;
-                } else if let Some(r) = active_file_review.take() {
-                    let _ = r.response_tx.send(FileReviewDecision::Reject { reason: None });
-                    chat.push(sys(format!("rejected edit · {}", r.path)));
+                } else if let Some(r) = active_approval.take() {
+                    let _ = r.response_tx.send(ApprovalDecision::Reject { reason: None });
+                    chat.push(sys(format!("rejected {} · {}", r.kind.label(), r.summary)));
                     *status = "rejected · continuing".into();
                 }
             }
-            KeyCode::Left | KeyCode::Up => {
-                review.selected = 0;
-                review.reason_focused = false;
+            KeyCode::Up | KeyCode::Left => {
+                review.selected = review.selected.saturating_sub(1);
+                if review.selected != 2 {
+                    review.reason_focused = false;
+                }
             }
-            KeyCode::Right | KeyCode::Down => {
-                review.selected = 1;
+            KeyCode::Down | KeyCode::Right => {
+                if review.selected < 2 {
+                    review.selected += 1;
+                }
             }
             KeyCode::Tab => {
-                review.selected = 1;
+                review.selected = 2;
                 review.reason_focused = true;
             }
             KeyCode::Enter => {
-                if let Some(r) = active_file_review.take() {
-                    let decision = if r.selected == 0 && !r.reason_focused {
-                        FileReviewDecision::Accept
-                    } else {
+                if let Some(r) = active_approval.take() {
+                    let decision = if r.reason_focused || r.selected == 2 {
                         let reason = r.reason.trim().to_string();
-                        FileReviewDecision::Reject {
+                        ApprovalDecision::Reject {
                             reason: (!reason.is_empty()).then_some(reason),
                         }
+                    } else if r.selected == 1 {
+                        ApprovalDecision::AcceptSession
+                    } else {
+                        ApprovalDecision::Accept
                     };
                     match &decision {
-                        FileReviewDecision::Accept => {
-                            chat.push(sys(format!("accepted edit · {}", r.path)));
+                        ApprovalDecision::Accept => {
+                            chat.push(sys(format!(
+                                "accepted {} · {}",
+                                r.kind.label(),
+                                r.summary
+                            )));
                             *status = "accepted · continuing".into();
                         }
-                        FileReviewDecision::Reject { reason } => {
+                        ApprovalDecision::AcceptSession => {
+                            chat.push(sys(format!(
+                                "accepted all {} for this session",
+                                r.kind.label()
+                            )));
+                            *status = "session auto-approve on · continuing".into();
+                        }
+                        ApprovalDecision::Reject { reason } => {
                             if let Some(why) = reason {
                                 chat.push(sys(format!(
-                                    "rejected edit · {} · {why}",
-                                    r.path
+                                    "rejected {} · {} · {why}",
+                                    r.kind.label(),
+                                    r.summary
                                 )));
                             } else {
-                                chat.push(sys(format!("rejected edit · {}", r.path)));
+                                chat.push(sys(format!(
+                                    "rejected {} · {}",
+                                    r.kind.label(),
+                                    r.summary
+                                )));
                             }
                             *status = "rejected · continuing".into();
                         }
@@ -1109,8 +1162,11 @@ async fn handle_key(
             KeyCode::Char('a') | KeyCode::Char('A') if !review.reason_focused => {
                 review.selected = 0;
             }
-            KeyCode::Char('r') | KeyCode::Char('R') if !review.reason_focused => {
+            KeyCode::Char('s') | KeyCode::Char('S') if !review.reason_focused => {
                 review.selected = 1;
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') if !review.reason_focused => {
+                review.selected = 2;
             }
             _ => {}
         }
@@ -2253,13 +2309,14 @@ async fn apply_effect(
                     runtime.resumed = false;
                     chat.clear();
                     let policy =
-                        FileEditReviewPolicy::parse(&runtime.settings.file_edit_review);
-                    let enabled = policy.enabled_for_session(true);
-                    if let Some(bridge) = &runtime.file_review {
-                        bridge.set_enabled(enabled);
+                        ApprovalPolicy::parse(&runtime.settings.file_edit_review);
+                    let enabled = policy.asks_for_session(true);
+                    if let Some(bridge) = &runtime.tool_approval {
+                        bridge.clear_session_grants();
+                        bridge.set_policy_active(enabled);
                     }
                     *status = if enabled {
-                        "ready · new session · file edits require accept/reject".into()
+                        "ready · new session · tool approval on (files + bash)".into()
                     } else {
                         "ready · new session".into()
                     };
@@ -2277,12 +2334,35 @@ async fn apply_effect(
             match arg {
                 None => {
                     let active = runtime
-                        .file_review
+                        .tool_approval
                         .as_ref()
-                        .map(|b| b.enabled())
+                        .map(|b| b.policy_active())
                         .unwrap_or(false);
+                    let grants = runtime
+                        .tool_approval
+                        .as_ref()
+                        .map(|b| {
+                            let g = b.auto_approve_groups();
+                            let mut parts = Vec::new();
+                            if g.contains(GROUP_FILE) {
+                                parts.push("file");
+                            }
+                            if g.contains(GROUP_BASH) {
+                                parts.push("bash");
+                            }
+                            if parts.is_empty() {
+                                "(none)".into()
+                            } else {
+                                parts.join(", ")
+                            }
+                        })
+                        .unwrap_or_else(|| "(none)".into());
+                    let mut perms = String::new();
+                    for (k, v) in &runtime.settings.tool_permissions {
+                        perms.push_str(&format!("\n    {k}: {v}"));
+                    }
                     chat.push(sys(format!(
-                        "file edit review: {} (session active: {active})\n  /review newSession|always|never\n  settings.diffEditor: {}",
+                        "tool approval policy: {} (session asking: {active})\n  session auto-approve: {grants}\n  /review newSession|always|never\n  settings.toolPermissions:{perms}\n  settings.diffEditor: {}",
                         runtime.settings.file_edit_review,
                         runtime
                             .settings
@@ -2292,17 +2372,20 @@ async fn apply_effect(
                     )));
                 }
                 Some(raw) => {
-                    let policy = FileEditReviewPolicy::parse(&raw);
+                    let policy = ApprovalPolicy::parse(&raw);
                     runtime.settings.file_edit_review = policy.as_str().into();
-                    let enabled = policy.enabled_for_session(!runtime.resumed);
-                    if let Some(bridge) = &runtime.file_review {
-                        bridge.set_enabled(enabled);
+                    let enabled = policy.asks_for_session(!runtime.resumed);
+                    if let Some(bridge) = &runtime.tool_approval {
+                        bridge.set_policy_active(enabled);
+                        bridge.set_permissions(permissions_from_settings(
+                            &runtime.settings.tool_permissions,
+                        ));
                     }
                     let _ = runtime
                         .settings
                         .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
                     chat.push(sys(format!(
-                        "file edit review → {} (this session: {})",
+                        "tool approval → {} (this session: {})",
                         policy.as_str(),
                         if enabled { "on" } else { "off" }
                     )));
@@ -2368,8 +2451,12 @@ async fn apply_effect(
             }
         }
         CommandEffect::Settings => {
+            let mut perms = String::new();
+            for (k, v) in &runtime.settings.tool_permissions {
+                perms.push_str(&format!("\n    {k}: {v}"));
+            }
             chat.push(sys(format!(
-                "settings ({})\n  provider: {}\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  fileEditReview: {}\n  diffEditor: {}\n  ui: {}",
+                "settings ({})\n  provider: {}\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  toolApproval: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  ui: {}",
                 crate::config::paths::settings_path(&runtime.agent_dir).display(),
                 runtime.settings.default_provider,
                 runtime.settings.default_model,
