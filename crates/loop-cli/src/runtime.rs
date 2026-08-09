@@ -323,7 +323,6 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         selected_tools: &selected,
         tool_snippets: &snippets,
         context_files: &context_files,
-        skills: &resources.skills,
     });
 
     let sessions_db = sessions_db_path(&agent_dir);

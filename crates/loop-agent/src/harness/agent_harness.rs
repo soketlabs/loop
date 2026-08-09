@@ -819,14 +819,6 @@ impl AgentHarness {
         };
 
         let resources = self.resources.read().await.clone();
-        let mut system_prompt = self.system_prompt.read().await.clone();
-        if !resources.skills.is_empty() {
-            system_prompt = format!(
-                "{system_prompt}\n\n{}",
-                format_skills_for_system_prompt(&resources.skills)
-            );
-        }
-
         let all_tools = self.tools.read().await.clone();
         let active = self.active_tool_names.read().await.clone();
         let tools = if let Some(names) = active {
@@ -837,6 +829,17 @@ impl AgentHarness {
         } else {
             all_tools
         };
+
+        // Progressive disclosure (pi): only advertise skills when `read` is available
+        // so the model can load SKILL.md on demand.
+        let mut system_prompt = self.system_prompt.read().await.clone();
+        let has_read = tools.iter().any(|t| t.name == "read");
+        if has_read && !resources.skills.is_empty() {
+            let skills_block = format_skills_for_system_prompt(&resources.skills);
+            if !skills_block.is_empty() {
+                system_prompt = format!("{system_prompt}\n\n{skills_block}");
+            }
+        }
 
         let mut stream_options = self.stream_options.read().await.clone();
         {

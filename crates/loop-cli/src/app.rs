@@ -2519,7 +2519,7 @@ async fn apply_effect(
                     };
                     text.push_str(&format!("\n  /skill:{} — {}\n      {}", s.name, desc, s.path.display()));
                 }
-                text.push_str("\n\nInvoke with /skill:<name> [args] or let the model pick them up automatically.");
+                text.push_str("\n\nInvoke with /skill:<name> [args], or let the model read a skill's SKILL.md when the task matches.");
                 chat.push(sys(text));
             }
         }
