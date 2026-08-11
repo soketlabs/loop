@@ -47,6 +47,12 @@ pub enum ChatItem {
         detail: String,
         status: CardStatus,
     },
+    /// Local `!command` output — always shown in full (never collapsed).
+    Shell {
+        command: String,
+        output: String,
+        exit_code: Option<i32>,
+    },
     System { text: String },
 }
 
@@ -109,6 +115,8 @@ pub struct FooterOpts<'a> {
     pub path_line: &'a str,
     /// Right status (e.g. `soket/qwen3-30b · medium`).
     pub model_line: &'a str,
+    /// Right of the bottom status row (e.g. `12,345 · 23% · 29,440/128,000`).
+    pub usage_line: &'a str,
 }
 
 /// Whether a transcript item is finished and safe to flush into scrollback.
@@ -119,7 +127,7 @@ pub fn item_is_committed(
     streaming_thinking: Option<usize>,
 ) -> bool {
     match item {
-        ChatItem::User { .. } | ChatItem::System { .. } => true,
+        ChatItem::User { .. } | ChatItem::System { .. } | ChatItem::Shell { .. } => true,
         // Keep queued messages in the live footer so Esc can still remove them.
         ChatItem::Queued { .. } => false,
         ChatItem::Assistant { .. } => streaming_assistant != Some(index),
@@ -507,6 +515,13 @@ pub fn format_item_lines(
             }
             lines.push(Line::from(""));
         }
+        ChatItem::Shell {
+            command,
+            output,
+            exit_code,
+        } => {
+            lines.extend(format_shell_box(command, output, *exit_code, theme, w));
+        }
         ChatItem::System { text } => {
             for l in text.lines() {
                 lines.extend(wrap_plain(l, theme.dim(), w));
@@ -515,6 +530,107 @@ pub fn format_item_lines(
         }
     }
     lines
+}
+
+/// Always-visible boxed `!command` output.
+fn format_shell_box(
+    command: &str,
+    output: &str,
+    exit_code: Option<i32>,
+    theme: &Theme,
+    w: usize,
+) -> Vec<Line<'static>> {
+    let border = theme.style("border");
+    let text = theme.style("text");
+    let code_style = match exit_code {
+        Some(0) | None => theme.style("success"),
+        Some(_) => theme.style("error"),
+    };
+
+    // Inner width between the vertical borders (`│` + content + `│`).
+    let inner = w.saturating_sub(2).max(8);
+    let content_w = inner.saturating_sub(2).max(1); // side padding inside the box
+
+    let hline = |l: char, r: char| -> Line<'static> {
+        Line::from(Span::styled(
+            format!("{l}{}{r}", "─".repeat(inner)),
+            border,
+        ))
+    };
+    let pad_row = |spans: Vec<Span<'static>>| -> Line<'static> {
+        let used: usize = spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        let mut all = vec![Span::styled("│".to_string(), border)];
+        all.extend(spans);
+        if used < inner {
+            all.push(Span::raw(" ".repeat(inner - used)));
+        }
+        all.push(Span::styled("│".to_string(), border));
+        Line::from(all)
+    };
+    let content_row = |prefix: Vec<Span<'static>>, body: String, body_style: Style| -> Line<'static> {
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(prefix);
+        spans.push(Span::styled(body, body_style));
+        pad_row(spans)
+    };
+
+    let mut out = Vec::new();
+    out.push(hline('╭', '╮'));
+
+    // Command header: `$ cmd` (wrap long commands).
+    let mut cmd_first = true;
+    for part in soft_wrap(command, content_w.saturating_sub(2).max(1)) {
+        if cmd_first {
+            out.push(content_row(
+                vec![Span::styled("$ ".to_string(), theme.accent())],
+                part,
+                text,
+            ));
+            cmd_first = false;
+        } else {
+            out.push(content_row(
+                vec![Span::raw("  ".to_string())],
+                part,
+                text,
+            ));
+        }
+    }
+    if cmd_first {
+        out.push(content_row(
+            vec![Span::styled("$".to_string(), theme.accent())],
+            String::new(),
+            text,
+        ));
+    }
+
+    if !output.is_empty() {
+        out.push(hline('├', '┤'));
+        for l in output.lines() {
+            if l.is_empty() {
+                out.push(pad_row(Vec::new()));
+                continue;
+            }
+            for part in soft_wrap(l, content_w) {
+                out.push(content_row(Vec::new(), part, text));
+            }
+        }
+    }
+
+    if let Some(code) = exit_code {
+        out.push(hline('├', '┤'));
+        out.push(content_row(
+            Vec::new(),
+            format!("[exit {code}]"),
+            code_style,
+        ));
+    }
+
+    out.push(hline('╰', '╯'));
+    out.push(Line::from(""));
+    out
 }
 
 /// Draw lines into a buffer (used by `insert_before`).
@@ -788,20 +904,92 @@ fn draw_status(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
         )),
         Span::styled(opts.model_line.to_string(), opts.theme.muted()),
     ]);
-    let bottom = if opts.working {
+
+    let status_left = if opts.working {
         let spin = SPINNER_FRAMES[opts.spinner_frame % SPINNER_FRAMES.len()];
-        Line::from(Span::styled(
-            format!(" {spin} {}", opts.status),
-            opts.theme.accent(),
-        ))
+        format!(" {spin} {}", opts.status)
     } else {
-        Line::from(Span::styled(
-            format!(" {}", opts.status),
-            opts.theme.dim(),
-        ))
+        format!(" {}", opts.status)
+    };
+    let usage = opts.usage_line;
+    let gap = area.width.saturating_sub(
+        (UnicodeWidthStr::width(status_left.as_str()) + UnicodeWidthStr::width(usage)) as u16,
+    ) as usize;
+    let bottom = if opts.working {
+        Line::from(vec![
+            Span::styled(status_left, opts.theme.accent()),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(usage.to_string(), opts.theme.muted()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(status_left, opts.theme.dim()),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(usage.to_string(), opts.theme.muted()),
+        ])
     };
     frame.render_widget(Paragraph::new(top), chunks[0]);
     frame.render_widget(Paragraph::new(bottom), chunks[1]);
+}
+
+/// Format a token count for the footer: commas below 1M, then `M` / `B` with decimals.
+pub fn format_compact_tokens(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format_token_unit(n as f64 / 1_000_000_000.0, 'B')
+    } else if n >= 1_000_000 {
+        format_token_unit(n as f64 / 1_000_000.0, 'M')
+    } else {
+        format_commas(n)
+    }
+}
+
+fn format_token_unit(v: f64, unit: char) -> String {
+    let rounded = (v * 10.0).round() / 10.0;
+    if (rounded - rounded.trunc()).abs() < f64::EPSILON {
+        format!("{:.0}{unit}", rounded)
+    } else {
+        format!("{rounded:.1}{unit}")
+    }
+}
+
+fn format_commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out.chars().rev().collect()
+}
+
+/// Footer usage summary: `total · pct% · current/window`.
+pub fn format_token_usage_line(
+    total_tokens: u64,
+    context_tokens: Option<u64>,
+    context_window: u64,
+) -> String {
+    let total = format_compact_tokens(total_tokens);
+    if context_window == 0 {
+        return total;
+    }
+    let window = format_compact_tokens(context_window);
+    match context_tokens {
+        Some(tokens) => {
+            let pct = ((tokens as f64 / context_window as f64) * 100.0).clamp(0.0, 999.0);
+            let pct_label = if pct < 10.0 {
+                format!("{pct:.1}%")
+            } else {
+                format!("{:.0}%", pct.round())
+            };
+            format!(
+                "{total} · {pct_label} · {}/{window}",
+                format_compact_tokens(tokens)
+            )
+        }
+        None => format!("{total} · —/{window}"),
+    }
 }
 
 fn picker_height(picker: &PickerView) -> u16 {
@@ -1295,5 +1483,35 @@ mod tests {
             } if id == "call_1" && name == "bash" && detail.contains("a.rs")
         ));
         assert!(matches!(&items[4], ChatItem::User { text } if text == "thanks"));
+    }
+
+    #[test]
+    fn compact_tokens_uses_commas_then_m_b() {
+        assert_eq!(format_compact_tokens(0), "0");
+        assert_eq!(format_compact_tokens(999), "999");
+        assert_eq!(format_compact_tokens(1_000), "1,000");
+        assert_eq!(format_compact_tokens(12_345), "12,345");
+        assert_eq!(format_compact_tokens(999_999), "999,999");
+        assert_eq!(format_compact_tokens(1_000_000), "1M");
+        assert_eq!(format_compact_tokens(1_250_000), "1.3M");
+        assert_eq!(format_compact_tokens(1_000_000_000), "1B");
+        assert_eq!(format_compact_tokens(2_500_000_000), "2.5B");
+    }
+
+    #[test]
+    fn usage_line_shows_total_percent_and_window() {
+        assert_eq!(
+            format_token_usage_line(12_345, Some(29_440), 128_000),
+            "12,345 · 23% · 29,440/128,000"
+        );
+        assert_eq!(
+            format_token_usage_line(500, Some(500), 128_000),
+            "500 · 0.4% · 500/128,000"
+        );
+        assert_eq!(
+            format_token_usage_line(1_000, None, 128_000),
+            "1,000 · —/128,000"
+        );
+        assert_eq!(format_token_usage_line(42, None, 0), "42");
     }
 }

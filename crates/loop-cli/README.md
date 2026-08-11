@@ -47,6 +47,10 @@ Claude skills are **opt-in** via settings:
 
 `/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/new`, `/review`, `/compact`, `/resume`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
 
+## Local shell (`!command`)
+
+Type `!ls -la` (or any shell command) to run it in the current sandbox/host environment. Output is shown in the transcript only — it is **not** sent to the model and is **not** added to session messages.
+
 ## Keybindings
 
 | Shortcut | Action |
@@ -61,6 +65,7 @@ Claude skills are **opt-in** via settings:
 | `ctrl+t` | Toggle thinking visibility |
 | `ctrl+x` | Copy last assistant message |
 | `ctrl+g` | External editor (`$EDITOR`) |
+| `!command` | Run shell locally (not sent to the model) |
 
 See `/hotkeys`. Override in `keybindings.json`.
 
@@ -71,7 +76,26 @@ Ship `dark` and `light`. Custom JSON themes use the same color tokens as pi. Cha
 ## Sandbox
 
 `/sandbox off` — host tools  
-`/sandbox local-shell` — soft workdir isolation via `LocalShellSandbox`
+`/sandbox local` — same as `--full --runc` (rootless Podman + runc)  
+`/sandbox local --partial` — host FS (jailed); only `bash` via `podman exec`  
+`/sandbox local --full --runsc` — gVisor  
+`/sandbox local --partial --krun` — libkrun microVM  
+
+The project workdir is bind-mounted at the **same absolute path** inside the container (e.g. `/home/you/proj` → `/home/you/proj`), so `@file` tags and tool paths stay identical on host and guest.
+
+**Runtimes** (pick one):
+- `--runc` (default) — rootless containers; needs `podman` + `runc`
+- `--crun` — same model with `crun`
+- `--runsc` / `--gvisor` — gVisor; needs `runsc`
+- `--krun` — microVM; needs `crun-krun` + `/dev/kvm`
+
+**Isolation** (pick one): `--full` (default) or `--partial`.
+
+If deps for the chosen runtime are missing, Loop prints install instructions and leaves sandbox **off**. Startup with `"mode": "local"` falls back to off with a warning. Remote sandbox is reserved (`/sandbox remote …`).
+
+```json
+{ "sandbox": { "mode": "local", "isolation": "full", "runtime": "runc" } }
+```
 
 ## File edit review / tool approval
 

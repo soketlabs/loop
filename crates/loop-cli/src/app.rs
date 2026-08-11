@@ -17,12 +17,15 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
 use loop_agent::harness::{
-    format_prompt_template_invocation, format_skill_invocation, AgentHarnessPhase, LocalShellSandbox,
-    Sandbox, SandboxConfig, SandboxMode, SessionForkPoint, SessionForkSelection,
+    format_prompt_template_invocation, AgentHarnessPhase, KrunSandbox, Sandbox, SandboxMode,
+    SessionForkPoint, SessionForkSelection,
 };
-use loop_agent::types::{AgentEvent, AgentThinkingLevel};
+use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel};
 use loop_ai::providers::{SOKET_BASE_URL, SOKET_PROVIDER_ID};
-use loop_ai::{Credential, CredentialStore, ModelsRefreshOptions, ToolResultContent};
+use loop_ai::{
+    calculate_context_tokens, Credential, CredentialStore, Message, ModelsRefreshOptions,
+    ToolResultContent, Usage,
+};
 
 use crate::commands::{self, AutocompleteEntry, CommandEffect};
 use crate::keybindings::{hotkey_help, Action};
@@ -34,15 +37,28 @@ use crate::tool_approval::{
 };
 use crate::tui::{
     chat_items_from_agent_messages, filter_files, find_at_mention, find_tool_index,
-    format_item_lines, insert_text, item_is_committed, list_files, render_lines_to_buffer,
-    tool_args_summary, welcome_lines, CardStatus, ChatItem, FileEntry, FOOTER_HEIGHT, FooterOpts,
-    InputBuffer, PickerRow, PickerView,
+    format_item_lines, format_token_usage_line, insert_text, item_is_committed, list_files,
+    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, FileEntry,
+    FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow, PickerView,
 };
 
 enum UiEvent {
     Agent(AgentEvent),
     /// `/compact` finished (success message or error).
     CompactDone(Result<String, String>),
+    /// `/sandbox` enable/disable finished.
+    SandboxDone(Result<SandboxDoneOk, String>),
+}
+
+/// Successful sandbox switch applied on the UI thread.
+enum SandboxDoneOk {
+    /// Sandbox disabled.
+    Off,
+    /// Local sandbox enabled.
+    Local {
+        isolation: String,
+        runtime: String,
+    },
 }
 
 /// Pending accept/reject prompt for a tool call.
@@ -87,6 +103,91 @@ struct QueuedMessage {
     display: String,
     /// Sent to `harness.prompt`.
     prompt: String,
+}
+
+/// Live token / context stats for the footer usage line.
+#[derive(Debug, Clone)]
+struct TokenBarState {
+    total_tokens: u64,
+    context_tokens: Option<u64>,
+    context_window: u64,
+}
+
+impl TokenBarState {
+    fn from_model(runtime: &Runtime) -> Self {
+        let context_window = runtime
+            .models
+            .get_model(
+                &runtime.settings.default_provider,
+                &runtime.settings.default_model,
+            )
+            .map(|m| m.context_window)
+            .unwrap_or(0);
+        Self {
+            total_tokens: 0,
+            context_tokens: Some(0),
+            context_window,
+        }
+    }
+
+    async fn load(runtime: &Runtime) -> Self {
+        let mut state = Self::from_model(runtime);
+        state.refresh(runtime).await;
+        state
+    }
+
+    async fn refresh(&mut self, runtime: &Runtime) {
+        self.sync_window(runtime);
+        if let Ok(stats) = runtime.harness.session_stats().await {
+            self.total_tokens = stats.tokens.total_tokens();
+            if let Some(ctx) = stats.context_usage {
+                self.context_tokens = ctx.tokens;
+                self.context_window = ctx.context_window;
+            }
+        }
+    }
+
+    fn sync_window(&mut self, runtime: &Runtime) {
+        if let Some(m) = runtime.models.get_model(
+            &runtime.settings.default_provider,
+            &runtime.settings.default_model,
+        ) {
+            self.context_window = m.context_window;
+        }
+    }
+
+    fn reset(&mut self, runtime: &Runtime) {
+        *self = Self::from_model(runtime);
+    }
+
+    fn apply_usage(&mut self, usage: &Usage) {
+        self.total_tokens = self
+            .total_tokens
+            .saturating_add(usage.input)
+            .saturating_add(usage.output)
+            .saturating_add(usage.cache_read)
+            .saturating_add(usage.cache_write);
+        let ctx = calculate_context_tokens(usage);
+        if ctx > 0 {
+            self.context_tokens = Some(ctx);
+        }
+    }
+
+    fn apply_message(&mut self, message: &AgentMessage) {
+        match message {
+            AgentMessage::Llm(Message::Assistant(a)) => self.apply_usage(&a.usage),
+            AgentMessage::Llm(Message::ToolResult(t)) => {
+                if let Some(usage) = &t.usage {
+                    self.apply_usage(usage);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn usage_line(&self) -> String {
+        format_token_usage_line(self.total_tokens, self.context_tokens, self.context_window)
+    }
 }
 
 /// Run the interactive CLI (inline viewport — native terminal scrollback).
@@ -240,6 +341,8 @@ async fn run_loop(
     let mut last_spin = Instant::now();
     let version = env!("CARGO_PKG_VERSION");
     let path_line = path_status_line(&runtime.cwd);
+    let mut token_bar = TokenBarState::load(runtime).await;
+    let mut refresh_token_bar = false;
 
     // Welcome banner into terminal scrollback (above the footer).
     print_welcome(terminal, runtime, version)?;
@@ -438,12 +541,20 @@ async fn run_loop(
             parts.join(" · ")
         } else if !message_queue.is_empty() {
             format!("{} queued · sending…", message_queue.len())
+        } else if !runtime.active_skills.is_empty() {
+            let names = runtime.active_skills.join(", ");
+            format!("skill(s) active: {names} · type your message")
         } else {
             status.clone()
         };
 
         let live: Vec<ChatItem> = chat[flushed..].to_vec();
         let setup_mode = pending_login.is_some();
+        if refresh_token_bar {
+            token_bar.refresh(runtime).await;
+            refresh_token_bar = false;
+        }
+        let usage_line = token_bar.usage_line();
 
         terminal.draw(|f| {
             crate::tui::draw_footer(
@@ -463,6 +574,7 @@ async fn run_loop(
                     mask_input: setup_mode,
                     path_line: &path_line,
                     model_line: &model_line,
+                    usage_line: &usage_line,
                 },
             );
         })?;
@@ -481,6 +593,8 @@ async fn run_loop(
                 &mut streaming_thinking,
                 &mut working,
                 &mut message_queue,
+                &mut token_bar,
+                &mut refresh_token_bar,
             );
             continue;
         }
@@ -515,8 +629,11 @@ async fn run_loop(
                         at_mention.as_ref(),
                         &mut ac_selected,
                         &tx,
+                        &mut token_bar,
+                        &mut refresh_token_bar,
                     )
                     .await?;
+                    token_bar.sync_window(runtime);
                 }
                 Event::Resize(w, _) => {
                     let _ = terminal.autoresize();
@@ -577,6 +694,8 @@ async fn run_loop(
             &mut streaming_thinking,
             &mut working,
             &mut message_queue,
+            &mut token_bar,
+            &mut refresh_token_bar,
         );
     }
 
@@ -851,7 +970,7 @@ fn truncate_status(s: &str, max: usize) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn drain_ui_events(
-    runtime: &Runtime,
+    runtime: &mut Runtime,
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
     review_rx: &mut mpsc::UnboundedReceiver<ApprovalPrompt>,
     active_approval: &mut Option<ActiveApproval>,
@@ -861,6 +980,8 @@ fn drain_ui_events(
     streaming_thinking: &mut Option<usize>,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
+    token_bar: &mut TokenBarState,
+    refresh_token_bar: &mut bool,
 ) {
     while let Ok(ev) = rx.try_recv() {
         match ev {
@@ -872,6 +993,8 @@ fn drain_ui_events(
                     streaming_assistant,
                     streaming_thinking,
                     working,
+                    token_bar,
+                    refresh_token_bar,
                 );
             }
             UiEvent::CompactDone(result) => {
@@ -880,9 +1003,42 @@ fn drain_ui_events(
                     Ok(msg) => {
                         chat.push(sys(msg));
                         *status = "ready".into();
+                        // Compaction invalidates prior context estimates until the next turn.
+                        token_bar.context_tokens = None;
+                        *refresh_token_bar = true;
                     }
                     Err(e) => {
                         chat.push(sys(format!("compact failed: {e}")));
+                        *status = "ready".into();
+                    }
+                }
+            }
+            UiEvent::SandboxDone(result) => {
+                *working = false;
+                match result {
+                    Ok(SandboxDoneOk::Off) => {
+                        runtime.settings.sandbox.mode = "off".into();
+                        let _ = runtime.settings.save_file(
+                            &crate::config::paths::settings_path(&runtime.agent_dir),
+                        );
+                        chat.push(sys("sandbox → off"));
+                        *status = "ready".into();
+                    }
+                    Ok(SandboxDoneOk::Local {
+                        isolation,
+                        runtime: oci,
+                    }) => {
+                        runtime.settings.sandbox.mode = "local".into();
+                        runtime.settings.sandbox.isolation = isolation.clone();
+                        runtime.settings.sandbox.runtime = oci.clone();
+                        let _ = runtime.settings.save_file(
+                            &crate::config::paths::settings_path(&runtime.agent_dir),
+                        );
+                        chat.push(sys(format!("sandbox → local --{isolation} --{oci}")));
+                        *status = "ready".into();
+                    }
+                    Err(e) => {
+                        chat.push(sys(e));
                         *status = "ready".into();
                     }
                 }
@@ -1049,6 +1205,72 @@ fn submit_user_text(
     }
 }
 
+/// Run `!command` locally: show output in the transcript, never send to the LLM
+/// or append to the session message list.
+async fn run_bang_command(
+    runtime: &Runtime,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
+    command: &str,
+) {
+    let command = command.trim();
+    if command.is_empty() {
+        let idx = push_before_queued(chat, sys("usage: !command"));
+        bump_stream_index(streaming_assistant, idx);
+        bump_stream_index(streaming_thinking, idx);
+        *status = "ready".into();
+        return;
+    }
+
+    *status = format!("running · !{command}");
+    let env = match runtime.harness.tool_env().await {
+        Ok(env) => env,
+        Err(e) => {
+            let idx = push_before_queued(chat, sys(format!("shell error: {e}")));
+            bump_stream_index(streaming_assistant, idx);
+            bump_stream_index(streaming_thinking, idx);
+            *status = "shell failed".into();
+            return;
+        }
+    };
+
+    let options = loop_agent::harness::types::ShellExecOptions::default();
+    let item = match env.exec(command, options).await {
+        Ok(out) => {
+            let combined = if out.stderr.is_empty() {
+                out.stdout
+            } else if out.stdout.is_empty() {
+                out.stderr
+            } else {
+                format!("{}\n{}", out.stdout, out.stderr)
+            };
+            *status = if out.exit_code == 0 {
+                "done".into()
+            } else {
+                format!("exit {}", out.exit_code)
+            };
+            ChatItem::Shell {
+                command: command.to_string(),
+                output: combined,
+                exit_code: Some(out.exit_code),
+            }
+        }
+        Err(e) => {
+            *status = "shell failed".into();
+            ChatItem::Shell {
+                command: command.to_string(),
+                output: format!("error: {e}"),
+                exit_code: None,
+            }
+        }
+    };
+    let idx = push_before_queued(chat, item);
+    bump_stream_index(streaming_assistant, idx);
+    bump_stream_index(streaming_thinking, idx);
+}
+
 async fn handle_key(
     key: crossterm::event::KeyEvent,
     runtime: &mut Runtime,
@@ -1076,6 +1298,8 @@ async fn handle_key(
     at_mention: Option<&crate::tui::AtMention>,
     ac_selected: &mut usize,
     tx: &mpsc::UnboundedSender<UiEvent>,
+    token_bar: &mut TokenBarState,
+    refresh_token_bar: &mut bool,
 ) -> anyhow::Result<()> {
     if let Some(review) = active_approval.as_mut() {
         match key.code {
@@ -1249,6 +1473,8 @@ async fn handle_key(
                         Some(point.entry_id.as_str()),
                         None,
                         Some(point.text),
+                        token_bar,
+                        refresh_token_bar,
                     )
                     .await;
                 }
@@ -1489,7 +1715,17 @@ async fn handle_key(
                 if line.is_empty() {
                     return Ok(());
                 }
-                if line.starts_with('/') {
+                if let Some(command) = line.strip_prefix('!') {
+                    run_bang_command(
+                        runtime,
+                        chat,
+                        status,
+                        streaming_assistant,
+                        streaming_thinking,
+                        command,
+                    )
+                    .await;
+                } else if line.starts_with('/') {
                     let skill_names: Vec<_> = runtime
                         .resources
                         .skills
@@ -1521,6 +1757,8 @@ async fn handle_key(
                             purge_ui_events,
                             input,
                             tx,
+                            token_bar,
+                            refresh_token_bar,
                         )
                         .await?;
                     }
@@ -1837,6 +2075,8 @@ async fn adopt_forked_session(
     through_entry_id: Option<&str>,
     name: Option<String>,
     draft: Option<String>,
+    token_bar: &mut TokenBarState,
+    refresh_token_bar: &mut bool,
 ) {
     message_queue.clear();
     *streaming_assistant = None;
@@ -1850,6 +2090,7 @@ async fn adopt_forked_session(
     {
         Ok(id) => {
             runtime.session_id = id.clone();
+            runtime.active_skills.clear();
             *chat = match runtime.harness.session_context().await {
                 Ok(ctx) => chat_items_from_agent_messages(&ctx.messages),
                 Err(e) => {
@@ -1870,6 +2111,8 @@ async fn adopt_forked_session(
             }
             *redraw_request = true;
             *purge_ui_events = true;
+            *refresh_token_bar = true;
+            token_bar.sync_window(runtime);
         }
         Err(e) => {
             chat.push(sys(format!("fork failed: {e}")));
@@ -1897,6 +2140,8 @@ fn handle_agent_event(
     streaming_assistant: &mut Option<usize>,
     streaming_thinking: &mut Option<usize>,
     working: &mut bool,
+    token_bar: &mut TokenBarState,
+    refresh_token_bar: &mut bool,
 ) {
     match ev {
         AgentEvent::AgentStart => {
@@ -1913,6 +2158,7 @@ fn handle_agent_event(
             }
             // Ensure any content that landed after queued bubbles can flush.
             settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
+            *refresh_token_bar = true;
         }
         AgentEvent::MessageStart { message } => {
             // Assistant items are created lazily on the first text delta so that
@@ -1921,7 +2167,8 @@ fn handle_agent_event(
                 *streaming_assistant = None;
             }
         }
-        AgentEvent::MessageEnd { .. } => {
+        AgentEvent::MessageEnd { message } => {
+            token_bar.apply_message(&message);
             *streaming_assistant = None;
             if let Some(idx) = streaming_thinking.take() {
                 if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
@@ -2178,6 +2425,8 @@ async fn apply_effect(
     purge_ui_events: &mut bool,
     input: &mut InputBuffer,
     tx: &mpsc::UnboundedSender<UiEvent>,
+    token_bar: &mut TokenBarState,
+    refresh_token_bar: &mut bool,
 ) -> anyhow::Result<bool> {
     match effect {
         CommandEffect::Quit => return Ok(true),
@@ -2235,6 +2484,7 @@ async fn apply_effect(
                     .settings
                     .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
                 chat.push(sys(format!("model → {provider}/{model}")));
+                token_bar.sync_window(runtime);
             } else {
                 chat.push(sys(format!(
                     "model not found: {provider}/{model} — try /model or refresh"
@@ -2244,41 +2494,100 @@ async fn apply_effect(
         CommandEffect::SetSandbox(mode) => {
             if mode.is_empty() {
                 chat.push(sys(format!(
-                    "sandbox mode: {} (use /sandbox off|local-shell)",
-                    runtime.settings.sandbox.mode
+                    "sandbox mode: {} (use /sandbox off|local [--full|--partial] [--crun|--runc|--runsc|--krun])",
+                    runtime.settings.sandbox.display()
                 )));
                 return Ok(false);
             }
-            match mode.as_str() {
-                "off" | "disabled" => {
-                    runtime.harness.clear_sandbox().await;
-                    runtime.settings.sandbox.mode = "off".into();
-                    chat.push(sys("sandbox → off"));
-                }
-                "local-shell" | "local" => {
-                    let sb = LocalShellSandbox::new(SandboxConfig {
-                        workdir: runtime.cwd.clone(),
-                        ..Default::default()
-                    });
-                    sb.start()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("sandbox: {e}"))?;
-                    runtime
-                        .harness
-                        .set_sandbox(SandboxMode::Enabled {
-                            sandbox: Arc::new(sb),
-                        })
+            let parts: Vec<&str> = mode.split_whitespace().collect();
+            match parts.as_slice() {
+                ["off"] | ["disabled"] => {
+                    let harness = Arc::clone(&runtime.harness);
+                    let tx = tx.clone();
+                    *working = true;
+                    *status = "disabling sandbox…".into();
+                    chat.push(sys(" "));
+                    chat.push(sys("disabling sandbox…"));
+                    tokio::spawn(async move {
+                        let result = async {
+                            harness.clear_sandbox().await;
+                            let env = harness
+                                .tool_env()
+                                .await
+                                .map_err(|e| format!("sandbox: {e}"))?;
+                            harness
+                                .set_tools(crate::runtime::build_tools(env))
+                                .await
+                                .map_err(|e| format!("sandbox: {e}"))?;
+                            Ok(SandboxDoneOk::Off)
+                        }
                         .await;
-                    runtime.settings.sandbox.mode = "local-shell".into();
-                    chat.push(sys("sandbox → local-shell"));
+                        let _ = tx.send(UiEvent::SandboxDone(result));
+                    });
+                    return Ok(false);
                 }
-                other => chat.push(sys(format!(
-                    "unknown sandbox '{other}' (off|local-shell)"
-                ))),
+                ["local", rest @ ..] => {
+                    let (isolation, oci_runtime) = match commands::parse_local_sandbox_flags(rest) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            chat.push(sys(e));
+                            return Ok(false);
+                        }
+                    };
+                    let harness = Arc::clone(&runtime.harness);
+                    let cwd = runtime.cwd.clone();
+                    let tx = tx.clone();
+                    let iso_s = isolation.as_str().to_string();
+                    let rt_s = oci_runtime.as_str().to_string();
+                    *working = true;
+                    *status = format!("enabling sandbox (--{iso_s} --{rt_s})…");
+                    chat.push(sys(" "));
+                    chat.push(sys(format!(
+                        "enabling sandbox (--{iso_s} --{rt_s})…"
+                    )));
+                    tokio::spawn(async move {
+                        let result = async {
+                            let sb = KrunSandbox::new(KrunSandbox::config_for(
+                                cwd,
+                                isolation,
+                                oci_runtime,
+                            ));
+                            sb.start().await.map_err(|e| e.to_string())?;
+                            let env = sb.env();
+                            if let Err(e) = harness
+                                .set_tools(crate::runtime::build_tools(Arc::clone(&env)))
+                                .await
+                            {
+                                let _ = sb.destroy().await;
+                                return Err(format!("sandbox: {e}"));
+                            }
+                            harness
+                                .set_sandbox(SandboxMode::Enabled {
+                                    sandbox: Arc::new(sb),
+                                })
+                                .await;
+                            Ok(SandboxDoneOk::Local {
+                                isolation: iso_s,
+                                runtime: rt_s,
+                            })
+                        }
+                        .await;
+                        let _ = tx.send(UiEvent::SandboxDone(result));
+                    });
+                    return Ok(false);
+                }
+                ["remote", ..] => {
+                    chat.push(sys(
+                        "remote sandbox is not implemented yet (use /sandbox local …)",
+                    ));
+                }
+                other => {
+                    let joined = other.join(" ");
+                    chat.push(sys(format!(
+                        "unknown sandbox '{joined}' (off|local [--full|--partial] [--crun|--runc|--runsc|--krun])"
+                    )));
+                }
             }
-            let _ = runtime
-                .settings
-                .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
         }
         CommandEffect::Login(provider) => {
             let p = provider.unwrap_or_else(|| SOKET_PROVIDER_ID.into());
@@ -2307,6 +2616,7 @@ async fn apply_effect(
                 Ok(id) => {
                     runtime.session_id = id;
                     runtime.resumed = false;
+                    runtime.active_skills.clear();
                     chat.clear();
                     let policy =
                         ApprovalPolicy::parse(&runtime.settings.file_edit_review);
@@ -2323,6 +2633,7 @@ async fn apply_effect(
                     // Clear screen + scrollback and reprint welcome with the new id.
                     *redraw_request = true;
                     *purge_ui_events = true;
+                    token_bar.reset(runtime);
                 }
                 Err(e) => {
                     chat.push(sys(format!("new session failed: {e}")));
@@ -2462,7 +2773,7 @@ async fn apply_effect(
                 runtime.settings.default_model,
                 runtime.settings.theme,
                 runtime.settings.default_thinking_level,
-                runtime.settings.sandbox.mode,
+                runtime.settings.sandbox.display(),
                 runtime.settings.file_edit_review,
                 runtime
                     .settings
@@ -2519,7 +2830,7 @@ async fn apply_effect(
                     };
                     text.push_str(&format!("\n  /skill:{} — {}\n      {}", s.name, desc, s.path.display()));
                 }
-                text.push_str("\n\nInvoke with /skill:<name> [args] or let the model pick them up automatically.");
+                text.push_str("\n\nActivate with /skill:<name> [optional args for the input]. Skills stay active until /new; the model sees them under <available_skills> and can read SKILL.md when relevant.");
                 chat.push(sys(text));
             }
         }
@@ -2580,27 +2891,30 @@ async fn apply_effect(
                 None,
                 None,
                 None,
+                token_bar,
+                refresh_token_bar,
             )
             .await;
         }
         CommandEffect::Skill { name, args } => {
-            if let Some(skill) = runtime.resources.skills.iter().find(|s| s.name == name) {
-                let prompt = format_skill_invocation(skill, &args);
-                let display = format!("/skill:{name} {args}");
-                if agent_is_busy(runtime, *working) {
-                    enqueue_user_message(chat, message_queue, display, prompt);
-                    *status = format!("{} messages queued", message_queue.len());
-                } else {
-                    start_user_turn(
-                        runtime,
-                        chat,
-                        status,
-                        streaming_assistant,
-                        streaming_thinking,
-                        working,
-                        display,
-                        prompt,
-                    );
+            if runtime.harness.activate_skill(&name).await {
+                if !runtime.active_skills.iter().any(|n| n == &name) {
+                    runtime.active_skills.push(name.clone());
+                }
+                let list = runtime.active_skills.join(", ");
+                chat.push(sys(format!(
+                    "skill `{name}` is active ({list}). Type your message when ready."
+                )));
+                *status = format!("skill(s) active: {list} · type your message");
+                let args = args.trim();
+                if !args.is_empty() {
+                    let current = input.as_str();
+                    if !current.is_empty()
+                        && !current.ends_with(|c: char| c.is_whitespace())
+                    {
+                        input.insert_str(" ");
+                    }
+                    input.insert_str(args);
                 }
             } else {
                 chat.push(sys(format!("skill not found: {name}")));

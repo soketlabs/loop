@@ -40,6 +40,26 @@ fn theme_builtins_load() {
 }
 
 #[test]
+fn parse_local_sandbox_flags_defaults_and_options() {
+    use loop_agent::harness::{KrunIsolation, LocalSandboxRuntime};
+
+    let (iso, rt) = commands::parse_local_sandbox_flags(&[]).unwrap();
+    assert_eq!(iso, KrunIsolation::Full);
+    assert_eq!(rt, LocalSandboxRuntime::Runc);
+
+    let (iso, rt) = commands::parse_local_sandbox_flags(&["--partial", "--krun"]).unwrap();
+    assert_eq!(iso, KrunIsolation::Partial);
+    assert_eq!(rt, LocalSandboxRuntime::Krun);
+
+    let (iso, rt) = commands::parse_local_sandbox_flags(&["full", "runsc"]).unwrap();
+    assert_eq!(iso, KrunIsolation::Full);
+    assert_eq!(rt, LocalSandboxRuntime::Runsc);
+
+    assert!(commands::parse_local_sandbox_flags(&["--crun", "--krun"]).is_err());
+    assert!(commands::parse_local_sandbox_flags(&["--full", "--partial"]).is_err());
+}
+
+#[test]
 fn settings_defaults_soket() {
     let s = Settings::default();
     assert_eq!(s.default_provider, "soket");
@@ -48,6 +68,9 @@ fn settings_defaults_soket() {
     assert_eq!(s.file_edit_review, "newSession");
     assert_eq!(s.tool_permissions.get("bash").map(String::as_str), Some("ask"));
     assert_eq!(s.tool_permissions.get("read").map(String::as_str), Some("allow"));
+    assert_eq!(s.sandbox.mode, "off");
+    assert_eq!(s.sandbox.isolation, "full");
+    assert_eq!(s.sandbox.runtime, "runc");
 }
 
 #[test]

@@ -49,7 +49,7 @@ pub enum SandboxError {
 /// Configuration for creating a sandbox.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SandboxConfig {
-    /// Logical workspace root inside the sandbox.
+    /// Logical workspace root (host path; bind-mounted at the same path in the guest).
     pub workdir: PathBuf,
     /// Opaque backend options.
     #[serde(default)]
@@ -62,7 +62,7 @@ pub struct SandboxConfig {
 /// A sandbox yields an [`ExecutionEnv`] for tool calls when enabled.
 #[async_trait]
 pub trait Sandbox: Send + Sync {
-    /// Stable kind id (`local-shell`, `docker`, …).
+    /// Stable kind id (`local`, `remote`, …).
     fn kind(&self) -> &str;
     /// Instance id.
     fn id(&self) -> &str;
