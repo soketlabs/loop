@@ -81,6 +81,8 @@ Ship `dark` and `light`. Custom JSON themes use the same color tokens as pi. Cha
 `/sandbox local --full --runsc` — gVisor  
 `/sandbox local --partial --krun` — libkrun microVM  
 
+The project workdir is bind-mounted at the **same absolute path** inside the container (e.g. `/home/you/proj` → `/home/you/proj`), so `@file` tags and tool paths stay identical on host and guest.
+
 **Runtimes** (pick one):
 - `--runc` (default) — rootless containers; needs `podman` + `runc`
 - `--crun` — same model with `crun`

@@ -11,7 +11,7 @@ use loop_agent::harness::types::{
 use loop_agent::harness::{
     create_read_tool, create_write_tool, KrunIsolation, KrunSandbox, KrunSandboxFactory,
     LocalSandboxRuntime, PodmanClient, PodmanExecOpts, PodmanRunOpts, Sandbox, SandboxConfig,
-    SandboxError, SandboxMode, SandboxRegistry, SandboxStatus, KRUN_GUEST_WORKDIR,
+    SandboxError, SandboxMode, SandboxRegistry, SandboxStatus,
 };
 use parking_lot::Mutex;
 use serde_json::json;
@@ -26,11 +26,9 @@ struct FakePodman {
 
 impl FakePodman {
     fn new() -> Self {
-        let mut dirs = std::collections::HashSet::new();
-        dirs.insert(KRUN_GUEST_WORKDIR.into());
         Self {
             files: Mutex::new(HashMap::new()),
-            dirs: Mutex::new(dirs),
+            dirs: Mutex::new(std::collections::HashSet::new()),
             running: Mutex::new(None),
             shell_log: Mutex::new(Vec::new()),
         }
@@ -74,6 +72,9 @@ impl PodmanClient for FakePodman {
     }
 
     async fn run(&self, opts: PodmanRunOpts) -> Result<String, SandboxError> {
+        // Same-path mount: seed the guest workdir (equals host workdir).
+        Self::ensure_parent(&mut self.dirs.lock(), &opts.guest_workdir);
+        self.dirs.lock().insert(opts.guest_workdir.clone());
         let id = format!("fake-{}", opts.name);
         *self.running.lock() = Some(id.clone());
         Ok(id)
@@ -244,6 +245,19 @@ async fn krun_full_fs_via_exec() {
     env.write_file(Path::new("hello.txt"), b"hi").await.unwrap();
     let text = env.read_text_file(Path::new("hello.txt")).await.unwrap();
     assert_eq!(text, "hi");
+
+    // Absolute host path must map 1:1 into the guest (same path, no /workspace rewrite).
+    let abs = dir.path().join("hello.txt");
+    let abs_text = env.read_text_file(&abs).await.unwrap();
+    assert_eq!(abs_text, "hi");
+    let abs_s = abs.to_string_lossy().into_owned();
+    let guest = client
+        .shell_log
+        .lock()
+        .iter()
+        .rev()
+        .find_map(|s| path_after(s, "cat -- "));
+    assert_eq!(guest.as_deref(), Some(abs_s.as_str()));
 
     let err = env.read_text_file(Path::new("../outside.txt")).await;
     assert!(err.is_err());

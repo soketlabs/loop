@@ -49,7 +49,7 @@ pub enum SandboxError {
 /// Configuration for creating a sandbox.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SandboxConfig {
-    /// Logical workspace root inside the sandbox.
+    /// Logical workspace root (host path; bind-mounted at the same path in the guest).
     pub workdir: PathBuf,
     /// Opaque backend options.
     #[serde(default)]

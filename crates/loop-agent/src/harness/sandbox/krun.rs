@@ -20,8 +20,6 @@ use crate::harness::types::{
     FileSystem, Shell, ShellExecOptions, ShellOutput,
 };
 
-/// Guest bind-mount path for the host workdir.
-pub const KRUN_GUEST_WORKDIR: &str = "/workspace";
 /// Default OCI image.
 pub const KRUN_DEFAULT_IMAGE: &str = "fedora:latest";
 /// Default OCI runtime for `/sandbox local` (rootless containers).
@@ -242,14 +240,19 @@ impl Sandbox for KrunSandbox {
 
         self.client.preflight(&self.runtime).await?;
 
-        let name = format!("loop-sandbox-{}", &self.id[..8.min(self.id.len())]);
+        // Use the full id (no hyphens). UUID v7's first 8 hex chars are timestamp
+        // bits and collide across instances started within ~65s.
+        let name = format!("loop-sandbox-{}", self.id.replace('-', ""));
+        // Mount at the same absolute path inside the guest so host and container
+        // paths match (e.g. `/home/u/proj/README.md` → `/home/u/proj/README.md`).
+        let guest_workdir = self.workdir.to_string_lossy().into_owned();
         let container_id = self
             .client
             .run(PodmanRunOpts {
                 name,
                 image: self.image.clone(),
                 host_workdir: self.workdir.clone(),
-                guest_workdir: KRUN_GUEST_WORKDIR.into(),
+                guest_workdir,
                 runtime: self.runtime.clone(),
                 cpus: self.cpus.clone(),
                 ram_mib: self.ram_mib.clone(),
@@ -331,6 +334,10 @@ impl KrunExecutionEnv {
         }
     }
 
+    /// Resolve a tool path to the absolute path used inside the guest.
+    ///
+    /// The host workdir is bind-mounted at the same absolute path, so guest and
+    /// host paths are identical (no `/workspace` rewrite).
     fn guest_path(&self, path: &Path) -> Result<PathBuf, FileError> {
         if path.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err(FileError::new(
@@ -343,29 +350,16 @@ impl KrunExecutionEnv {
         } else {
             self.host_workdir.join(path)
         };
-        let root = std::fs::canonicalize(&self.host_workdir).unwrap_or_else(|_| self.host_workdir.clone());
-        // For full mode the host path may not exist yet; check prefix without requiring canonicalize.
-        let norm = abs.clone();
-        if !norm.starts_with(&root) && !norm.starts_with(&self.host_workdir) {
-            // Also accept paths already expressed as guest paths under /workspace
-            if let Ok(rest) = path.strip_prefix(KRUN_GUEST_WORKDIR) {
-                return Ok(PathBuf::from(KRUN_GUEST_WORKDIR).join(rest));
-            }
+        let root =
+            std::fs::canonicalize(&self.host_workdir).unwrap_or_else(|_| self.host_workdir.clone());
+        // File may not exist yet; check prefix without requiring canonicalize.
+        if !abs.starts_with(&root) && !abs.starts_with(&self.host_workdir) {
             return Err(FileError::new(
                 FileErrorCode::InvalidPath,
                 format!("path escapes sandbox root: {}", abs.display()),
             ));
         }
-        let rel = norm
-            .strip_prefix(&root)
-            .or_else(|_| norm.strip_prefix(&self.host_workdir))
-            .map_err(|_| {
-                FileError::new(
-                    FileErrorCode::InvalidPath,
-                    format!("path escapes sandbox root: {}", abs.display()),
-                )
-            })?;
-        Ok(PathBuf::from(KRUN_GUEST_WORKDIR).join(rel))
+        Ok(abs)
     }
 
     fn guest_cwd(&self, options: &ShellExecOptions) -> Result<String, ExecutionError> {
@@ -503,7 +497,7 @@ impl FileSystem for KrunExecutionEnv {
         let parent = guest
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| KRUN_GUEST_WORKDIR.into());
+            .unwrap_or_else(|| self.host_workdir.to_string_lossy().into_owned());
         let script = format!(
             "mkdir -p {} && cat > {}",
             sh_quote(&parent),
@@ -531,7 +525,7 @@ impl FileSystem for KrunExecutionEnv {
         let parent = guest
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| KRUN_GUEST_WORKDIR.into());
+            .unwrap_or_else(|| self.host_workdir.to_string_lossy().into_owned());
         let script = format!(
             "mkdir -p {} && cat >> {}",
             sh_quote(&parent),

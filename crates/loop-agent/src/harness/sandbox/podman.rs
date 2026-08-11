@@ -20,7 +20,7 @@ pub struct PodmanRunOpts {
     pub image: String,
     /// Host path bind-mounted to [`Self::guest_workdir`].
     pub host_workdir: std::path::PathBuf,
-    /// Guest mount point (e.g. `/workspace`).
+    /// Guest mount point (same absolute path as the host workdir).
     pub guest_workdir: String,
     /// OCI runtime (`crun`, `runc`, `runsc`, `krun`).
     pub runtime: String,
@@ -306,6 +306,8 @@ impl PodmanClient for RealPodmanClient {
         let mut args: Vec<String> = vec![
             "run".into(),
             "-d".into(),
+            "--replace".into(),
+            "--rm".into(),
             "--runtime".into(),
             opts.runtime.clone(),
             "--name".into(),
