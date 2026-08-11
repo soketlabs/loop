@@ -20,9 +20,12 @@ use loop_agent::harness::{
     format_prompt_template_invocation, AgentHarnessPhase, KrunSandbox, Sandbox, SandboxMode,
     SessionForkPoint, SessionForkSelection,
 };
-use loop_agent::types::{AgentEvent, AgentThinkingLevel};
+use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel};
 use loop_ai::providers::{SOKET_BASE_URL, SOKET_PROVIDER_ID};
-use loop_ai::{Credential, CredentialStore, ModelsRefreshOptions, ToolResultContent};
+use loop_ai::{
+    calculate_context_tokens, Credential, CredentialStore, Message, ModelsRefreshOptions,
+    ToolResultContent, Usage,
+};
 
 use crate::commands::{self, AutocompleteEntry, CommandEffect};
 use crate::keybindings::{hotkey_help, Action};
@@ -34,9 +37,9 @@ use crate::tool_approval::{
 };
 use crate::tui::{
     chat_items_from_agent_messages, filter_files, find_at_mention, find_tool_index,
-    format_item_lines, insert_text, item_is_committed, list_files, render_lines_to_buffer,
-    tool_args_summary, welcome_lines, CardStatus, ChatItem, FileEntry, FOOTER_HEIGHT, FooterOpts,
-    InputBuffer, PickerRow, PickerView,
+    format_item_lines, format_token_usage_line, insert_text, item_is_committed, list_files,
+    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, FileEntry,
+    FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow, PickerView,
 };
 
 enum UiEvent {
@@ -100,6 +103,91 @@ struct QueuedMessage {
     display: String,
     /// Sent to `harness.prompt`.
     prompt: String,
+}
+
+/// Live token / context stats for the footer usage line.
+#[derive(Debug, Clone)]
+struct TokenBarState {
+    total_tokens: u64,
+    context_tokens: Option<u64>,
+    context_window: u64,
+}
+
+impl TokenBarState {
+    fn from_model(runtime: &Runtime) -> Self {
+        let context_window = runtime
+            .models
+            .get_model(
+                &runtime.settings.default_provider,
+                &runtime.settings.default_model,
+            )
+            .map(|m| m.context_window)
+            .unwrap_or(0);
+        Self {
+            total_tokens: 0,
+            context_tokens: Some(0),
+            context_window,
+        }
+    }
+
+    async fn load(runtime: &Runtime) -> Self {
+        let mut state = Self::from_model(runtime);
+        state.refresh(runtime).await;
+        state
+    }
+
+    async fn refresh(&mut self, runtime: &Runtime) {
+        self.sync_window(runtime);
+        if let Ok(stats) = runtime.harness.session_stats().await {
+            self.total_tokens = stats.tokens.total_tokens();
+            if let Some(ctx) = stats.context_usage {
+                self.context_tokens = ctx.tokens;
+                self.context_window = ctx.context_window;
+            }
+        }
+    }
+
+    fn sync_window(&mut self, runtime: &Runtime) {
+        if let Some(m) = runtime.models.get_model(
+            &runtime.settings.default_provider,
+            &runtime.settings.default_model,
+        ) {
+            self.context_window = m.context_window;
+        }
+    }
+
+    fn reset(&mut self, runtime: &Runtime) {
+        *self = Self::from_model(runtime);
+    }
+
+    fn apply_usage(&mut self, usage: &Usage) {
+        self.total_tokens = self
+            .total_tokens
+            .saturating_add(usage.input)
+            .saturating_add(usage.output)
+            .saturating_add(usage.cache_read)
+            .saturating_add(usage.cache_write);
+        let ctx = calculate_context_tokens(usage);
+        if ctx > 0 {
+            self.context_tokens = Some(ctx);
+        }
+    }
+
+    fn apply_message(&mut self, message: &AgentMessage) {
+        match message {
+            AgentMessage::Llm(Message::Assistant(a)) => self.apply_usage(&a.usage),
+            AgentMessage::Llm(Message::ToolResult(t)) => {
+                if let Some(usage) = &t.usage {
+                    self.apply_usage(usage);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn usage_line(&self) -> String {
+        format_token_usage_line(self.total_tokens, self.context_tokens, self.context_window)
+    }
 }
 
 /// Run the interactive CLI (inline viewport — native terminal scrollback).
@@ -253,6 +341,8 @@ async fn run_loop(
     let mut last_spin = Instant::now();
     let version = env!("CARGO_PKG_VERSION");
     let path_line = path_status_line(&runtime.cwd);
+    let mut token_bar = TokenBarState::load(runtime).await;
+    let mut refresh_token_bar = false;
 
     // Welcome banner into terminal scrollback (above the footer).
     print_welcome(terminal, runtime, version)?;
@@ -460,6 +550,11 @@ async fn run_loop(
 
         let live: Vec<ChatItem> = chat[flushed..].to_vec();
         let setup_mode = pending_login.is_some();
+        if refresh_token_bar {
+            token_bar.refresh(runtime).await;
+            refresh_token_bar = false;
+        }
+        let usage_line = token_bar.usage_line();
 
         terminal.draw(|f| {
             crate::tui::draw_footer(
@@ -479,6 +574,7 @@ async fn run_loop(
                     mask_input: setup_mode,
                     path_line: &path_line,
                     model_line: &model_line,
+                    usage_line: &usage_line,
                 },
             );
         })?;
@@ -497,6 +593,8 @@ async fn run_loop(
                 &mut streaming_thinking,
                 &mut working,
                 &mut message_queue,
+                &mut token_bar,
+                &mut refresh_token_bar,
             );
             continue;
         }
@@ -531,8 +629,11 @@ async fn run_loop(
                         at_mention.as_ref(),
                         &mut ac_selected,
                         &tx,
+                        &mut token_bar,
+                        &mut refresh_token_bar,
                     )
                     .await?;
+                    token_bar.sync_window(runtime);
                 }
                 Event::Resize(w, _) => {
                     let _ = terminal.autoresize();
@@ -593,6 +694,8 @@ async fn run_loop(
             &mut streaming_thinking,
             &mut working,
             &mut message_queue,
+            &mut token_bar,
+            &mut refresh_token_bar,
         );
     }
 
@@ -877,6 +980,8 @@ fn drain_ui_events(
     streaming_thinking: &mut Option<usize>,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
+    token_bar: &mut TokenBarState,
+    refresh_token_bar: &mut bool,
 ) {
     while let Ok(ev) = rx.try_recv() {
         match ev {
@@ -888,6 +993,8 @@ fn drain_ui_events(
                     streaming_assistant,
                     streaming_thinking,
                     working,
+                    token_bar,
+                    refresh_token_bar,
                 );
             }
             UiEvent::CompactDone(result) => {
@@ -896,6 +1003,9 @@ fn drain_ui_events(
                     Ok(msg) => {
                         chat.push(sys(msg));
                         *status = "ready".into();
+                        // Compaction invalidates prior context estimates until the next turn.
+                        token_bar.context_tokens = None;
+                        *refresh_token_bar = true;
                     }
                     Err(e) => {
                         chat.push(sys(format!("compact failed: {e}")));
@@ -1188,6 +1298,8 @@ async fn handle_key(
     at_mention: Option<&crate::tui::AtMention>,
     ac_selected: &mut usize,
     tx: &mpsc::UnboundedSender<UiEvent>,
+    token_bar: &mut TokenBarState,
+    refresh_token_bar: &mut bool,
 ) -> anyhow::Result<()> {
     if let Some(review) = active_approval.as_mut() {
         match key.code {
@@ -1361,6 +1473,8 @@ async fn handle_key(
                         Some(point.entry_id.as_str()),
                         None,
                         Some(point.text),
+                        token_bar,
+                        refresh_token_bar,
                     )
                     .await;
                 }
@@ -1643,6 +1757,8 @@ async fn handle_key(
                             purge_ui_events,
                             input,
                             tx,
+                            token_bar,
+                            refresh_token_bar,
                         )
                         .await?;
                     }
@@ -1959,6 +2075,8 @@ async fn adopt_forked_session(
     through_entry_id: Option<&str>,
     name: Option<String>,
     draft: Option<String>,
+    token_bar: &mut TokenBarState,
+    refresh_token_bar: &mut bool,
 ) {
     message_queue.clear();
     *streaming_assistant = None;
@@ -1993,6 +2111,8 @@ async fn adopt_forked_session(
             }
             *redraw_request = true;
             *purge_ui_events = true;
+            *refresh_token_bar = true;
+            token_bar.sync_window(runtime);
         }
         Err(e) => {
             chat.push(sys(format!("fork failed: {e}")));
@@ -2020,6 +2140,8 @@ fn handle_agent_event(
     streaming_assistant: &mut Option<usize>,
     streaming_thinking: &mut Option<usize>,
     working: &mut bool,
+    token_bar: &mut TokenBarState,
+    refresh_token_bar: &mut bool,
 ) {
     match ev {
         AgentEvent::AgentStart => {
@@ -2036,6 +2158,7 @@ fn handle_agent_event(
             }
             // Ensure any content that landed after queued bubbles can flush.
             settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
+            *refresh_token_bar = true;
         }
         AgentEvent::MessageStart { message } => {
             // Assistant items are created lazily on the first text delta so that
@@ -2044,7 +2167,8 @@ fn handle_agent_event(
                 *streaming_assistant = None;
             }
         }
-        AgentEvent::MessageEnd { .. } => {
+        AgentEvent::MessageEnd { message } => {
+            token_bar.apply_message(&message);
             *streaming_assistant = None;
             if let Some(idx) = streaming_thinking.take() {
                 if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
@@ -2301,6 +2425,8 @@ async fn apply_effect(
     purge_ui_events: &mut bool,
     input: &mut InputBuffer,
     tx: &mpsc::UnboundedSender<UiEvent>,
+    token_bar: &mut TokenBarState,
+    refresh_token_bar: &mut bool,
 ) -> anyhow::Result<bool> {
     match effect {
         CommandEffect::Quit => return Ok(true),
@@ -2358,6 +2484,7 @@ async fn apply_effect(
                     .settings
                     .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
                 chat.push(sys(format!("model → {provider}/{model}")));
+                token_bar.sync_window(runtime);
             } else {
                 chat.push(sys(format!(
                     "model not found: {provider}/{model} — try /model or refresh"
@@ -2506,6 +2633,7 @@ async fn apply_effect(
                     // Clear screen + scrollback and reprint welcome with the new id.
                     *redraw_request = true;
                     *purge_ui_events = true;
+                    token_bar.reset(runtime);
                 }
                 Err(e) => {
                     chat.push(sys(format!("new session failed: {e}")));
@@ -2763,6 +2891,8 @@ async fn apply_effect(
                 None,
                 None,
                 None,
+                token_bar,
+                refresh_token_bar,
             )
             .await;
         }

@@ -115,6 +115,8 @@ pub struct FooterOpts<'a> {
     pub path_line: &'a str,
     /// Right status (e.g. `soket/qwen3-30b · medium`).
     pub model_line: &'a str,
+    /// Right of the bottom status row (e.g. `12,345 · 23% · 29,440/128,000`).
+    pub usage_line: &'a str,
 }
 
 /// Whether a transcript item is finished and safe to flush into scrollback.
@@ -902,20 +904,92 @@ fn draw_status(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
         )),
         Span::styled(opts.model_line.to_string(), opts.theme.muted()),
     ]);
-    let bottom = if opts.working {
+
+    let status_left = if opts.working {
         let spin = SPINNER_FRAMES[opts.spinner_frame % SPINNER_FRAMES.len()];
-        Line::from(Span::styled(
-            format!(" {spin} {}", opts.status),
-            opts.theme.accent(),
-        ))
+        format!(" {spin} {}", opts.status)
     } else {
-        Line::from(Span::styled(
-            format!(" {}", opts.status),
-            opts.theme.dim(),
-        ))
+        format!(" {}", opts.status)
+    };
+    let usage = opts.usage_line;
+    let gap = area.width.saturating_sub(
+        (UnicodeWidthStr::width(status_left.as_str()) + UnicodeWidthStr::width(usage)) as u16,
+    ) as usize;
+    let bottom = if opts.working {
+        Line::from(vec![
+            Span::styled(status_left, opts.theme.accent()),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(usage.to_string(), opts.theme.muted()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(status_left, opts.theme.dim()),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(usage.to_string(), opts.theme.muted()),
+        ])
     };
     frame.render_widget(Paragraph::new(top), chunks[0]);
     frame.render_widget(Paragraph::new(bottom), chunks[1]);
+}
+
+/// Format a token count for the footer: commas below 1M, then `M` / `B` with decimals.
+pub fn format_compact_tokens(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format_token_unit(n as f64 / 1_000_000_000.0, 'B')
+    } else if n >= 1_000_000 {
+        format_token_unit(n as f64 / 1_000_000.0, 'M')
+    } else {
+        format_commas(n)
+    }
+}
+
+fn format_token_unit(v: f64, unit: char) -> String {
+    let rounded = (v * 10.0).round() / 10.0;
+    if (rounded - rounded.trunc()).abs() < f64::EPSILON {
+        format!("{:.0}{unit}", rounded)
+    } else {
+        format!("{rounded:.1}{unit}")
+    }
+}
+
+fn format_commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out.chars().rev().collect()
+}
+
+/// Footer usage summary: `total · pct% · current/window`.
+pub fn format_token_usage_line(
+    total_tokens: u64,
+    context_tokens: Option<u64>,
+    context_window: u64,
+) -> String {
+    let total = format_compact_tokens(total_tokens);
+    if context_window == 0 {
+        return total;
+    }
+    let window = format_compact_tokens(context_window);
+    match context_tokens {
+        Some(tokens) => {
+            let pct = ((tokens as f64 / context_window as f64) * 100.0).clamp(0.0, 999.0);
+            let pct_label = if pct < 10.0 {
+                format!("{pct:.1}%")
+            } else {
+                format!("{:.0}%", pct.round())
+            };
+            format!(
+                "{total} · {pct_label} · {}/{window}",
+                format_compact_tokens(tokens)
+            )
+        }
+        None => format!("{total} · —/{window}"),
+    }
 }
 
 fn picker_height(picker: &PickerView) -> u16 {
@@ -1409,5 +1483,35 @@ mod tests {
             } if id == "call_1" && name == "bash" && detail.contains("a.rs")
         ));
         assert!(matches!(&items[4], ChatItem::User { text } if text == "thanks"));
+    }
+
+    #[test]
+    fn compact_tokens_uses_commas_then_m_b() {
+        assert_eq!(format_compact_tokens(0), "0");
+        assert_eq!(format_compact_tokens(999), "999");
+        assert_eq!(format_compact_tokens(1_000), "1,000");
+        assert_eq!(format_compact_tokens(12_345), "12,345");
+        assert_eq!(format_compact_tokens(999_999), "999,999");
+        assert_eq!(format_compact_tokens(1_000_000), "1M");
+        assert_eq!(format_compact_tokens(1_250_000), "1.3M");
+        assert_eq!(format_compact_tokens(1_000_000_000), "1B");
+        assert_eq!(format_compact_tokens(2_500_000_000), "2.5B");
+    }
+
+    #[test]
+    fn usage_line_shows_total_percent_and_window() {
+        assert_eq!(
+            format_token_usage_line(12_345, Some(29_440), 128_000),
+            "12,345 · 23% · 29,440/128,000"
+        );
+        assert_eq!(
+            format_token_usage_line(500, Some(500), 128_000),
+            "500 · 0.4% · 500/128,000"
+        );
+        assert_eq!(
+            format_token_usage_line(1_000, None, 128_000),
+            "1,000 · —/128,000"
+        );
+        assert_eq!(format_token_usage_line(42, None, 0), "42");
     }
 }
