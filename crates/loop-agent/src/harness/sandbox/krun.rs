@@ -13,7 +13,7 @@ use crate::harness::sandbox::podman::{
     PodmanClient, PodmanExecOpts, PodmanRunOpts, RealPodmanClient,
 };
 use crate::harness::sandbox::traits::{
-    Sandbox, SandboxConfig, SandboxError, SandboxFactory, SandboxStatus,
+    Sandbox, SandboxConfig, SandboxError, SandboxFactory, SandboxInfo, SandboxStatus,
 };
 use crate::harness::types::{
     ExecutionError, ExecutionErrorCode, ExecutionEnv, FileError, FileErrorCode, FileInfo,
@@ -223,6 +223,28 @@ impl Sandbox for KrunSandbox {
 
     fn status(&self) -> SandboxStatus {
         *self.status.read()
+    }
+
+    fn info(&self) -> SandboxInfo {
+        let container = self
+            .container_id
+            .read()
+            .clone()
+            .unwrap_or_else(|| "—".into());
+        SandboxInfo::enabled(
+            self.kind(),
+            vec![
+                ("Status".into(), self.status().to_string()),
+                ("Isolation".into(), self.isolation.as_str().into()),
+                ("Runtime".into(), self.runtime.clone()),
+                ("Image".into(), self.image.clone()),
+                ("Workdir".into(), self.workdir.display().to_string()),
+                ("Container".into(), container),
+                ("CPUs".into(), self.cpus.clone()),
+                ("RAM".into(), format!("{} MiB", self.ram_mib)),
+                ("Id".into(), self.id.clone()),
+            ],
+        )
     }
 
     fn env(&self) -> Arc<dyn ExecutionEnv> {

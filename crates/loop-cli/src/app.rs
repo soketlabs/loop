@@ -2492,11 +2492,14 @@ async fn apply_effect(
             }
         }
         CommandEffect::SetSandbox(mode) => {
-            if mode.is_empty() {
-                chat.push(sys(format!(
-                    "sandbox mode: {} (use /sandbox off|local [--full|--partial] [--crun|--runc|--runsc|--krun])",
-                    runtime.settings.sandbox.display()
-                )));
+            if mode.is_empty() || mode.trim() == "status" {
+                let info = runtime.harness.sandbox_info().await;
+                chat.push(sys(info.format_box()));
+                if mode.is_empty() {
+                    chat.push(sys(
+                        "use /sandbox status|off|local [--full|--partial] [--crun|--runc|--runsc|--krun]",
+                    ));
+                }
                 return Ok(false);
             }
             let parts: Vec<&str> = mode.split_whitespace().collect();
@@ -2584,7 +2587,7 @@ async fn apply_effect(
                 other => {
                     let joined = other.join(" ");
                     chat.push(sys(format!(
-                        "unknown sandbox '{joined}' (off|local [--full|--partial] [--crun|--runc|--runsc|--krun])"
+                        "unknown sandbox '{joined}' (status|off|local [--full|--partial] [--crun|--runc|--runsc|--krun])"
                     )));
                 }
             }

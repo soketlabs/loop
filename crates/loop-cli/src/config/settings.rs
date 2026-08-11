@@ -81,7 +81,7 @@ impl Default for SandboxSettings {
 }
 
 impl SandboxSettings {
-    /// Human-readable status for `/sandbox` with no args.
+    /// Human-readable short status (settings only; prefer harness `sandbox_info` for live details).
     pub fn display(&self) -> String {
         match self.mode.as_str() {
             "local" => format!("local --{} --{}", self.isolation, self.runtime),

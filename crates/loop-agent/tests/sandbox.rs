@@ -11,7 +11,7 @@ use loop_agent::harness::types::{
 use loop_agent::harness::{
     create_read_tool, create_write_tool, KrunIsolation, KrunSandbox, KrunSandboxFactory,
     LocalSandboxRuntime, PodmanClient, PodmanExecOpts, PodmanRunOpts, Sandbox, SandboxConfig,
-    SandboxError, SandboxMode, SandboxRegistry, SandboxStatus,
+    SandboxError, SandboxInfo, SandboxMode, SandboxRegistry, SandboxStatus,
 };
 use parking_lot::Mutex;
 use serde_json::json;
@@ -240,6 +240,16 @@ async fn krun_full_fs_via_exec() {
     assert_eq!(sb.status(), SandboxStatus::Ready);
     assert_eq!(sb.kind(), "local");
     assert_eq!(sb.isolation(), KrunIsolation::Full);
+
+    let info = sb.info();
+    let box_text = info.format_box();
+    assert_eq!(info.fields.iter().find(|(k, _)| k == "Mode").map(|(_, v)| v.as_str()), Some("on"));
+    assert_eq!(info.fields.iter().find(|(k, _)| k == "Kind").map(|(_, v)| v.as_str()), Some("local"));
+    assert!(box_text.contains("full"));
+    assert!(box_text.contains("runc"));
+    assert!(box_text.contains("ready"));
+    // Off helper stays distinct from live instance data.
+    assert_eq!(SandboxInfo::off().fields[0].1, "off");
 
     let env = sb.env();
     env.write_file(Path::new("hello.txt"), b"hi").await.unwrap();

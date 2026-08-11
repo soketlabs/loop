@@ -75,6 +75,7 @@ Ship `dark` and `light`. Custom JSON themes use the same color tokens as pi. Cha
 
 ## Sandbox
 
+`/sandbox` / `/sandbox status` — boxed status (on/off, kind, runtime; not sent to the model)  
 `/sandbox off` — host tools  
 `/sandbox local` — same as `--full --runc` (rootless Podman + runc)  
 `/sandbox local --partial` — host FS (jailed); only `bash` via `podman exec`  

@@ -24,7 +24,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand {
             name: "sandbox",
             description: "Show or change sandbox mode",
-            args_hint: Some("[off|local [--full|--partial] [--crun|--runc|--runsc|--krun]]"),
+            args_hint: Some("[status|off|local [--full|--partial] [--crun|--runc|--runsc|--krun]]"),
         },
         SlashCommand {
             name: "settings",

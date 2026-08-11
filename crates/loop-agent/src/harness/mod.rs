@@ -27,8 +27,8 @@ pub use env::HostExecutionEnv;
 pub use sandbox::{
     check_krun_deps, check_local_sandbox_deps, KrunIsolation, KrunSandbox, KrunSandboxFactory,
     LocalSandboxRuntime, PodmanClient, PodmanExecOpts, PodmanRunOpts, Sandbox, SandboxConfig,
-    SandboxError, SandboxFactory, SandboxMode, SandboxRegistry, SandboxStatus, KRUN_DEFAULT_IMAGE,
-    KRUN_DEFAULT_RUNTIME, LOCAL_DEFAULT_RUNTIME,
+    SandboxError, SandboxFactory, SandboxInfo, SandboxMode, SandboxRegistry, SandboxStatus,
+    KRUN_DEFAULT_IMAGE, KRUN_DEFAULT_RUNTIME, LOCAL_DEFAULT_RUNTIME,
 };
 pub use session::{
     create_in_memory_session_store, create_jsonl_session_store, create_scanning_session_search,

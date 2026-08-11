@@ -17,7 +17,7 @@ use crate::harness::compaction::{
 };
 use crate::harness::hooks::{HarnessHookEvent, HookRegistry};
 use crate::harness::prompt_templates::format_prompt_template_invocation;
-use crate::harness::sandbox::{Sandbox, SandboxMode, SandboxStatus};
+use crate::harness::sandbox::{Sandbox, SandboxInfo, SandboxMode, SandboxStatus};
 use crate::harness::session::types::{PendingSessionWrite, Session, SessionTreeEntry};
 use crate::harness::skills::format_skill_invocation;
 use crate::harness::types::{
@@ -292,6 +292,14 @@ impl AgentHarness {
         let prev = std::mem::replace(&mut *self.sandbox.write().await, SandboxMode::Disabled);
         if let SandboxMode::Enabled { sandbox } = prev {
             let _ = sandbox.destroy().await;
+        }
+    }
+
+    /// Printable sandbox status for `/sandbox status` (CLI only; not sent to the model).
+    pub async fn sandbox_info(&self) -> SandboxInfo {
+        match &*self.sandbox.read().await {
+            SandboxMode::Disabled => SandboxInfo::off(),
+            SandboxMode::Enabled { sandbox } => sandbox.info(),
         }
     }
 
