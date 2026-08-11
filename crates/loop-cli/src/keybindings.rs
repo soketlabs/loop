@@ -273,5 +273,6 @@ pub fn hotkey_help() -> Vec<(&'static str, &'static str)> {
         ("alt+up", "Remove last queued message"),
         ("ctrl+g", "External editor"),
         ("/", "Slash commands"),
+        ("!command", "Run shell locally (not sent to the model)"),
     ]
 }

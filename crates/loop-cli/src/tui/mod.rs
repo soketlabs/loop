@@ -47,6 +47,12 @@ pub enum ChatItem {
         detail: String,
         status: CardStatus,
     },
+    /// Local `!command` output — always shown in full (never collapsed).
+    Shell {
+        command: String,
+        output: String,
+        exit_code: Option<i32>,
+    },
     System { text: String },
 }
 
@@ -119,7 +125,7 @@ pub fn item_is_committed(
     streaming_thinking: Option<usize>,
 ) -> bool {
     match item {
-        ChatItem::User { .. } | ChatItem::System { .. } => true,
+        ChatItem::User { .. } | ChatItem::System { .. } | ChatItem::Shell { .. } => true,
         // Keep queued messages in the live footer so Esc can still remove them.
         ChatItem::Queued { .. } => false,
         ChatItem::Assistant { .. } => streaming_assistant != Some(index),
@@ -507,6 +513,13 @@ pub fn format_item_lines(
             }
             lines.push(Line::from(""));
         }
+        ChatItem::Shell {
+            command,
+            output,
+            exit_code,
+        } => {
+            lines.extend(format_shell_box(command, output, *exit_code, theme, w));
+        }
         ChatItem::System { text } => {
             for l in text.lines() {
                 lines.extend(wrap_plain(l, theme.dim(), w));
@@ -515,6 +528,107 @@ pub fn format_item_lines(
         }
     }
     lines
+}
+
+/// Always-visible boxed `!command` output.
+fn format_shell_box(
+    command: &str,
+    output: &str,
+    exit_code: Option<i32>,
+    theme: &Theme,
+    w: usize,
+) -> Vec<Line<'static>> {
+    let border = theme.style("border");
+    let text = theme.style("text");
+    let code_style = match exit_code {
+        Some(0) | None => theme.style("success"),
+        Some(_) => theme.style("error"),
+    };
+
+    // Inner width between the vertical borders (`│` + content + `│`).
+    let inner = w.saturating_sub(2).max(8);
+    let content_w = inner.saturating_sub(2).max(1); // side padding inside the box
+
+    let hline = |l: char, r: char| -> Line<'static> {
+        Line::from(Span::styled(
+            format!("{l}{}{r}", "─".repeat(inner)),
+            border,
+        ))
+    };
+    let pad_row = |spans: Vec<Span<'static>>| -> Line<'static> {
+        let used: usize = spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        let mut all = vec![Span::styled("│".to_string(), border)];
+        all.extend(spans);
+        if used < inner {
+            all.push(Span::raw(" ".repeat(inner - used)));
+        }
+        all.push(Span::styled("│".to_string(), border));
+        Line::from(all)
+    };
+    let content_row = |prefix: Vec<Span<'static>>, body: String, body_style: Style| -> Line<'static> {
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(prefix);
+        spans.push(Span::styled(body, body_style));
+        pad_row(spans)
+    };
+
+    let mut out = Vec::new();
+    out.push(hline('╭', '╮'));
+
+    // Command header: `$ cmd` (wrap long commands).
+    let mut cmd_first = true;
+    for part in soft_wrap(command, content_w.saturating_sub(2).max(1)) {
+        if cmd_first {
+            out.push(content_row(
+                vec![Span::styled("$ ".to_string(), theme.accent())],
+                part,
+                text,
+            ));
+            cmd_first = false;
+        } else {
+            out.push(content_row(
+                vec![Span::raw("  ".to_string())],
+                part,
+                text,
+            ));
+        }
+    }
+    if cmd_first {
+        out.push(content_row(
+            vec![Span::styled("$".to_string(), theme.accent())],
+            String::new(),
+            text,
+        ));
+    }
+
+    if !output.is_empty() {
+        out.push(hline('├', '┤'));
+        for l in output.lines() {
+            if l.is_empty() {
+                out.push(pad_row(Vec::new()));
+                continue;
+            }
+            for part in soft_wrap(l, content_w) {
+                out.push(content_row(Vec::new(), part, text));
+            }
+        }
+    }
+
+    if let Some(code) = exit_code {
+        out.push(hline('├', '┤'));
+        out.push(content_row(
+            Vec::new(),
+            format!("[exit {code}]"),
+            code_style,
+        ));
+    }
+
+    out.push(hline('╰', '╯'));
+    out.push(Line::from(""));
+    out
 }
 
 /// Draw lines into a buffer (used by `insert_before`).

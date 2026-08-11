@@ -1095,6 +1095,72 @@ fn submit_user_text(
     }
 }
 
+/// Run `!command` locally: show output in the transcript, never send to the LLM
+/// or append to the session message list.
+async fn run_bang_command(
+    runtime: &Runtime,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
+    command: &str,
+) {
+    let command = command.trim();
+    if command.is_empty() {
+        let idx = push_before_queued(chat, sys("usage: !command"));
+        bump_stream_index(streaming_assistant, idx);
+        bump_stream_index(streaming_thinking, idx);
+        *status = "ready".into();
+        return;
+    }
+
+    *status = format!("running · !{command}");
+    let env = match runtime.harness.tool_env().await {
+        Ok(env) => env,
+        Err(e) => {
+            let idx = push_before_queued(chat, sys(format!("shell error: {e}")));
+            bump_stream_index(streaming_assistant, idx);
+            bump_stream_index(streaming_thinking, idx);
+            *status = "shell failed".into();
+            return;
+        }
+    };
+
+    let options = loop_agent::harness::types::ShellExecOptions::default();
+    let item = match env.exec(command, options).await {
+        Ok(out) => {
+            let combined = if out.stderr.is_empty() {
+                out.stdout
+            } else if out.stdout.is_empty() {
+                out.stderr
+            } else {
+                format!("{}\n{}", out.stdout, out.stderr)
+            };
+            *status = if out.exit_code == 0 {
+                "done".into()
+            } else {
+                format!("exit {}", out.exit_code)
+            };
+            ChatItem::Shell {
+                command: command.to_string(),
+                output: combined,
+                exit_code: Some(out.exit_code),
+            }
+        }
+        Err(e) => {
+            *status = "shell failed".into();
+            ChatItem::Shell {
+                command: command.to_string(),
+                output: format!("error: {e}"),
+                exit_code: None,
+            }
+        }
+    };
+    let idx = push_before_queued(chat, item);
+    bump_stream_index(streaming_assistant, idx);
+    bump_stream_index(streaming_thinking, idx);
+}
+
 async fn handle_key(
     key: crossterm::event::KeyEvent,
     runtime: &mut Runtime,
@@ -1535,7 +1601,17 @@ async fn handle_key(
                 if line.is_empty() {
                     return Ok(());
                 }
-                if line.starts_with('/') {
+                if let Some(command) = line.strip_prefix('!') {
+                    run_bang_command(
+                        runtime,
+                        chat,
+                        status,
+                        streaming_assistant,
+                        streaming_thinking,
+                        command,
+                    )
+                    .await;
+                } else if line.starts_with('/') {
                     let skill_names: Vec<_> = runtime
                         .resources
                         .skills
