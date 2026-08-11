@@ -17,8 +17,8 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
 use loop_agent::harness::{
-    format_prompt_template_invocation, AgentHarnessPhase, LocalShellSandbox,
-    Sandbox, SandboxConfig, SandboxMode, SessionForkPoint, SessionForkSelection,
+    format_prompt_template_invocation, AgentHarnessPhase, KrunSandbox, Sandbox, SandboxMode,
+    SessionForkPoint, SessionForkSelection,
 };
 use loop_agent::types::{AgentEvent, AgentThinkingLevel};
 use loop_ai::providers::{SOKET_BASE_URL, SOKET_PROVIDER_ID};
@@ -43,6 +43,19 @@ enum UiEvent {
     Agent(AgentEvent),
     /// `/compact` finished (success message or error).
     CompactDone(Result<String, String>),
+    /// `/sandbox` enable/disable finished.
+    SandboxDone(Result<SandboxDoneOk, String>),
+}
+
+/// Successful sandbox switch applied on the UI thread.
+enum SandboxDoneOk {
+    /// Sandbox disabled.
+    Off,
+    /// Local sandbox enabled.
+    Local {
+        isolation: String,
+        runtime: String,
+    },
 }
 
 /// Pending accept/reject prompt for a tool call.
@@ -854,7 +867,7 @@ fn truncate_status(s: &str, max: usize) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn drain_ui_events(
-    runtime: &Runtime,
+    runtime: &mut Runtime,
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
     review_rx: &mut mpsc::UnboundedReceiver<ApprovalPrompt>,
     active_approval: &mut Option<ActiveApproval>,
@@ -886,6 +899,36 @@ fn drain_ui_events(
                     }
                     Err(e) => {
                         chat.push(sys(format!("compact failed: {e}")));
+                        *status = "ready".into();
+                    }
+                }
+            }
+            UiEvent::SandboxDone(result) => {
+                *working = false;
+                match result {
+                    Ok(SandboxDoneOk::Off) => {
+                        runtime.settings.sandbox.mode = "off".into();
+                        let _ = runtime.settings.save_file(
+                            &crate::config::paths::settings_path(&runtime.agent_dir),
+                        );
+                        chat.push(sys("sandbox → off"));
+                        *status = "ready".into();
+                    }
+                    Ok(SandboxDoneOk::Local {
+                        isolation,
+                        runtime: oci,
+                    }) => {
+                        runtime.settings.sandbox.mode = "local".into();
+                        runtime.settings.sandbox.isolation = isolation.clone();
+                        runtime.settings.sandbox.runtime = oci.clone();
+                        let _ = runtime.settings.save_file(
+                            &crate::config::paths::settings_path(&runtime.agent_dir),
+                        );
+                        chat.push(sys(format!("sandbox → local --{isolation} --{oci}")));
+                        *status = "ready".into();
+                    }
+                    Err(e) => {
+                        chat.push(sys(e));
                         *status = "ready".into();
                     }
                 }
@@ -2248,41 +2291,100 @@ async fn apply_effect(
         CommandEffect::SetSandbox(mode) => {
             if mode.is_empty() {
                 chat.push(sys(format!(
-                    "sandbox mode: {} (use /sandbox off|local-shell)",
-                    runtime.settings.sandbox.mode
+                    "sandbox mode: {} (use /sandbox off|local [--full|--partial] [--crun|--runc|--runsc|--krun])",
+                    runtime.settings.sandbox.display()
                 )));
                 return Ok(false);
             }
-            match mode.as_str() {
-                "off" | "disabled" => {
-                    runtime.harness.clear_sandbox().await;
-                    runtime.settings.sandbox.mode = "off".into();
-                    chat.push(sys("sandbox → off"));
-                }
-                "local-shell" | "local" => {
-                    let sb = LocalShellSandbox::new(SandboxConfig {
-                        workdir: runtime.cwd.clone(),
-                        ..Default::default()
-                    });
-                    sb.start()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("sandbox: {e}"))?;
-                    runtime
-                        .harness
-                        .set_sandbox(SandboxMode::Enabled {
-                            sandbox: Arc::new(sb),
-                        })
+            let parts: Vec<&str> = mode.split_whitespace().collect();
+            match parts.as_slice() {
+                ["off"] | ["disabled"] => {
+                    let harness = Arc::clone(&runtime.harness);
+                    let tx = tx.clone();
+                    *working = true;
+                    *status = "disabling sandbox…".into();
+                    chat.push(sys(" "));
+                    chat.push(sys("disabling sandbox…"));
+                    tokio::spawn(async move {
+                        let result = async {
+                            harness.clear_sandbox().await;
+                            let env = harness
+                                .tool_env()
+                                .await
+                                .map_err(|e| format!("sandbox: {e}"))?;
+                            harness
+                                .set_tools(crate::runtime::build_tools(env))
+                                .await
+                                .map_err(|e| format!("sandbox: {e}"))?;
+                            Ok(SandboxDoneOk::Off)
+                        }
                         .await;
-                    runtime.settings.sandbox.mode = "local-shell".into();
-                    chat.push(sys("sandbox → local-shell"));
+                        let _ = tx.send(UiEvent::SandboxDone(result));
+                    });
+                    return Ok(false);
                 }
-                other => chat.push(sys(format!(
-                    "unknown sandbox '{other}' (off|local-shell)"
-                ))),
+                ["local", rest @ ..] => {
+                    let (isolation, oci_runtime) = match commands::parse_local_sandbox_flags(rest) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            chat.push(sys(e));
+                            return Ok(false);
+                        }
+                    };
+                    let harness = Arc::clone(&runtime.harness);
+                    let cwd = runtime.cwd.clone();
+                    let tx = tx.clone();
+                    let iso_s = isolation.as_str().to_string();
+                    let rt_s = oci_runtime.as_str().to_string();
+                    *working = true;
+                    *status = format!("enabling sandbox (--{iso_s} --{rt_s})…");
+                    chat.push(sys(" "));
+                    chat.push(sys(format!(
+                        "enabling sandbox (--{iso_s} --{rt_s})…"
+                    )));
+                    tokio::spawn(async move {
+                        let result = async {
+                            let sb = KrunSandbox::new(KrunSandbox::config_for(
+                                cwd,
+                                isolation,
+                                oci_runtime,
+                            ));
+                            sb.start().await.map_err(|e| e.to_string())?;
+                            let env = sb.env();
+                            if let Err(e) = harness
+                                .set_tools(crate::runtime::build_tools(Arc::clone(&env)))
+                                .await
+                            {
+                                let _ = sb.destroy().await;
+                                return Err(format!("sandbox: {e}"));
+                            }
+                            harness
+                                .set_sandbox(SandboxMode::Enabled {
+                                    sandbox: Arc::new(sb),
+                                })
+                                .await;
+                            Ok(SandboxDoneOk::Local {
+                                isolation: iso_s,
+                                runtime: rt_s,
+                            })
+                        }
+                        .await;
+                        let _ = tx.send(UiEvent::SandboxDone(result));
+                    });
+                    return Ok(false);
+                }
+                ["remote", ..] => {
+                    chat.push(sys(
+                        "remote sandbox is not implemented yet (use /sandbox local …)",
+                    ));
+                }
+                other => {
+                    let joined = other.join(" ");
+                    chat.push(sys(format!(
+                        "unknown sandbox '{joined}' (off|local [--full|--partial] [--crun|--runc|--runsc|--krun])"
+                    )));
+                }
             }
-            let _ = runtime
-                .settings
-                .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
         }
         CommandEffect::Login(provider) => {
             let p = provider.unwrap_or_else(|| SOKET_PROVIDER_ID.into());
@@ -2467,7 +2569,7 @@ async fn apply_effect(
                 runtime.settings.default_model,
                 runtime.settings.theme,
                 runtime.settings.default_thinking_level,
-                runtime.settings.sandbox.mode,
+                runtime.settings.sandbox.display(),
                 runtime.settings.file_edit_review,
                 runtime
                     .settings

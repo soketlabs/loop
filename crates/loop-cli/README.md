@@ -71,7 +71,24 @@ Ship `dark` and `light`. Custom JSON themes use the same color tokens as pi. Cha
 ## Sandbox
 
 `/sandbox off` — host tools  
-`/sandbox local-shell` — soft workdir isolation via `LocalShellSandbox`
+`/sandbox local` — same as `--full --runc` (rootless Podman + runc)  
+`/sandbox local --partial` — host FS (jailed); only `bash` via `podman exec`  
+`/sandbox local --full --runsc` — gVisor  
+`/sandbox local --partial --krun` — libkrun microVM  
+
+**Runtimes** (pick one):
+- `--runc` (default) — rootless containers; needs `podman` + `runc`
+- `--crun` — same model with `crun`
+- `--runsc` / `--gvisor` — gVisor; needs `runsc`
+- `--krun` — microVM; needs `crun-krun` + `/dev/kvm`
+
+**Isolation** (pick one): `--full` (default) or `--partial`.
+
+If deps for the chosen runtime are missing, Loop prints install instructions and leaves sandbox **off**. Startup with `"mode": "local"` falls back to off with a warning. Remote sandbox is reserved (`/sandbox remote …`).
+
+```json
+{ "sandbox": { "mode": "local", "isolation": "full", "runtime": "runc" } }
+```
 
 ## File edit review / tool approval
 

@@ -62,7 +62,7 @@ pub struct SandboxConfig {
 /// A sandbox yields an [`ExecutionEnv`] for tool calls when enabled.
 #[async_trait]
 pub trait Sandbox: Send + Sync {
-    /// Stable kind id (`local-shell`, `docker`, …).
+    /// Stable kind id (`local`, `remote`, …).
     fn kind(&self) -> &str;
     /// Instance id.
     fn id(&self) -> &str;

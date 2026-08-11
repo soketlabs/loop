@@ -278,14 +278,21 @@ impl AgentHarness {
         *self.phase.lock()
     }
 
-    /// Set sandbox mode (applies on next turn).
+    /// Set sandbox mode (applies on next turn). Destroys any previous sandbox.
     pub async fn set_sandbox(&self, mode: SandboxMode) {
+        let prev = std::mem::replace(&mut *self.sandbox.write().await, SandboxMode::Disabled);
+        if let SandboxMode::Enabled { sandbox } = prev {
+            let _ = sandbox.destroy().await;
+        }
         *self.sandbox.write().await = mode;
     }
 
-    /// Disable sandbox.
+    /// Disable sandbox and destroy the previous instance if any.
     pub async fn clear_sandbox(&self) {
-        *self.sandbox.write().await = SandboxMode::Disabled;
+        let prev = std::mem::replace(&mut *self.sandbox.write().await, SandboxMode::Disabled);
+        if let SandboxMode::Enabled { sandbox } = prev {
+            let _ = sandbox.destroy().await;
+        }
     }
 
     /// Ensure sandbox ready when enabled.
