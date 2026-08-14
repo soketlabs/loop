@@ -3,9 +3,11 @@
 pub mod editor;
 pub mod file_mentions;
 pub mod highlight;
+pub mod history;
 pub mod markdown;
 
 pub use editor::InputBuffer;
+pub use history::CommandHistory;
 pub use file_mentions::{filter_files, find_at_mention, insert_text, list_files, AtMention, FileEntry};
 
 use ratatui::buffer::Buffer;

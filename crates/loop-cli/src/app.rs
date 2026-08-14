@@ -38,8 +38,8 @@ use crate::tool_approval::{
 use crate::tui::{
     chat_items_from_agent_messages, filter_files, find_at_mention, find_tool_index,
     format_item_lines, format_token_usage_line, insert_text, item_is_committed, list_files,
-    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, FileEntry,
-    FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow, PickerView,
+    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, CommandHistory,
+    FileEntry, FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow, PickerView,
 };
 
 enum UiEvent {
@@ -294,6 +294,7 @@ async fn run_loop(
     };
     let mut flushed = 0usize;
     let mut input = InputBuffer::new();
+    let mut history = CommandHistory::load(crate::config::paths::history_path(&runtime.agent_dir));
     let mut status: String = if runtime.needs_api_key_setup {
         "setup · paste your API key · enter save".into()
     } else if runtime.resumed {
@@ -606,6 +607,7 @@ async fn run_loop(
                         key,
                         runtime,
                         &mut input,
+                        &mut history,
                         &mut chat,
                         &mut status,
                         &mut clear_presses,
@@ -1275,6 +1277,7 @@ async fn handle_key(
     key: crossterm::event::KeyEvent,
     runtime: &mut Runtime,
     input: &mut InputBuffer,
+    history: &mut CommandHistory,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     clear_presses: &mut u8,
@@ -1661,6 +1664,7 @@ async fn handle_key(
                     *status = "ctrl+c again to quit".into();
                 } else {
                     input.clear();
+                    history.reset_browse();
                 }
                 return Ok(());
             }
@@ -1711,6 +1715,7 @@ async fn handle_key(
             }
             Action::Submit => {
                 let line = input.as_str().trim().to_string();
+                history.push(&line);
                 input.clear();
                 if line.is_empty() {
                     return Ok(());
@@ -1789,11 +1794,19 @@ async fn handle_key(
                 return Ok(());
             }
             Action::MoveUp => {
-                let _ = input.move_up();
+                if !input.move_up() {
+                    if let Some(text) = history.previous(input.as_str()) {
+                        input.set(text);
+                    }
+                }
                 return Ok(());
             }
             Action::MoveDown => {
-                let _ = input.move_down();
+                if !input.move_down() {
+                    if let Some(text) = history.next() {
+                        input.set(text);
+                    }
+                }
                 return Ok(());
             }
             Action::MoveWordLeft => {
@@ -1895,6 +1908,7 @@ async fn handle_key(
             Action::FollowUp => {
                 let line = input.as_str().trim().to_string();
                 if !line.is_empty() {
+                    history.push(&line);
                     input.clear();
                     submit_user_text(
                         runtime,
