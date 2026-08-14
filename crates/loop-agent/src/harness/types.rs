@@ -222,6 +222,9 @@ pub enum AgentHarnessPhase {
     BranchSummary,
     /// Retrying summarization.
     Retry,
+    /// Running a multi-agent workflow.
+    #[cfg(feature = "orchestration")]
+    Workflow,
 }
 
 /// Compaction result.
@@ -263,6 +266,9 @@ pub enum AgentHarnessError {
     /// Sandbox error.
     #[error("sandbox: {0}")]
     Sandbox(String),
+    /// Agent loop error (preserves structured error from the inner turn loop).
+    #[error("agent loop: {0}")]
+    AgentLoop(#[from] crate::agent_loop::AgentLoopError),
     /// Other.
     #[error("{0}")]
     Other(String),

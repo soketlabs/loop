@@ -1,0 +1,25 @@
+[package]
+name = "loop-orchestration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Multi-agent orchestration: planner, workflow, scheduler, and memory"
+
+[features]
+default = []
+sqlite = ["dep:rusqlite"]
+
+[dependencies]
+loop-ai = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+tokio-stream = { workspace = true }
+rusqlite = { workspace = true, optional = true }

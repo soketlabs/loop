@@ -13,7 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 loop-ai = { workspace = true }
-loop-agent = { workspace = true }
+loop-agent = { workspace = true, features = ["mcp"] }
+loop-mcp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -45,6 +46,8 @@ walkdir = { workspace = true }
 ignore = { workspace = true }
 tempfile = { workspace = true }
 regex = { workspace = true }
+axum = { workspace = true }
+rmcp = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

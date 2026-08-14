@@ -2583,6 +2583,54 @@ async fn apply_effect(
             )
             .await;
         }
+        CommandEffect::Mcp(sub) => {
+            let sub = sub.trim();
+            match sub {
+                "list" | "" => {
+                    let conns = runtime.mcp_client.list_connections().await;
+                    if conns.is_empty() {
+                        chat.push(sys("No MCP servers connected.\n\nConfigure in settings.json under \"mcpServers\", then /reload or /mcp reload."));
+                    } else {
+                        let mut text = format!("MCP connections ({}):\n", conns.len());
+                        for (name, count) in &conns {
+                            text.push_str(&format!("  {name} — {count} tools\n"));
+                        }
+                        chat.push(sys(text));
+                    }
+                }
+                "reload" => {
+                    runtime.mcp_client.disconnect_all().await;
+                    if runtime.settings.mcp_servers.is_empty() {
+                        chat.push(sys("No MCP servers configured in settings.json"));
+                    } else {
+                        let entries = crate::runtime::mcp_server_entries(&runtime.settings.mcp_servers);
+                        let results = runtime.mcp_client.connect_all(&entries).await;
+                        let mut text = String::from("MCP reload:\n");
+                        for (name, result) in &results {
+                            match result {
+                                Ok(count) => text.push_str(&format!("  ✓ {name} — {count} tools\n")),
+                                Err(e) => text.push_str(&format!("  ✗ {name} — {e}\n")),
+                            }
+                        }
+                        let mcp_tools = loop_agent::harness::mcp::bridge::mcp_tools_to_agent_tools_async(
+                            runtime.mcp_client.connections(),
+                        ).await;
+                        let mut all_tools: Vec<_> = runtime.harness.get_tools().await
+                            .into_iter()
+                            .filter(|t| !t.name.starts_with("mcp__"))
+                            .collect();
+                        all_tools.extend(mcp_tools);
+                        if let Err(e) = runtime.harness.set_tools(all_tools).await {
+                            text.push_str(&format!("  error setting tools: {e}\n"));
+                        }
+                        chat.push(sys(text));
+                    }
+                }
+                other => {
+                    chat.push(sys(format!("Unknown /mcp sub-command: {other}\n\nUsage: /mcp [list|reload]")));
+                }
+            }
+        }
         CommandEffect::Skill { name, args } => {
             if let Some(skill) = runtime.resources.skills.iter().find(|s| s.name == name) {
                 let prompt = format_skill_invocation(skill, &args);
