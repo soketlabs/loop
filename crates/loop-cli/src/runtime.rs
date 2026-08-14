@@ -9,10 +9,10 @@ use rustyline::DefaultEditor;
 use loop_agent::harness::{
     create_bash_tool, create_edit_tool, create_read_tool, create_session_repository,
     create_sqlite_session_store, create_write_tool, AgentHarness, AgentHarnessOptions,
-    AgentHarnessResources, HostExecutionEnv, LocalShellSandbox, Sandbox, SandboxConfig,
-    SandboxMode,
+    AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime,
+    Sandbox, SandboxMode,
 };
-use loop_agent::types::AgentThinkingLevel;
+use loop_agent::types::{AgentThinkingLevel, AgentTool};
 use loop_ai::providers::{
     custom_provider, soket_provider, CustomModelSpec, CustomProviderConfig, SOKET_API_KEY_ENVS,
     SOKET_DEFAULT_MODEL_ID, SOKET_PROVIDER_ID,
@@ -73,6 +73,8 @@ pub struct Runtime {
     pub tool_approval: Option<std::sync::Arc<crate::tool_approval::ToolApprovalBridge>>,
     /// MCP client manager for external tool servers.
     pub mcp_client: Arc<loop_mcp::McpClientManager>,
+    /// Skills activated via `/skill:name` (not yet cleared; mirrored on the harness).
+    pub active_skills: Vec<String>,
 }
 
 /// CLI bootstrap flags affecting runtime.
@@ -95,6 +97,16 @@ pub struct BootstrapOpts {
     pub interactive: bool,
     /// Resume session id.
     pub session_id: Option<String>,
+}
+
+/// Build the standard tool set bound to an execution environment.
+pub fn build_tools(env: Arc<dyn loop_agent::harness::ExecutionEnv>) -> Vec<AgentTool> {
+    vec![
+        create_read_tool(Arc::clone(&env)),
+        create_write_tool(Arc::clone(&env)),
+        create_edit_tool(Arc::clone(&env)),
+        create_bash_tool(env),
+    ]
 }
 
 /// Ensure a Soket API key exists, or defer prompting to the TUI when interactive.
@@ -325,7 +337,6 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         selected_tools: &selected,
         tool_snippets: &snippets,
         context_files: &context_files,
-        skills: &resources.skills,
     });
 
     let sessions_db = sessions_db_path(&agent_dir);
@@ -362,29 +373,48 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         }
     }
 
-    let host = Arc::new(HostExecutionEnv::new(&opts.cwd));
-    let tools = vec![
-        create_read_tool(Arc::clone(&host) as _),
-        create_write_tool(Arc::clone(&host) as _),
-        create_edit_tool(Arc::clone(&host) as _),
-        create_bash_tool(Arc::clone(&host) as _),
-    ];
+    let host: Arc<dyn loop_agent::harness::ExecutionEnv> =
+        Arc::new(HostExecutionEnv::new(&opts.cwd));
 
-    let sandbox = match settings.sandbox.mode.as_str() {
-        "local-shell" => {
-            let sb = LocalShellSandbox::new(SandboxConfig {
-                workdir: opts.cwd.clone(),
-                ..Default::default()
-            });
-            sb.start()
-                .await
-                .map_err(|e| anyhow::anyhow!("sandbox: {e}"))?;
-            SandboxMode::Enabled {
-                sandbox: Arc::new(sb),
+    let (sandbox, tool_env): (SandboxMode, Arc<dyn loop_agent::harness::ExecutionEnv>) =
+        match settings.sandbox.mode.as_str() {
+            "local" => {
+                let isolation = KrunIsolation::parse(&settings.sandbox.isolation)
+                    .unwrap_or(KrunIsolation::Full);
+                let oci_runtime = LocalSandboxRuntime::parse(&settings.sandbox.runtime)
+                    .unwrap_or(LocalSandboxRuntime::Runc);
+                settings.sandbox.isolation = isolation.as_str().into();
+                settings.sandbox.runtime = oci_runtime.as_str().into();
+                let sb = KrunSandbox::new(KrunSandbox::config_for(
+                    opts.cwd.clone(),
+                    isolation,
+                    oci_runtime,
+                ));
+                match sb.start().await {
+                    Ok(()) => {
+                        let env = sb.env();
+                        (
+                            SandboxMode::Enabled {
+                                sandbox: Arc::new(sb),
+                            },
+                            env,
+                        )
+                    }
+                    Err(e) => {
+                        tracing::warn!("local sandbox disabled at startup: {e}");
+                        eprintln!("warning: local sandbox not enabled:\n{e}");
+                        settings.sandbox.mode = "off".into();
+                        (SandboxMode::Disabled, Arc::clone(&host))
+                    }
+                }
             }
-        }
-        _ => SandboxMode::Disabled,
-    };
+            _ => {
+                settings.sandbox.mode = "off".into();
+                (SandboxMode::Disabled, Arc::clone(&host))
+            }
+        };
+
+    let tools = build_tools(Arc::clone(&tool_env));
 
     let session_id = session.metadata().id.clone();
     let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
@@ -458,6 +488,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         needs_api_key_setup,
         tool_approval: None,
         mcp_client,
+        active_skills: Vec::new(),
     })
 }
 

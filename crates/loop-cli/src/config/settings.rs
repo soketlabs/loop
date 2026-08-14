@@ -44,12 +44,18 @@ impl Default for CompactionSettingsJson {
 }
 
 /// Sandbox settings.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxSettings {
-    /// `off` or `local-shell`.
+    /// `off` or `local`.
     #[serde(default = "default_sandbox_mode")]
     pub mode: String,
+    /// When `mode` is `local`: `full` or `partial`.
+    #[serde(default = "default_sandbox_isolation")]
+    pub isolation: String,
+    /// When `mode` is `local`: `runc` (default), `crun`, `runsc`, or `krun`.
+    #[serde(default = "default_sandbox_runtime")]
+    pub runtime: String,
 }
 
 fn default_sandbox_mode() -> String {
@@ -75,6 +81,32 @@ pub struct McpServerConfig {
     /// Extra HTTP headers sent with every request (remote only).
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+fn default_sandbox_isolation() -> String {
+    "full".into()
+}
+
+fn default_sandbox_runtime() -> String {
+    "runc".into()
+}
+
+impl Default for SandboxSettings {
+    fn default() -> Self {
+        Self {
+            mode: default_sandbox_mode(),
+            isolation: default_sandbox_isolation(),
+            runtime: default_sandbox_runtime(),
+        }
+    }
+}
+
+impl SandboxSettings {
+    /// Human-readable short status (settings only; prefer harness `sandbox_info` for live details).
+    pub fn display(&self) -> String {
+        match self.mode.as_str() {
+            "local" => format!("local --{} --{}", self.isolation, self.runtime),
+            other => other.to_string(),
+        }
+    }
 }
 
 /// User / project settings.

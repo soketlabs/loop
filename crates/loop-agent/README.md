@@ -13,7 +13,7 @@ Inspired by `@earendil-works/pi-agent-core`, implemented in pure Rust for a unif
 | Harness | `harness::AgentHarness` | Sessions, snapshots, sandbox, resources |
 | Sessions | `harness::session` | Memory, JSONL, SQLite (+ FTS), scanning search |
 | Tools | `harness::tools` | `read` / `write` / `edit` / `bash` over `ExecutionEnv` |
-| Sandbox | `harness::sandbox` | Pluggable env for tool side-effects (`LocalShellSandbox`) |
+| Sandbox | `harness::sandbox` | Pluggable env for tool side-effects (`KrunSandbox` / local krun) |
 
 ## Quick start
 
@@ -44,11 +44,18 @@ agent.prompt("Hello").await.unwrap();
 When harness sandbox mode is enabled, tool FS/shell ops use `sandbox.env()`:
 
 ```rust
-use loop_agent::harness::{LocalShellSandbox, SandboxConfig, SandboxMode};
-// SandboxMode::Enabled { sandbox: Arc::new(LocalShellSandbox::new(...)) }
+use loop_agent::harness::{KrunIsolation, KrunSandbox, LocalSandboxRuntime, SandboxMode};
+// SandboxMode::Enabled { sandbox: Arc::new(KrunSandbox::new(
+//     KrunSandbox::config_for(workdir, KrunIsolation::Full, LocalSandboxRuntime::Runc))) }
 ```
 
-`LocalShellSandbox` is an isolated workdir + sibling shell on the same machine (test/soft isolation, not a security boundary). Register more backends via `SandboxFactory` / `SandboxRegistry` (`docker`, remote, … later).
+`KrunSandbox` (`kind` = `local`) runs a Podman container with a selectable OCI runtime:
+
+- **Runtimes:** `runc` (default), `crun`, `runsc` (gVisor), `krun` (microVM)
+- **full** — `read` / `write` / `edit` / `bash` via `podman exec`
+- **partial** — FS on the host bind-mount (path-jailed); only `bash` via `podman exec`
+
+A future `remote` kind is reserved but not implemented.
 
 ## Sessions
 

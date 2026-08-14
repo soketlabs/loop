@@ -17,7 +17,7 @@ use crate::harness::compaction::{
 };
 use crate::harness::hooks::{HarnessHookEvent, HookRegistry};
 use crate::harness::prompt_templates::format_prompt_template_invocation;
-use crate::harness::sandbox::{Sandbox, SandboxMode, SandboxStatus};
+use crate::harness::sandbox::{Sandbox, SandboxInfo, SandboxMode, SandboxStatus};
 use crate::harness::session::types::{PendingSessionWrite, Session, SessionTreeEntry};
 use crate::harness::skills::format_skill_invocation;
 use crate::harness::types::{
@@ -106,6 +106,9 @@ pub struct AgentHarness {
     active_tool_names: RwLock<Option<Vec<String>>>,
     system_prompt: RwLock<String>,
     resources: RwLock<AgentHarnessResources>,
+    /// Skills activated via `/skill:name` (included in `<available_skills>` even
+    /// when `disable-model-invocation` is set). Does not trigger a prompt.
+    active_skill_names: RwLock<Vec<String>>,
     stream_options: RwLock<SimpleStreamOptions>,
     sandbox: RwLock<SandboxMode>,
     phase: Mutex<AgentHarnessPhase>,
@@ -148,6 +151,7 @@ impl AgentHarness {
             active_tool_names: RwLock::new(None),
             system_prompt: RwLock::new(options.system_prompt),
             resources: RwLock::new(options.resources),
+            active_skill_names: RwLock::new(Vec::new()),
             stream_options: RwLock::new(stream_options),
             sandbox: RwLock::new(options.sandbox),
             phase: Mutex::new(AgentHarnessPhase::Idle),
@@ -218,6 +222,7 @@ impl AgentHarness {
         self.follow_up.lock().clear();
         self.next_turn.lock().clear();
         self.pending_writes.lock().clear();
+        self.active_skill_names.write().await.clear();
 
         Ok(id)
     }
@@ -267,6 +272,7 @@ impl AgentHarness {
         self.follow_up.lock().clear();
         self.next_turn.lock().clear();
         self.pending_writes.lock().clear();
+        self.active_skill_names.write().await.clear();
 
         Ok(id)
     }
@@ -276,14 +282,29 @@ impl AgentHarness {
         *self.phase.lock()
     }
 
-    /// Set sandbox mode (applies on next turn).
+    /// Set sandbox mode (applies on next turn). Destroys any previous sandbox.
     pub async fn set_sandbox(&self, mode: SandboxMode) {
+        let prev = std::mem::replace(&mut *self.sandbox.write().await, SandboxMode::Disabled);
+        if let SandboxMode::Enabled { sandbox } = prev {
+            let _ = sandbox.destroy().await;
+        }
         *self.sandbox.write().await = mode;
     }
 
-    /// Disable sandbox.
+    /// Disable sandbox and destroy the previous instance if any.
     pub async fn clear_sandbox(&self) {
-        *self.sandbox.write().await = SandboxMode::Disabled;
+        let prev = std::mem::replace(&mut *self.sandbox.write().await, SandboxMode::Disabled);
+        if let SandboxMode::Enabled { sandbox } = prev {
+            let _ = sandbox.destroy().await;
+        }
+    }
+
+    /// Printable sandbox status for `/sandbox status` (CLI only; not sent to the model).
+    pub async fn sandbox_info(&self) -> SandboxInfo {
+        match &*self.sandbox.read().await {
+            SandboxMode::Disabled => SandboxInfo::off(),
+            SandboxMode::Enabled { sandbox } => sandbox.info(),
+        }
     }
 
     /// Ensure sandbox ready when enabled.
@@ -417,6 +438,33 @@ impl AgentHarness {
     /// Get resources (clone).
     pub async fn get_resources(&self) -> AgentHarnessResources {
         self.resources.read().await.clone()
+    }
+
+    /// Activate a skill for subsequent turns without prompting.
+    ///
+    /// The skill is listed under `<available_skills>` (including skills with
+    /// `disable-model-invocation`). Returns `false` if the skill is unknown.
+    pub async fn activate_skill(&self, name: &str) -> bool {
+        let resources = self.resources.read().await;
+        if !resources.skills.iter().any(|s| s.name == name) {
+            return false;
+        }
+        drop(resources);
+        let mut active = self.active_skill_names.write().await;
+        if !active.iter().any(|n| n == name) {
+            active.push(name.to_string());
+        }
+        true
+    }
+
+    /// Names of skills activated via [`Self::activate_skill`].
+    pub async fn active_skills(&self) -> Vec<String> {
+        self.active_skill_names.read().await.clone()
+    }
+
+    /// Clear user-activated skills.
+    pub async fn clear_active_skills(&self) {
+        self.active_skill_names.write().await.clear();
     }
 
     /// Subscribe to events.
@@ -897,14 +945,6 @@ impl AgentHarness {
         };
 
         let resources = self.resources.read().await.clone();
-        let mut system_prompt = self.system_prompt.read().await.clone();
-        if !resources.skills.is_empty() {
-            system_prompt = format!(
-                "{system_prompt}\n\n{}",
-                format_skills_for_system_prompt(&resources.skills)
-            );
-        }
-
         let all_tools = self.tools.read().await.clone();
         let active = self.active_tool_names.read().await.clone();
         let tools = if let Some(names) = active {
@@ -915,6 +955,19 @@ impl AgentHarness {
         } else {
             all_tools
         };
+
+        // Progressive disclosure (pi): only advertise skills when `read` is available
+        // so the model can load SKILL.md on demand. User-activated skills
+        // (`/skill:name`) are always included, even with disable-model-invocation.
+        let mut system_prompt = self.system_prompt.read().await.clone();
+        let has_read = tools.iter().any(|t| t.name == "read");
+        if has_read && !resources.skills.is_empty() {
+            let active = self.active_skill_names.read().await.clone();
+            let skills_block = format_skills_for_system_prompt(&resources.skills, &active);
+            if !skills_block.is_empty() {
+                system_prompt = format!("{system_prompt}\n\n{skills_block}");
+            }
+        }
 
         let mut stream_options = self.stream_options.read().await.clone();
         {

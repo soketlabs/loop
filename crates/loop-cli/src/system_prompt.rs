@@ -2,8 +2,6 @@
 
 use std::path::{Path, PathBuf};
 
-use loop_agent::harness::{format_skills_for_system_prompt, Skill};
-
 use crate::config::paths::{
     append_system_md_path, get_agent_dir, get_project_dir, system_md_path,
 };
@@ -34,8 +32,6 @@ pub struct BuildSystemPromptOptions<'a> {
     pub tool_snippets: &'a [(&'a str, &'a str)],
     /// Context files.
     pub context_files: &'a [ContextFile],
-    /// Skills.
-    pub skills: &'a [Skill],
 }
 
 /// Default tool snippets.
@@ -49,6 +45,9 @@ pub fn default_tool_snippets() -> Vec<(&'static str, &'static str)> {
 }
 
 /// Build the system prompt.
+///
+/// Skills are not embedded here: `AgentHarness` appends the pi-style
+/// `<available_skills>` block each turn (with paths) when `read` is available.
 pub fn build_system_prompt(opts: BuildSystemPromptOptions<'_>) -> String {
     let cwd = opts.cwd.display().to_string().replace('\\', "/");
     let append = opts
@@ -111,11 +110,6 @@ pub fn build_system_prompt(opts: BuildSystemPromptOptions<'_>) -> String {
             ));
         }
         prompt.push_str("</project_context>\n");
-    }
-
-    let has_read = opts.selected_tools.contains(&"read");
-    if has_read && !opts.skills.is_empty() {
-        prompt.push_str(&format_skills_for_system_prompt(opts.skills));
     }
 
     prompt.push_str(&format!("\nCurrent working directory: {cwd}"));
