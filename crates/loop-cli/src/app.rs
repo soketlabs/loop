@@ -735,7 +735,7 @@ fn flush_committed(
         if !lines.is_empty() {
             let h = lines.len() as u16;
             terminal.insert_before(h, |buf| {
-                render_lines_to_buffer(&lines, buf);
+                render_lines_to_buffer(&lines, buf, theme);
             })?;
         }
         *flushed += 1;
@@ -821,7 +821,7 @@ fn print_welcome(
         width,
     );
     terminal.insert_before(lines.len() as u16, |buf| {
-        render_lines_to_buffer(&lines, buf);
+        render_lines_to_buffer(&lines, buf, &runtime.theme);
     })?;
     Ok(())
 }
@@ -2477,6 +2477,8 @@ async fn apply_effect(
                         .settings
                         .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
                     chat.push(sys(format!("theme → {name}")));
+                    // Reprint scrollback so already-flushed messages pick up the new colors.
+                    *redraw_request = true;
                 }
                 Err(e) => chat.push(sys(format!("theme error: {e}"))),
             }

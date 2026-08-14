@@ -636,8 +636,9 @@ fn format_shell_box(
 }
 
 /// Draw lines into a buffer (used by `insert_before`).
-pub fn render_lines_to_buffer(lines: &[Line<'static>], buf: &mut Buffer) {
+pub fn render_lines_to_buffer(lines: &[Line<'static>], buf: &mut Buffer, theme: &Theme) {
     Paragraph::new(lines.to_vec())
+        .style(theme.page())
         .wrap(Wrap { trim: false })
         .render(buf.area, buf);
 }
@@ -645,6 +646,7 @@ pub fn render_lines_to_buffer(lines: &[Line<'static>], buf: &mut Buffer) {
 /// Draw the inline footer (live stream + input + picker + status).
 pub fn draw_footer(frame: &mut Frame, opts: FooterOpts<'_>) {
     let area = frame.area();
+    frame.buffer_mut().set_style(area, opts.theme.page());
     let width = area.width.max(1);
 
     let live_lines = {
@@ -693,7 +695,12 @@ pub fn draw_footer(frame: &mut Frame, opts: FooterOpts<'_>) {
         } else {
             live_lines
         };
-        frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), chunks[0]);
+        frame.render_widget(
+            Paragraph::new(visible)
+                .style(opts.theme.page())
+                .wrap(Wrap { trim: false }),
+            chunks[0],
+        );
     }
 
     draw_input(frame, chunks[1], &opts);
@@ -703,7 +710,6 @@ pub fn draw_footer(frame: &mut Frame, opts: FooterOpts<'_>) {
 
 fn draw_input(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
     let rule = Style::default().fg(opts.theme.get("borderAccent"));
-    // No fill behind typed text — only the top/bottom rules frame the editor.
     let text_style = opts.theme.style("text");
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -715,11 +721,15 @@ fn draw_input(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
         .split(area);
 
     let rule_line = "─".repeat(area.width as usize);
+    let page = opts.theme.page();
     frame.render_widget(
-        Paragraph::new(Span::styled(rule_line.clone(), rule)),
+        Paragraph::new(Span::styled(rule_line.clone(), rule)).style(page),
         chunks[0],
     );
-    frame.render_widget(Paragraph::new(Span::styled(rule_line, rule)), chunks[2]);
+    frame.render_widget(
+        Paragraph::new(Span::styled(rule_line, rule)).style(page),
+        chunks[2],
+    );
 
     let display = if opts.mask_input {
         "•".repeat(opts.input.chars().count())
@@ -744,7 +754,12 @@ fn draw_input(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
         placeholder,
         area.width as usize,
     );
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(opts.theme.page())
+            .wrap(Wrap { trim: false }),
+        chunks[1],
+    );
 }
 
 fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView) {
@@ -829,7 +844,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
             ]
         }
     };
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(lines).style(theme.page()), area);
 }
 
 fn picker_lines(
@@ -930,8 +945,9 @@ fn draw_status(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
             Span::styled(usage.to_string(), opts.theme.muted()),
         ])
     };
-    frame.render_widget(Paragraph::new(top), chunks[0]);
-    frame.render_widget(Paragraph::new(bottom), chunks[1]);
+    let page = opts.theme.page();
+    frame.render_widget(Paragraph::new(top).style(page), chunks[0]);
+    frame.render_widget(Paragraph::new(bottom).style(page), chunks[1]);
 }
 
 /// Format a token count for the footer: commas below 1M, then `M` / `B` with decimals.
@@ -1018,11 +1034,10 @@ fn render_input_lines(
     placeholder: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
-    // Absolute black block (theme `cursor`, default #000000). White cell bg keeps it
-    // visible on dark terminals where a bare black glyph would disappear.
+    // Block caret in the theme cursor color, sitting on the page background.
     let caret_style = Style::default()
         .fg(theme.get("cursor"))
-        .bg(Color::Rgb(255, 255, 255));
+        .bg(theme.get("bg"));
     let lines: Vec<&str> = if input.is_empty() {
         vec![""]
     } else {

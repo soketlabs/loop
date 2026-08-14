@@ -37,6 +37,7 @@ fn theme_builtins_load() {
     let _ = dark.get("accent");
     let light = Theme::light();
     assert_eq!(light.name, "light");
+    assert!(Theme::load("Light", &[]).is_ok());
 }
 
 #[test]
