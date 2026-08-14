@@ -81,6 +81,8 @@ pub struct McpServerConfig {
     /// Extra HTTP headers sent with every request (remote only).
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+}
+
 fn default_sandbox_isolation() -> String {
     "full".into()
 }
