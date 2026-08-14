@@ -13,5 +13,6 @@ pub mod resources;
 pub mod runtime;
 pub mod system_prompt;
 pub mod theme;
+pub mod mcp_serve;
 pub mod tool_approval;
 pub mod tui;

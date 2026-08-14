@@ -13,6 +13,12 @@ pub mod tools;
 pub mod types;
 pub mod utils;
 
+#[cfg(feature = "orchestration")]
+pub mod orchestration;
+
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
 pub use skills::{format_skill_invocation, load_skills};
 pub use prompt_templates::{format_prompt_template_invocation, load_prompt_templates};
 pub use system_prompt::format_skills_for_system_prompt;

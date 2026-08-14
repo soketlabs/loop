@@ -137,6 +137,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: None,
         },
         SlashCommand {
+            name: "mcp",
+            description: "Manage MCP server connections",
+            args_hint: Some("[list|reload]"),
+        },
+        SlashCommand {
             name: "quit",
             description: "Quit Loop",
             args_hint: None,
@@ -341,6 +346,9 @@ pub enum CommandEffect {
     Fork,
     /// Clone.
     CloneSession,
+    /// MCP sub-command.
+    Mcp(String),
+    /// Skill invoke.
     /// Skill activate (does not send a prompt).
     Skill {
         /// Skill name.
@@ -426,6 +434,7 @@ pub fn dispatch(cmd: &ParsedCommand, skill_names: &[String], template_names: &[S
         "scoped-models" => CommandEffect::ScopedModels,
         "fork" => CommandEffect::Fork,
         "clone" => CommandEffect::CloneSession,
+        "mcp" => CommandEffect::Mcp(cmd.args.clone()),
         other => {
             if let Some(name) = other.strip_prefix("skill:") {
                 return CommandEffect::Skill {

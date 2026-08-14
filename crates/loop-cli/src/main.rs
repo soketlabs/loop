@@ -47,6 +47,19 @@ struct Cli {
     #[arg(long, global = true)]
     print: Option<String>,
 
+    /// Start as an MCP server (streamable HTTP) instead of interactive mode.
+    #[arg(long)]
+    serve_mcp: bool,
+
+    /// Port for the MCP server (default: 3100).
+    #[arg(long, default_value = "3100")]
+    mcp_port: u16,
+
+    /// Bearer token for MCP server authentication. When set, all HTTP requests
+    /// to the MCP endpoint must include `Authorization: Bearer <token>`.
+    #[arg(long)]
+    mcp_token: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -106,7 +119,7 @@ async fn real_main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let interactive = cli.print.is_none();
+    let interactive = cli.print.is_none() && !cli.serve_mcp;
     let runtime = bootstrap(BootstrapOpts {
         cwd,
         provider: cli.provider,
@@ -119,6 +132,10 @@ async fn real_main() -> anyhow::Result<()> {
         session_id: cli.resume,
     })
     .await?;
+
+    if cli.serve_mcp {
+        return loop_cli::mcp_serve::run_mcp_server(runtime, cli.mcp_port, cli.mcp_token).await;
+    }
 
     if let Some(prompt) = cli.print {
         let msg = runtime.harness.prompt(prompt).await?;

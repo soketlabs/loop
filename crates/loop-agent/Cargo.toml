@@ -11,6 +11,8 @@ readme = "README.md"
 default = ["sqlite", "proxy"]
 sqlite = ["dep:rusqlite"]
 proxy = ["dep:reqwest", "dep:eventsource-stream", "dep:bytes"]
+mcp = ["dep:loop-mcp", "dep:rmcp"]
+orchestration = ["dep:loop-orchestration"]
 
 [dependencies]
 loop-ai = { workspace = true }
@@ -38,6 +40,9 @@ rusqlite = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 eventsource-stream = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+loop-orchestration = { workspace = true, optional = true }
+loop-mcp = { workspace = true, optional = true }
+rmcp = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
