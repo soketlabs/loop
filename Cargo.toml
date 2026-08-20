@@ -47,7 +47,7 @@ base64 = "0.22"
 mime_guess = "2"
 walkdir = "2"
 clap = { version = "4", features = ["derive", "env"] }
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = { version = "0.28", features = ["event-stream"] }
 dirs = "6"
 anyhow = "1"
