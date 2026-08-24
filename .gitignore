@@ -5,3 +5,9 @@
 *.swp
 .DS_Store
 /docs/
+
+# Benchmark run logs (keep template + sample committed)
+/bench/runs/runs.csv
+/bench/runs/scorecard*.md
+/bench/runs/out/
+/bench
