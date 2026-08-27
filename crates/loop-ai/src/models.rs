@@ -493,12 +493,23 @@ impl Models {
             options.headers = Some(merged);
 
             let mut inner = provider.stream(&model, &context, options, auth);
+            let mut saw_terminal = false;
             while let Some(ev) = inner.next().await {
                 let terminal = ev.is_terminal();
                 handle.push(ev);
                 if terminal {
+                    saw_terminal = true;
                     break;
                 }
+            }
+            if !saw_terminal {
+                let mut msg = crate::types::AssistantMessage::pending(&model);
+                msg.stop_reason = StopReason::Error;
+                msg.error_message = Some("stream ended without completing".into());
+                handle.push(AssistantMessageEvent::Error {
+                    reason: StopReason::Error,
+                    error: msg,
+                });
             }
         });
 
@@ -568,14 +579,24 @@ impl Models {
             let merged = Self::merge_headers(&provider, &model, &auth, &options.base);
             options.base.headers = Some(merged);
 
-            let inner = provider.stream_simple(&model, &context, options, auth);
-            let mut inner = inner;
+            let mut inner = provider.stream_simple(&model, &context, options, auth);
+            let mut saw_terminal = false;
             while let Some(ev) = inner.next().await {
                 let terminal = ev.is_terminal();
                 handle.push(ev);
                 if terminal {
+                    saw_terminal = true;
                     break;
                 }
+            }
+            if !saw_terminal {
+                let mut msg = crate::types::AssistantMessage::pending(&model);
+                msg.stop_reason = StopReason::Error;
+                msg.error_message = Some("stream ended without completing".into());
+                handle.push(AssistantMessageEvent::Error {
+                    reason: StopReason::Error,
+                    error: msg,
+                });
             }
         });
 

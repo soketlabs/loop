@@ -26,7 +26,7 @@ use crate::config::paths::{
     auth_path, ensure_agent_dirs, get_agent_dir, models_json_path, models_store_path,
     sessions_db_path, settings_path,
 };
-use crate::config::settings::{load_settings, Settings};
+use crate::config::settings::{load_settings, McpServerConfig, Settings};
 use crate::config::trust::TrustStore;
 use crate::config::paths::{keybindings_path, trust_path};
 use crate::keybindings::Keybindings;
@@ -71,6 +71,8 @@ pub struct Runtime {
     pub needs_api_key_setup: bool,
     /// Interactive tool approval bridge (set by the TUI).
     pub tool_approval: Option<std::sync::Arc<crate::tool_approval::ToolApprovalBridge>>,
+    /// MCP client manager for external tool servers.
+    pub mcp_client: Arc<loop_mcp::McpClientManager>,
     /// Skills activated via `/skill:name` (not yet cleared; mirrored on the harness).
     pub active_skills: Vec<String>,
 }
@@ -292,18 +294,22 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
 
     let models = build_models(&agent_dir, Arc::clone(&credentials))?;
     if !needs_api_key_setup {
-        let refresh = models
-            .refresh(ModelsRefreshOptions {
-                allow_network: Some(true),
-                force: true,
-                provider_id: Some(SOKET_PROVIDER_ID.into()),
-            })
-            .await;
-        if !refresh.errors.is_empty() {
+        // Spawn catalog refresh in the background so startup isn't blocked
+        // by a slow or unreachable API server. Seed / cached models are
+        // already available and will be replaced once the fetch completes.
+        let bg_models = Arc::clone(&models);
+        tokio::spawn(async move {
+            let refresh = bg_models
+                .refresh(ModelsRefreshOptions {
+                    allow_network: Some(true),
+                    force: true,
+                    provider_id: Some(SOKET_PROVIDER_ID.into()),
+                })
+                .await;
             for (pid, err) in &refresh.errors {
                 tracing::warn!("model refresh {pid}: {err}");
             }
-        }
+        });
     }
 
     let provider = settings.default_provider.clone();
@@ -445,6 +451,29 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let theme = Theme::load(&settings.theme, &theme_dirs).unwrap_or_else(|_| Theme::dark());
     let keybindings = Keybindings::load(&keybindings_path(&agent_dir))?;
 
+    let mcp_client = Arc::new(loop_mcp::McpClientManager::new());
+    if !settings.mcp_servers.is_empty() {
+        let entries = mcp_server_entries(&settings.mcp_servers);
+        let results = mcp_client.connect_all(&entries).await;
+        for (name, result) in &results {
+            match result {
+                Ok(count) => tracing::info!("mcp: connected to '{name}' ({count} tools)"),
+                Err(e) => tracing::warn!("mcp: failed to connect to '{name}': {e}"),
+            }
+        }
+        let mcp_tools = loop_agent::harness::mcp::bridge::mcp_tools_to_agent_tools_async(
+            mcp_client.connections(),
+        ).await;
+        if !mcp_tools.is_empty() {
+            let mut all_tools = harness.get_tools().await;
+            all_tools.extend(mcp_tools);
+            harness
+                .set_tools(all_tools)
+                .await
+                .map_err(|e| anyhow::anyhow!("set MCP tools: {e}"))?;
+        }
+    }
+
     Ok(Runtime {
         agent_dir,
         cwd: opts.cwd,
@@ -462,6 +491,36 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         resumed,
         needs_api_key_setup,
         tool_approval: None,
+        mcp_client,
         active_skills: Vec::new(),
     })
+}
+
+/// Convert settings MCP config into client entries.
+pub fn mcp_server_entries(
+    configs: &std::collections::BTreeMap<String, McpServerConfig>,
+) -> Vec<loop_mcp::McpServerEntry> {
+    let mut entries = Vec::new();
+    for (name, cfg) in configs {
+        let transport = if let Some(url) = &cfg.url {
+            loop_mcp::McpTransport::Http {
+                url: url.clone(),
+                headers: cfg.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            }
+        } else if let Some(command) = &cfg.command {
+            loop_mcp::McpTransport::Stdio {
+                command: command.clone(),
+                args: cfg.args.clone(),
+                env: cfg.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            }
+        } else {
+            tracing::warn!("mcp: skipping '{name}': neither 'command' nor 'url' configured");
+            continue;
+        };
+        entries.push(loop_mcp::McpServerEntry {
+            name: name.clone(),
+            transport,
+        });
+    }
+    entries
 }

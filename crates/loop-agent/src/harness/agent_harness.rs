@@ -17,7 +17,7 @@ use crate::harness::compaction::{
 };
 use crate::harness::hooks::{HarnessHookEvent, HookRegistry};
 use crate::harness::prompt_templates::format_prompt_template_invocation;
-use crate::harness::sandbox::{Sandbox, SandboxMode, SandboxStatus};
+use crate::harness::sandbox::{Sandbox, SandboxInfo, SandboxMode, SandboxStatus};
 use crate::harness::session::types::{PendingSessionWrite, Session, SessionTreeEntry};
 use crate::harness::skills::format_skill_invocation;
 use crate::harness::types::{
@@ -130,6 +130,8 @@ pub struct AgentHarness {
     steering_mode: Mutex<QueueMode>,
     #[allow(dead_code)]
     follow_up_mode: Mutex<QueueMode>,
+    #[cfg(feature = "mcp")]
+    mcp_client: Arc<loop_mcp::McpClientManager>,
 }
 
 impl AgentHarness {
@@ -169,6 +171,8 @@ impl AgentHarness {
             after_tool_call: Mutex::new(None),
             steering_mode: Mutex::new(QueueMode::OneAtATime),
             follow_up_mode: Mutex::new(QueueMode::OneAtATime),
+            #[cfg(feature = "mcp")]
+            mcp_client: Arc::new(loop_mcp::McpClientManager::new()),
         }
     }
 
@@ -295,6 +299,14 @@ impl AgentHarness {
         }
     }
 
+    /// Printable sandbox status for `/sandbox status` (CLI only; not sent to the model).
+    pub async fn sandbox_info(&self) -> SandboxInfo {
+        match &*self.sandbox.read().await {
+            SandboxMode::Disabled => SandboxInfo::off(),
+            SandboxMode::Enabled { sandbox } => sandbox.info(),
+        }
+    }
+
     /// Ensure sandbox ready when enabled.
     pub async fn ensure_sandbox_ready(
         &self,
@@ -336,6 +348,80 @@ impl AgentHarness {
             }
         }
         *self.tools.write().await = tools;
+        Ok(())
+    }
+
+    /// Get the current set of tools (cloned, async).
+    pub async fn get_tools(&self) -> Vec<AgentTool> {
+        self.tools.read().await.clone()
+    }
+
+    /// Synchronous snapshot of the current tools (for factory closures).
+    pub fn tools_snapshot(&self) -> Vec<AgentTool> {
+        self.tools.blocking_read().clone()
+    }
+
+    /// Connect to configured MCP servers and merge their tools into the tool list.
+    ///
+    /// Each MCP tool is prefixed `mcp__{server}__{tool}` to avoid collisions.
+    /// Existing MCP tools are replaced on reconnect.
+    #[cfg(feature = "mcp")]
+    pub async fn connect_mcp_servers(
+        &self,
+        entries: &[loop_mcp::McpServerEntry],
+    ) -> Vec<(String, Result<usize, String>)> {
+        let results = self.mcp_client.connect_all(entries).await;
+        if let Err(e) = self.refresh_mcp_tools().await {
+            tracing::error!("failed to refresh MCP tools after connect: {e}");
+        }
+        results
+    }
+
+    /// Disconnect a single MCP server and refresh the tool list.
+    #[cfg(feature = "mcp")]
+    pub async fn disconnect_mcp_server(&self, name: &str) -> bool {
+        let removed = self.mcp_client.disconnect(name).await;
+        if removed {
+            if let Err(e) = self.refresh_mcp_tools().await {
+                tracing::error!("failed to refresh MCP tools after disconnect: {e}");
+            }
+        }
+        removed
+    }
+
+    /// Disconnect all MCP servers and remove their tools.
+    #[cfg(feature = "mcp")]
+    pub async fn disconnect_all_mcp(&self) {
+        self.mcp_client.disconnect_all().await;
+        if let Err(e) = self.refresh_mcp_tools().await {
+            tracing::error!("failed to refresh MCP tools after disconnect_all: {e}");
+        }
+    }
+
+    /// List connected MCP servers and their tool counts.
+    #[cfg(feature = "mcp")]
+    pub async fn list_mcp_connections(&self) -> Vec<(String, usize)> {
+        self.mcp_client.list_connections().await
+    }
+
+    /// Get a reference to the MCP client manager.
+    #[cfg(feature = "mcp")]
+    pub fn mcp_client(&self) -> &Arc<loop_mcp::McpClientManager> {
+        &self.mcp_client
+    }
+
+    /// Re-read tools from all connected MCP servers and merge them into the
+    /// harness tool list. Existing `mcp__*` tools are replaced.
+    #[cfg(feature = "mcp")]
+    async fn refresh_mcp_tools(&self) -> Result<(), AgentHarnessError> {
+        let mcp_tools = crate::harness::mcp::bridge::mcp_tools_to_agent_tools_async(
+            self.mcp_client.connections(),
+        )
+        .await;
+
+        let mut tools = self.tools.write().await;
+        tools.retain(|t| !t.name.starts_with("mcp__"));
+        tools.extend(mcp_tools);
         Ok(())
     }
 
@@ -1039,7 +1125,9 @@ impl AgentHarness {
             let store = session.store();
             let sid = session.metadata().id.clone();
             for w in writes {
-                let _ = store.append_entry(&sid, w).await;
+                if let Err(e) = store.append_entry(&sid, w).await {
+                    tracing::error!(session_id = %sid, "session write failed: {e}");
+                }
             }
         }
 
@@ -1064,6 +1152,135 @@ impl AgentHarness {
     /// Tool env that the current sandbox/host would provide (for rebuilding tools).
     pub async fn tool_env(&self) -> Result<Arc<dyn ExecutionEnv>, AgentHarnessError> {
         Ok(self.create_turn_state().await?.tool_env)
+    }
+
+    #[cfg(feature = "orchestration")]
+    /// Start a multi-agent workflow from a task graph.
+    ///
+    /// The harness transitions to `Workflow` phase and runs the scheduler until
+    /// all tasks complete. Each `AgentTurn` task spawns an agent loop as a worker.
+    pub async fn start_workflow(
+        &self,
+        graph: loop_orchestration::planner::TaskGraph,
+        config: Option<loop_orchestration::scheduler::SchedulerConfig>,
+    ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
+        self.acquire_idle_phase(AgentHarnessPhase::Workflow).await?;
+
+        let result = self.run_workflow_inner(graph, config).await;
+
+        self.release_to_idle();
+        result
+    }
+
+    #[cfg(feature = "orchestration")]
+    async fn run_workflow_inner(
+        &self,
+        graph: loop_orchestration::planner::TaskGraph,
+        config: Option<loop_orchestration::scheduler::SchedulerConfig>,
+    ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
+        use loop_orchestration::memory::bus::create_memory_bus;
+        use loop_orchestration::memory::SharedMemory;
+        use loop_orchestration::scheduler::{Scheduler, WorkerPool};
+        use loop_orchestration::workflow::{MemoryEventLog, SignalRouter, WorkflowEngine};
+        use crate::harness::orchestration::agent_worker::{AgentWorker, ShellWorker};
+
+        let workflow_id = format!("wf_{}", uuid::Uuid::now_v7());
+        let scheduler_config = config.unwrap_or_default();
+
+        let event_log = Arc::new(MemoryEventLog::new());
+        let signal_router = Arc::new(SignalRouter::new());
+        let engine = Arc::new(
+            WorkflowEngine::new(event_log as Arc<dyn loop_orchestration::workflow::EventLog>)
+                .with_signal_router(Arc::clone(&signal_router)),
+        );
+
+        let bus = create_memory_bus();
+        let shared_memory = Arc::new(SharedMemory::new(bus));
+
+        let model = self.model.read().await.clone();
+        let system_prompt = self.system_prompt.read().await.clone();
+        let tools = self.tools.read().await.clone();
+        let host_env = Arc::clone(&self.host_env);
+
+        let agent_worker = Arc::new(AgentWorker::new(
+            Arc::clone(&self.stream_fn),
+            Arc::clone(&host_env),
+            tools,
+            model,
+            system_prompt,
+        ));
+
+        let shell_worker = Arc::new(ShellWorker::new(Arc::clone(&host_env)));
+
+        let mut pool = WorkerPool::new(scheduler_config.max_concurrency);
+        pool.register(agent_worker);
+        pool.register(shell_worker);
+
+        let task_count = graph.tasks.len();
+        let _ = self
+            .hooks
+            .emit(HarnessHookEvent::WorkflowStarted {
+                workflow_id: workflow_id.clone(),
+                task_count,
+            })
+            .await;
+
+        let subscribers = self.subscribers.lock().clone();
+        for sub in &subscribers {
+            sub(crate::types::AgentEvent::AgentStart).await;
+        }
+
+        engine
+            .start_workflow(workflow_id.clone(), graph)
+            .await
+            .map_err(|e| AgentHarnessError::Other(e.to_string()))?;
+
+        let scheduler = Scheduler::new(
+            Arc::clone(&engine),
+            pool,
+            shared_memory,
+            scheduler_config,
+        );
+
+        let result = scheduler
+            .run(&workflow_id)
+            .await
+            .map_err(|e| AgentHarnessError::Other(e.to_string()))?;
+
+        let _ = self
+            .hooks
+            .emit(HarnessHookEvent::WorkflowCompleted {
+                workflow_id,
+                success: result.success,
+            })
+            .await;
+
+        Ok(result)
+    }
+
+    #[cfg(feature = "orchestration")]
+    /// Start a workflow using an LLM planner to decompose a goal.
+    ///
+    /// This is a convenience that creates an LlmPlanner, decomposes the goal,
+    /// then runs the workflow.
+    pub async fn start_workflow_from_goal(
+        &self,
+        goal: &str,
+        context: Option<loop_orchestration::planner::PlannerContext>,
+        config: Option<loop_orchestration::scheduler::SchedulerConfig>,
+    ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
+        use loop_orchestration::planner::{LlmPlanner, Planner};
+
+        let model = self.model.read().await.clone();
+        let planner = LlmPlanner::new(Arc::clone(&self.stream_fn), model);
+        let ctx = context.unwrap_or_default();
+
+        let graph = planner
+            .decompose(goal, &ctx)
+            .await
+            .map_err(|e| AgentHarnessError::Other(e.to_string()))?;
+
+        self.start_workflow(graph, config).await
     }
 }
 

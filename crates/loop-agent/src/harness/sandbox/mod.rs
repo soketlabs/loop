@@ -15,5 +15,5 @@ pub use podman::{
 };
 pub use registry::SandboxRegistry;
 pub use traits::{
-    Sandbox, SandboxConfig, SandboxError, SandboxFactory, SandboxMode, SandboxStatus,
+    Sandbox, SandboxConfig, SandboxError, SandboxFactory, SandboxInfo, SandboxMode, SandboxStatus,
 };

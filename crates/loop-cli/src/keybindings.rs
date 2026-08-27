@@ -267,7 +267,7 @@ pub fn hotkey_help() -> Vec<(&'static str, &'static str)> {
         ("shift+tab", "Cycle thinking level"),
         ("ctrl+t", "Toggle thinking visibility"),
         ("ctrl+o", "Expand/collapse tool output & reasoning"),
-        ("↑↓", "Navigate / commands & model list"),
+        ("↑↓", "Previous/next command; lists"),
         ("ctrl+x", "Copy last assistant message"),
         ("alt+enter", "Queue message while busy"),
         ("alt+up", "Remove last queued message"),

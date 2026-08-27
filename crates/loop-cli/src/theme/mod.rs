@@ -59,10 +59,11 @@ impl Theme {
 
     /// Load theme by name from builtins + search dirs.
     pub fn load(name: &str, search_dirs: &[PathBuf]) -> anyhow::Result<Self> {
-        if name == "dark" {
+        let key = name.trim();
+        if key.eq_ignore_ascii_case("dark") {
             return Ok(Self::dark());
         }
-        if name == "light" {
+        if key.eq_ignore_ascii_case("light") {
             return Ok(Self::light());
         }
         for dir in search_dirs {
@@ -108,6 +109,11 @@ impl Theme {
     /// Style for a token.
     pub fn style(&self, key: &str) -> Style {
         Style::default().fg(self.get(key))
+    }
+
+    /// Page fg/bg for the footer and flushed transcript.
+    pub fn page(&self) -> Style {
+        Style::default().fg(self.get("text")).bg(self.get("bg"))
     }
 
     /// Accent style.
@@ -184,4 +190,24 @@ pub fn theme_search_dirs(agent_dir: &Path, project_dir: Option<&Path>) -> Vec<Pa
         dirs.push(p.join("themes"));
     }
     dirs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rgb_sum(c: Color) -> u16 {
+        match c {
+            Color::Rgb(r, g, b) => u16::from(r) + u16::from(g) + u16::from(b),
+            other => panic!("expected rgb color, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn light_theme_uses_light_surfaces() {
+        let light = Theme::light();
+        assert!(rgb_sum(light.get("bg")) > 500);
+        assert!(rgb_sum(light.get("userMessageBg")) > rgb_sum(light.get("text")));
+        assert!(rgb_sum(light.get("toolSuccessBg")) > rgb_sum(light.get("toolTitle")));
+    }
 }

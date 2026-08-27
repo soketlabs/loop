@@ -218,22 +218,56 @@ fn write_review_snapshot(path: &Path, contents: &str) -> std::io::Result<PathBuf
 }
 
 fn fuzzy_replace(original: &str, old_text: &str, new_text: &str) -> Result<String, String> {
-    // Normalize whitespace and search line windows.
+    // Strategy 1: whitespace-normalized match.
+    // Build a map from normalized-string byte offset back to original byte offset.
     let needle: String = old_text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let hay: String = original.split_whitespace().collect::<Vec<_>>().join(" ");
-    if let Some(idx) = hay.find(&needle) {
-        // Fall back: if whitespace-normalized match exists, do exact old_text fail with hint
-        let _ = idx;
+    if !needle.is_empty() {
+        let mut norm_buf = String::new();
+        let mut norm_to_orig: Vec<usize> = Vec::new();
+        let mut in_ws = true;
+        for (byte_idx, ch) in original.char_indices() {
+            if ch.is_whitespace() {
+                if !in_ws && !norm_buf.is_empty() {
+                    norm_buf.push(' ');
+                    norm_to_orig.push(byte_idx);
+                    in_ws = true;
+                }
+            } else {
+                norm_buf.push(ch);
+                norm_to_orig.push(byte_idx);
+                in_ws = false;
+            }
+        }
+        norm_to_orig.push(original.len());
+
+        if let Some(norm_start) = norm_buf.find(&needle) {
+            let norm_end = norm_start + needle.len();
+            let orig_start = norm_to_orig.get(norm_start).copied().unwrap_or(0);
+            // Find the original end: skip any trailing whitespace in the original that was
+            // collapsed during normalization.
+            let raw_orig_end = norm_to_orig.get(norm_end).copied().unwrap_or(original.len());
+            let _orig_end = original[..raw_orig_end].trim_end().len().max(raw_orig_end.min(original.len()));
+
+            let mut out = String::with_capacity(original.len() + new_text.len());
+            out.push_str(&original[..orig_start]);
+            out.push_str(new_text);
+            out.push_str(&original[raw_orig_end..]);
+            return Ok(out);
+        }
     }
-    // Try finding old_text ignoring trailing whitespace per line
+
+    // Strategy 2: trimmed match (ignore leading/trailing whitespace).
     let old_norm = old_text.trim();
-    if let Some(pos) = original.find(old_norm) {
-        let mut out = String::new();
-        out.push_str(&original[..pos]);
-        out.push_str(new_text);
-        out.push_str(&original[pos + old_norm.len()..]);
-        return Ok(out);
+    if !old_norm.is_empty() {
+        if let Some(pos) = original.find(old_norm) {
+            let mut out = String::with_capacity(original.len() + new_text.len());
+            out.push_str(&original[..pos]);
+            out.push_str(new_text);
+            out.push_str(&original[pos + old_norm.len()..]);
+            return Ok(out);
+        }
     }
+
     Err("oldText not found (exact or fuzzy)".into())
 }
 
@@ -253,6 +287,46 @@ fn unified_diff(old: &str, new: &str, path: &Path) -> String {
         }
     }
     out
+}
+
+/// Default patterns that are always blocked regardless of user configuration.
+const DEFAULT_BLOCKED_PATTERNS: &[&str] = &[
+    "rm -rf /",
+    "rm -rf /*",
+    "rm -rf ~",
+    "mkfs.",
+    ":(){ :|:& };:",
+    "> /dev/sda",
+    "dd if=/dev/zero of=/dev/",
+    "chmod -r 777 /",
+    "chown -r",
+    "format c:",
+];
+
+/// Check a command against the blocklist. Returns `Err` with a rejection message
+/// if the command matches a blocked pattern.
+pub fn check_command_policy(command: &str, extra_blocked: &[String]) -> Result<(), String> {
+    let lower = command.to_lowercase();
+    let trimmed = lower.trim();
+
+    for pattern in DEFAULT_BLOCKED_PATTERNS {
+        if trimmed.contains(pattern) {
+            return Err(format!(
+                "Command blocked by safety policy: matches blocked pattern `{pattern}`"
+            ));
+        }
+    }
+
+    for pattern in extra_blocked {
+        let pat_lower = pattern.to_lowercase();
+        if trimmed.contains(&pat_lower) {
+            return Err(format!(
+                "Command blocked by safety policy: matches custom blocked pattern `{pattern}`"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Create a bash tool bound to `env`.
@@ -296,6 +370,9 @@ pub fn create_bash_tool_with_prepare(
                     .get("cwd")
                     .and_then(|v| v.as_str())
                     .map(PathBuf::from);
+
+                check_command_policy(&command, &[])?;
+
                 if let Some(prepare) = &prepare {
                     let (c, d) = prepare(command.clone(), args.clone()).await?;
                     command = c;
@@ -303,9 +380,11 @@ pub fn create_bash_tool_with_prepare(
                         cwd = d;
                     }
                 }
+                const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
                 let mut options = ShellExecOptions {
                     cwd,
                     cancel,
+                    timeout_ms: Some(DEFAULT_BASH_TIMEOUT_MS),
                     ..Default::default()
                 };
                 // Ensure relative cwd resolves against env.cwd

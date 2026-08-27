@@ -38,8 +38,8 @@ use crate::tool_approval::{
 use crate::tui::{
     chat_items_from_agent_messages, filter_files, find_at_mention, find_tool_index,
     format_item_lines, format_token_usage_line, insert_text, item_is_committed, list_files,
-    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, FileEntry,
-    FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow, PickerView,
+    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, CommandHistory,
+    FileEntry, FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow, PickerView,
 };
 
 enum UiEvent {
@@ -294,6 +294,7 @@ async fn run_loop(
     };
     let mut flushed = 0usize;
     let mut input = InputBuffer::new();
+    let mut history = CommandHistory::load(crate::config::paths::history_path(&runtime.agent_dir));
     let mut status: String = if runtime.needs_api_key_setup {
         "setup · paste your API key · enter save".into()
     } else if runtime.resumed {
@@ -606,6 +607,7 @@ async fn run_loop(
                         key,
                         runtime,
                         &mut input,
+                        &mut history,
                         &mut chat,
                         &mut status,
                         &mut clear_presses,
@@ -733,7 +735,7 @@ fn flush_committed(
         if !lines.is_empty() {
             let h = lines.len() as u16;
             terminal.insert_before(h, |buf| {
-                render_lines_to_buffer(&lines, buf);
+                render_lines_to_buffer(&lines, buf, theme);
             })?;
         }
         *flushed += 1;
@@ -819,7 +821,7 @@ fn print_welcome(
         width,
     );
     terminal.insert_before(lines.len() as u16, |buf| {
-        render_lines_to_buffer(&lines, buf);
+        render_lines_to_buffer(&lines, buf, &runtime.theme);
     })?;
     Ok(())
 }
@@ -1275,6 +1277,7 @@ async fn handle_key(
     key: crossterm::event::KeyEvent,
     runtime: &mut Runtime,
     input: &mut InputBuffer,
+    history: &mut CommandHistory,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     clear_presses: &mut u8,
@@ -1661,6 +1664,7 @@ async fn handle_key(
                     *status = "ctrl+c again to quit".into();
                 } else {
                     input.clear();
+                    history.reset_browse();
                 }
                 return Ok(());
             }
@@ -1711,6 +1715,7 @@ async fn handle_key(
             }
             Action::Submit => {
                 let line = input.as_str().trim().to_string();
+                history.push(&line);
                 input.clear();
                 if line.is_empty() {
                     return Ok(());
@@ -1789,11 +1794,19 @@ async fn handle_key(
                 return Ok(());
             }
             Action::MoveUp => {
-                let _ = input.move_up();
+                if !input.move_up() {
+                    if let Some(text) = history.previous(input.as_str()) {
+                        input.set(text);
+                    }
+                }
                 return Ok(());
             }
             Action::MoveDown => {
-                let _ = input.move_down();
+                if !input.move_down() {
+                    if let Some(text) = history.next() {
+                        input.set(text);
+                    }
+                }
                 return Ok(());
             }
             Action::MoveWordLeft => {
@@ -1895,6 +1908,7 @@ async fn handle_key(
             Action::FollowUp => {
                 let line = input.as_str().trim().to_string();
                 if !line.is_empty() {
+                    history.push(&line);
                     input.clear();
                     submit_user_text(
                         runtime,
@@ -2463,6 +2477,8 @@ async fn apply_effect(
                         .settings
                         .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
                     chat.push(sys(format!("theme → {name}")));
+                    // Reprint scrollback so already-flushed messages pick up the new colors.
+                    *redraw_request = true;
                 }
                 Err(e) => chat.push(sys(format!("theme error: {e}"))),
             }
@@ -2492,11 +2508,14 @@ async fn apply_effect(
             }
         }
         CommandEffect::SetSandbox(mode) => {
-            if mode.is_empty() {
-                chat.push(sys(format!(
-                    "sandbox mode: {} (use /sandbox off|local [--full|--partial] [--crun|--runc|--runsc|--krun])",
-                    runtime.settings.sandbox.display()
-                )));
+            if mode.is_empty() || mode.trim() == "status" {
+                let info = runtime.harness.sandbox_info().await;
+                chat.push(sys(info.format_box()));
+                if mode.is_empty() {
+                    chat.push(sys(
+                        "use /sandbox status|off|local [--full|--partial] [--crun|--runc|--runsc|--krun]",
+                    ));
+                }
                 return Ok(false);
             }
             let parts: Vec<&str> = mode.split_whitespace().collect();
@@ -2584,7 +2603,7 @@ async fn apply_effect(
                 other => {
                     let joined = other.join(" ");
                     chat.push(sys(format!(
-                        "unknown sandbox '{joined}' (off|local [--full|--partial] [--crun|--runc|--runsc|--krun])"
+                        "unknown sandbox '{joined}' (status|off|local [--full|--partial] [--crun|--runc|--runsc|--krun])"
                     )));
                 }
             }
@@ -2895,6 +2914,54 @@ async fn apply_effect(
                 refresh_token_bar,
             )
             .await;
+        }
+        CommandEffect::Mcp(sub) => {
+            let sub = sub.trim();
+            match sub {
+                "list" | "" => {
+                    let conns = runtime.mcp_client.list_connections().await;
+                    if conns.is_empty() {
+                        chat.push(sys("No MCP servers connected.\n\nConfigure in settings.json under \"mcpServers\", then /reload or /mcp reload."));
+                    } else {
+                        let mut text = format!("MCP connections ({}):\n", conns.len());
+                        for (name, count) in &conns {
+                            text.push_str(&format!("  {name} — {count} tools\n"));
+                        }
+                        chat.push(sys(text));
+                    }
+                }
+                "reload" => {
+                    runtime.mcp_client.disconnect_all().await;
+                    if runtime.settings.mcp_servers.is_empty() {
+                        chat.push(sys("No MCP servers configured in settings.json"));
+                    } else {
+                        let entries = crate::runtime::mcp_server_entries(&runtime.settings.mcp_servers);
+                        let results = runtime.mcp_client.connect_all(&entries).await;
+                        let mut text = String::from("MCP reload:\n");
+                        for (name, result) in &results {
+                            match result {
+                                Ok(count) => text.push_str(&format!("  ✓ {name} — {count} tools\n")),
+                                Err(e) => text.push_str(&format!("  ✗ {name} — {e}\n")),
+                            }
+                        }
+                        let mcp_tools = loop_agent::harness::mcp::bridge::mcp_tools_to_agent_tools_async(
+                            runtime.mcp_client.connections(),
+                        ).await;
+                        let mut all_tools: Vec<_> = runtime.harness.get_tools().await
+                            .into_iter()
+                            .filter(|t| !t.name.starts_with("mcp__"))
+                            .collect();
+                        all_tools.extend(mcp_tools);
+                        if let Err(e) = runtime.harness.set_tools(all_tools).await {
+                            text.push_str(&format!("  error setting tools: {e}\n"));
+                        }
+                        chat.push(sys(text));
+                    }
+                }
+                other => {
+                    chat.push(sys(format!("Unknown /mcp sub-command: {other}\n\nUsage: /mcp [list|reload]")));
+                }
+            }
         }
         CommandEffect::Skill { name, args } => {
             if runtime.harness.activate_skill(&name).await {

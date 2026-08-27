@@ -62,6 +62,27 @@ fn default_sandbox_mode() -> String {
     "off".into()
 }
 
+/// Configuration for an external MCP server (stdio or remote HTTP).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerConfig {
+    /// Command to spawn a stdio MCP server. Mutually exclusive with `url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Arguments passed to the command (stdio only).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment variables for the child process (stdio only).
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// URL for a remote streamable-HTTP MCP server. Mutually exclusive with `command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Extra HTTP headers sent with every request (remote only).
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
 fn default_sandbox_isolation() -> String {
     "full".into()
 }
@@ -81,7 +102,7 @@ impl Default for SandboxSettings {
 }
 
 impl SandboxSettings {
-    /// Human-readable status for `/sandbox` with no args.
+    /// Human-readable short status (settings only; prefer harness `sandbox_info` for live details).
     pub fn display(&self) -> String {
         match self.mode.as_str() {
             "local" => format!("local --{} --{}", self.isolation, self.runtime),
@@ -155,6 +176,9 @@ pub struct Settings {
     /// Default project trust: `ask`, `always`, `never` (global only).
     #[serde(default = "default_trust")]
     pub default_project_trust: String,
+    /// External MCP servers keyed by name.
+    #[serde(default)]
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
 fn default_provider() -> String {
@@ -208,6 +232,7 @@ impl Default for Settings {
             diff_editor: None,
             tool_permissions: default_tool_permissions_settings(),
             default_project_trust: default_trust(),
+            mcp_servers: BTreeMap::new(),
         }
     }
 }
@@ -280,6 +305,11 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
     if !project.tool_permissions.is_empty() {
         for (k, v) in project.tool_permissions {
             base.tool_permissions.insert(k, v);
+        }
+    }
+    if !project.mcp_servers.is_empty() {
+        for (k, v) in project.mcp_servers {
+            base.mcp_servers.insert(k, v);
         }
     }
     base

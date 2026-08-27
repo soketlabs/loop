@@ -19,6 +19,7 @@
   },
   "colors": {
     "cursor": "#555555",
+    "bg": "",
     "accent": "accent",
     "border": "blue",
     "borderAccent": "cyan",

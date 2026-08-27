@@ -73,6 +73,11 @@ pub fn keybindings_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("keybindings.json")
 }
 
+/// TUI input history path.
+pub fn history_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("history.json")
+}
+
 /// Trust store path.
 pub fn trust_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("trust.json")
