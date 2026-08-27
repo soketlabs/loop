@@ -294,18 +294,22 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
 
     let models = build_models(&agent_dir, Arc::clone(&credentials))?;
     if !needs_api_key_setup {
-        let refresh = models
-            .refresh(ModelsRefreshOptions {
-                allow_network: Some(true),
-                force: true,
-                provider_id: Some(SOKET_PROVIDER_ID.into()),
-            })
-            .await;
-        if !refresh.errors.is_empty() {
+        // Spawn catalog refresh in the background so startup isn't blocked
+        // by a slow or unreachable API server. Seed / cached models are
+        // already available and will be replaced once the fetch completes.
+        let bg_models = Arc::clone(&models);
+        tokio::spawn(async move {
+            let refresh = bg_models
+                .refresh(ModelsRefreshOptions {
+                    allow_network: Some(true),
+                    force: true,
+                    provider_id: Some(SOKET_PROVIDER_ID.into()),
+                })
+                .await;
             for (pid, err) in &refresh.errors {
                 tracing::warn!("model refresh {pid}: {err}");
             }
-        }
+        });
     }
 
     let provider = settings.default_provider.clone();

@@ -39,7 +39,7 @@ pub fn stream_proxy(options: ProxyStreamOptions) -> StreamFn {
         Box::pin(async move {
             let stream = create_assistant_message_event_stream();
             let handle = stream.handle();
-            let client = reqwest::Client::new();
+            let client = loop_ai::streaming_http_client();
             let url = format!(
                 "{}/api/stream",
                 options.proxy_url.trim_end_matches('/')

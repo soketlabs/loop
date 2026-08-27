@@ -7,7 +7,6 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
-use tracing::debug;
 
 use crate::api::detect_compat::resolve_compat;
 use crate::api::transform_messages::transform_messages;
@@ -23,16 +22,22 @@ use crate::types::{
 use crate::utils::{calculate_cost, parse_streaming_json};
 
 /// Adapter for OpenAI-compatible Chat Completions APIs.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct OpenAICompletionsAdapter {
     client: reqwest::Client,
 }
 
+impl Default for OpenAICompletionsAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OpenAICompletionsAdapter {
-    /// Create with a default reqwest client.
+    /// Create with a streaming-optimised reqwest client (connect timeout, no overall timeout).
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: super::http::streaming_http_client(),
         }
     }
 
@@ -251,6 +256,9 @@ async fn run_stream(
     let byte_stream = response.bytes_stream();
     let mut event_stream = byte_stream.eventsource();
 
+    // If no SSE chunk arrives within this window, treat the connection as stalled.
+    const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
     loop {
         let next = if let Some(token) = &cancel {
             tokio::select! {
@@ -264,10 +272,28 @@ async fn run_stream(
                     });
                     return Ok(());
                 }
-                ev = event_stream.next() => ev,
+                ev = tokio::time::timeout(SSE_IDLE_TIMEOUT, event_stream.next()) => {
+                    match ev {
+                        Ok(inner) => inner,
+                        Err(_) => {
+                            return Err(StreamFail {
+                                message: format!("server stopped responding (no data for {}s)", SSE_IDLE_TIMEOUT.as_secs()),
+                                aborted: false,
+                            });
+                        }
+                    }
+                }
             }
         } else {
-            event_stream.next().await
+            match tokio::time::timeout(SSE_IDLE_TIMEOUT, event_stream.next()).await {
+                Ok(inner) => inner,
+                Err(_) => {
+                    return Err(StreamFail {
+                        message: format!("server stopped responding (no data for {}s)", SSE_IDLE_TIMEOUT.as_secs()),
+                        aborted: false,
+                    });
+                }
+            }
         };
 
         let Some(event) = next else { break };
@@ -287,7 +313,7 @@ async fn run_stream(
         let chunk: Value = match serde_json::from_str(data) {
             Ok(v) => v,
             Err(e) => {
-                debug!(error = %e, data, "skipping unparseable sse chunk");
+                tracing::warn!(error = %e, "skipping unparseable SSE chunk");
                 continue;
             }
         };

@@ -89,7 +89,7 @@ pub async fn list_openai_models(
     map: &MapRemoteModelOptions,
 ) -> Result<Vec<Model>, ListModelsError> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
+    let client = super::http::http_client();
     let mut req = client.get(&url);
     if let Some(key) = api_key {
         if !key.is_empty() {
