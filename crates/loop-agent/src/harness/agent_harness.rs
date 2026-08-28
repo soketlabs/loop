@@ -227,6 +227,58 @@ impl AgentHarness {
         Ok(id)
     }
 
+    /// Abort any in-flight turn and switch to an existing session by id.
+    pub async fn switch_session(&self, id: &str) -> Result<String, AgentHarnessError> {
+        self.assert_not_shut_down()?;
+        self.abort();
+        self.wait_for_idle().await;
+
+        let store = self.session.lock().await.store();
+        let reader = store
+            .load(id)
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        let new_session = Session::new(store, reader);
+        let sid = new_session.metadata().id.clone();
+
+        *self.session.lock().await = new_session;
+        {
+            let mut opts = self.stream_options.write().await;
+            opts.base.session_id = Some(sid.clone());
+        }
+        self.steering.lock().clear();
+        self.follow_up.lock().clear();
+        self.next_turn.lock().clear();
+        self.pending_writes.lock().clear();
+        self.active_skill_names.write().await.clear();
+
+        Ok(sid)
+    }
+
+    /// Set the display name for the active session.
+    pub async fn set_session_name(&self, name: impl Into<String>) -> Result<(), AgentHarnessError> {
+        let name = name.into();
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        self.assert_not_shut_down()?;
+        let write = crate::harness::session::types::PendingSessionWrite::SessionInfo {
+            name: trimmed.to_string(),
+        };
+        if *self.phase.lock() == AgentHarnessPhase::Idle {
+            let session = self.session.lock().await;
+            session
+                .store()
+                .append_entry(&session.metadata().id, write)
+                .await
+                .map_err(AgentHarnessError::Session)?;
+        } else {
+            self.pending_writes.lock().push(write);
+        }
+        Ok(())
+    }
+
     /// List user-message fork points on the active branch (oldest → newest).
     pub async fn fork_points(
         &self,

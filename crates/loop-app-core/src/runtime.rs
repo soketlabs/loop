@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
-use rustyline::DefaultEditor;
 
 use loop_agent::harness::{
     create_bash_tool, create_edit_tool, create_read_tool, create_session_repository,
@@ -28,8 +27,7 @@ use crate::config::paths::{
 };
 use crate::config::settings::{load_settings, McpServerConfig, Settings};
 use crate::config::trust::TrustStore;
-use crate::config::paths::{keybindings_path, trust_path};
-use crate::keybindings::Keybindings;
+use crate::config::paths::{trust_path};
 use crate::resources::{load_resources, LoadedResources};
 use crate::system_prompt::{
     build_system_prompt, default_tool_snippets, load_context_files, resolve_system_prompt_files,
@@ -53,8 +51,6 @@ pub struct Runtime {
     pub harness: Arc<AgentHarness>,
     /// Theme.
     pub theme: Theme,
-    /// Keybindings.
-    pub keybindings: Keybindings,
     /// Resources.
     pub resources: LoadedResources,
     /// Project trusted.
@@ -231,8 +227,9 @@ pub fn resolve_trust(
                 "Trust project config from {}? [y/N]",
                 cwd.display()
             );
-            let mut rl = DefaultEditor::new()?;
-            let answer = rl.readline("> ")?;
+            let mut answer = String::new();
+            std::io::Write::write_all(&mut std::io::stderr(), b"> ").ok();
+            std::io::stdin().read_line(&mut answer)?;
             let yes = matches!(answer.trim().to_lowercase().as_str(), "y" | "yes");
             trust.set(cwd, yes)?;
             Ok(yes)
@@ -449,7 +446,6 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         project_trusted.then_some(crate::config::paths::get_project_dir(&opts.cwd)).as_ref().map(|p| p.as_path()),
     );
     let theme = Theme::load(&settings.theme, &theme_dirs).unwrap_or_else(|_| Theme::dark());
-    let keybindings = Keybindings::load(&keybindings_path(&agent_dir))?;
 
     let mcp_client = Arc::new(loop_mcp::McpClientManager::new());
     if !settings.mcp_servers.is_empty() {
@@ -482,7 +478,6 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         credentials,
         harness,
         theme,
-        keybindings,
         resources,
         project_trusted,
         trust,

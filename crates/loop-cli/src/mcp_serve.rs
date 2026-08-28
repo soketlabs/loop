@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use loop_agent::harness::mcp::LoopToolProvider;
 use loop_mcp::server::McpServer;
 
-use crate::runtime::Runtime;
+use loop_app_core::Runtime;
 
 /// Bearer token auth middleware. If `expected_token` is `Some`, every request
 /// must carry a matching `Authorization: Bearer <token>` header.

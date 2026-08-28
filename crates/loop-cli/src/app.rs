@@ -29,7 +29,7 @@ use loop_ai::{
 
 use crate::commands::{self, AutocompleteEntry, CommandEffect};
 use crate::keybindings::{hotkey_help, Action};
-use crate::runtime::Runtime;
+use crate::{build_tools, mcp_server_entries, CliRuntime};
 use crate::theme::Theme;
 use crate::tool_approval::{
     auto_approve_from_entries, permissions_from_settings, ApprovalDecision, ApprovalKind,
@@ -114,7 +114,7 @@ struct TokenBarState {
 }
 
 impl TokenBarState {
-    fn from_model(runtime: &Runtime) -> Self {
+    fn from_model(runtime: &CliRuntime) -> Self {
         let context_window = runtime
             .models
             .get_model(
@@ -130,13 +130,13 @@ impl TokenBarState {
         }
     }
 
-    async fn load(runtime: &Runtime) -> Self {
+    async fn load(runtime: &CliRuntime) -> Self {
         let mut state = Self::from_model(runtime);
         state.refresh(runtime).await;
         state
     }
 
-    async fn refresh(&mut self, runtime: &Runtime) {
+    async fn refresh(&mut self, runtime: &CliRuntime) {
         self.sync_window(runtime);
         if let Ok(stats) = runtime.harness.session_stats().await {
             self.total_tokens = stats.tokens.total_tokens();
@@ -147,7 +147,7 @@ impl TokenBarState {
         }
     }
 
-    fn sync_window(&mut self, runtime: &Runtime) {
+    fn sync_window(&mut self, runtime: &CliRuntime) {
         if let Some(m) = runtime.models.get_model(
             &runtime.settings.default_provider,
             &runtime.settings.default_model,
@@ -156,7 +156,7 @@ impl TokenBarState {
         }
     }
 
-    fn reset(&mut self, runtime: &Runtime) {
+    fn reset(&mut self, runtime: &CliRuntime) {
         *self = Self::from_model(runtime);
     }
 
@@ -191,7 +191,7 @@ impl TokenBarState {
 }
 
 /// Run the interactive CLI (inline viewport — native terminal scrollback).
-pub async fn run(mut runtime: Runtime) -> anyhow::Result<()> {
+pub async fn run(mut runtime: CliRuntime) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     let _ = execute!(
@@ -236,7 +236,7 @@ pub async fn run(mut runtime: Runtime) -> anyhow::Result<()> {
 
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    runtime: &mut Runtime,
+    runtime: &mut CliRuntime,
 ) -> anyhow::Result<Option<String>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     let tx_agent = tx.clone();
@@ -750,7 +750,7 @@ fn flush_committed(
 #[allow(clippy::too_many_arguments)]
 fn reset_and_redraw(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    runtime: &Runtime,
+    runtime: &CliRuntime,
     version: &str,
     chat: &[ChatItem],
     flushed: &mut usize,
@@ -803,7 +803,7 @@ fn reset_and_redraw(
 /// Print the welcome banner + info card into terminal scrollback.
 fn print_welcome(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    runtime: &Runtime,
+    runtime: &CliRuntime,
     version: &str,
 ) -> anyhow::Result<()> {
     let endpoint = endpoint_for(runtime);
@@ -827,7 +827,7 @@ fn print_welcome(
 }
 
 /// Dynamic `(name, description)` command entries for skills and prompt templates.
-fn dynamic_command_entries(runtime: &Runtime) -> Vec<(String, String)> {
+fn dynamic_command_entries(runtime: &CliRuntime) -> Vec<(String, String)> {
     let mut extra: Vec<(String, String)> = runtime
         .resources
         .skills
@@ -972,7 +972,7 @@ fn truncate_status(s: &str, max: usize) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn drain_ui_events(
-    runtime: &mut Runtime,
+    runtime: &mut CliRuntime,
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
     review_rx: &mut mpsc::UnboundedReceiver<ApprovalPrompt>,
     active_approval: &mut Option<ActiveApproval>,
@@ -1071,7 +1071,7 @@ fn drain_ui_events(
     );
 }
 
-fn agent_is_busy(runtime: &Runtime, working: bool) -> bool {
+fn agent_is_busy(runtime: &CliRuntime, working: bool) -> bool {
     working || runtime.harness.phase() != AgentHarnessPhase::Idle
 }
 
@@ -1107,7 +1107,7 @@ fn dequeue_last_message(
 }
 
 fn start_user_turn(
-    runtime: &Runtime,
+    runtime: &CliRuntime,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     streaming_assistant: &mut Option<usize>,
@@ -1144,7 +1144,7 @@ fn start_user_turn(
 }
 
 fn try_drain_message_queue(
-    runtime: &Runtime,
+    runtime: &CliRuntime,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     streaming_assistant: &mut Option<usize>,
@@ -1176,7 +1176,7 @@ fn try_drain_message_queue(
 }
 
 fn submit_user_text(
-    runtime: &Runtime,
+    runtime: &CliRuntime,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     streaming_assistant: &mut Option<usize>,
@@ -1210,7 +1210,7 @@ fn submit_user_text(
 /// Run `!command` locally: show output in the transcript, never send to the LLM
 /// or append to the session message list.
 async fn run_bang_command(
-    runtime: &Runtime,
+    runtime: &CliRuntime,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     streaming_assistant: &mut Option<usize>,
@@ -1275,7 +1275,7 @@ async fn run_bang_command(
 
 async fn handle_key(
     key: crossterm::event::KeyEvent,
-    runtime: &mut Runtime,
+    runtime: &mut CliRuntime,
     input: &mut InputBuffer,
     history: &mut CommandHistory,
     chat: &mut Vec<ChatItem>,
@@ -2048,7 +2048,7 @@ impl ForkPickerState {
 }
 
 async fn open_fork_picker(
-    runtime: &Runtime,
+    runtime: &CliRuntime,
     fork_picker: &mut Option<ForkPickerState>,
     model_picker: &mut Option<ModelPickerState>,
     chat: &mut Vec<ChatItem>,
@@ -2075,7 +2075,7 @@ async fn open_fork_picker(
 
 #[allow(clippy::too_many_arguments)]
 async fn adopt_forked_session(
-    runtime: &mut Runtime,
+    runtime: &mut CliRuntime,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     working: &mut bool,
@@ -2135,7 +2135,7 @@ async fn adopt_forked_session(
     }
 }
 
-fn endpoint_for(runtime: &Runtime) -> String {
+fn endpoint_for(runtime: &CliRuntime) -> String {
     runtime
         .models
         .get_model(
@@ -2424,7 +2424,7 @@ fn upsert_tool(
 
 async fn apply_effect(
     effect: CommandEffect,
-    runtime: &mut Runtime,
+    runtime: &mut CliRuntime,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     pending_login: &mut Option<String>,
@@ -2535,7 +2535,7 @@ async fn apply_effect(
                                 .await
                                 .map_err(|e| format!("sandbox: {e}"))?;
                             harness
-                                .set_tools(crate::runtime::build_tools(env))
+                                .set_tools(build_tools(env))
                                 .await
                                 .map_err(|e| format!("sandbox: {e}"))?;
                             Ok(SandboxDoneOk::Off)
@@ -2574,7 +2574,7 @@ async fn apply_effect(
                             sb.start().await.map_err(|e| e.to_string())?;
                             let env = sb.env();
                             if let Err(e) = harness
-                                .set_tools(crate::runtime::build_tools(Arc::clone(&env)))
+                                .set_tools(build_tools(Arc::clone(&env)))
                                 .await
                             {
                                 let _ = sb.destroy().await;
@@ -2812,7 +2812,8 @@ async fn apply_effect(
                     return Ok(false);
                 }
             };
-            runtime.trust.set(&runtime.cwd, decision)?;
+            let cwd = runtime.cwd.clone();
+            runtime.trust.set(&cwd, decision)?;
             runtime.project_trusted = decision;
             chat.push(sys(format!("project trust → {decision}")));
         }
@@ -2935,7 +2936,7 @@ async fn apply_effect(
                     if runtime.settings.mcp_servers.is_empty() {
                         chat.push(sys("No MCP servers configured in settings.json"));
                     } else {
-                        let entries = crate::runtime::mcp_server_entries(&runtime.settings.mcp_servers);
+                        let entries = mcp_server_entries(&runtime.settings.mcp_servers);
                         let results = runtime.mcp_client.connect_all(&entries).await;
                         let mut text = String::from("MCP reload:\n");
                         for (name, result) in &results {
@@ -3015,7 +3016,7 @@ async fn apply_effect(
     Ok(false)
 }
 
-async fn cycle_model(runtime: &mut Runtime, forward: bool, chat: &mut Vec<ChatItem>) {
+async fn cycle_model(runtime: &mut CliRuntime, forward: bool, chat: &mut Vec<ChatItem>) {
     let models = runtime.models.get_models(None);
     if models.is_empty() {
         return;
@@ -3040,7 +3041,7 @@ async fn cycle_model(runtime: &mut Runtime, forward: bool, chat: &mut Vec<ChatIt
     chat.push(sys(format!("model → {}/{}", m.provider, m.id)));
 }
 
-async fn cycle_thinking(runtime: &mut Runtime, chat: &mut Vec<ChatItem>) {
+async fn cycle_thinking(runtime: &mut CliRuntime, chat: &mut Vec<ChatItem>) {
     let order = [
         AgentThinkingLevel::Off,
         AgentThinkingLevel::Low,

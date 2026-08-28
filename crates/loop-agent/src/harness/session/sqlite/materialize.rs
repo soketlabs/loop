@@ -150,5 +150,15 @@ pub fn update_materialized_on_append(
         )
         .map_err(|e| SessionError::Storage(e.to_string()))?;
     }
+    if let SessionTreeEntry::SessionInfo { name, .. } = entry {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            conn.execute(
+                "UPDATE sessions SET name=?1 WHERE id=?2",
+                params![trimmed, session_id],
+            )
+            .map_err(|e| SessionError::Storage(e.to_string()))?;
+        }
+    }
     Ok(())
 }

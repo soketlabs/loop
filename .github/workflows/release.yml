@@ -214,9 +214,157 @@ jobs:
             ${{ env.CHECKSUM }}
           if-no-files-found: error
 
+  build-desktop:
+    name: Build Desktop (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            sign: true
+          - os: macos-14
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            sign: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (nightly for GPUI)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfontconfig1-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libvulkan-dev
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.target }}
+
+      - name: Build release
+        env:
+          RUST_FONTCONFIG_DLOPEN: "1"
+        run: cargo build -p loop-desktop --release --locked --target ${{ matrix.target }}
+
+      - name: Import Apple certificate
+        if: matrix.sign && env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/app-signing.keychain-db"
+          security create-keychain -p "$APPLE_CERTIFICATE_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$APPLE_CERTIFICATE_PASSWORD" "$KEYCHAIN"
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$APPLE_CERTIFICATE_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Sign macOS binary
+        if: matrix.sign && env.KEYCHAIN != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/loop-desktop"
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | grep "Developer ID Application" \
+            | head -1 \
+            | sed -E 's/.*"(Developer ID Application[^"]+)".*/\1/')
+          if [[ -z "$IDENTITY" ]]; then
+            echo "::warning::No Developer ID Application identity found; skipping signing"
+            exit 0
+          fi
+          codesign --force --options runtime --timestamp --sign "$IDENTITY" "$bin"
+          codesign --verify --verbose "$bin"
+          echo "MACOS_SIGNED=true" >> "$GITHUB_ENV"
+
+      - name: Notarize binary
+        if: matrix.sign && env.MACOS_SIGNED == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/loop-desktop"
+          NOTARIZE_ZIP="$(mktemp -d)/loop-desktop-notarize.zip"
+          ditto -c -k --keepParent "$bin" "$NOTARIZE_ZIP"
+          xcrun notarytool submit "$NOTARIZE_ZIP" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait \
+            --timeout 15m
+
+      - name: Clean up keychain
+        if: matrix.sign && env.KEYCHAIN != '' && always()
+        shell: bash
+        run: security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/loop-desktop"
+          staging="loop-desktop-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp "$bin" "$staging/loop-desktop"
+          chmod +x "$staging/loop-desktop"
+          tar -czf "${staging}.tar.gz" "$staging"
+          shasum -a 256 "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+          echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
+          echo "CHECKSUM=${staging}.tar.gz.sha256" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $staging = "loop-desktop-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/loop-desktop.exe" "$staging/loop-desktop.exe"
+          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
+          $hash = (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "$staging.zip.sha256" -Value "$hash  $staging.zip"
+          "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CHECKSUM=$staging.zip.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loop-desktop-${{ matrix.target }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.CHECKSUM }}
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, build-desktop]
     runs-on: ubuntu-latest
     if: >
       startsWith(github.ref, 'refs/tags/v') ||

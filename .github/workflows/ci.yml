@@ -31,7 +31,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build -p loop-cli --locked
+        run: cargo build -p loop-cli -p loop-app-core --locked
 
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test -p loop-ai -p loop-agent -p loop-mcp -p loop-orchestration -p loop-app-core -p loop-cli --locked

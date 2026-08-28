@@ -1,0 +1,1291 @@
+//! Root GPUI application shell.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
+use gpui::prelude::FluentBuilder;
+use gpui::*;
+use gpui_component::button::*;
+use gpui_component::h_flex;
+use gpui_component::input::{InputEvent, Textarea, TextareaState};
+use gpui_component::menu::DropdownMenu;
+use gpui_component::menu::PopupMenuItem;
+use gpui_component::scroll::ScrollableElement;
+use gpui_component::separator::Separator;
+use gpui_component::spinner::Spinner;
+use gpui_component::v_flex;
+use gpui_component::{
+    Icon, IconName, Sizable, Theme, VirtualListScrollHandle, v_virtual_list, *,
+};
+
+use crate::controller::{DesktopCommand, DesktopController, DesktopSnapshot};
+use crate::state::{ChatRow, ToolCardStatus};
+
+const SESSION_ROW_HEIGHT: f32 = 48.0;
+const SIDEBAR_WIDTH: f32 = 248.0;
+const DIFF_PANEL_WIDTH: f32 = 400.0;
+const TOOLBAR_HEIGHT: f32 = 32.0;
+
+struct DesktopApp {
+    controller: Arc<DesktopController>,
+    composer: Entity<TextareaState>,
+    chat_scroll: ScrollHandle,
+    session_scroll: VirtualListScrollHandle,
+    session_item_sizes: Rc<Vec<gpui::Size<Pixels>>>,
+    /// Tracks chat length + last message size to auto-scroll on new content.
+    chat_scroll_sig: (usize, usize, bool),
+    diff_panel_open: bool,
+    sidebar_open: bool,
+    last_pending_changes: usize,
+    expanded_thinking: HashSet<String>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl DesktopApp {
+    fn send_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).value().trim().to_string();
+        if text.is_empty() || self.controller.snapshot().streaming {
+            return;
+        }
+        self.composer.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        let controller = Arc::clone(&self.controller);
+        tokio::spawn(async move {
+            if let Err(error) = controller.handle_command(DesktopCommand::Prompt(text)).await {
+                tracing::warn!("prompt failed: {error:#}");
+            }
+        });
+    }
+
+    fn sync_session_sizes(&mut self, count: usize) {
+        self.session_item_sizes =
+            Rc::new(vec![size(px(SIDEBAR_WIDTH - 16.), px(SESSION_ROW_HEIGHT)); count.max(1)]);
+    }
+
+    fn run_command(&self, cmd: DesktopCommand) {
+        let controller = Arc::clone(&self.controller);
+        tokio::spawn(async move {
+            if let Err(error) = controller.handle_command(cmd).await {
+                tracing::warn!("desktop command failed: {error:#}");
+            }
+        });
+    }
+
+    fn maybe_scroll_chat(&mut self, snap: &DesktopSnapshot) {
+        let sig = chat_scroll_signature(snap);
+        if sig != self.chat_scroll_sig {
+            self.chat_scroll_sig = sig;
+            if self.chat_scroll.max_offset().y > px(0.) {
+                self.chat_scroll.scroll_to_bottom();
+            }
+        }
+    }
+}
+
+fn chat_scroll_signature(snap: &DesktopSnapshot) -> (usize, usize, bool) {
+    let last_len = snap
+        .chat_rows
+        .last()
+        .map(|row| match row {
+            ChatRow::User { text, .. } | ChatRow::Assistant { text, .. } => text.len(),
+            ChatRow::Thinking { text, .. } => text.len(),
+            _ => 0,
+        })
+        .unwrap_or(0);
+    (snap.chat_rows.len(), last_len, snap.streaming)
+}
+
+impl Render for DesktopApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let snap = self.controller.snapshot();
+        self.sync_session_sizes(snap.sessions.len());
+        self.maybe_scroll_chat(&snap);
+        if snap.pending_changes.len() > self.last_pending_changes {
+            self.diff_panel_open = true;
+        }
+        self.last_pending_changes = snap.pending_changes.len();
+        let app = cx.entity().clone();
+        let project = crate::chat_ui::project_label(&snap.cwd);
+        window.set_window_title(&format!("Loop — {project}"));
+
+        v_flex()
+            .id("desktop-root")
+            .size_full()
+            .min_h_0()
+            .min_w_0()
+            .overflow_hidden()
+            .bg(cx.theme().background)
+            .child(render_toolbar(
+                &snap,
+                self.diff_panel_open,
+                self.sidebar_open,
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .id("desktop-main")
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .when(self.sidebar_open, |el| {
+                        el.child(render_sidebar(
+                            &snap,
+                            &self.session_scroll,
+                            self.session_item_sizes.clone(),
+                            cx,
+                        ))
+                    })
+                    .child(
+                        v_flex()
+                            .id("desktop-chat-column")
+                            .flex_1()
+                            .h_full()
+                            .min_w_0()
+                            .min_h_0()
+                            .child(render_chat_panel(
+                                &snap,
+                                &self.expanded_thinking,
+                                cx,
+                            ))
+                            .child(render_composer(&snap, &self.composer, app, cx)),
+                    )
+                    .when(self.diff_panel_open, |el| {
+                        el.child(render_diff_panel(&snap, cx))
+                    }),
+            )
+            .when(snap.approval_prompt.is_some(), |el| {
+                el.child(render_approval_overlay(
+                    snap.approval_prompt.as_ref().unwrap(),
+                    cx,
+                ))
+            })
+    }
+}
+
+actions!(desktop, [ToggleDiffPanel, ToggleSidebar]);
+
+fn render_toolbar(
+    snap: &DesktopSnapshot,
+    diff_open: bool,
+    sidebar_open: bool,
+    cx: &mut Context<DesktopApp>,
+) -> impl IntoElement {
+    let session = snap
+        .sessions
+        .iter()
+        .find(|s| s.active)
+        .map(|s| crate::session_title::display_title(s.name.as_deref()))
+        .unwrap_or_else(|| "New chat".into());
+    let activity = crate::chat_ui::activity_label(snap.streaming, snap.phase, &snap.chat_rows);
+
+    h_flex()
+        .id("desktop-toolbar")
+        .w_full()
+        .h(px(TOOLBAR_HEIGHT))
+        .flex_shrink_0()
+        .items_center()
+        .justify_between()
+        .px_2()
+        .gap_2()
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().sidebar)
+        .child(
+            h_flex()
+                .items_center()
+                .gap_1()
+                .min_w_0()
+                .child(
+                    Button::new("toggle-sidebar")
+                        .ghost()
+                        .xsmall()
+                        .icon(if sidebar_open {
+                            IconName::PanelLeftClose
+                        } else {
+                            IconName::PanelLeftOpen
+                        })
+                        .tooltip(if sidebar_open {
+                            "Hide sessions"
+                        } else {
+                            "Show sessions"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sidebar_open = !this.sidebar_open;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .text_sm()
+                        .font_medium()
+                        .text_ellipsis()
+                        .text_color(cx.theme().foreground)
+                        .child(session),
+                ),
+        )
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .flex_shrink_0()
+                .when_some(activity, |el, label| {
+                    el.child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(Spinner::new().xsmall().color(cx.theme().accent))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().accent)
+                                    .child(label)
+                                    .with_animation(
+                                        "activity-pulse",
+                                        Animation::new(Duration::from_millis(1400)).repeat(),
+                                        |this, delta| {
+                                            let t = (delta * std::f32::consts::PI * 2.).sin().abs();
+                                            this.opacity(0.45 + 0.55 * t)
+                                        },
+                                    ),
+                            ),
+                    )
+                })
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(short_model(&snap.model_label)),
+                )
+                .child(
+                    Button::new("toggle-diff-panel")
+                        .ghost()
+                        .xsmall()
+                        .icon(if diff_open {
+                            IconName::PanelRightClose
+                        } else {
+                            IconName::PanelRightOpen
+                        })
+                        .tooltip(if diff_open {
+                            "Hide review panel"
+                        } else {
+                            "Show review panel"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.diff_panel_open = !this.diff_panel_open;
+                            cx.notify();
+                        })),
+                ),
+        )
+}
+
+fn render_sidebar(
+    snap: &DesktopSnapshot,
+    scroll: &VirtualListScrollHandle,
+    item_sizes: Rc<Vec<gpui::Size<Pixels>>>,
+    cx: &mut Context<DesktopApp>,
+) -> impl IntoElement {
+    let sessions = snap.sessions.clone();
+    v_flex()
+        .w(px(SIDEBAR_WIDTH))
+        .min_w(px(200.))
+        .max_w(px(320.))
+        .flex_shrink_0()
+        .h_full()
+        .min_h_0()
+        .bg(cx.theme().sidebar)
+        .border_r_1()
+        .border_color(cx.theme().border)
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .px_2()
+                .h(px(TOOLBAR_HEIGHT))
+                .flex_shrink_0()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Sessions"),
+                )
+                .child(
+                    Button::new("new-session")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Plus)
+                        .tooltip("New chat")
+                        .on_click(cx.listener(|this, _, _, _| {
+                            this.run_command(DesktopCommand::NewSession);
+                        })),
+                ),
+        )
+        .child(
+            div().px_2().pb_2().child(
+                Button::new("new-session-full")
+                    .outline()
+                    .compact()
+                    .w_full()
+                    .label("New chat")
+                    .icon(IconName::Plus)
+                    .on_click(cx.listener(|this, _, _, _| {
+                        this.run_command(DesktopCommand::NewSession);
+                    })),
+            ),
+        )
+        .child(
+            v_flex().flex_1().min_h_0().child(
+                v_virtual_list(
+                    cx.entity().clone(),
+                    "sessions",
+                    item_sizes,
+                    move |_, visible_range, _, cx| {
+                        visible_range
+                            .filter_map(|ix| sessions.get(ix).cloned())
+                            .map(|s| render_session_row(s, cx).into_any_element())
+                            .collect::<Vec<_>>()
+                    },
+                )
+                .track_scroll(scroll)
+                .flex_1(),
+            ),
+        )
+}
+
+fn render_session_row(s: crate::state::SessionRow, cx: &mut Context<DesktopApp>) -> impl IntoElement {
+    let label = crate::session_title::display_title(s.name.as_deref());
+    let session_id = s.id.clone();
+    let active = s.active;
+    let running = s.running;
+    let time = crate::chat_ui::relative_time(s.updated_at);
+
+    h_flex()
+        .id(SharedString::from(session_id.clone()))
+        .w_full()
+        .h(px(SESSION_ROW_HEIGHT))
+        .items_center()
+        .gap_2()
+        .px_2()
+        .rounded_md()
+        .cursor_pointer()
+        .when(active, |el| el.bg(cx.theme().accent.opacity(0.14)))
+        .hover(|el| {
+            if active {
+                el
+            } else {
+                el.bg(cx.theme().muted.opacity(0.35))
+            }
+        })
+        .on_click(cx.listener({
+            move |this, _, _, _| {
+                this.run_command(DesktopCommand::SelectSession(session_id.clone()));
+            }
+        }))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .font_medium()
+                                .text_ellipsis()
+                                .text_color(if active {
+                                    cx.theme().foreground
+                                } else {
+                                    cx.theme().sidebar_foreground
+                                })
+                                .child(label),
+                        )
+                        .when(running, |el| {
+                            el.child(
+                                Spinner::new()
+                                    .xsmall()
+                                    .color(cx.theme().accent),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(time),
+                ),
+        )
+}
+
+fn render_chat_panel(
+    snap: &DesktopSnapshot,
+    expanded_thinking: &HashSet<String>,
+    cx: &mut Context<DesktopApp>,
+) -> impl IntoElement {
+    let rows = snap.chat_rows.clone();
+    let expanded = expanded_thinking.clone();
+    let empty = rows.is_empty();
+    let streaming = snap.streaming;
+    let selected = snap.selected_change_id.clone();
+    let show_working = streaming
+        && !rows.iter().any(|r| match r {
+            ChatRow::Assistant { streaming: true, .. } => true,
+            ChatRow::Thinking { done: false, .. } => true,
+            ChatRow::Tool {
+                status: ToolCardStatus::Running | ToolCardStatus::Pending,
+                ..
+            } => true,
+            _ => false,
+        });
+
+    v_flex()
+        .id("chat-scroll")
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .overflow_y_scrollbar()
+        .child(
+            v_flex()
+                .w_full()
+                .px_4()
+                .py_3()
+                .gap_3()
+                .when(empty && !streaming, |el| el.child(render_empty_state(snap, cx)))
+                .children(rows.iter().map(|row| {
+                    render_chat_row(
+                        row,
+                        expanded.contains(row_id(row)),
+                        selected.as_deref(),
+                        cx,
+                    )
+                }))
+                .when(show_working, |el| el.child(render_working_row(snap, cx))),
+        )
+}
+
+fn row_id(row: &ChatRow) -> &str {
+    match row {
+        ChatRow::User { id, .. }
+        | ChatRow::Assistant { id, .. }
+        | ChatRow::Thinking { id, .. }
+        | ChatRow::Tool { id, .. }
+        | ChatRow::FileChange { id, .. } => id,
+        ChatRow::System(_) => "system",
+    }
+}
+
+fn render_empty_state(snap: &DesktopSnapshot, cx: &mut Context<DesktopApp>) -> impl IntoElement {
+    let project = crate::chat_ui::project_label(&snap.cwd);
+    v_flex()
+        .w_full()
+        .py_8()
+        .items_center()
+        .justify_center()
+        .gap_3()
+        .child(
+            div()
+                .size_12()
+                .rounded_full()
+                .bg(cx.theme().accent.opacity(0.15))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::new(IconName::Bot)
+                        .size_8()
+                        .text_color(cx.theme().accent),
+                ),
+        )
+        .child(
+            div()
+                .text_lg()
+                .font_semibold()
+                .text_color(cx.theme().foreground)
+                .child("What should we work on?"),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("Ask Loop to edit, search, or run commands in {project}")),
+        )
+}
+
+fn render_working_row(snap: &DesktopSnapshot, cx: &mut Context<DesktopApp>) -> impl IntoElement {
+    let label = crate::chat_ui::activity_label(true, snap.phase, &snap.chat_rows)
+        .unwrap_or_else(|| "Working".into());
+    h_flex()
+        .items_center()
+        .gap_2()
+        .py_1()
+        .child(Spinner::new().small().color(cx.theme().accent))
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(label)
+                .with_animation(
+                    "working-fade",
+                    Animation::new(Duration::from_millis(1200)).repeat(),
+                    |this, delta| {
+                        let t = (delta * std::f32::consts::PI * 2.).sin().abs();
+                        this.opacity(0.5 + 0.5 * t)
+                    },
+                ),
+        )
+}
+
+fn render_chat_row(
+    row: &ChatRow,
+    thinking_open: bool,
+    selected_change: Option<&str>,
+    cx: &mut Context<DesktopApp>,
+) -> Div {
+    match row {
+        ChatRow::User { text, .. } => h_flex().w_full().justify_end().child(
+            div()
+                .max_w(px(560.))
+                .px_4()
+                .py_3()
+                .rounded_xl()
+                .bg(cx.theme().accent.opacity(0.16))
+                .text_color(cx.theme().foreground)
+                .child(text.clone()),
+        ),
+        ChatRow::Assistant { id, text, streaming } => v_flex()
+            .w_full()
+            .gap_1()
+            .child(crate::markdown::render_markdown(
+                format!("assistant-{id}"),
+                text.clone(),
+                cx,
+            ))
+            .when(*streaming, |el| el.child(crate::markdown::streaming_caret(cx))),
+        ChatRow::Thinking { id, text, done } => {
+            let open = !*done || thinking_open;
+            let preview = thinking_preview(text, *done);
+            let think_id = id.clone();
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .id(SharedString::from(format!("think-toggle-{id}")))
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.expanded_thinking.contains(&think_id) {
+                                this.expanded_thinking.remove(&think_id);
+                            } else {
+                                this.expanded_thinking.insert(think_id.clone());
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            Icon::new(if open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size_4()
+                            .text_color(cx.theme().muted_foreground),
+                        )
+                        .when(!*done, |el| {
+                            el.child(Spinner::new().xsmall().color(cx.theme().muted_foreground))
+                        })
+                        .child(
+                            div()
+                                .text_sm()
+                                .italic()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if *done { "Thought" } else { "Thinking" }),
+                        )
+                        .when(!open && !preview.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .text_ellipsis()
+                                    .text_color(cx.theme().muted_foreground.opacity(0.8))
+                                    .child(preview),
+                            )
+                        }),
+                )
+                .when(open && !text.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .pl_6()
+                            .text_sm()
+                            .italic()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(text.clone()),
+                    )
+                })
+        }
+        ChatRow::Tool {
+            name,
+            summary,
+            status,
+            ..
+        } => {
+            let color = match status {
+                ToolCardStatus::Running | ToolCardStatus::Pending => cx.theme().warning,
+                ToolCardStatus::Success => cx.theme().muted_foreground,
+                ToolCardStatus::Error => cx.theme().danger,
+            };
+            h_flex().w_full().items_center().child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .border_l_2()
+                    .border_color(color.opacity(0.7))
+                    .bg(color.opacity(0.06))
+                    .when(*status == ToolCardStatus::Running, |el| {
+                        el.child(Spinner::new().xsmall().color(color))
+                    })
+                    .when(*status == ToolCardStatus::Success, |el| {
+                        el.child(
+                            Icon::new(IconName::Check)
+                                .size_4()
+                                .text_color(cx.theme().success),
+                        )
+                    })
+                    .when(*status == ToolCardStatus::Error, |el| {
+                        el.child(
+                            Icon::new(IconName::CircleX)
+                                .size_4()
+                                .text_color(cx.theme().danger),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_color(color)
+                            .child(crate::chat_ui::tool_activity_label(name, summary, *status)),
+                    ),
+            )
+        }
+        ChatRow::FileChange {
+            id,
+            path,
+            added,
+            removed,
+            ..
+        } => {
+            let selected = selected_change == Some(id.as_str());
+            let change_id = id.clone();
+            h_flex().w_full().child(
+                h_flex()
+                    .id(SharedString::from(format!("change-{id}")))
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if selected {
+                        cx.theme().accent.opacity(0.5)
+                    } else {
+                        cx.theme().border
+                    })
+                    .bg(if selected {
+                        cx.theme().accent.opacity(0.1)
+                    } else {
+                        cx.theme().muted.opacity(0.2)
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.diff_panel_open = true;
+                        this.run_command(DesktopCommand::SelectFileChange(change_id.clone()));
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(IconName::File)
+                            .size_4()
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_color(cx.theme().foreground)
+                            .child(short_path(path)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().success)
+                            .child(format!("+{added}")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().danger)
+                            .child(format!("−{removed}")),
+                    ),
+            )
+        }
+        ChatRow::System(text) => div()
+            .w_full()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(text.clone()),
+    }
+}
+
+fn thinking_preview(text: &str, done: bool) -> String {
+    let line = if done {
+        text.lines().find(|l| !l.trim().is_empty())
+    } else {
+        text.lines().rev().find(|l| !l.trim().is_empty())
+    }
+    .unwrap_or("")
+    .trim();
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() > 72 {
+        format!("{}…", chars[..69].iter().collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
+fn short_path(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    match (p.parent().and_then(|d| d.file_name()), p.file_name()) {
+        (Some(parent), Some(name)) => format!("{}/{}", parent.to_string_lossy(), name.to_string_lossy()),
+        (_, Some(name)) => name.to_string_lossy().into_owned(),
+        _ => path.to_string(),
+    }
+}
+
+fn render_composer(
+    snap: &DesktopSnapshot,
+    composer: &Entity<TextareaState>,
+    app: Entity<DesktopApp>,
+    cx: &mut Context<DesktopApp>,
+) -> impl IntoElement {
+    let models = snap.available_models.clone();
+    let current_model = snap.model_label.clone();
+    v_flex()
+        .w_full()
+        .flex_shrink_0()
+        .border_t_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().background)
+        .px_3()
+        .pt_2()
+        .pb_2()
+        .gap_1()
+        .child(Textarea::new(composer).appearance(false).bordered(false))
+        .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Button::new("model")
+                                        .ghost()
+                                        .small()
+                                        .label(if models.is_empty() {
+                                            snap.model_label.clone()
+                                        } else {
+                                            format!("{} ▾", short_model(&snap.model_label))
+                                        })
+                                        .dropdown_caret(true)
+                                        .dropdown_menu({
+                                            let models = models.clone();
+                                            let current_model = current_model.clone();
+                                            let app = app.clone();
+                                            move |mut menu, _, _| {
+                                                if models.is_empty() {
+                                                    return menu.label("No models loaded yet");
+                                                }
+                                                menu = menu.scrollable(true).max_h(px(320.));
+                                                for (provider, model_id, name) in &models {
+                                                    let label = if name.is_empty() {
+                                                        format!("{provider}/{model_id}")
+                                                    } else {
+                                                        format!("{name} ({provider}/{model_id})")
+                                                    };
+                                                    let checked = format!("{provider}/{model_id}")
+                                                        == current_model;
+                                                    let p = provider.clone();
+                                                    let m = model_id.clone();
+                                                    let app = app.clone();
+                                                    menu = menu.item(
+                                                        PopupMenuItem::new(label)
+                                                            .checked(checked)
+                                                            .on_click(move |_, _, cx| {
+                                                                app.update(cx, |this, _| {
+                                                                    this.run_command(
+                                                                        DesktopCommand::SetModel {
+                                                                            provider: p.clone(),
+                                                                            model_id: m.clone(),
+                                                                        },
+                                                                    );
+                                                                });
+                                                            }),
+                                                    );
+                                                }
+                                                menu
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new("thinking")
+                                        .ghost()
+                                        .small()
+                                        .label(format!("think: {}", snap.thinking_label))
+                                        .on_click(cx.listener(|this, _, _, _| {
+                                            this.run_command(DesktopCommand::CycleThinking);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(snap.stats.summary_line()),
+                                ),
+                        )
+                        .child(
+                            Button::new("send")
+                                .primary()
+                                .icon(IconName::ArrowUp)
+                                .tooltip(if snap.streaming {
+                                    "Working…"
+                                } else {
+                                    "Send"
+                                })
+                                .loading(snap.streaming)
+                                .disabled(snap.streaming)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.send_prompt(window, cx);
+                                })),
+                        ),
+        )
+}
+
+fn short_model(label: &str) -> String {
+    label
+        .rsplit_once('/')
+        .map(|(_, id)| id.to_string())
+        .unwrap_or_else(|| label.to_string())
+}
+
+fn render_diff_panel(snap: &DesktopSnapshot, cx: &mut Context<DesktopApp>) -> impl IntoElement {
+    let selected = snap
+        .pending_changes
+        .iter()
+        .find(|c| Some(c.id.as_str()) == snap.selected_change_id.as_deref())
+        .or_else(|| snap.pending_changes.last());
+
+    let editor_label = snap
+        .detected_editors
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Open".into());
+
+    v_flex()
+        .w(px(DIFF_PANEL_WIDTH))
+        .min_w(px(280.))
+        .max_w(px(520.))
+        .flex_shrink_0()
+        .h_full()
+        .min_h_0()
+        .bg(cx.theme().sidebar)
+        .border_l_1()
+        .border_color(cx.theme().border)
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(
+                    div()
+                        .text_sm()
+                        .font_medium()
+                        .text_ellipsis()
+                        .child(
+                            selected
+                                .map(|c| short_path(&c.path.display().to_string()))
+                                .unwrap_or_else(|| "Review".into()),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .when_some(selected, |el, c| {
+                            el.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().success)
+                                    .child(format!("+{}", c.added)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().danger)
+                                    .child(format!("−{}", c.removed)),
+                            )
+                        })
+                        .child(
+                            Button::new("open-editor")
+                                .ghost()
+                                .xsmall()
+                                .label(editor_label)
+                                .disabled(selected.is_none())
+                                .on_click(cx.listener(|this, _, _, _| {
+                                    this.run_command(DesktopCommand::OpenInEditor);
+                                })),
+                        )
+                        .child(
+                            Button::new("close-diff-panel")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::PanelRightClose)
+                                .tooltip("Hide review panel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.diff_panel_open = false;
+                                    cx.notify();
+                                })),
+                        ),
+                ),
+        )
+        .when(snap.pending_changes.len() > 1, |el| {
+            el.child(
+                v_flex()
+                    .px_2()
+                    .py_2()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .children(snap.pending_changes.iter().map(|c| {
+                        let id = c.id.clone();
+                        let selected = Some(c.id.as_str()) == snap.selected_change_id.as_deref();
+                        Button::new(format!("diff-file-{id}"))
+                            .ghost()
+                            .small()
+                            .label(format!(
+                                "{}  +{} −{}",
+                                short_path(&c.path.display().to_string()),
+                                c.added,
+                                c.removed
+                            ))
+                            .when(selected, |b| b.primary())
+                            .on_click(cx.listener(move |this, _, _, _| {
+                                this.run_command(DesktopCommand::SelectFileChange(id.clone()));
+                            }))
+                    })),
+            )
+        })
+        .child(
+            v_flex()
+                .gap_0()
+                .p_3()
+                .overflow_y_scrollbar()
+                .flex_1()
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_sm()
+                .children(
+                    selected
+                        .map(|c| {
+                            let diff = similar::TextDiff::from_lines(
+                                c.before.as_deref().unwrap_or(""),
+                                &c.after,
+                            );
+                            diff.iter_all_changes()
+                                .map(|change| {
+                                    let (sign, color, bg) = match change.tag() {
+                                        similar::ChangeTag::Insert => {
+                                            ("+", cx.theme().success, cx.theme().success.opacity(0.08))
+                                        }
+                                        similar::ChangeTag::Delete => {
+                                            ("−", cx.theme().danger, cx.theme().danger.opacity(0.08))
+                                        }
+                                        similar::ChangeTag::Equal => {
+                                            (" ", cx.theme().muted_foreground, cx.theme().background)
+                                        }
+                                    };
+                                    div()
+                                        .px_1()
+                                        .bg(bg)
+                                        .text_color(color)
+                                        .child(format!("{sign}{}", change.value().trim_end()))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .into_iter()
+                        .flatten(),
+                )
+                .when(selected.is_none(), |el| {
+                    el.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("No pending file changes"),
+                    )
+                }),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .p_3()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .child(
+                    Button::new("accept")
+                        .primary()
+                        .label("Keep")
+                        .disabled(selected.is_none())
+                        .on_click(cx.listener(|this, _, _, _| {
+                            if let Some(id) = this
+                                .controller
+                                .snapshot()
+                                .selected_change_id
+                                .clone()
+                                .or_else(|| {
+                                    this.controller
+                                        .snapshot()
+                                        .pending_changes
+                                        .last()
+                                        .map(|c| c.id.clone())
+                                })
+                            {
+                                this.run_command(DesktopCommand::AcceptFileChange(id));
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("reject")
+                        .danger()
+                        .label("Revert")
+                        .disabled(selected.is_none())
+                        .on_click(cx.listener(|this, _, _, _| {
+                            if let Some(id) = this
+                                .controller
+                                .snapshot()
+                                .selected_change_id
+                                .clone()
+                                .or_else(|| {
+                                    this.controller
+                                        .snapshot()
+                                        .pending_changes
+                                        .last()
+                                        .map(|c| c.id.clone())
+                                })
+                            {
+                                this.run_command(DesktopCommand::RejectFileChange(id));
+                            }
+                        })),
+                ),
+        )
+}
+
+fn render_approval_overlay(
+    prompt: &crate::approval::ApprovalUiPrompt,
+    cx: &mut Context<DesktopApp>,
+) -> impl IntoElement {
+    div()
+        .absolute()
+        .inset_0()
+        .bg(rgba(0x00000099))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            v_flex()
+                .w(px(480.0))
+                .rounded_xl()
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().background)
+                .shadow_lg()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .p_4()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            Icon::new(IconName::TriangleAlert)
+                                .size_4()
+                                .text_color(cx.theme().warning),
+                        )
+                        .child(
+                            div()
+                                .font_semibold()
+                                .child(format!("Allow {}?", prompt.tool_name)),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .p_4()
+                        .child(prompt.summary.clone())
+                        .when(!prompt.detail.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .text_sm()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(prompt.detail.clone()),
+                            )
+                        }),
+                )
+                .child(Separator::horizontal())
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .p_4()
+                        .justify_end()
+                        .child(
+                            Button::new("reject")
+                                .label("Reject")
+                                .on_click(cx.listener(|this, _, _, _| {
+                                    this.run_command(DesktopCommand::ResolveApproval {
+                                        accept: false,
+                                        session: false,
+                                        reason: None,
+                                    });
+                                })),
+                        )
+                        .child(
+                            Button::new("accept")
+                                .primary()
+                                .label("Allow")
+                                .on_click(cx.listener(|this, _, _, _| {
+                                    this.run_command(DesktopCommand::ResolveApproval {
+                                        accept: true,
+                                        session: false,
+                                        reason: None,
+                                    });
+                                })),
+                        )
+                        .child(
+                            Button::new("accept-session")
+                                .outline()
+                                .label("Always allow")
+                                .on_click(cx.listener(|this, _, _, _| {
+                                    this.run_command(DesktopCommand::ResolveApproval {
+                                        accept: true,
+                                        session: true,
+                                        reason: None,
+                                    });
+                                })),
+                        ),
+                ),
+        )
+}
+
+/// Launch the desktop application.
+pub async fn run_desktop(cwd: PathBuf) -> anyhow::Result<()> {
+    let controller = Arc::new(DesktopController::new(cwd).await?);
+
+    let controller_ui = Arc::clone(&controller);
+    let ui_rx = controller.ui_receiver();
+
+    gpui_platform::application()
+        .with_assets(gpui_component_assets::Assets)
+        .run(move |cx| {
+            gpui_component::init(cx);
+            Theme::change(ThemeMode::Dark, None, cx);
+
+            cx.spawn(async move |cx| {
+                let mut options = WindowOptions::default();
+                options.window_min_size = Some(size(px(840.), px(560.)));
+                options.window_bounds = Some(cx.update(|cx| {
+                    WindowBounds::centered(size(px(1280.), px(840.)), cx)
+                }));
+
+                cx.open_window(options, move |window, cx| {
+                    Theme::change(ThemeMode::Dark, Some(window), cx);
+                    let composer = cx.new(|cx| {
+                        TextareaState::new(window, cx)
+                            .auto_grow(1, 8)
+                            .submit_on_enter(true)
+                            .placeholder("Ask Loop to make a change…")
+                    });
+
+                    let view = cx.new(|cx| {
+                        let subscriptions = vec![cx.subscribe_in(
+                            &composer,
+                            window,
+                            |this: &mut DesktopApp, input, event, window, cx| {
+                                if let InputEvent::PressEnter { shift, .. } = event {
+                                    if !shift {
+                                        this.send_prompt(window, cx);
+                                        input.update(cx, |state, cx| {
+                                            state.set_value("", window, cx);
+                                        });
+                                    }
+                                }
+                            },
+                        )];
+
+                        DesktopApp {
+                            controller: Arc::clone(&controller_ui),
+                            composer,
+                            chat_scroll: ScrollHandle::new(),
+                            session_scroll: VirtualListScrollHandle::new(),
+                            session_item_sizes: Rc::new(vec![size(
+                                px(SIDEBAR_WIDTH - 16.),
+                                px(SESSION_ROW_HEIGHT),
+                            )]),
+                            chat_scroll_sig: (0, 0, false),
+                            diff_panel_open: false,
+                            sidebar_open: true,
+                            last_pending_changes: 0,
+                            expanded_thinking: HashSet::new(),
+                            _subscriptions: subscriptions,
+                        }
+                    });
+
+                    let poll_rx = ui_rx.clone();
+                    let view_entity = view.clone();
+                    cx.spawn(async move |cx| {
+                        loop {
+                            if poll_rx.recv().await.is_err() {
+                                break;
+                            }
+                            while poll_rx.try_recv().is_ok() {}
+                            let _ = view_entity.update(cx, |_, cx| cx.notify());
+                            cx.background_executor()
+                                .timer(Duration::from_millis(16))
+                                .await;
+                        }
+                    })
+                    .detach();
+
+                    cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
+                })
+                .expect("open window");
+            })
+            .detach();
+        });
+
+    Ok(())
+}
