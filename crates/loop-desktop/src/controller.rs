@@ -9,6 +9,7 @@ use loop_agent::harness::{
     create_session_repository, create_sqlite_session_store, AgentHarnessPhase,
 };
 use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel, AgentToolResult};
+use loop_ai::AssistantMessageEvent;
 use loop_app_core::tool_approval::{permissions_from_settings, ApprovalDecision, ToolApprovalBridge};
 use loop_app_core::{bootstrap, BootstrapOpts, Runtime};
 use parking_lot::Mutex;
@@ -610,8 +611,24 @@ fn apply_agent_event(
                 s.stats.apply_message(msg);
             }
         }
-        AgentEvent::MessageUpdate { message, .. } => {
-            merge_streaming_message(&mut s.chat_rows, message);
+        AgentEvent::MessageUpdate {
+            message,
+            assistant_message_event,
+        } => {
+            let thinking_ended = matches!(
+                assistant_message_event,
+                AssistantMessageEvent::ThinkingEnd { .. }
+                    | AssistantMessageEvent::TextStart { .. }
+                    | AssistantMessageEvent::TextDelta { .. }
+            );
+            merge_streaming_message(&mut s.chat_rows, message, thinking_ended);
+            if matches!(
+                assistant_message_event,
+                AssistantMessageEvent::TextStart { .. }
+                    | AssistantMessageEvent::TextDelta { .. }
+            ) {
+                ensure_streaming_assistant(&mut s.chat_rows);
+            }
             s.stats.apply_message(message);
         }
         AgentEvent::MessageEnd { message } => {
@@ -700,55 +717,101 @@ fn path_from_tool_args(args: &Value) -> Option<PathBuf> {
     None
 }
 
-fn merge_streaming_message(rows: &mut Vec<ChatRow>, message: &AgentMessage) {
-    if let AgentMessage::Llm(loop_ai::Message::Assistant(a)) = message {
-        let mut text = String::new();
-        for block in &a.content {
-            match block {
-                loop_ai::AssistantContent::Text(t) => text.push_str(&t.text),
-                loop_ai::AssistantContent::Thinking(t) => {
-                    if let Some(last) = rows.last_mut() {
-                        if matches!(last, ChatRow::Thinking { done: false, .. }) {
-                            if let ChatRow::Thinking { text: existing, .. } = last {
-                                *existing = t.thinking.clone();
-                                return;
-                            }
-                        }
-                    }
-                    rows.push(ChatRow::Thinking {
-                        id: uuid::Uuid::now_v7().to_string(),
-                        text: t.thinking.clone(),
-                        done: false,
-                    });
-                }
-                _ => {}
-            }
-        }
-        if !text.is_empty() {
-            if let Some(last) = rows.last_mut() {
-                if matches!(last, ChatRow::Assistant { streaming: true, .. }) {
-                    if let ChatRow::Assistant { text: existing, .. } = last {
-                        *existing = text;
-                        return;
-                    }
-                }
-            }
-            rows.push(ChatRow::Assistant {
-                id: uuid::Uuid::now_v7().to_string(),
-                text,
-                streaming: true,
-            });
+fn merge_streaming_message(rows: &mut Vec<ChatRow>, message: &AgentMessage, thinking_ended: bool) {
+    let AgentMessage::Llm(loop_ai::Message::Assistant(a)) = message else {
+        return;
+    };
+
+    let mut text = String::new();
+    let mut thinking = None;
+    for block in &a.content {
+        match block {
+            loop_ai::AssistantContent::Text(t) => text.push_str(&t.text),
+            loop_ai::AssistantContent::Thinking(t) => thinking = Some(t.thinking.clone()),
+            _ => {}
         }
     }
+
+    let finish_thinking = thinking_ended || !text.is_empty();
+    if let Some(think) = thinking {
+        if let Some(row) = rows
+            .iter_mut()
+            .rev()
+            .find(|r| matches!(r, ChatRow::Thinking { .. }))
+        {
+            if let ChatRow::Thinking {
+                text: existing,
+                done,
+                ..
+            } = row
+            {
+                *existing = think;
+                if finish_thinking {
+                    *done = true;
+                }
+            }
+        } else {
+            rows.push(ChatRow::Thinking {
+                id: uuid::Uuid::now_v7().to_string(),
+                text: think,
+                done: finish_thinking,
+            });
+        }
+    } else if finish_thinking {
+        if let Some(ChatRow::Thinking { done, .. }) = rows
+            .iter_mut()
+            .rev()
+            .find(|r| matches!(r, ChatRow::Thinking { .. }))
+        {
+            *done = true;
+        }
+    }
+
+    if text.is_empty() {
+        return;
+    }
+    if let Some(row) = rows
+        .iter_mut()
+        .rev()
+        .find(|r| matches!(r, ChatRow::Assistant { streaming: true, .. }))
+    {
+        if let ChatRow::Assistant {
+            text: existing, ..
+        } = row
+        {
+            *existing = text;
+        }
+        return;
+    }
+    rows.push(ChatRow::Assistant {
+        id: uuid::Uuid::now_v7().to_string(),
+        text,
+        streaming: true,
+    });
+}
+
+fn ensure_streaming_assistant(rows: &mut Vec<ChatRow>) {
+    if rows
+        .iter()
+        .rev()
+        .any(|r| matches!(r, ChatRow::Assistant { streaming: true, .. }))
+    {
+        return;
+    }
+    rows.push(ChatRow::Assistant {
+        id: uuid::Uuid::now_v7().to_string(),
+        text: String::new(),
+        streaming: true,
+    });
 }
 
 fn finalize_streaming_message(rows: &mut Vec<ChatRow>, message: &AgentMessage) {
-    if let Some(last) = rows.last_mut() {
-        if matches!(last, ChatRow::Thinking { .. }) {
-            if let ChatRow::Thinking { done, .. } = last {
-                *done = true;
-            }
-        }
+    if let Some(ChatRow::Thinking { done, .. }) = rows
+        .iter_mut()
+        .rev()
+        .find(|r| matches!(r, ChatRow::Thinking { .. }))
+    {
+        *done = true;
     }
     if let AgentMessage::Llm(loop_ai::Message::Assistant(a)) = message {
         let mut text = String::new();
@@ -761,7 +824,10 @@ fn finalize_streaming_message(rows: &mut Vec<ChatRow>, message: &AgentMessage) {
             text: existing,
             streaming,
             ..
-        }) = rows.last_mut()
+        }) = rows
+            .iter_mut()
+            .rev()
+            .find(|r| matches!(r, ChatRow::Assistant { .. }))
         {
             if !text.is_empty() {
                 *existing = text;
@@ -839,5 +905,89 @@ fn thinking_label_str(level: AgentThinkingLevel) -> String {
         AgentThinkingLevel::High => "high".into(),
         AgentThinkingLevel::XHigh => "xhigh".into(),
         AgentThinkingLevel::Max => "max".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loop_ai::{AssistantContent, AssistantMessage, StopReason, TextContent, ThinkingContent, Usage};
+
+    fn assistant_partial(thinking: Option<&str>, text: &str) -> AgentMessage {
+        let mut content = Vec::new();
+        if let Some(think) = thinking {
+            content.push(AssistantContent::Thinking(ThinkingContent {
+                thinking: think.to_string(),
+                thinking_signature: None,
+                redacted: None,
+            }));
+        }
+        if !text.is_empty() {
+            content.push(AssistantContent::Text(TextContent {
+                text: text.to_string(),
+                text_signature: None,
+            }));
+        }
+        AgentMessage::assistant(AssistantMessage {
+            content,
+            api: "test".into(),
+            provider: "test".into(),
+            model: "test".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::empty(),
+            stop_reason: StopReason::Pending,
+            error_message: None,
+            raw_stop_reason: None,
+            timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn thinking_then_text_streams_assistant_instead_of_waiting_for_end() {
+        let mut rows = Vec::new();
+        merge_streaming_message(&mut rows, &assistant_partial(Some("plan"), ""), false);
+        assert!(matches!(
+            rows.as_slice(),
+            [ChatRow::Thinking {
+                text,
+                done: false,
+                ..
+            }] if text == "plan"
+        ));
+
+        merge_streaming_message(
+            &mut rows,
+            &assistant_partial(Some("plan"), "Hello"),
+            true,
+        );
+        assert!(matches!(
+            rows.as_slice(),
+            [
+                ChatRow::Thinking { done: true, .. },
+                ChatRow::Assistant {
+                    text,
+                    streaming: true,
+                    ..
+                }
+            ] if text == "Hello"
+        ));
+
+        merge_streaming_message(
+            &mut rows,
+            &assistant_partial(Some("plan"), "Hello world"),
+            true,
+        );
+        assert!(matches!(
+            rows.as_slice(),
+            [
+                ChatRow::Thinking { done: true, .. },
+                ChatRow::Assistant {
+                    text,
+                    streaming: true,
+                    ..
+                }
+            ] if text == "Hello world"
+        ));
     }
 }

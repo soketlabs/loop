@@ -13,7 +13,7 @@ use gpui_component::h_flex;
 use gpui_component::input::{InputEvent, Textarea, TextareaState};
 use gpui_component::menu::DropdownMenu;
 use gpui_component::menu::PopupMenuItem;
-use gpui_component::scroll::ScrollableElement;
+use gpui_component::scroll::{Scrollbar, ScrollableElement};
 use gpui_component::separator::Separator;
 use gpui_component::spinner::Spinner;
 use gpui_component::v_flex;
@@ -28,6 +28,7 @@ const SESSION_ROW_HEIGHT: f32 = 48.0;
 const SIDEBAR_WIDTH: f32 = 248.0;
 const DIFF_PANEL_WIDTH: f32 = 400.0;
 const TOOLBAR_HEIGHT: f32 = 32.0;
+const FOLLOW_BOTTOM_PX: f32 = 80.0;
 
 struct DesktopApp {
     controller: Arc<DesktopController>,
@@ -37,6 +38,8 @@ struct DesktopApp {
     session_item_sizes: Rc<Vec<gpui::Size<Pixels>>>,
     /// Tracks chat length + last message size to auto-scroll on new content.
     chat_scroll_sig: (usize, usize, bool),
+    /// Stick to new tokens until the user scrolls away from the bottom.
+    follow_chat: bool,
     diff_panel_open: bool,
     sidebar_open: bool,
     last_pending_changes: usize,
@@ -50,6 +53,7 @@ impl DesktopApp {
         if text.is_empty() || self.controller.snapshot().streaming {
             return;
         }
+        self.follow_chat = true;
         self.composer.update(cx, |state, cx| {
             state.set_value("", window, cx);
         });
@@ -75,14 +79,44 @@ impl DesktopApp {
         });
     }
 
-    fn maybe_scroll_chat(&mut self, snap: &DesktopSnapshot) {
-        let sig = chat_scroll_signature(snap);
-        if sig != self.chat_scroll_sig {
-            self.chat_scroll_sig = sig;
-            if self.chat_scroll.max_offset().y > px(0.) {
-                self.chat_scroll.scroll_to_bottom();
-            }
+    fn chat_is_near_bottom(&self) -> bool {
+        let max_y = self.chat_scroll.max_offset().y;
+        if max_y <= px(1.) {
+            return true;
         }
+        max_y + self.chat_scroll.offset().y <= px(FOLLOW_BOTTOM_PX)
+    }
+
+    fn maybe_scroll_chat(&mut self, snap: &DesktopSnapshot) {
+        if !self.follow_chat && self.chat_is_near_bottom() {
+            self.follow_chat = true;
+        }
+        let sig = chat_scroll_signature(snap);
+        let content_changed = sig != self.chat_scroll_sig;
+        self.chat_scroll_sig = sig;
+        if self.follow_chat && (content_changed || snap.streaming) {
+            self.chat_scroll.scroll_to_bottom();
+        }
+    }
+
+    fn on_chat_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(px(16.));
+        // Offset is 0 at the top and more negative as you scroll down, so a
+        // positive wheel delta moves toward older content.
+        if delta.y > px(0.) {
+            self.follow_chat = false;
+        }
+        cx.on_next_frame(window, |this, _, cx| {
+            if this.chat_is_near_bottom() {
+                this.follow_chat = true;
+            }
+            cx.notify();
+        });
     }
 }
 
@@ -149,6 +183,7 @@ impl Render for DesktopApp {
                             .child(render_chat_panel(
                                 &snap,
                                 &self.expanded_thinking,
+                                self.chat_scroll.clone(),
                                 cx,
                             ))
                             .child(render_composer(&snap, &self.composer, app, cx)),
@@ -321,6 +356,7 @@ fn render_sidebar(
                         .icon(IconName::Plus)
                         .tooltip("New chat")
                         .on_click(cx.listener(|this, _, _, _| {
+                            this.follow_chat = true;
                             this.run_command(DesktopCommand::NewSession);
                         })),
                 ),
@@ -334,6 +370,7 @@ fn render_sidebar(
                     .label("New chat")
                     .icon(IconName::Plus)
                     .on_click(cx.listener(|this, _, _, _| {
+                        this.follow_chat = true;
                         this.run_command(DesktopCommand::NewSession);
                     })),
             ),
@@ -383,6 +420,7 @@ fn render_session_row(s: crate::state::SessionRow, cx: &mut Context<DesktopApp>)
         })
         .on_click(cx.listener({
             move |this, _, _, _| {
+                this.follow_chat = true;
                 this.run_command(DesktopCommand::SelectSession(session_id.clone()));
             }
         }))
@@ -429,6 +467,7 @@ fn render_session_row(s: crate::state::SessionRow, cx: &mut Context<DesktopApp>)
 fn render_chat_panel(
     snap: &DesktopSnapshot,
     expanded_thinking: &HashSet<String>,
+    chat_scroll: ScrollHandle,
     cx: &mut Context<DesktopApp>,
 ) -> impl IntoElement {
     let rows = snap.chat_rows.clone();
@@ -447,29 +486,47 @@ fn render_chat_panel(
             _ => false,
         });
 
-    v_flex()
-        .id("chat-scroll")
+    let content = v_flex()
+        .id("chat-scroll-content")
+        .w_full()
+        .flex_none()
+        .h_auto()
+        .min_h_full()
+        .px_4()
+        .py_3()
+        .gap_3()
+        .when(empty && !streaming, |el| el.child(render_empty_state(snap, cx)))
+        .children(rows.iter().map(|row| {
+            render_chat_row(
+                row,
+                expanded.contains(row_id(row)),
+                selected.as_deref(),
+                cx,
+            )
+        }))
+        .when(show_working, |el| el.child(render_working_row(snap, cx)));
+
+    div()
+        .id("chat-panel")
         .flex_1()
         .min_h_0()
-        .w_full()
-        .overflow_y_scrollbar()
+        .size_full()
+        .relative()
         .child(
-            v_flex()
-                .w_full()
-                .px_4()
-                .py_3()
-                .gap_3()
-                .when(empty && !streaming, |el| el.child(render_empty_state(snap, cx)))
-                .children(rows.iter().map(|row| {
-                    render_chat_row(
-                        row,
-                        expanded.contains(row_id(row)),
-                        selected.as_deref(),
-                        cx,
-                    )
+            div()
+                .id("chat-scroll")
+                .size_full()
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .track_scroll(&chat_scroll)
+                .restrict_scroll_to_axis()
+                .on_scroll_wheel(cx.listener(|this, event, window, cx| {
+                    this.on_chat_scroll_wheel(event, window, cx);
                 }))
-                .when(show_working, |el| el.child(render_working_row(snap, cx))),
+                .child(content),
         )
+        .child(Scrollbar::vertical(&chat_scroll))
 }
 
 fn row_id(row: &ChatRow) -> &str {
@@ -1256,6 +1313,7 @@ pub async fn run_desktop(cwd: PathBuf) -> anyhow::Result<()> {
                                 px(SESSION_ROW_HEIGHT),
                             )]),
                             chat_scroll_sig: (0, 0, false),
+                            follow_chat: true,
                             diff_panel_open: false,
                             sidebar_open: true,
                             last_pending_changes: 0,
