@@ -70,18 +70,34 @@ impl ComposerStats {
         }
     }
 
-    pub fn summary_line(&self) -> String {
-        let ctx = self
+    /// Context fill as 0–100 for the composer ring.
+    pub fn context_pct(&self) -> f32 {
+        match (self.context_tokens, self.context_window) {
+            (Some(t), w) if w > 0 => ((t as f64 / w as f64) * 100.0).clamp(0.0, 100.0) as f32,
+            _ => 0.0,
+        }
+    }
+
+    /// Hover detail: used / window and percent.
+    pub fn context_tooltip(&self) -> String {
+        let used = self
             .context_tokens
-            .map(|t| format!("{t}"))
+            .map(|t| t.to_string())
             .unwrap_or_else(|| "—".into());
-        let pct = match (self.context_tokens, self.context_window) {
-            (Some(t), w) if w > 0 => format!(" {:.0}%", (t as f64 / w as f64) * 100.0),
-            _ => String::new(),
+        let window = if self.context_window > 0 {
+            self.context_window.to_string()
+        } else {
+            "—".into()
         };
-        format!(
-            "ctx {ctx}/{}{pct} · tokens {}",
-            self.context_window, self.total_tokens
-        )
+        let pct = self.context_pct();
+        if self.context_window > 0 {
+            format!("Context {used} / {window} ({pct:.0}%)")
+        } else {
+            format!("Context {used} / {window}")
+        }
+    }
+
+    pub fn tokens_label(&self) -> String {
+        format!("tokens {}", self.total_tokens)
     }
 }

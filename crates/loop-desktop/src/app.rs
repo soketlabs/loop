@@ -13,16 +13,18 @@ use gpui_component::h_flex;
 use gpui_component::input::{InputEvent, Textarea, TextareaState};
 use gpui_component::menu::DropdownMenu;
 use gpui_component::menu::PopupMenuItem;
+use gpui_component::progress::ProgressCircle;
 use gpui_component::scroll::{Scrollbar, ScrollableElement};
 use gpui_component::separator::Separator;
 use gpui_component::spinner::Spinner;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::v_flex;
 use gpui_component::{
     Icon, IconName, Sizable, Theme, ThemeMode, VirtualListScrollHandle, v_virtual_list, *,
 };
 
 use crate::controller::{DesktopCommand, DesktopController, DesktopSnapshot};
-use crate::state::{ChatRow, ToolCardStatus};
+use crate::state::{ChatRow, ComposerStats, ToolCardStatus};
 
 const SESSION_ROW_HEIGHT: f32 = 48.0;
 const SIDEBAR_WIDTH: f32 = 248.0;
@@ -1100,107 +1102,149 @@ fn render_composer(
 ) -> impl IntoElement {
     let models = snap.available_models.clone();
     let current_model = snap.model_label.clone();
+    let border = cx.theme().border;
+
     v_flex()
         .w_full()
         .flex_shrink_0()
         .border_t_1()
-        .border_color(cx.theme().border)
+        .border_color(border)
         .bg(cx.theme().background)
-        .px_3()
-        .pt_2()
-        .pb_2()
-        .gap_1()
-        .child(Textarea::new(composer).appearance(false).bordered(false))
+        // Row 1: multiline input + submit
         .child(
-                    h_flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    Button::new("model")
-                                        .ghost()
-                                        .small()
-                                        .label(if models.is_empty() {
-                                            snap.model_label.clone()
-                                        } else {
-                                            format!("{} ▾", short_model(&snap.model_label))
-                                        })
-                                        .dropdown_caret(true)
-                                        .dropdown_menu({
-                                            let models = models.clone();
-                                            let current_model = current_model.clone();
-                                            let app = app.clone();
-                                            move |mut menu, _, _| {
-                                                if models.is_empty() {
-                                                    return menu.label("No models loaded yet");
-                                                }
-                                                menu = menu.scrollable(true).max_h(px(320.));
-                                                for (provider, model_id, name) in &models {
-                                                    let label = if name.is_empty() {
-                                                        format!("{provider}/{model_id}")
-                                                    } else {
-                                                        format!("{name} ({provider}/{model_id})")
-                                                    };
-                                                    let checked = format!("{provider}/{model_id}")
-                                                        == current_model;
-                                                    let p = provider.clone();
-                                                    let m = model_id.clone();
-                                                    let app = app.clone();
-                                                    menu = menu.item(
-                                                        PopupMenuItem::new(label)
-                                                            .checked(checked)
-                                                            .on_click(move |_, _, cx| {
-                                                                app.update(cx, |this, _| {
-                                                                    this.run_command(
-                                                                        DesktopCommand::SetModel {
-                                                                            provider: p.clone(),
-                                                                            model_id: m.clone(),
-                                                                        },
-                                                                    );
-                                                                });
-                                                            }),
-                                                    );
-                                                }
-                                                menu
-                                            }
-                                        }),
-                                )
-                                .child(
-                                    Button::new("thinking")
-                                        .ghost()
-                                        .small()
-                                        .label(format!("think: {}", snap.thinking_label))
-                                        .on_click(cx.listener(|this, _, _, _| {
-                                            this.run_command(DesktopCommand::CycleThinking);
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(snap.stats.summary_line()),
-                                ),
-                        )
-                        .child(
-                            Button::new("send")
-                                .primary()
-                                .icon(IconName::ArrowUp)
-                                .tooltip(if snap.streaming {
-                                    "Working…"
-                                } else {
-                                    "Send"
-                                })
-                                .loading(snap.streaming)
-                                .disabled(snap.streaming)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.send_prompt(window, cx);
-                                })),
-                        ),
+            h_flex()
+                .w_full()
+                .items_end()
+                .gap_2()
+                .px_3()
+                .pt_2()
+                .pb_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Textarea::new(composer).appearance(false).bordered(false)),
+                )
+                .child(
+                    Button::new("send")
+                        .primary()
+                        .icon(IconName::ArrowUp)
+                        .tooltip(if snap.streaming {
+                            "Working…"
+                        } else {
+                            "Send"
+                        })
+                        .loading(snap.streaming)
+                        .disabled(snap.streaming)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.send_prompt(window, cx);
+                        })),
+                ),
         )
+        // Row 2: status bar — line under input, columns separated by vertical lines
+        .child(
+            h_flex()
+                .w_full()
+                .items_stretch()
+                .border_t_1()
+                .border_color(border)
+                .child(composer_status_cell(
+                    Button::new("model")
+                        .ghost()
+                        .xsmall()
+                        .compact()
+                        .label(if models.is_empty() {
+                            snap.model_label.clone()
+                        } else {
+                            short_model(&snap.model_label)
+                        })
+                        .dropdown_caret(!models.is_empty())
+                        .dropdown_menu({
+                            let models = models.clone();
+                            let current_model = current_model.clone();
+                            let app = app.clone();
+                            move |mut menu, _, _| {
+                                if models.is_empty() {
+                                    return menu.label("No models loaded yet");
+                                }
+                                menu = menu.scrollable(true).max_h(px(320.));
+                                for (provider, model_id, name) in &models {
+                                    let label = if name.is_empty() {
+                                        format!("{provider}/{model_id}")
+                                    } else {
+                                        format!("{name} ({provider}/{model_id})")
+                                    };
+                                    let checked =
+                                        format!("{provider}/{model_id}") == current_model;
+                                    let p = provider.clone();
+                                    let m = model_id.clone();
+                                    let app = app.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(label)
+                                            .checked(checked)
+                                            .on_click(move |_, _, cx| {
+                                                app.update(cx, |this, _| {
+                                                    this.run_command(DesktopCommand::SetModel {
+                                                        provider: p.clone(),
+                                                        model_id: m.clone(),
+                                                    });
+                                                });
+                                            }),
+                                    );
+                                }
+                                menu
+                            }
+                        }),
+                    false,
+                    cx,
+                ))
+                .child(composer_status_cell(
+                    Button::new("thinking")
+                        .ghost()
+                        .xsmall()
+                        .compact()
+                        .label(format!("think: {}", snap.thinking_label))
+                        .tooltip("Cycle thinking level")
+                        .on_click(cx.listener(|this, _, _, _| {
+                            this.run_command(DesktopCommand::CycleThinking);
+                        })),
+                    false,
+                    cx,
+                ))
+                .child(composer_status_cell(
+                    render_context_ring(&snap.stats, cx),
+                    false,
+                    cx,
+                ))
+                .child(composer_status_cell(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .whitespace_nowrap()
+                        .child(snap.stats.tokens_label()),
+                    true,
+                    cx,
+                )),
+        )
+}
+
+fn composer_status_cell(
+    content: impl IntoElement,
+    last: bool,
+    cx: &App,
+) -> impl IntoElement {
+    h_flex()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .px_2()
+        .py_1()
+        .min_w_0()
+        .min_h(px(28.))
+        .when(!last, |el| {
+            el.border_r_1().border_color(cx.theme().border)
+        })
+        .child(content)
 }
 
 fn short_model(label: &str) -> String {
@@ -1208,6 +1252,31 @@ fn short_model(label: &str) -> String {
         .rsplit_once('/')
         .map(|(_, id)| id.to_string())
         .unwrap_or_else(|| label.to_string())
+}
+
+fn render_context_ring(stats: &ComposerStats, cx: &App) -> impl IntoElement {
+    let pct = stats.context_pct();
+    let tip = stats.context_tooltip();
+    let color = if pct >= 90.0 {
+        cx.theme().danger
+    } else if pct >= 70.0 {
+        cx.theme().warning
+    } else {
+        cx.theme().muted_foreground
+    };
+
+    div()
+        .id("composer-ctx-ring")
+        .flex_shrink_0()
+        .px_2()
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .child(
+            ProgressCircle::new("composer-ctx")
+                .small()
+                .value(pct)
+                .color(color)
+                .accessibility_label(stats.context_tooltip()),
+        )
 }
 
 fn render_diff_panel(snap: &DesktopSnapshot, cx: &mut Context<DesktopApp>) -> impl IntoElement {
