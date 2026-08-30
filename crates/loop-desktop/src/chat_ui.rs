@@ -187,7 +187,7 @@ mod tests {
         let detail = (1..=30).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
         let (preview, more) = truncate_tool_detail(&detail, 5);
         assert_eq!(more, 25);
-        assert!(preview.starts_with("…\n"));
+        assert!(!preview.starts_with("…"));
         assert!(preview.contains("line 30"));
         assert!(!preview.contains("line 1\n"));
     }
@@ -226,6 +226,7 @@ pub fn tool_content_preview(name: &str, args: &Value) -> String {
 }
 
 /// Cap preview text for the chat card (keeps the UI responsive on large writes).
+/// Returns `(preview, hidden_line_count)` where preview is the trailing lines.
 pub fn truncate_tool_detail(detail: &str, max_lines: usize) -> (String, usize) {
     let total = detail.lines().count();
     if total <= max_lines {
@@ -233,5 +234,5 @@ pub fn truncate_tool_detail(detail: &str, max_lines: usize) -> (String, usize) {
     }
     let kept: Vec<&str> = detail.lines().rev().take(max_lines).collect();
     let preview = kept.into_iter().rev().collect::<Vec<_>>().join("\n");
-    (format!("…\n{preview}"), total.saturating_sub(max_lines))
+    (preview, total.saturating_sub(max_lines))
 }

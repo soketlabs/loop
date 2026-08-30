@@ -814,6 +814,38 @@ fn apply_agent_event(
                 ToolCardStatus::Running,
             );
         }
+        AgentEvent::ToolExecutionUpdate {
+            tool_call_id,
+            tool_name,
+            partial_result,
+            ..
+        } => {
+            if !matches!(tool_name.as_str(), "bash" | "shell") {
+                return;
+            }
+            let out = tool_result_text(partial_result);
+            if out.is_empty() {
+                return;
+            }
+            if let Some(row) = s
+                .chat_rows
+                .iter_mut()
+                .rev()
+                .find(|r| matches!(r, ChatRow::Tool { id, .. } if id == tool_call_id))
+            {
+                if let ChatRow::Tool { detail, status, .. } = row {
+                    // Ignore late updates that race past ToolExecutionEnd.
+                    if matches!(
+                        *status,
+                        ToolCardStatus::Running | ToolCardStatus::Pending
+                    ) && out.len() >= detail.len()
+                    {
+                        *detail = out;
+                        *status = ToolCardStatus::Running;
+                    }
+                }
+            }
+        }
         AgentEvent::ToolExecutionEnd {
             tool_call_id,
             tool_name,

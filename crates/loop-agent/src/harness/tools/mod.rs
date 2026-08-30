@@ -361,7 +361,7 @@ pub fn create_bash_tool_with_prepare(
             }),
             &["command"],
         ),
-        move |_id, args, cancel, _on_update| {
+        move |_id, args, cancel, on_update| {
             let env = Arc::clone(&env);
             let prepare = prepare.clone();
             async move {
@@ -392,6 +392,20 @@ pub fn create_bash_tool_with_prepare(
                     if c.is_relative() {
                         options.cwd = Some(env.cwd().join(c));
                     }
+                }
+                if let Some(on_update) = on_update {
+                    options.on_output = Some(Arc::new(move |text: &str| {
+                        on_update(AgentToolResult {
+                            content: vec![ToolResultContent::Text(TextContent {
+                                text: text.to_string(),
+                                text_signature: None,
+                            })],
+                            details: json!({ "partial": true }),
+                            usage: None,
+                            added_tool_names: None,
+                            terminate: None,
+                        });
+                    }));
                 }
                 let captured = execute_shell_with_capture(env, &command, options, None)
                     .await

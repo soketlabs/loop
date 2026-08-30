@@ -44,7 +44,8 @@ struct DesktopApp {
     follow_chat: bool,
     diff_panel_open: bool,
     sidebar_open: bool,
-    expanded_thinking: HashSet<String>,
+    /// Expanded thinking / tool output cards (ids are unique across row kinds).
+    expanded_rows: HashSet<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -181,7 +182,7 @@ impl Render for DesktopApp {
                             .min_h_0()
                             .child(render_chat_panel(
                                 &snap,
-                                &self.expanded_thinking,
+                                &self.expanded_rows,
                                 self.chat_scroll.clone(),
                                 cx,
                             ))
@@ -507,13 +508,13 @@ fn render_session_row(s: crate::state::SessionRow, cx: &mut Context<DesktopApp>)
 
 fn render_chat_panel(
     snap: &DesktopSnapshot,
-    expanded_thinking: &HashSet<String>,
+    expanded_rows: &HashSet<String>,
     chat_scroll: ScrollHandle,
     cx: &mut Context<DesktopApp>,
 ) -> impl IntoElement {
     let rows = snap.chat_rows.clone();
     let pending = snap.pending_changes.clone();
-    let expanded = expanded_thinking.clone();
+    let expanded = expanded_rows.clone();
     let empty = rows.is_empty();
     let streaming = snap.streaming;
     let selected = snap.selected_change_id.clone();
@@ -647,7 +648,7 @@ fn render_working_row(snap: &DesktopSnapshot, cx: &mut Context<DesktopApp>) -> i
 
 fn render_chat_row(
     row: &ChatRow,
-    thinking_open: bool,
+    row_expanded: bool,
     selected_change: Option<&str>,
     pending: &[crate::state::PendingFileChange],
     cx: &mut Context<DesktopApp>,
@@ -676,7 +677,7 @@ fn render_chat_row(
             .when(*streaming, |el| el.child(crate::markdown::streaming_caret(cx)))
             .into_any_element(),
         ChatRow::Thinking { id, text, done } => {
-            let open = thinking_open;
+            let open = row_expanded;
             let think_id = id.clone();
             let still_thinking = !*done;
             v_flex()
@@ -689,10 +690,10 @@ fn render_chat_row(
                         .gap_2()
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            if this.expanded_thinking.contains(&think_id) {
-                                this.expanded_thinking.remove(&think_id);
+                            if this.expanded_rows.contains(&think_id) {
+                                this.expanded_rows.remove(&think_id);
                             } else {
-                                this.expanded_thinking.insert(think_id.clone());
+                                this.expanded_rows.insert(think_id.clone());
                                 // Follow streaming thought content after expand.
                                 this.follow_chat = true;
                             }
@@ -757,24 +758,26 @@ fn render_chat_row(
                 .into_any_element()
         }
         ChatRow::Tool {
+            id,
             name,
             summary,
             detail,
             status,
-            ..
-        } => render_tool_row(name, summary, detail, *status, cx).into_any_element(),
+        } => render_tool_row(id, name, summary, detail, *status, row_expanded, cx)
+            .into_any_element(),
         ChatRow::Shell {
+            id,
             command,
             output,
             exit_code,
-            ..
         } => {
             let status = match exit_code {
                 Some(0) => ToolCardStatus::Success,
                 Some(_) => ToolCardStatus::Error,
                 None => ToolCardStatus::Error,
             };
-            render_tool_row("bash", command, output, status, cx).into_any_element()
+            render_tool_row(id, "bash", command, output, status, row_expanded, cx)
+                .into_any_element()
         }
         ChatRow::FileChange {
             id,
@@ -875,11 +878,16 @@ fn render_chat_row(
     }
 }
 
+const TOOL_PREVIEW_LINES: usize = 12;
+const TOOL_LINE_HEIGHT_PX: f32 = 18.0;
+
 fn render_tool_row(
+    id: &str,
     name: &str,
     summary: &str,
     detail: &str,
     status: ToolCardStatus,
+    expanded: bool,
     cx: &mut Context<DesktopApp>,
 ) -> Div {
     let color = match status {
@@ -891,20 +899,32 @@ fn render_tool_row(
     let boxed = crate::chat_ui::is_shell_tool(name)
         || (crate::chat_ui::is_file_mutation_tool(name)
             && matches!(status, ToolCardStatus::Pending | ToolCardStatus::Running));
+    let running = matches!(status, ToolCardStatus::Pending | ToolCardStatus::Running);
 
     if boxed {
-        let (preview, more) = if detail.is_empty() {
+        let total_lines = if detail.is_empty() {
+            0
+        } else {
+            detail.lines().count().max(1)
+        };
+        let (preview, hidden_above) = if detail.is_empty() {
             (
-                if matches!(status, ToolCardStatus::Pending | ToolCardStatus::Running) {
+                if running {
                     "…".to_string()
                 } else {
                     String::new()
                 },
                 0,
             )
+        } else if expanded {
+            (detail.to_string(), 0)
         } else {
-            crate::chat_ui::truncate_tool_detail(detail, 16)
+            crate::chat_ui::truncate_tool_detail(detail, TOOL_PREVIEW_LINES)
         };
+        let can_expand = total_lines > TOOL_PREVIEW_LINES || (running && !detail.is_empty());
+        let card_id = id.to_string();
+        let body_id = SharedString::from(format!("tool-body-{id}"));
+
         let mut body = v_flex().w_full().gap_0p5().px_3().py_2();
         if preview.is_empty() {
             body = body.child(
@@ -927,16 +947,43 @@ fn render_tool_row(
                         }),
                 );
             }
-            if more > 0 {
+            if !expanded && hidden_above > 0 {
                 body = body.child(
                     div()
                         .pt_1()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(format!("… {more} more lines")),
+                        .child(format!("↑ {hidden_above} earlier lines · click to expand")),
+                );
+            } else if expanded && can_expand {
+                body = body.child(
+                    div()
+                        .pt_1()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("click to collapse"),
                 );
             }
         }
+
+        let collapsed_max = px(TOOL_LINE_HEIGHT_PX * (TOOL_PREVIEW_LINES as f32 + 2.0));
+        let body = body
+            .id(body_id)
+            .when(can_expand || !detail.is_empty(), |el| {
+                el.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                    if this.expanded_rows.contains(&card_id) {
+                        this.expanded_rows.remove(&card_id);
+                    } else {
+                        this.expanded_rows.insert(card_id.clone());
+                        this.follow_chat = true;
+                    }
+                    cx.notify();
+                }))
+            })
+            .when(!expanded, |el| {
+                el.max_h(collapsed_max).overflow_hidden()
+            });
+
         v_flex()
             .w_full()
             .rounded_lg()
@@ -954,10 +1001,7 @@ fn render_tool_row(
                     .border_b_1()
                     .border_color(color.opacity(0.25))
                     .bg(color.opacity(0.08))
-                    .when(
-                        status == ToolCardStatus::Running || status == ToolCardStatus::Pending,
-                        |el| el.child(Spinner::new().xsmall().color(color)),
-                    )
+                    .when(running, |el| el.child(Spinner::new().xsmall().color(color)))
                     .when(status == ToolCardStatus::Success, |el| {
                         el.child(
                             Icon::new(IconName::Check)
@@ -1001,10 +1045,7 @@ fn render_tool_row(
                 .border_l_2()
                 .border_color(color.opacity(0.7))
                 .bg(color.opacity(0.06))
-                .when(
-                    status == ToolCardStatus::Running || status == ToolCardStatus::Pending,
-                    |el| el.child(Spinner::new().xsmall().color(color)),
-                )
+                .when(running, |el| el.child(Spinner::new().xsmall().color(color)))
                 .when(status == ToolCardStatus::Success, |el| {
                     el.child(
                         Icon::new(IconName::Check)
@@ -1646,7 +1687,7 @@ pub async fn run_desktop(cwd: PathBuf) -> anyhow::Result<()> {
                             follow_chat: true,
                             diff_panel_open: false,
                             sidebar_open: true,
-                            expanded_thinking: HashSet::new(),
+                            expanded_rows: HashSet::new(),
                             _subscriptions: subscriptions,
                         }
                     });

@@ -114,8 +114,11 @@ pub struct FileInfo {
     pub size: u64,
 }
 
+/// Callback invoked with the cumulative combined stdout+stderr text as it arrives.
+pub type ShellOutputCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Options for shell exec.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ShellExecOptions {
     /// Working directory.
     pub cwd: Option<PathBuf>,
@@ -127,6 +130,21 @@ pub struct ShellExecOptions {
     pub timeout_ms: Option<u64>,
     /// Cancellation.
     pub cancel: Option<CancellationToken>,
+    /// Optional live output callback (host env streams; sandboxes may ignore).
+    pub on_output: Option<ShellOutputCallback>,
+}
+
+impl std::fmt::Debug for ShellExecOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShellExecOptions")
+            .field("cwd", &self.cwd)
+            .field("env", &self.env)
+            .field("inherit_env", &self.inherit_env)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("cancel", &self.cancel.as_ref().map(|_| "CancellationToken"))
+            .field("on_output", &self.on_output.as_ref().map(|_| "ShellOutputCallback"))
+            .finish()
+    }
 }
 
 impl Default for ShellExecOptions {
@@ -137,6 +155,7 @@ impl Default for ShellExecOptions {
             inherit_env: true,
             timeout_ms: None,
             cancel: None,
+            on_output: None,
         }
     }
 }
