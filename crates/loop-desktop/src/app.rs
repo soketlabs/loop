@@ -127,6 +127,7 @@ fn chat_scroll_signature(snap: &DesktopSnapshot) -> (usize, usize, bool) {
             ChatRow::User { text, .. } | ChatRow::Assistant { text, .. } => text.len(),
             ChatRow::Thinking { text, .. } => text.len(),
             ChatRow::Tool { detail, summary, .. } => detail.len().saturating_add(summary.len()),
+            ChatRow::Shell { output, command, .. } => output.len().saturating_add(command.len()),
             _ => 0,
         })
         .unwrap_or(0);
@@ -575,7 +576,8 @@ fn row_id(row: &ChatRow) -> &str {
         | ChatRow::Assistant { id, .. }
         | ChatRow::Thinking { id, .. }
         | ChatRow::Tool { id, .. }
-        | ChatRow::FileChange { id, .. } => id,
+        | ChatRow::FileChange { id, .. }
+        | ChatRow::Shell { id, .. } => id,
         ChatRow::System(_) => "system",
     }
 }
@@ -759,6 +761,19 @@ fn render_chat_row(
             status,
             ..
         } => render_tool_row(name, summary, detail, *status, cx).into_any_element(),
+        ChatRow::Shell {
+            command,
+            output,
+            exit_code,
+            ..
+        } => {
+            let status = match exit_code {
+                Some(0) => ToolCardStatus::Success,
+                Some(_) => ToolCardStatus::Error,
+                None => ToolCardStatus::Error,
+            };
+            render_tool_row("bash", command, output, status, cx).into_any_element()
+        }
         ChatRow::FileChange {
             id,
             path,

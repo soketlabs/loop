@@ -8,6 +8,7 @@ use async_channel::{Receiver, Sender};
 use loop_agent::harness::{
     create_session_repository, create_sqlite_session_store, AgentHarnessPhase,
 };
+use loop_agent::harness::types::ShellExecOptions;
 use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel, AgentToolResult};
 use loop_ai::AssistantMessageEvent;
 use loop_app_core::tool_approval::{permissions_from_settings, ApprovalDecision, ToolApprovalBridge};
@@ -272,6 +273,9 @@ impl DesktopController {
                 if text.trim().is_empty() {
                     return Ok(());
                 }
+                if let Some(command) = text.strip_prefix('!') {
+                    return self.run_bang_command(&text, command).await;
+                }
                 let needs_title = self.session_needs_title().await?;
                 let fallback = crate::session_title::fallback_title(&text);
                 let session_id = self.snapshot.lock().active_session_id.clone();
@@ -504,6 +508,78 @@ impl DesktopController {
                 self.refresh_stats().await?;
             }
         }
+        Ok(())
+    }
+
+    /// Run `!command` locally: show the user bubble + output, never send to the LLM
+    /// or append to the session message list.
+    async fn run_bang_command(&self, raw: &str, command: &str) -> anyhow::Result<()> {
+        let command = command.trim();
+        {
+            let mut snap = self.snapshot.lock();
+            snap.chat_rows.push(ChatRow::User {
+                id: uuid::Uuid::now_v7().to_string(),
+                text: raw.to_string(),
+            });
+            if command.is_empty() {
+                snap.chat_rows.push(ChatRow::System("usage: !command".into()));
+            } else {
+                snap.streaming = true;
+            }
+        }
+        self.notify_ui();
+        if command.is_empty() {
+            return Ok(());
+        }
+
+        let env = match self.runtime.harness.tool_env().await {
+            Ok(env) => env,
+            Err(e) => {
+                {
+                    let mut snap = self.snapshot.lock();
+                    snap.streaming = false;
+                    snap.chat_rows.push(ChatRow::Shell {
+                        id: uuid::Uuid::now_v7().to_string(),
+                        command: command.to_string(),
+                        output: format!("shell error: {e}"),
+                        exit_code: None,
+                    });
+                }
+                self.notify_ui();
+                return Ok(());
+            }
+        };
+
+        let row = match env.exec(command, ShellExecOptions::default()).await {
+            Ok(out) => {
+                let combined = if out.stderr.is_empty() {
+                    out.stdout
+                } else if out.stdout.is_empty() {
+                    out.stderr
+                } else {
+                    format!("{}\n{}", out.stdout, out.stderr)
+                };
+                ChatRow::Shell {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    command: command.to_string(),
+                    output: combined,
+                    exit_code: Some(out.exit_code),
+                }
+            }
+            Err(e) => ChatRow::Shell {
+                id: uuid::Uuid::now_v7().to_string(),
+                command: command.to_string(),
+                output: format!("error: {e}"),
+                exit_code: None,
+            },
+        };
+
+        {
+            let mut snap = self.snapshot.lock();
+            snap.streaming = false;
+            snap.chat_rows.push(row);
+        }
+        self.notify_ui();
         Ok(())
     }
 

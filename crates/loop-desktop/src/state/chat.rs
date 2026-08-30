@@ -34,6 +34,13 @@ pub enum ChatRow {
         added: usize,
         removed: usize,
     },
+    /// Local `!command` result — transcript only, never sent to the model.
+    Shell {
+        id: String,
+        command: String,
+        output: String,
+        exit_code: Option<i32>,
+    },
     System(String),
 }
 
