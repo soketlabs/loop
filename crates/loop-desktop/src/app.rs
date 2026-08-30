@@ -67,6 +67,22 @@ impl DesktopApp {
         });
     }
 
+    fn stop_agent(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.controller.snapshot().agent_turn {
+            return;
+        }
+        self.run_command(DesktopCommand::Stop);
+        cx.notify();
+    }
+
+    fn apply_restore_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.controller.take_restore_composer() {
+            self.composer.update(cx, |state, cx| {
+                state.set_value(&text, window, cx);
+            });
+        }
+    }
+
     fn sync_session_sizes(&mut self, count: usize) {
         self.session_item_sizes =
             Rc::new(vec![size(px(SIDEBAR_WIDTH - 16.), px(SESSION_ROW_HEIGHT)); count.max(1)]);
@@ -139,6 +155,7 @@ fn chat_scroll_signature(snap: &DesktopSnapshot) -> (usize, usize, bool) {
 
 impl Render for DesktopApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_restore_composer(window, cx);
         let snap = self.controller.snapshot();
         self.sync_session_sizes(snap.sessions.len());
         self.maybe_scroll_chat(&snap);
@@ -1166,21 +1183,35 @@ fn render_composer(
                         .min_w_0()
                         .child(Textarea::new(composer).appearance(false).bordered(false)),
                 )
-                .child(
-                    Button::new("send")
-                        .primary()
-                        .icon(IconName::ArrowUp)
-                        .tooltip(if snap.streaming {
-                            "Working…"
-                        } else {
-                            "Send"
-                        })
-                        .loading(snap.streaming)
-                        .disabled(snap.streaming)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.send_prompt(window, cx);
-                        })),
-                ),
+                .child({
+                    let stoppable = snap.agent_turn;
+                    if stoppable {
+                        Button::new("stop")
+                            .primary()
+                            .tooltip("Stop")
+                            .child(
+                                div()
+                                    .size_3()
+                                    .rounded(px(2.))
+                                    .bg(cx.theme().primary_foreground),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.stop_agent(window, cx);
+                            }))
+                            .into_any_element()
+                    } else {
+                        Button::new("send")
+                            .primary()
+                            .icon(IconName::ArrowUp)
+                            .tooltip("Send")
+                            .disabled(snap.streaming)
+                            .loading(snap.streaming)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.send_prompt(window, cx);
+                            }))
+                            .into_any_element()
+                    }
+                }),
         )
         // Row 2: status bar — line under input, columns separated by vertical lines
         .child(
@@ -1662,13 +1693,14 @@ pub async fn run_desktop(cwd: PathBuf) -> anyhow::Result<()> {
                         let subscriptions = vec![cx.subscribe_in(
                             &composer,
                             window,
-                            |this: &mut DesktopApp, input, event, window, cx| {
+                            |this: &mut DesktopApp, _input, event, window, cx| {
                                 if let InputEvent::PressEnter { shift, .. } = event {
                                     if !shift {
-                                        this.send_prompt(window, cx);
-                                        input.update(cx, |state, cx| {
-                                            state.set_value("", window, cx);
-                                        });
+                                        if this.controller.snapshot().agent_turn {
+                                            this.stop_agent(window, cx);
+                                        } else if !this.controller.snapshot().streaming {
+                                            this.send_prompt(window, cx);
+                                        }
                                     }
                                 }
                             },

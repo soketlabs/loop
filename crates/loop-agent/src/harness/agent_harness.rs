@@ -1166,13 +1166,15 @@ impl AgentHarness {
             context,
             config,
             emit,
-            Some(token),
+            Some(token.clone()),
             Some(Arc::clone(&self.stream_fn)),
         )
         .await;
 
         let writes = std::mem::take(&mut *self.pending_writes.lock());
-        {
+        // Aborted turns should leave no session footprint so a follow-up prompt
+        // (or UI "stop") behaves as if the turn never ran.
+        if !token.is_cancelled() {
             let session = self.session.lock().await;
             let store = session.store();
             let sid = session.metadata().id.clone();

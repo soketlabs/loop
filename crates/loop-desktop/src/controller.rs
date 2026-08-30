@@ -33,6 +33,8 @@ struct FileEditSnapshot {
 #[derive(Debug)]
 pub enum DesktopCommand {
     Prompt(String),
+    /// Abort the in-flight agent turn and roll UI back as if it never ran.
+    Stop,
     SetModel { provider: String, model_id: String },
     CycleModel,
     SetThinking(AgentThinkingLevel),
@@ -49,6 +51,14 @@ pub enum DesktopCommand {
     RefreshSessions,
     SelectSession(String),
     NewSession,
+}
+
+/// Checkpoint taken at the start of a prompt so Stop can unwind the turn.
+#[derive(Debug, Clone)]
+struct TurnCheckpoint {
+    text: String,
+    chat_len: usize,
+    pending_change_ids: Vec<String>,
 }
 
 /// Snapshot pushed to the GPUI entity after each controller update.
@@ -68,6 +78,10 @@ pub struct DesktopSnapshot {
     pub available_models: Vec<(String, String, String)>,
     pub approval_prompt: Option<ApprovalUiPrompt>,
     pub detected_editors: Vec<String>,
+    /// When set, the composer should take this text (Stop restoring the prompt).
+    pub restore_composer: Option<String>,
+    /// True while an agent Prompt is in flight (not bang-shell).
+    pub agent_turn: bool,
 }
 
 /// Background controller owning the shared runtime.
@@ -82,6 +96,14 @@ pub struct DesktopController {
     model_index: Arc<Mutex<usize>>,
     thinking_levels: Vec<AgentThinkingLevel>,
     thinking_index: Arc<Mutex<usize>>,
+    /// In-flight prompt checkpoint for Stop rollback.
+    turn_checkpoint: Arc<Mutex<Option<TurnCheckpoint>>>,
+    /// When true, discard the current turn after abort and ignore late agent events.
+    discard_turn: Arc<Mutex<bool>>,
+    /// Drop agent events until the next Prompt starts (after Stop).
+    suppress_events: Arc<std::sync::atomic::AtomicBool>,
+    /// Serialize agent prompts so a resubmit after Stop cannot race a still-finishing turn.
+    prompt_lock: tokio::sync::Mutex<()>,
 }
 
 impl DesktopController {
@@ -126,6 +148,8 @@ impl DesktopController {
             available_models: available_models.clone(),
             approval_prompt: None,
             detected_editors,
+            restore_composer: None,
+            agent_turn: false,
         }));
 
         let tool_env = runtime.harness.tool_env().await?;
@@ -174,6 +198,10 @@ impl DesktopController {
             model_index: Arc::new(Mutex::new(0)),
             thinking_levels,
             thinking_index: Arc::new(Mutex::new(thinking_index)),
+            turn_checkpoint: Arc::new(Mutex::new(None)),
+            discard_turn: Arc::new(Mutex::new(false)),
+            suppress_events: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            prompt_lock: tokio::sync::Mutex::new(()),
         };
 
         controller.subscribe_agent_events();
@@ -226,12 +254,23 @@ impl DesktopController {
         let snap = Arc::clone(&self.snapshot);
         let file_snapshots = Arc::clone(&self.file_snapshots);
         let ui_tick = self.ui_tick_tx.clone();
+        let suppress = Arc::clone(&self.suppress_events);
 
         self.runtime.harness.subscribe(move |event| {
             let snap = Arc::clone(&snap);
             let file_snapshots = Arc::clone(&file_snapshots);
             let ui_tick = ui_tick.clone();
+            let suppress = Arc::clone(&suppress);
             async move {
+                if suppress.load(std::sync::atomic::Ordering::Relaxed) {
+                    if matches!(event, AgentEvent::AgentEnd { .. }) {
+                        let mut s = snap.lock();
+                        s.streaming = false;
+                        s.phase = AgentHarnessPhase::Idle;
+                    }
+                    let _ = ui_tick.try_send(());
+                    return;
+                }
                 apply_agent_event(&snap, &file_snapshots, event);
                 let _ = ui_tick.try_send(());
             }
@@ -286,12 +325,33 @@ impl DesktopController {
                 if let Some(command) = text.strip_prefix('!') {
                     return self.run_bang_command(&text, command).await;
                 }
+                // Wait out any aborted turn before starting a new one. Without this,
+                // a quick Stop→resubmit races harness.prompt() and gets Busy while the
+                // user bubble is already shown.
+                let _prompt_guard = self.prompt_lock.lock().await;
+                self.runtime.harness.wait_for_idle().await;
+
                 let needs_title = self.session_needs_title().await?;
                 let fallback = crate::session_title::fallback_title(&text);
                 let session_id = self.snapshot.lock().active_session_id.clone();
                 {
                     let mut snap = self.snapshot.lock();
+                    let checkpoint = TurnCheckpoint {
+                        text: text.clone(),
+                        chat_len: snap.chat_rows.len(),
+                        pending_change_ids: snap
+                            .pending_changes
+                            .iter()
+                            .map(|c| c.id.clone())
+                            .collect(),
+                    };
+                    *self.turn_checkpoint.lock() = Some(checkpoint);
+                    *self.discard_turn.lock() = false;
+                    self.suppress_events
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                     snap.streaming = true;
+                    snap.agent_turn = true;
+                    snap.restore_composer = None;
                     snap.chat_rows.push(ChatRow::User {
                         id: uuid::Uuid::now_v7().to_string(),
                         text: text.clone(),
@@ -312,13 +372,26 @@ impl DesktopController {
                     .await;
                 }
                 let result = self.runtime.harness.prompt(text.clone()).await;
+                let discarded = self.take_discard_and_rollback();
                 {
                     let mut snap = self.snapshot.lock();
                     snap.streaming = false;
+                    snap.agent_turn = false;
                     snap.phase = self.runtime.harness.phase();
                 }
                 self.notify_ui();
-                result.map_err(|e| anyhow::anyhow!(e))?;
+                if discarded {
+                    return Ok(());
+                }
+                if let Err(error) = result {
+                    // Keep the optimistic user bubble from sticking around on failure.
+                    self.suppress_events
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.apply_turn_rollback();
+                    self.notify_ui();
+                    return Err(anyhow::anyhow!(error));
+                }
+                *self.turn_checkpoint.lock() = None;
                 if needs_title {
                     let runtime = Arc::clone(&self.runtime);
                     let snapshot = Arc::clone(&self.snapshot);
@@ -354,6 +427,9 @@ impl DesktopController {
                 }
                 self.refresh_stats().await?;
                 self.refresh_sessions().await?;
+            }
+            DesktopCommand::Stop => {
+                self.stop_turn().await;
             }
             DesktopCommand::SetModel { provider, model_id } => {
                 if let Some(model) = self.runtime.models.get_model(&provider, &model_id) {
@@ -485,9 +561,15 @@ impl DesktopController {
                     snap.pending_changes.clear();
                     snap.selected_change_id = None;
                     snap.streaming = false;
+                    snap.agent_turn = false;
                     snap.approval_prompt = None;
+                    snap.restore_composer = None;
                 }
                 *self.pending_approval.lock() = None;
+                *self.turn_checkpoint.lock() = None;
+                *self.discard_turn.lock() = false;
+                self.suppress_events
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 self.file_snapshots.lock().clear();
                 self.hydrate_transcript().await?;
                 self.refresh_sessions().await?;
@@ -510,9 +592,15 @@ impl DesktopController {
                     snap.pending_changes.clear();
                     snap.selected_change_id = None;
                     snap.streaming = false;
+                    snap.agent_turn = false;
                     snap.approval_prompt = None;
+                    snap.restore_composer = None;
                 }
                 *self.pending_approval.lock() = None;
+                *self.turn_checkpoint.lock() = None;
+                *self.discard_turn.lock() = false;
+                self.suppress_events
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 self.file_snapshots.lock().clear();
                 self.refresh_sessions().await?;
                 self.refresh_stats().await?;
@@ -599,6 +687,102 @@ impl DesktopController {
         self.snapshot.lock().stats = stats;
         self.notify_ui();
         Ok(())
+    }
+
+    /// Abort the in-flight turn and immediately roll the UI back.
+    async fn stop_turn(&self) {
+        if self.turn_checkpoint.lock().is_none() {
+            return;
+        }
+        *self.discard_turn.lock() = true;
+        self.suppress_events
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(pending) = self.pending_approval.lock().take() {
+            pending.respond(ApprovalDecision::Reject {
+                reason: Some("stopped by user".into()),
+            });
+        }
+        {
+            let mut snap = self.snapshot.lock();
+            snap.approval_prompt = None;
+        }
+        self.runtime.harness.abort();
+        self.apply_turn_rollback();
+        self.notify_ui();
+        // Ensure the aborted turn has fully released the harness before a
+        // resubmit can start (prompt_lock alone isn't enough if Stop returns first).
+        self.runtime.harness.wait_for_idle().await;
+    }
+
+    /// After `prompt()` returns, finish discard if Stop was requested.
+    /// Returns true when the turn was discarded.
+    ///
+    /// Leaves `turn_checkpoint` in place on the non-discard path so the caller
+    /// can still roll back if `harness.prompt` failed.
+    fn take_discard_and_rollback(&self) -> bool {
+        let discard = std::mem::replace(&mut *self.discard_turn.lock(), false);
+        if !discard {
+            return false;
+        }
+        self.suppress_events
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Stop may have already rolled the UI back; ensure idle flags.
+        if self.turn_checkpoint.lock().is_some() {
+            self.apply_turn_rollback();
+        } else {
+            let mut snap = self.snapshot.lock();
+            snap.streaming = false;
+            snap.agent_turn = false;
+            snap.phase = AgentHarnessPhase::Idle;
+        }
+        true
+    }
+
+    fn apply_turn_rollback(&self) {
+        let Some(checkpoint) = self.turn_checkpoint.lock().take() else {
+            let mut snap = self.snapshot.lock();
+            snap.streaming = false;
+            snap.agent_turn = false;
+            snap.phase = AgentHarnessPhase::Idle;
+            snap.approval_prompt = None;
+            return;
+        };
+        let mut snap = self.snapshot.lock();
+        if snap.chat_rows.len() > checkpoint.chat_len {
+            snap.chat_rows.truncate(checkpoint.chat_len);
+        }
+        let kept: std::collections::HashSet<_> =
+            checkpoint.pending_change_ids.into_iter().collect();
+        let to_revert: Vec<_> = snap
+            .pending_changes
+            .iter()
+            .filter(|c| !kept.contains(&c.id))
+            .cloned()
+            .collect();
+        snap.pending_changes
+            .retain(|c| kept.contains(&c.id));
+        if let Some(sel) = snap.selected_change_id.as_deref() {
+            if !snap.pending_changes.iter().any(|c| c.id == sel) {
+                snap.selected_change_id = None;
+            }
+        }
+        snap.streaming = false;
+        snap.agent_turn = false;
+        snap.phase = AgentHarnessPhase::Idle;
+        snap.approval_prompt = None;
+        snap.restore_composer = Some(checkpoint.text);
+        drop(snap);
+        self.file_snapshots.lock().clear();
+        for change in to_revert {
+            if let Err(error) = crate::state::reject_change(&change) {
+                tracing::warn!("failed to revert {}: {error:#}", change.path.display());
+            }
+        }
+    }
+
+    /// Consume a one-shot composer restore value set by Stop.
+    pub fn take_restore_composer(&self) -> Option<String> {
+        self.snapshot.lock().restore_composer.take()
     }
 
     async fn session_needs_title(&self) -> anyhow::Result<bool> {
