@@ -1,6 +1,6 @@
 //! Bridges `AgentHarness` events to the GPUI UI thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -35,6 +35,10 @@ pub enum DesktopCommand {
     Prompt(String),
     /// Abort the in-flight agent turn and roll UI back as if it never ran.
     Stop,
+    /// Drop the most recently queued follow-up.
+    DequeueLast,
+    /// Drop every queued follow-up.
+    ClearQueue,
     SetModel { provider: String, model_id: String },
     CycleModel,
     SetThinking(AgentThinkingLevel),
@@ -82,6 +86,8 @@ pub struct DesktopSnapshot {
     pub restore_composer: Option<String>,
     /// True while an agent Prompt is in flight (not bang-shell).
     pub agent_turn: bool,
+    /// Follow-up prompts waiting until the current turn finishes (FIFO).
+    pub queued_messages: VecDeque<String>,
 }
 
 /// Background controller owning the shared runtime.
@@ -150,6 +156,7 @@ impl DesktopController {
             detected_editors,
             restore_composer: None,
             agent_turn: false,
+            queued_messages: VecDeque::new(),
         }));
 
         let tool_env = runtime.harness.tool_env().await?;
@@ -325,111 +332,51 @@ impl DesktopController {
                 if let Some(command) = text.strip_prefix('!') {
                     return self.run_bang_command(&text, command).await;
                 }
-                // Wait out any aborted turn before starting a new one. Without this,
-                // a quick Stop→resubmit races harness.prompt() and gets Busy while the
-                // user bubble is already shown.
-                let _prompt_guard = self.prompt_lock.lock().await;
-                self.runtime.harness.wait_for_idle().await;
 
-                let needs_title = self.session_needs_title().await?;
-                let fallback = crate::session_title::fallback_title(&text);
-                let session_id = self.snapshot.lock().active_session_id.clone();
-                {
-                    let mut snap = self.snapshot.lock();
-                    let checkpoint = TurnCheckpoint {
-                        text: text.clone(),
-                        chat_len: snap.chat_rows.len(),
-                        pending_change_ids: snap
-                            .pending_changes
-                            .iter()
-                            .map(|c| c.id.clone())
-                            .collect(),
-                    };
-                    *self.turn_checkpoint.lock() = Some(checkpoint);
-                    *self.discard_turn.lock() = false;
-                    self.suppress_events
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                    snap.streaming = true;
-                    snap.agent_turn = true;
-                    snap.restore_composer = None;
-                    snap.chat_rows.push(ChatRow::User {
-                        id: uuid::Uuid::now_v7().to_string(),
-                        text: text.clone(),
-                    });
-                    if needs_title {
-                        if let Some(row) = snap.sessions.iter_mut().find(|s| s.id == session_id) {
-                            row.name = Some(fallback.clone());
-                        }
-                    }
-                }
-                self.notify_ui();
-                if needs_title {
-                    let _ = crate::session_title::persist_session_name(
-                        &self.runtime,
-                        &session_id,
-                        &fallback,
-                    )
-                    .await;
-                }
-                let result = self.runtime.harness.prompt(text.clone()).await;
-                let discarded = self.take_discard_and_rollback();
-                {
-                    let mut snap = self.snapshot.lock();
-                    snap.streaming = false;
-                    snap.agent_turn = false;
-                    snap.phase = self.runtime.harness.phase();
-                }
-                self.notify_ui();
-                if discarded {
+                // Enqueue without waiting on the prompt lock so the composer can
+                // show "N queued" immediately while a turn is in flight.
+                if self.should_queue_prompt() {
+                    self.enqueue_prompt(text);
                     return Ok(());
                 }
-                if let Err(error) = result {
-                    // Keep the optimistic user bubble from sticking around on failure.
-                    self.suppress_events
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    self.apply_turn_rollback();
-                    self.notify_ui();
-                    return Err(anyhow::anyhow!(error));
+
+                let _prompt_guard = self.prompt_lock.lock().await;
+                // Re-check under the lock — a turn may have started between the
+                // fast-path check and acquiring the lock.
+                if self.should_queue_prompt() {
+                    self.enqueue_prompt(text);
+                    return Ok(());
                 }
-                *self.turn_checkpoint.lock() = None;
-                if needs_title {
-                    let runtime = Arc::clone(&self.runtime);
-                    let snapshot = Arc::clone(&self.snapshot);
-                    let ui_tick = self.ui_tick_tx.clone();
-                    let message = text.clone();
-                    let (provider, model_id) = {
-                        let label = snapshot.lock().model_label.clone();
-                        split_model_label(&label)
+
+                // Preserve FIFO: if follow-ups were left over, append this message
+                // and drain from the front.
+                let mut next = if self.snapshot.lock().queued_messages.is_empty() {
+                    text
+                } else {
+                    self.enqueue_prompt(text);
+                    self.pop_queued_prompt().expect("queue non-empty")
+                };
+                loop {
+                    self.run_prompt_turn(next).await?;
+                    let Some(queued) = self.pop_queued_prompt() else {
+                        break;
                     };
-                    tokio::spawn(async move {
-                        let title = crate::session_title::generate_session_title(
-                            &runtime,
-                            &message,
-                            provider.as_deref(),
-                            model_id.as_deref(),
-                        )
-                        .await
-                        .unwrap_or(fallback);
-                        if crate::session_title::persist_session_name(
-                            &runtime,
-                            &session_id,
-                            &title,
-                        )
-                        .await
-                        .is_ok()
-                        {
-                            if let Ok(rows) = load_session_rows(&runtime, &snapshot).await {
-                                snapshot.lock().sessions = rows;
-                                let _ = ui_tick.try_send(());
-                            }
-                        }
-                    });
+                    next = queued;
                 }
-                self.refresh_stats().await?;
-                self.refresh_sessions().await?;
             }
             DesktopCommand::Stop => {
+                self.clear_queued_prompts();
                 self.stop_turn().await;
+            }
+            DesktopCommand::DequeueLast => {
+                {
+                    let mut snap = self.snapshot.lock();
+                    snap.queued_messages.pop_back();
+                }
+                self.notify_ui();
+            }
+            DesktopCommand::ClearQueue => {
+                self.clear_queued_prompts();
             }
             DesktopCommand::SetModel { provider, model_id } => {
                 if let Some(model) = self.runtime.models.get_model(&provider, &model_id) {
@@ -564,6 +511,7 @@ impl DesktopController {
                     snap.agent_turn = false;
                     snap.approval_prompt = None;
                     snap.restore_composer = None;
+                    snap.queued_messages.clear();
                 }
                 *self.pending_approval.lock() = None;
                 *self.turn_checkpoint.lock() = None;
@@ -595,6 +543,7 @@ impl DesktopController {
                     snap.agent_turn = false;
                     snap.approval_prompt = None;
                     snap.restore_composer = None;
+                    snap.queued_messages.clear();
                 }
                 *self.pending_approval.lock() = None;
                 *self.turn_checkpoint.lock() = None;
@@ -606,6 +555,144 @@ impl DesktopController {
                 self.refresh_stats().await?;
             }
         }
+        Ok(())
+    }
+
+    fn should_queue_prompt(&self) -> bool {
+        let snap = self.snapshot.lock();
+        snap.agent_turn
+            || snap.streaming
+            || snap.phase != AgentHarnessPhase::Idle
+            || self.runtime.harness.phase() != AgentHarnessPhase::Idle
+    }
+
+    fn enqueue_prompt(&self, text: String) {
+        {
+            let mut snap = self.snapshot.lock();
+            snap.queued_messages.push_back(text);
+        }
+        self.notify_ui();
+    }
+
+    fn pop_queued_prompt(&self) -> Option<String> {
+        let mut snap = self.snapshot.lock();
+        let next = snap.queued_messages.pop_front();
+        if next.is_some() {
+            // Release lock before notify to avoid holding it across UI wakeups.
+            drop(snap);
+            self.notify_ui();
+            return next;
+        }
+        next
+    }
+
+    fn clear_queued_prompts(&self) {
+        {
+            let mut snap = self.snapshot.lock();
+            snap.queued_messages.clear();
+        }
+        self.notify_ui();
+    }
+
+    /// Run a single agent turn. Caller must hold `prompt_lock` and ensure idle.
+    async fn run_prompt_turn(&self, text: String) -> anyhow::Result<()> {
+        // Wait out any aborted turn before starting a new one. Without this,
+        // a quick Stop→resubmit races harness.prompt() and gets Busy while the
+        // user bubble is already shown.
+        self.runtime.harness.wait_for_idle().await;
+
+        let needs_title = self.session_needs_title().await?;
+        let fallback = crate::session_title::fallback_title(&text);
+        let session_id = self.snapshot.lock().active_session_id.clone();
+        {
+            let mut snap = self.snapshot.lock();
+            let checkpoint = TurnCheckpoint {
+                text: text.clone(),
+                chat_len: snap.chat_rows.len(),
+                pending_change_ids: snap
+                    .pending_changes
+                    .iter()
+                    .map(|c| c.id.clone())
+                    .collect(),
+            };
+            *self.turn_checkpoint.lock() = Some(checkpoint);
+            *self.discard_turn.lock() = false;
+            self.suppress_events
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            snap.streaming = true;
+            snap.agent_turn = true;
+            snap.restore_composer = None;
+            snap.chat_rows.push(ChatRow::User {
+                id: uuid::Uuid::now_v7().to_string(),
+                text: text.clone(),
+            });
+            if needs_title {
+                if let Some(row) = snap.sessions.iter_mut().find(|s| s.id == session_id) {
+                    row.name = Some(fallback.clone());
+                }
+            }
+        }
+        self.notify_ui();
+        if needs_title {
+            let _ = crate::session_title::persist_session_name(
+                &self.runtime,
+                &session_id,
+                &fallback,
+            )
+            .await;
+        }
+        let result = self.runtime.harness.prompt(text.clone()).await;
+        let discarded = self.take_discard_and_rollback();
+        {
+            let mut snap = self.snapshot.lock();
+            snap.streaming = false;
+            snap.agent_turn = false;
+            snap.phase = self.runtime.harness.phase();
+        }
+        self.notify_ui();
+        if discarded {
+            return Ok(());
+        }
+        if let Err(error) = result {
+            // Keep the optimistic user bubble from sticking around on failure.
+            self.suppress_events
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.apply_turn_rollback();
+            self.notify_ui();
+            return Err(anyhow::anyhow!(error));
+        }
+        *self.turn_checkpoint.lock() = None;
+        if needs_title {
+            let runtime = Arc::clone(&self.runtime);
+            let snapshot = Arc::clone(&self.snapshot);
+            let ui_tick = self.ui_tick_tx.clone();
+            let message = text.clone();
+            let (provider, model_id) = {
+                let label = snapshot.lock().model_label.clone();
+                split_model_label(&label)
+            };
+            tokio::spawn(async move {
+                let title = crate::session_title::generate_session_title(
+                    &runtime,
+                    &message,
+                    provider.as_deref(),
+                    model_id.as_deref(),
+                )
+                .await
+                .unwrap_or(fallback);
+                if crate::session_title::persist_session_name(&runtime, &session_id, &title)
+                    .await
+                    .is_ok()
+                {
+                    if let Ok(rows) = load_session_rows(&runtime, &snapshot).await {
+                        snapshot.lock().sessions = rows;
+                        let _ = ui_tick.try_send(());
+                    }
+                }
+            });
+        }
+        self.refresh_stats().await?;
+        self.refresh_sessions().await?;
         Ok(())
     }
 

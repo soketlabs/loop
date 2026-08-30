@@ -52,19 +52,16 @@ struct DesktopApp {
 impl DesktopApp {
     fn send_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_string();
-        if text.is_empty() || self.controller.snapshot().streaming {
+        if text.is_empty() {
             return;
         }
         self.follow_chat = true;
         self.composer.update(cx, |state, cx| {
             state.set_value("", window, cx);
         });
-        let controller = Arc::clone(&self.controller);
-        tokio::spawn(async move {
-            if let Err(error) = controller.handle_command(DesktopCommand::Prompt(text)).await {
-                tracing::warn!("prompt failed: {error:#}");
-            }
-        });
+        // Controller enqueues when busy and drains one-by-one when idle.
+        self.run_command(DesktopCommand::Prompt(text));
+        cx.notify();
     }
 
     fn stop_agent(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -414,9 +411,10 @@ fn render_sidebar(
                         .xsmall()
                         .icon(IconName::Plus)
                         .tooltip("New chat")
-                        .on_click(cx.listener(|this, _, _, _| {
+                        .on_click(cx.listener(|this, _, _, cx| {
                             this.follow_chat = true;
                             this.run_command(DesktopCommand::NewSession);
+                            cx.notify();
                         })),
                 ),
         )
@@ -428,9 +426,10 @@ fn render_sidebar(
                     .w_full()
                     .label("New chat")
                     .icon(IconName::Plus)
-                    .on_click(cx.listener(|this, _, _, _| {
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.follow_chat = true;
                         this.run_command(DesktopCommand::NewSession);
+                        cx.notify();
                     })),
             ),
         )
@@ -478,9 +477,10 @@ fn render_session_row(s: crate::state::SessionRow, cx: &mut Context<DesktopApp>)
             }
         })
         .on_click(cx.listener({
-            move |this, _, _, _| {
+            move |this, _, _, cx| {
                 this.follow_chat = true;
                 this.run_command(DesktopCommand::SelectSession(session_id.clone()));
+                cx.notify();
             }
         }))
         .child(
@@ -1161,6 +1161,9 @@ fn render_composer(
     let models = snap.available_models.clone();
     let current_model = snap.model_label.clone();
     let border = cx.theme().border;
+    let queued_count = snap.queued_messages.len();
+    let next_preview = snap.queued_messages.front().cloned();
+    let busy = snap.agent_turn;
 
     v_flex()
         .w_full()
@@ -1168,7 +1171,10 @@ fn render_composer(
         .border_t_1()
         .border_color(border)
         .bg(cx.theme().background)
-        // Row 1: multiline input + submit
+        .when(queued_count > 0, |el| {
+            el.child(render_queue_bar(queued_count, next_preview.as_deref(), cx))
+        })
+        // Row 1: multiline input + submit / stop
         .child(
             h_flex()
                 .w_full()
@@ -1183,34 +1189,36 @@ fn render_composer(
                         .min_w_0()
                         .child(Textarea::new(composer).appearance(false).bordered(false)),
                 )
-                .child({
-                    let stoppable = snap.agent_turn;
-                    if stoppable {
+                .child(
+                    Button::new("send")
+                        .primary()
+                        .icon(IconName::ArrowUp)
+                        .tooltip(if busy {
+                            "Queue message"
+                        } else if queued_count > 0 {
+                            "Send (queued messages wait)"
+                        } else {
+                            "Send"
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.send_prompt(window, cx);
+                        })),
+                )
+                .when(busy, |el| {
+                    el.child(
                         Button::new("stop")
-                            .primary()
+                            .danger()
                             .tooltip("Stop")
                             .child(
                                 div()
                                     .size_3()
                                     .rounded(px(2.))
-                                    .bg(cx.theme().primary_foreground),
+                                    .bg(cx.theme().danger_foreground),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.stop_agent(window, cx);
-                            }))
-                            .into_any_element()
-                    } else {
-                        Button::new("send")
-                            .primary()
-                            .icon(IconName::ArrowUp)
-                            .tooltip("Send")
-                            .disabled(snap.streaming)
-                            .loading(snap.streaming)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.send_prompt(window, cx);
-                            }))
-                            .into_any_element()
-                    }
+                            })),
+                    )
                 }),
         )
         // Row 2: status bar — line under input, columns separated by vertical lines
@@ -1298,6 +1306,98 @@ fn render_composer(
                     cx,
                 )),
         )
+}
+
+fn render_queue_bar(
+    count: usize,
+    next_preview: Option<&str>,
+    cx: &mut Context<DesktopApp>,
+) -> impl IntoElement {
+    let label = if count == 1 {
+        "1 queued message".to_string()
+    } else {
+        format!("{count} queued messages")
+    };
+    let preview = next_preview
+        .map(|t| truncate_queue_preview(t, 72))
+        .unwrap_or_default();
+    let muted = cx.theme().muted;
+    let muted_fg = cx.theme().muted_foreground;
+    let accent = cx.theme().accent;
+
+    h_flex()
+        .id("composer-queue-bar")
+        .w_full()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .bg(muted.opacity(0.45))
+        .child(
+            div()
+                .flex_shrink_0()
+                .size_1_5()
+                .rounded_full()
+                .bg(accent),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(cx.theme().foreground)
+                        .child(label),
+                )
+                .when(!preview.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .child(format!("Next: {preview}")),
+                    )
+                }),
+        )
+        .child(
+            Button::new("queue-remove-last")
+                .ghost()
+                .xsmall()
+                .icon(IconName::CircleX)
+                .tooltip("Remove last queued message")
+                .on_click(cx.listener(|this, _, _, _| {
+                    this.run_command(DesktopCommand::DequeueLast);
+                })),
+        )
+        .when(count > 1, |el| {
+            el.child(
+                Button::new("queue-clear")
+                    .ghost()
+                    .xsmall()
+                    .label("Clear")
+                    .tooltip("Clear all queued messages")
+                    .on_click(cx.listener(|this, _, _, _| {
+                        this.run_command(DesktopCommand::ClearQueue);
+                    })),
+            )
+        })
+}
+
+fn truncate_queue_preview(text: &str, max_chars: usize) -> String {
+    let trimmed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if trimmed.chars().count() <= max_chars {
+        return trimmed;
+    }
+    let mut out: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn composer_status_cell(
@@ -1696,11 +1796,9 @@ pub async fn run_desktop(cwd: PathBuf) -> anyhow::Result<()> {
                             |this: &mut DesktopApp, _input, event, window, cx| {
                                 if let InputEvent::PressEnter { shift, .. } = event {
                                     if !shift {
-                                        if this.controller.snapshot().agent_turn {
-                                            this.stop_agent(window, cx);
-                                        } else if !this.controller.snapshot().streaming {
-                                            this.send_prompt(window, cx);
-                                        }
+                                        // Enter always submits: queues while busy, sends when idle.
+                                        // Stop remains on the stop button only.
+                                        this.send_prompt(window, cx);
                                     }
                                 }
                             },
