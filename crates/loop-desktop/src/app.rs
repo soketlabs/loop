@@ -18,7 +18,7 @@ use gpui_component::separator::Separator;
 use gpui_component::spinner::Spinner;
 use gpui_component::v_flex;
 use gpui_component::{
-    Icon, IconName, Sizable, Theme, VirtualListScrollHandle, v_virtual_list, *,
+    Icon, IconName, Sizable, Theme, ThemeMode, VirtualListScrollHandle, v_virtual_list, *,
 };
 
 use crate::controller::{DesktopCommand, DesktopController, DesktopSnapshot};
@@ -42,7 +42,6 @@ struct DesktopApp {
     follow_chat: bool,
     diff_panel_open: bool,
     sidebar_open: bool,
-    last_pending_changes: usize,
     expanded_thinking: HashSet<String>,
     _subscriptions: Vec<Subscription>,
 }
@@ -127,6 +126,7 @@ fn chat_scroll_signature(snap: &DesktopSnapshot) -> (usize, usize, bool) {
         .map(|row| match row {
             ChatRow::User { text, .. } | ChatRow::Assistant { text, .. } => text.len(),
             ChatRow::Thinking { text, .. } => text.len(),
+            ChatRow::Tool { detail, summary, .. } => detail.len().saturating_add(summary.len()),
             _ => 0,
         })
         .unwrap_or(0);
@@ -138,10 +138,6 @@ impl Render for DesktopApp {
         let snap = self.controller.snapshot();
         self.sync_session_sizes(snap.sessions.len());
         self.maybe_scroll_chat(&snap);
-        if snap.pending_changes.len() > self.last_pending_changes {
-            self.diff_panel_open = true;
-        }
-        self.last_pending_changes = snap.pending_changes.len();
         let app = cx.entity().clone();
         let project = crate::chat_ui::project_label(&snap.cwd);
         window.set_window_title(&format!("Loop — {project}"));
@@ -201,7 +197,31 @@ impl Render for DesktopApp {
     }
 }
 
-actions!(desktop, [ToggleDiffPanel, ToggleSidebar]);
+actions!(desktop, [ToggleDiffPanel, ToggleSidebar, ToggleTheme]);
+
+fn theme_mode_from_name(name: &str) -> ThemeMode {
+    if name.eq_ignore_ascii_case("light") {
+        ThemeMode::Light
+    } else {
+        ThemeMode::Dark
+    }
+}
+
+fn toggle_theme(this: &mut DesktopApp, window: &mut Window, cx: &mut Context<DesktopApp>) {
+    let next = if cx.theme().is_dark() {
+        ThemeMode::Light
+    } else {
+        ThemeMode::Dark
+    };
+    Theme::change(next, Some(window), cx);
+    cx.refresh_windows();
+    let name = next.name().to_string();
+    let controller = Arc::clone(&this.controller);
+    tokio::spawn(async move {
+        controller.persist_theme(&name);
+    });
+    cx.notify();
+}
 
 fn render_toolbar(
     snap: &DesktopSnapshot,
@@ -295,6 +315,24 @@ fn render_toolbar(
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(short_model(&snap.model_label)),
+                )
+                .child(
+                    Button::new("toggle-theme")
+                        .ghost()
+                        .xsmall()
+                        .icon(if cx.theme().is_dark() {
+                            IconName::Sun
+                        } else {
+                            IconName::Moon
+                        })
+                        .tooltip(if cx.theme().is_dark() {
+                            "Switch to light theme"
+                        } else {
+                            "Switch to dark theme"
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            toggle_theme(this, window, cx);
+                        })),
                 )
                 .child(
                     Button::new("toggle-diff-panel")
@@ -471,6 +509,7 @@ fn render_chat_panel(
     cx: &mut Context<DesktopApp>,
 ) -> impl IntoElement {
     let rows = snap.chat_rows.clone();
+    let pending = snap.pending_changes.clone();
     let expanded = expanded_thinking.clone();
     let empty = rows.is_empty();
     let streaming = snap.streaming;
@@ -501,6 +540,7 @@ fn render_chat_panel(
                 row,
                 expanded.contains(row_id(row)),
                 selected.as_deref(),
+                &pending,
                 cx,
             )
         }))
@@ -605,8 +645,9 @@ fn render_chat_row(
     row: &ChatRow,
     thinking_open: bool,
     selected_change: Option<&str>,
+    pending: &[crate::state::PendingFileChange],
     cx: &mut Context<DesktopApp>,
-) -> Div {
+) -> impl IntoElement {
     match row {
         ChatRow::User { text, .. } => h_flex().w_full().justify_end().child(
             div()
@@ -614,10 +655,12 @@ fn render_chat_row(
                 .px_4()
                 .py_3()
                 .rounded_xl()
+                .border_1()
+                .border_color(cx.theme().border)
                 .bg(cx.theme().accent.opacity(0.16))
                 .text_color(cx.theme().foreground)
                 .child(text.clone()),
-        ),
+        ).into_any_element(),
         ChatRow::Assistant { id, text, streaming } => v_flex()
             .w_full()
             .gap_1()
@@ -626,11 +669,12 @@ fn render_chat_row(
                 text.clone(),
                 cx,
             ))
-            .when(*streaming, |el| el.child(crate::markdown::streaming_caret(cx))),
+            .when(*streaming, |el| el.child(crate::markdown::streaming_caret(cx)))
+            .into_any_element(),
         ChatRow::Thinking { id, text, done } => {
-            let open = !*done || thinking_open;
-            let preview = thinking_preview(text, *done);
+            let open = thinking_open;
             let think_id = id.clone();
+            let still_thinking = !*done;
             v_flex()
                 .w_full()
                 .gap_1()
@@ -645,6 +689,8 @@ fn render_chat_row(
                                 this.expanded_thinking.remove(&think_id);
                             } else {
                                 this.expanded_thinking.insert(think_id.clone());
+                                // Follow streaming thought content after expand.
+                                this.follow_chat = true;
                             }
                             cx.notify();
                         }))
@@ -657,7 +703,7 @@ fn render_chat_row(
                             .size_4()
                             .text_color(cx.theme().muted_foreground),
                         )
-                        .when(!*done, |el| {
+                        .when(still_thinking, |el| {
                             el.child(Spinner::new().xsmall().color(cx.theme().muted_foreground))
                         })
                         .child(
@@ -665,17 +711,32 @@ fn render_chat_row(
                                 .text_sm()
                                 .italic()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(if *done { "Thought" } else { "Thinking" }),
+                                .child(if *done {
+                                    "Thought".to_string()
+                                } else {
+                                    "Thinking".to_string()
+                                })
+                                .with_animation(
+                                    SharedString::from(format!("thinking-pulse-{id}")),
+                                    Animation::new(Duration::from_millis(1100)).repeat(),
+                                    move |this, delta| {
+                                        if still_thinking && !open {
+                                            let t = (delta * std::f32::consts::PI * 2.)
+                                                .sin()
+                                                .abs();
+                                            this.opacity(0.45 + 0.55 * t)
+                                        } else {
+                                            this.opacity(1.)
+                                        }
+                                    },
+                                ),
                         )
-                        .when(!open && !preview.is_empty(), |el| {
+                        .when(!open && *done && !text.is_empty(), |el| {
                             el.child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
                                     .text_sm()
-                                    .text_ellipsis()
-                                    .text_color(cx.theme().muted_foreground.opacity(0.8))
-                                    .child(preview),
+                                    .text_color(cx.theme().muted_foreground.opacity(0.7))
+                                    .child("· click to expand"),
                             )
                         }),
                 )
@@ -689,54 +750,15 @@ fn render_chat_row(
                             .child(text.clone()),
                     )
                 })
+                .into_any_element()
         }
         ChatRow::Tool {
             name,
             summary,
+            detail,
             status,
             ..
-        } => {
-            let color = match status {
-                ToolCardStatus::Running | ToolCardStatus::Pending => cx.theme().warning,
-                ToolCardStatus::Success => cx.theme().muted_foreground,
-                ToolCardStatus::Error => cx.theme().danger,
-            };
-            h_flex().w_full().items_center().child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .border_l_2()
-                    .border_color(color.opacity(0.7))
-                    .bg(color.opacity(0.06))
-                    .when(*status == ToolCardStatus::Running, |el| {
-                        el.child(Spinner::new().xsmall().color(color))
-                    })
-                    .when(*status == ToolCardStatus::Success, |el| {
-                        el.child(
-                            Icon::new(IconName::Check)
-                                .size_4()
-                                .text_color(cx.theme().success),
-                        )
-                    })
-                    .when(*status == ToolCardStatus::Error, |el| {
-                        el.child(
-                            Icon::new(IconName::CircleX)
-                                .size_4()
-                                .text_color(cx.theme().danger),
-                        )
-                    })
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .text_color(color)
-                            .child(crate::chat_ui::tool_activity_label(name, summary, *status)),
-                    ),
-            )
-        }
+        } => render_tool_row(name, summary, detail, *status, cx).into_any_element(),
         ChatRow::FileChange {
             id,
             path,
@@ -746,79 +768,304 @@ fn render_chat_row(
         } => {
             let selected = selected_change == Some(id.as_str());
             let change_id = id.clone();
-            h_flex().w_full().child(
-                h_flex()
-                    .id(SharedString::from(format!("change-{id}")))
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .border_1()
-                    .border_color(if selected {
-                        cx.theme().accent.opacity(0.5)
-                    } else {
-                        cx.theme().border
-                    })
-                    .bg(if selected {
-                        cx.theme().accent.opacity(0.1)
-                    } else {
-                        cx.theme().muted.opacity(0.2)
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.diff_panel_open = true;
-                        this.run_command(DesktopCommand::SelectFileChange(change_id.clone()));
-                        cx.notify();
-                    }))
-                    .child(
-                        Icon::new(IconName::File)
-                            .size_4()
-                            .text_color(cx.theme().muted_foreground),
+            let change = pending.iter().find(|c| c.id == *id);
+            let preview = change
+                .map(|c| {
+                    crate::state::preview_diff_lines(
+                        c.before.as_deref().unwrap_or(""),
+                        &c.after,
+                        18,
                     )
-                    .child(
+                })
+                .unwrap_or_default();
+
+            v_flex()
+                .id(SharedString::from(format!("change-{id}")))
+                .w_full()
+                .rounded_lg()
+                .border_1()
+                .border_color(if selected {
+                    cx.theme().accent.opacity(0.55)
+                } else {
+                    cx.theme().border
+                })
+                .bg(cx.theme().muted.opacity(0.22))
+                .overflow_hidden()
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.diff_panel_open = true;
+                    this.run_command(DesktopCommand::SelectFileChange(change_id.clone()));
+                    cx.notify();
+                }))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(cx.theme().border.opacity(0.8))
+                        .child(
+                            Icon::new(IconName::File)
+                                .size_4()
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_ellipsis()
+                                .text_color(cx.theme().foreground)
+                                .child(short_path(path)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().success)
+                                .child(format!("+{added}")),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .child(format!("−{removed}")),
+                        ),
+                )
+                .when(!preview.is_empty(), |el| {
+                    el.child(render_diff_preview_body(&preview, cx))
+                })
+                .when(preview.is_empty(), |el| {
+                    el.child(
                         div()
-                            .text_sm()
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .text_color(cx.theme().foreground)
-                            .child(short_path(path)),
-                    )
-                    .child(
-                        div()
+                            .px_3()
+                            .py_2()
                             .text_xs()
-                            .text_color(cx.theme().success)
-                            .child(format!("+{added}")),
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Click to review diff"),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().danger)
-                            .child(format!("−{removed}")),
-                    ),
-            )
+                })
+                .into_any_element()
         }
         ChatRow::System(text) => div()
             .w_full()
             .text_sm()
             .text_color(cx.theme().muted_foreground)
-            .child(text.clone()),
+            .child(text.clone())
+            .into_any_element(),
     }
 }
 
-fn thinking_preview(text: &str, done: bool) -> String {
-    let line = if done {
-        text.lines().find(|l| !l.trim().is_empty())
+fn render_tool_row(
+    name: &str,
+    summary: &str,
+    detail: &str,
+    status: ToolCardStatus,
+    cx: &mut Context<DesktopApp>,
+) -> Div {
+    let color = match status {
+        ToolCardStatus::Running | ToolCardStatus::Pending => cx.theme().warning,
+        ToolCardStatus::Success => cx.theme().muted_foreground,
+        ToolCardStatus::Error => cx.theme().danger,
+    };
+    let title = crate::chat_ui::tool_activity_label(name, summary, status);
+    let boxed = crate::chat_ui::is_shell_tool(name)
+        || (crate::chat_ui::is_file_mutation_tool(name)
+            && matches!(status, ToolCardStatus::Pending | ToolCardStatus::Running));
+
+    if boxed {
+        let (preview, more) = if detail.is_empty() {
+            (
+                if matches!(status, ToolCardStatus::Pending | ToolCardStatus::Running) {
+                    "…".to_string()
+                } else {
+                    String::new()
+                },
+                0,
+            )
+        } else {
+            crate::chat_ui::truncate_tool_detail(detail, 16)
+        };
+        let mut body = v_flex().w_full().gap_0p5().px_3().py_2();
+        if preview.is_empty() {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No output"),
+            );
+        } else {
+            for line in preview.lines() {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_color(cx.theme().foreground.opacity(0.85))
+                        .child(if line.is_empty() {
+                            " ".to_string()
+                        } else {
+                            line.to_string()
+                        }),
+                );
+            }
+            if more > 0 {
+                body = body.child(
+                    div()
+                        .pt_1()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("… {more} more lines")),
+                );
+            }
+        }
+        v_flex()
+            .w_full()
+            .rounded_lg()
+            .border_1()
+            .border_color(color.opacity(0.35))
+            .bg(cx.theme().muted.opacity(0.25))
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(color.opacity(0.25))
+                    .bg(color.opacity(0.08))
+                    .when(
+                        status == ToolCardStatus::Running || status == ToolCardStatus::Pending,
+                        |el| el.child(Spinner::new().xsmall().color(color)),
+                    )
+                    .when(status == ToolCardStatus::Success, |el| {
+                        el.child(
+                            Icon::new(IconName::Check)
+                                .size_4()
+                                .text_color(cx.theme().success),
+                        )
+                    })
+                    .when(status == ToolCardStatus::Error, |el| {
+                        el.child(
+                            Icon::new(IconName::CircleX)
+                                .size_4()
+                                .text_color(cx.theme().danger),
+                        )
+                    })
+                    .when(crate::chat_ui::is_shell_tool(name), |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_color(cx.theme().muted_foreground)
+                                .child(">_"),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_color(color)
+                            .child(title),
+                    ),
+            )
+            .child(body)
     } else {
-        text.lines().rev().find(|l| !l.trim().is_empty())
+        h_flex().w_full().items_center().child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .border_l_2()
+                .border_color(color.opacity(0.7))
+                .bg(color.opacity(0.06))
+                .when(
+                    status == ToolCardStatus::Running || status == ToolCardStatus::Pending,
+                    |el| el.child(Spinner::new().xsmall().color(color)),
+                )
+                .when(status == ToolCardStatus::Success, |el| {
+                    el.child(
+                        Icon::new(IconName::Check)
+                            .size_4()
+                            .text_color(cx.theme().success),
+                    )
+                })
+                .when(status == ToolCardStatus::Error, |el| {
+                    el.child(
+                        Icon::new(IconName::CircleX)
+                            .size_4()
+                            .text_color(cx.theme().danger),
+                    )
+                })
+                .child(
+                    div()
+                        .text_sm()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_color(color)
+                        .child(title),
+                ),
+        )
     }
-    .unwrap_or("")
-    .trim();
-    let chars: Vec<char> = line.chars().collect();
-    if chars.len() > 72 {
-        format!("{}…", chars[..69].iter().collect::<String>())
-    } else {
-        line.to_string()
+}
+
+fn render_diff_preview_body(
+    lines: &[crate::state::DiffPreviewLine],
+    cx: &mut Context<DesktopApp>,
+) -> Div {
+    let mut body = v_flex()
+        .w_full()
+        .gap_0()
+        .font_family(cx.theme().mono_font_family.clone())
+        .text_xs();
+    for line in lines {
+        let (sign, fg, bg) = match line.tag {
+            similar::ChangeTag::Insert => (
+                "+",
+                cx.theme().success,
+                cx.theme().success.opacity(0.12),
+            ),
+            similar::ChangeTag::Delete => (
+                "−",
+                cx.theme().danger,
+                cx.theme().danger.opacity(0.12),
+            ),
+            similar::ChangeTag::Equal => (
+                " ",
+                cx.theme().muted_foreground,
+                gpui::transparent_black(),
+            ),
+        };
+        let gutter = line
+            .new_no
+            .or(line.old_no)
+            .map(|n| format!("{n:>4}"))
+            .unwrap_or_else(|| "    ".into());
+        body = body.child(
+            h_flex()
+                .w_full()
+                .items_start()
+                .gap_2()
+                .px_2()
+                .py_0p5()
+                .bg(bg)
+                .child(
+                    div()
+                        .text_color(cx.theme().muted_foreground.opacity(0.7))
+                        .child(gutter),
+                )
+                .child(
+                    div()
+                        .text_color(fg)
+                        .child(format!("{sign}{}", if line.text.is_empty() { " " } else { &line.text })),
+                ),
+        );
     }
+    body
 }
 
 fn short_path(path: &str) -> String {
@@ -1261,6 +1508,7 @@ fn render_approval_overlay(
 /// Launch the desktop application.
 pub async fn run_desktop(cwd: PathBuf) -> anyhow::Result<()> {
     let controller = Arc::new(DesktopController::new(cwd).await?);
+    let initial_theme = theme_mode_from_name(controller.theme_name());
 
     let controller_ui = Arc::clone(&controller);
     let ui_rx = controller.ui_receiver();
@@ -1269,7 +1517,7 @@ pub async fn run_desktop(cwd: PathBuf) -> anyhow::Result<()> {
         .with_assets(gpui_component_assets::Assets)
         .run(move |cx| {
             gpui_component::init(cx);
-            Theme::change(ThemeMode::Dark, None, cx);
+            Theme::change(initial_theme, None, cx);
 
             cx.spawn(async move |cx| {
                 let mut options = WindowOptions::default();
@@ -1279,7 +1527,7 @@ pub async fn run_desktop(cwd: PathBuf) -> anyhow::Result<()> {
                 }));
 
                 cx.open_window(options, move |window, cx| {
-                    Theme::change(ThemeMode::Dark, Some(window), cx);
+                    Theme::change(initial_theme, Some(window), cx);
                     let composer = cx.new(|cx| {
                         TextareaState::new(window, cx)
                             .auto_grow(1, 8)
@@ -1316,7 +1564,6 @@ pub async fn run_desktop(cwd: PathBuf) -> anyhow::Result<()> {
                             follow_chat: true,
                             diff_panel_open: false,
                             sidebar_open: true,
-                            last_pending_changes: 0,
                             expanded_thinking: HashSet::new(),
                             _subscriptions: subscriptions,
                         }

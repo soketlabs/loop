@@ -11,7 +11,7 @@ use loop_agent::harness::{
 use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel, AgentToolResult};
 use loop_ai::AssistantMessageEvent;
 use loop_app_core::tool_approval::{permissions_from_settings, ApprovalDecision, ToolApprovalBridge};
-use loop_app_core::{bootstrap, BootstrapOpts, Runtime};
+use loop_app_core::{bootstrap, settings_path, BootstrapOpts, Runtime, Settings};
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -129,6 +129,8 @@ impl DesktopController {
             permissions_from_settings(&runtime.settings.tool_permissions),
             Default::default(),
         );
+        // Review file edits in the desktop diff panel; do not spawn Cursor/VS Code on each write.
+        bridge.set_open_external_diff(false);
         let bridge = Arc::new(bridge);
         runtime
             .harness
@@ -184,6 +186,25 @@ impl DesktopController {
 
     pub fn runtime(&self) -> Arc<Runtime> {
         Arc::clone(&self.runtime)
+    }
+
+    /// Preferred UI theme name from settings (`dark` / `light`).
+    pub fn theme_name(&self) -> &str {
+        &self.runtime.settings.theme
+    }
+
+    /// Persist the desktop/CLI theme preference to `~/.loop/agent/settings.json`.
+    pub fn persist_theme(&self, name: &str) {
+        let path = settings_path(&self.runtime.agent_dir);
+        match Settings::load_file(&path) {
+            Ok(mut settings) => {
+                settings.theme = name.to_string();
+                if let Err(error) = settings.save_file(&path) {
+                    tracing::warn!("failed to save theme setting: {error:#}");
+                }
+            }
+            Err(error) => tracing::warn!("failed to load settings for theme save: {error:#}"),
+        }
     }
 
     fn notify_ui(&self) {
@@ -611,28 +632,65 @@ fn apply_agent_event(
                 s.stats.apply_message(msg);
             }
         }
+        AgentEvent::MessageStart { message } => {
+            // New assistant message: later text starts a fresh bubble (after tools/thinking).
+            if message.role() == "assistant" {
+                close_streaming_assistant(&mut s.chat_rows);
+            }
+        }
         AgentEvent::MessageUpdate {
             message,
             assistant_message_event,
         } => {
-            let thinking_ended = matches!(
-                assistant_message_event,
-                AssistantMessageEvent::ThinkingEnd { .. }
-                    | AssistantMessageEvent::TextStart { .. }
-                    | AssistantMessageEvent::TextDelta { .. }
-            );
-            merge_streaming_message(&mut s.chat_rows, message, thinking_ended);
-            if matches!(
-                assistant_message_event,
-                AssistantMessageEvent::TextStart { .. }
-                    | AssistantMessageEvent::TextDelta { .. }
-            ) {
-                ensure_streaming_assistant(&mut s.chat_rows);
+            match assistant_message_event {
+                AssistantMessageEvent::TextStart { .. } => {
+                    finish_open_thinking(&mut s.chat_rows);
+                    // New text segment after thinking/tools.
+                    close_streaming_assistant(&mut s.chat_rows);
+                    ensure_streaming_assistant(&mut s.chat_rows);
+                }
+                AssistantMessageEvent::TextDelta { delta, .. } => {
+                    finish_open_thinking(&mut s.chat_rows);
+                    append_assistant_delta(&mut s.chat_rows, delta);
+                }
+                AssistantMessageEvent::TextEnd { .. } => {
+                    close_streaming_assistant(&mut s.chat_rows);
+                }
+                AssistantMessageEvent::ThinkingStart { .. } => {
+                    close_streaming_assistant(&mut s.chat_rows);
+                    open_thinking(&mut s.chat_rows);
+                }
+                AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                    append_thinking_delta(&mut s.chat_rows, delta);
+                }
+                AssistantMessageEvent::ThinkingEnd { .. } => {
+                    finish_open_thinking(&mut s.chat_rows);
+                }
+                AssistantMessageEvent::ToolcallStart { .. }
+                | AssistantMessageEvent::ToolcallDelta { .. } => {
+                    finish_open_thinking(&mut s.chat_rows);
+                    close_streaming_assistant(&mut s.chat_rows);
+                    upsert_streaming_tool_calls(&mut s.chat_rows, message);
+                }
+                AssistantMessageEvent::ToolcallEnd { tool_call, .. } => {
+                    finish_open_thinking(&mut s.chat_rows);
+                    close_streaming_assistant(&mut s.chat_rows);
+                    upsert_tool_row(
+                        &mut s.chat_rows,
+                        &tool_call.id,
+                        &tool_call.name,
+                        crate::chat_ui::tool_args_summary(&tool_call.name, &tool_call.arguments),
+                        crate::chat_ui::tool_content_preview(&tool_call.name, &tool_call.arguments),
+                        ToolCardStatus::Pending,
+                    );
+                }
+                _ => {}
             }
             s.stats.apply_message(message);
         }
         AgentEvent::MessageEnd { message } => {
-            finalize_streaming_message(&mut s.chat_rows, message);
+            finish_open_thinking(&mut s.chat_rows);
+            close_streaming_assistant(&mut s.chat_rows);
             s.stats.apply_message(message);
         }
         AgentEvent::ToolExecutionStart {
@@ -648,12 +706,14 @@ fn apply_agent_event(
                         .insert(tool_call_id.clone(), (path, before));
                 }
             }
-            s.chat_rows.push(ChatRow::Tool {
-                id: tool_call_id.clone(),
-                name: tool_name.clone(),
-                summary: crate::chat_ui::tool_args_summary(tool_name, args),
-                status: ToolCardStatus::Running,
-            });
+            upsert_tool_row(
+                &mut s.chat_rows,
+                tool_call_id,
+                tool_name,
+                crate::chat_ui::tool_args_summary(tool_name, args),
+                crate::chat_ui::tool_content_preview(tool_name, args),
+                ToolCardStatus::Running,
+            );
         }
         AgentEvent::ToolExecutionEnd {
             tool_call_id,
@@ -668,12 +728,21 @@ fn apply_agent_event(
                 .rev()
                 .find(|r| matches!(r, ChatRow::Tool { id, .. } if id == tool_call_id))
             {
-                if let ChatRow::Tool { status, .. } = row {
+                if let ChatRow::Tool { status, detail, .. } = row {
                     *status = if *is_error {
                         ToolCardStatus::Error
                     } else {
                         ToolCardStatus::Success
                     };
+                    // Prefer command output for shell; drop write/edit body once FileChange card lands.
+                    if matches!(tool_name.as_str(), "bash" | "shell") {
+                        let out = tool_result_text(result);
+                        if !out.is_empty() {
+                            *detail = out;
+                        }
+                    } else if crate::chat_ui::is_file_mutation_tool(tool_name) && !*is_error {
+                        detail.clear();
+                    }
                 }
             }
             if (tool_name == "write" || tool_name == "edit") && !*is_error {
@@ -708,85 +777,58 @@ fn apply_agent_event(
     }
 }
 
-fn path_from_tool_args(args: &Value) -> Option<PathBuf> {
-    for key in ["path", "file_path", "file"] {
-        if let Some(path) = args.get(key).and_then(|v| v.as_str()) {
-            return Some(PathBuf::from(path));
-        }
-    }
-    None
-}
-
-fn merge_streaming_message(rows: &mut Vec<ChatRow>, message: &AgentMessage, thinking_ended: bool) {
-    let AgentMessage::Llm(loop_ai::Message::Assistant(a)) = message else {
-        return;
-    };
-
-    let mut text = String::new();
-    let mut thinking = None;
-    for block in &a.content {
-        match block {
-            loop_ai::AssistantContent::Text(t) => text.push_str(&t.text),
-            loop_ai::AssistantContent::Thinking(t) => thinking = Some(t.thinking.clone()),
-            _ => {}
-        }
-    }
-
-    let finish_thinking = thinking_ended || !text.is_empty();
-    if let Some(think) = thinking {
-        if let Some(row) = rows
-            .iter_mut()
-            .rev()
-            .find(|r| matches!(r, ChatRow::Thinking { .. }))
-        {
-            if let ChatRow::Thinking {
-                text: existing,
-                done,
-                ..
-            } = row
-            {
-                *existing = think;
-                if finish_thinking {
-                    *done = true;
-                }
-            }
-        } else {
-            rows.push(ChatRow::Thinking {
-                id: uuid::Uuid::now_v7().to_string(),
-                text: think,
-                done: finish_thinking,
-            });
-        }
-    } else if finish_thinking {
-        if let Some(ChatRow::Thinking { done, .. }) = rows
-            .iter_mut()
-            .rev()
-            .find(|r| matches!(r, ChatRow::Thinking { .. }))
-        {
-            *done = true;
-        }
-    }
-
-    if text.is_empty() {
-        return;
-    }
-    if let Some(row) = rows
+fn close_streaming_assistant(rows: &mut Vec<ChatRow>) {
+    if let Some(ChatRow::Assistant { streaming, .. }) = rows
         .iter_mut()
         .rev()
         .find(|r| matches!(r, ChatRow::Assistant { streaming: true, .. }))
     {
-        if let ChatRow::Assistant {
-            text: existing, ..
-        } = row
-        {
-            *existing = text;
-        }
+        *streaming = false;
+    }
+}
+
+fn finish_open_thinking(rows: &mut Vec<ChatRow>) {
+    if let Some(ChatRow::Thinking { done, .. }) = rows
+        .iter_mut()
+        .rev()
+        .find(|r| matches!(r, ChatRow::Thinking { done: false, .. }))
+    {
+        *done = true;
+    }
+}
+
+fn open_thinking(rows: &mut Vec<ChatRow>) {
+    if rows
+        .iter()
+        .rev()
+        .any(|r| matches!(r, ChatRow::Thinking { done: false, .. }))
+    {
         return;
     }
-    rows.push(ChatRow::Assistant {
+    rows.push(ChatRow::Thinking {
         id: uuid::Uuid::now_v7().to_string(),
+        text: String::new(),
+        done: false,
+    });
+}
+
+fn append_thinking_delta(rows: &mut Vec<ChatRow>, delta: &str) {
+    if let Some(ChatRow::Thinking {
         text,
-        streaming: true,
+        done: false,
+        ..
+    }) = rows
+        .iter_mut()
+        .rev()
+        .find(|r| matches!(r, ChatRow::Thinking { done: false, .. }))
+    {
+        text.push_str(delta);
+        return;
+    }
+    rows.push(ChatRow::Thinking {
+        id: uuid::Uuid::now_v7().to_string(),
+        text: delta.to_string(),
+        done: false,
     });
 }
 
@@ -805,42 +847,98 @@ fn ensure_streaming_assistant(rows: &mut Vec<ChatRow>) {
     });
 }
 
-fn finalize_streaming_message(rows: &mut Vec<ChatRow>, message: &AgentMessage) {
-    if let Some(ChatRow::Thinking { done, .. }) = rows
+fn append_assistant_delta(rows: &mut Vec<ChatRow>, delta: &str) {
+    if let Some(ChatRow::Assistant {
+        text,
+        streaming: true,
+        ..
+    }) = rows
         .iter_mut()
         .rev()
-        .find(|r| matches!(r, ChatRow::Thinking { .. }))
+        .find(|r| matches!(r, ChatRow::Assistant { streaming: true, .. }))
     {
-        *done = true;
+        text.push_str(delta);
+        return;
     }
-    if let AgentMessage::Llm(loop_ai::Message::Assistant(a)) = message {
-        let mut text = String::new();
-        for block in &a.content {
-            if let loop_ai::AssistantContent::Text(t) = block {
-                text.push_str(&t.text);
-            }
+    rows.push(ChatRow::Assistant {
+        id: uuid::Uuid::now_v7().to_string(),
+        text: delta.to_string(),
+        streaming: true,
+    });
+}
+
+fn upsert_streaming_tool_calls(rows: &mut Vec<ChatRow>, message: &AgentMessage) {
+    let AgentMessage::Llm(loop_ai::Message::Assistant(a)) = message else {
+        return;
+    };
+    for block in &a.content {
+        let loop_ai::AssistantContent::ToolCall(tc) = block else {
+            continue;
+        };
+        if tc.id.is_empty() || tc.name.is_empty() {
+            continue;
         }
-        if let Some(ChatRow::Assistant {
-            text: existing,
-            streaming,
+        // Show write/edit while args stream so large file bodies don't look hung.
+        if !crate::chat_ui::is_file_mutation_tool(&tc.name) {
+            continue;
+        }
+        upsert_tool_row(
+            rows,
+            &tc.id,
+            &tc.name,
+            crate::chat_ui::tool_args_summary(&tc.name, &tc.arguments),
+            crate::chat_ui::tool_content_preview(&tc.name, &tc.arguments),
+            ToolCardStatus::Pending,
+        );
+    }
+}
+
+fn upsert_tool_row(
+    rows: &mut Vec<ChatRow>,
+    id: &str,
+    name: &str,
+    summary: String,
+    detail: String,
+    status: ToolCardStatus,
+) {
+    if let Some(row) = rows
+        .iter_mut()
+        .rev()
+        .find(|r| matches!(r, ChatRow::Tool { id: tid, .. } if tid == id))
+    {
+        if let ChatRow::Tool {
+            name: existing_name,
+            summary: existing_summary,
+            detail: existing_detail,
+            status: existing_status,
             ..
-        }) = rows
-            .iter_mut()
-            .rev()
-            .find(|r| matches!(r, ChatRow::Assistant { .. }))
+        } = row
         {
-            if !text.is_empty() {
-                *existing = text;
+            *existing_name = name.to_string();
+            *existing_summary = summary;
+            if detail.len() >= existing_detail.len() || existing_detail.is_empty() {
+                *existing_detail = detail;
             }
-            *streaming = false;
-        } else if !text.is_empty() {
-            rows.push(ChatRow::Assistant {
-                id: uuid::Uuid::now_v7().to_string(),
-                text,
-                streaming: false,
-            });
+            *existing_status = status;
+        }
+        return;
+    }
+    rows.push(ChatRow::Tool {
+        id: id.to_string(),
+        name: name.to_string(),
+        summary,
+        detail,
+        status,
+    });
+}
+
+fn path_from_tool_args(args: &Value) -> Option<PathBuf> {
+    for key in ["path", "file_path", "file"] {
+        if let Some(path) = args.get(key).and_then(|v| v.as_str()) {
+            return Some(PathBuf::from(path));
         }
     }
+    None
 }
 
 fn extract_file_path(result: &AgentToolResult) -> Option<PathBuf> {
@@ -911,25 +1009,23 @@ fn thinking_label_str(level: AgentThinkingLevel) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loop_ai::{AssistantContent, AssistantMessage, StopReason, TextContent, ThinkingContent, Usage};
+    use loop_ai::{AssistantContent, AssistantMessage, StopReason, TextContent, ToolCall, Usage};
+    use serde_json::json;
 
-    fn assistant_partial(thinking: Option<&str>, text: &str) -> AgentMessage {
-        let mut content = Vec::new();
-        if let Some(think) = thinking {
-            content.push(AssistantContent::Thinking(ThinkingContent {
-                thinking: think.to_string(),
-                thinking_signature: None,
-                redacted: None,
-            }));
-        }
-        if !text.is_empty() {
-            content.push(AssistantContent::Text(TextContent {
-                text: text.to_string(),
-                text_signature: None,
-            }));
-        }
+    fn assistant_with_write(text: &str, path: &str, content: &str) -> AgentMessage {
         AgentMessage::assistant(AssistantMessage {
-            content,
+            content: vec![
+                AssistantContent::Text(TextContent {
+                    text: text.to_string(),
+                    text_signature: None,
+                }),
+                AssistantContent::ToolCall(ToolCall {
+                    id: "call_write".into(),
+                    name: "write".into(),
+                    arguments: json!({ "path": path, "content": content }),
+                    thought_signature: None,
+                }),
+            ],
             api: "test".into(),
             provider: "test".into(),
             model: "test".into(),
@@ -944,9 +1040,10 @@ mod tests {
     }
 
     #[test]
-    fn thinking_then_text_streams_assistant_instead_of_waiting_for_end() {
+    fn thinking_then_text_streams_via_deltas() {
         let mut rows = Vec::new();
-        merge_streaming_message(&mut rows, &assistant_partial(Some("plan"), ""), false);
+        open_thinking(&mut rows);
+        append_thinking_delta(&mut rows, "plan");
         assert!(matches!(
             rows.as_slice(),
             [ChatRow::Thinking {
@@ -956,11 +1053,8 @@ mod tests {
             }] if text == "plan"
         ));
 
-        merge_streaming_message(
-            &mut rows,
-            &assistant_partial(Some("plan"), "Hello"),
-            true,
-        );
+        finish_open_thinking(&mut rows);
+        append_assistant_delta(&mut rows, "Hello");
         assert!(matches!(
             rows.as_slice(),
             [
@@ -973,11 +1067,7 @@ mod tests {
             ] if text == "Hello"
         ));
 
-        merge_streaming_message(
-            &mut rows,
-            &assistant_partial(Some("plan"), "Hello world"),
-            true,
-        );
+        append_assistant_delta(&mut rows, " world");
         assert!(matches!(
             rows.as_slice(),
             [
@@ -988,6 +1078,71 @@ mod tests {
                     ..
                 }
             ] if text == "Hello world"
+        ));
+    }
+
+    #[test]
+    fn toolcall_stream_does_not_duplicate_assistant_text() {
+        let mut rows = Vec::new();
+        let intro = "I'll create a Python script.";
+        append_assistant_delta(&mut rows, intro);
+        close_streaming_assistant(&mut rows);
+
+        // Simulate several tool-call deltas that still carry the intro text in `message`.
+        for body in ["p", "print(1)", "print(1)\n"] {
+            let msg = assistant_with_write(intro, "sort.py", body);
+            finish_open_thinking(&mut rows);
+            close_streaming_assistant(&mut rows);
+            upsert_streaming_tool_calls(&mut rows, &msg);
+        }
+
+        let assistant_count = rows
+            .iter()
+            .filter(|r| matches!(r, ChatRow::Assistant { .. }))
+            .count();
+        assert_eq!(assistant_count, 1, "rows={rows:?}");
+        assert!(matches!(
+            rows.as_slice(),
+            [
+                ChatRow::Assistant {
+                    text,
+                    streaming: false,
+                    ..
+                },
+                ChatRow::Tool {
+                    name,
+                    summary,
+                    detail,
+                    status: ToolCardStatus::Pending,
+                    ..
+                }
+            ] if text == intro
+                && name == "write"
+                && summary == "sort.py"
+                && detail == "print(1)\n"
+        ));
+    }
+
+    #[test]
+    fn text_after_tool_starts_new_bubble_not_clone() {
+        let mut rows = Vec::new();
+        append_assistant_delta(&mut rows, "Intro.");
+        close_streaming_assistant(&mut rows);
+        upsert_streaming_tool_calls(
+            &mut rows,
+            &assistant_with_write("Intro.", "a.py", "x"),
+        );
+        close_streaming_assistant(&mut rows);
+
+        // Later model text (after tools) must be a new bubble.
+        append_assistant_delta(&mut rows, "Done.");
+        assert!(matches!(
+            rows.as_slice(),
+            [
+                ChatRow::Assistant { text: a, streaming: false, .. },
+                ChatRow::Tool { .. },
+                ChatRow::Assistant { text: b, streaming: true, .. },
+            ] if a == "Intro." && b == "Done."
         ));
     }
 }

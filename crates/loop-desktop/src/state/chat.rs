@@ -24,6 +24,8 @@ pub enum ChatRow {
         id: String,
         name: String,
         summary: String,
+        /// Preview body (e.g. file contents for write/edit).
+        detail: String,
         status: ToolCardStatus,
     },
     FileChange {

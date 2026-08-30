@@ -1,6 +1,7 @@
 //! Chat presentation helpers (tool labels, summaries, activity).
 
 use loop_agent::harness::AgentHarnessPhase;
+use serde_json::Value;
 
 use crate::state::{ChatRow, ToolCardStatus};
 
@@ -128,7 +129,7 @@ fn tool_done_verb(name: &str) -> String {
 }
 
 /// Truncate tool args to a short summary (matches CLI behavior).
-pub fn tool_args_summary(name: &str, args: &serde_json::Value) -> String {
+pub fn tool_args_summary(name: &str, args: &Value) -> String {
     let pick = |keys: &[&str]| {
         for k in keys {
             if let Some(s) = args.get(*k).and_then(|v| v.as_str()) {
@@ -157,4 +158,80 @@ pub fn tool_args_summary(name: &str, args: &serde_json::Value) -> String {
             t
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn write_preview_extracts_content() {
+        let args = json!({"path": "src/main.rs", "content": "fn main() {}\n"});
+        assert_eq!(tool_args_summary("write", &args), "src/main.rs");
+        assert_eq!(tool_content_preview("write", &args), "fn main() {}\n");
+    }
+
+    #[test]
+    fn edit_preview_prefers_new_text() {
+        let args = json!({
+            "path": "a.rs",
+            "oldText": "old",
+            "newText": "new body"
+        });
+        assert_eq!(tool_content_preview("edit", &args), "new body");
+    }
+
+    #[test]
+    fn truncate_keeps_tail() {
+        let detail = (1..=30).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        let (preview, more) = truncate_tool_detail(&detail, 5);
+        assert_eq!(more, 25);
+        assert!(preview.starts_with("…\n"));
+        assert!(preview.contains("line 30"));
+        assert!(!preview.contains("line 1\n"));
+    }
+}
+
+/// Whether this tool should render as a boxed output card (shell / terminal).
+pub fn is_shell_tool(name: &str) -> bool {
+    matches!(name, "bash" | "shell")
+}
+
+/// Whether this tool should render as an editing content box while streaming.
+pub fn is_file_mutation_tool(name: &str) -> bool {
+    matches!(name, "write" | "edit")
+}
+
+/// Extract file body preview from write/edit tool args (may be partial while streaming).
+pub fn tool_content_preview(name: &str, args: &Value) -> String {
+    match name {
+        "write" => args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "edit" => {
+            let new_text = args.get("newText").and_then(|v| v.as_str()).unwrap_or("");
+            if !new_text.is_empty() {
+                return new_text.to_string();
+            }
+            args.get("oldText")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Cap preview text for the chat card (keeps the UI responsive on large writes).
+pub fn truncate_tool_detail(detail: &str, max_lines: usize) -> (String, usize) {
+    let total = detail.lines().count();
+    if total <= max_lines {
+        return (detail.to_string(), 0);
+    }
+    let kept: Vec<&str> = detail.lines().rev().take(max_lines).collect();
+    let preview = kept.into_iter().rev().collect::<Vec<_>>().join("\n");
+    (format!("…\n{preview}"), total.saturating_sub(max_lines))
 }

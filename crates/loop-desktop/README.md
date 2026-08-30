@@ -32,8 +32,11 @@ Features:
 - **VirtualList** for sessions and chat rows
 - Markdown assistant messages, thinking blocks, tool cards, clickable file-change chips
 - Diff panel with +/- line highlights, accept/reject (git restore fallback), external editor open
+- File-change cards in chat with inline colored line diffs; click opens the review panel (does not spawn an external IDE on write)
+- Thinking rows stay collapsed with a pulse animation until expanded
 - Tool approval modal (Accept / Reject / Always allow)
 - PTY terminal dock (toggle with Ctrl+`)
+- Light/dark theme toggle in the toolbar (persists via `settings.theme`)
 
 ## CI / release
 
