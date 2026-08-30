@@ -852,16 +852,16 @@ fn render_chat_row(
                 .when(!preview.is_empty(), |el| {
                     el.child(render_diff_preview_body(&preview, cx))
                 })
-                .when(preview.is_empty(), |el| {
-                    el.child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Click to review diff"),
-                    )
-                })
+                .child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .border_t_1()
+                        .border_color(cx.theme().border.opacity(0.8))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Click to view diff"),
+                )
                 .into_any_element()
         }
         ChatRow::System(text) => div()

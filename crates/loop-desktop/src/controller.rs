@@ -20,6 +20,15 @@ use tokio::sync::mpsc;
 use crate::approval::{ApprovalUiPrompt, PendingApproval};
 use crate::state::{ChatRow, ComposerStats, PendingFileChange, SessionRow, ToolCardStatus};
 
+/// Pre-edit snapshot captured at tool-start (paths resolved against project cwd).
+#[derive(Debug, Clone)]
+struct FileEditSnapshot {
+    path: PathBuf,
+    before: Option<String>,
+    /// `write` args `content` — used when the on-disk read is unavailable.
+    after_hint: Option<String>,
+}
+
 /// UI-facing agent command.
 #[derive(Debug)]
 pub enum DesktopCommand {
@@ -68,7 +77,8 @@ pub struct DesktopController {
     ui_tick_tx: Sender<()>,
     snapshot: Arc<Mutex<DesktopSnapshot>>,
     pending_approval: Arc<Mutex<Option<PendingApproval>>>,
-    file_snapshots: Arc<Mutex<HashMap<String, (PathBuf, Option<String>)>>>,
+    /// Pre-write file contents keyed by tool call id (absolute path + optional after hint).
+    file_snapshots: Arc<Mutex<HashMap<String, FileEditSnapshot>>>,
     model_index: Arc<Mutex<usize>>,
     thinking_levels: Vec<AgentThinkingLevel>,
     thinking_index: Arc<Mutex<usize>>,
@@ -692,7 +702,7 @@ fn split_model_label(label: &str) -> (Option<String>, Option<String>) {
 
 fn apply_agent_event(
     snap: &Arc<Mutex<DesktopSnapshot>>,
-    file_snapshots: &Arc<Mutex<HashMap<String, (PathBuf, Option<String>)>>>,
+    file_snapshots: &Arc<Mutex<HashMap<String, FileEditSnapshot>>>,
     event: AgentEvent,
 ) {
     let mut s = snap.lock();
@@ -775,11 +785,24 @@ fn apply_agent_event(
             args,
         } => {
             if tool_name == "write" || tool_name == "edit" {
-                if let Some(path) = path_from_tool_args(args) {
+                if let Some(rel) = path_from_tool_args(args) {
+                    let path = resolve_project_path(&s.cwd, &rel);
                     let before = std::fs::read_to_string(&path).ok();
-                    file_snapshots
-                        .lock()
-                        .insert(tool_call_id.clone(), (path, before));
+                    let after_hint = if tool_name == "write" {
+                        args.get("content")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    } else {
+                        None
+                    };
+                    file_snapshots.lock().insert(
+                        tool_call_id.clone(),
+                        FileEditSnapshot {
+                            path,
+                            before,
+                            after_hint,
+                        },
+                    );
                 }
             }
             upsert_tool_row(
@@ -823,29 +846,19 @@ fn apply_agent_event(
             }
             if (tool_name == "write" || tool_name == "edit") && !*is_error {
                 let snapshot = file_snapshots.lock().remove(tool_call_id);
-                if let Some((path, before)) = snapshot.or_else(|| {
-                    extract_file_path(result).map(|p| {
-                        let before = std::fs::read_to_string(&p).ok();
-                        (p, before)
-                    })
-                }) {
-                    let after = std::fs::read_to_string(&path).unwrap_or_default();
-                    let change = PendingFileChange::from_paths(path.clone(), before, after);
+                if let Some(change) =
+                    pending_change_from_write(result, snapshot, &s.cwd)
+                {
                     s.chat_rows.push(ChatRow::FileChange {
                         id: change.id.clone(),
-                        path: path.display().to_string(),
+                        path: change.path.display().to_string(),
                         added: change.added,
                         removed: change.removed,
                     });
-                    s.pending_changes.push(change);
                     if s.selected_change_id.is_none() {
-                        s.selected_change_id = Some(
-                            s.pending_changes
-                                .last()
-                                .map(|c| c.id.clone())
-                                .unwrap_or_default(),
-                        );
+                        s.selected_change_id = Some(change.id.clone());
                     }
+                    s.pending_changes.push(change);
                 }
             }
         }
@@ -1017,19 +1030,68 @@ fn path_from_tool_args(args: &Value) -> Option<PathBuf> {
     None
 }
 
-fn extract_file_path(result: &AgentToolResult) -> Option<PathBuf> {
-    let text = tool_result_text(result);
-    for line in text.lines() {
-        let trimmed = line.trim().trim_matches('"');
-        if looks_like_path(trimmed) {
-            return Some(PathBuf::from(trimmed));
-        }
+fn resolve_project_path(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
     }
-    None
+}
+
+/// Build a pending change from write/edit tool result + pre-start snapshot.
+///
+/// Prefer absolute `details.path` / `details.previousPath` from the tool. Fall back to the
+/// start-of-tool snapshot (resolved against project cwd) because approval often deletes
+/// `previousPath` before `ToolExecutionEnd` is observed.
+fn pending_change_from_write(
+    result: &AgentToolResult,
+    snapshot: Option<FileEditSnapshot>,
+    cwd: &Path,
+) -> Option<PendingFileChange> {
+    let details = &result.details;
+    let path = details
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .or_else(|| snapshot.as_ref().map(|s| s.path.clone()))
+        .or_else(|| {
+            // Last resort: "Wrote N bytes to /abs/path"
+            let text = tool_result_text(result);
+            text.split_whitespace()
+                .rev()
+                .find(|tok| looks_like_path(tok))
+                .map(PathBuf::from)
+        })?;
+    let path = resolve_project_path(cwd, &path);
+
+    let before = snapshot
+        .as_ref()
+        .and_then(|s| s.before.clone())
+        .or_else(|| {
+            details
+                .get("previousPath")
+                .and_then(|v| v.as_str())
+                .and_then(|p| std::fs::read_to_string(p).ok())
+        })
+        .or_else(|| {
+            if details.get("created").and_then(|v| v.as_bool()) == Some(true) {
+                Some(String::new())
+            } else {
+                None
+            }
+        });
+
+    let after = std::fs::read_to_string(&path)
+        .ok()
+        .or_else(|| snapshot.and_then(|s| s.after_hint))
+        .unwrap_or_default();
+
+    Some(PendingFileChange::from_paths(path, before, after))
 }
 
 fn looks_like_path(s: &str) -> bool {
-    Path::new(s).extension().is_some() || s.contains('/') || s.contains('\\')
+    let p = Path::new(s);
+    p.is_absolute() || p.extension().is_some() || s.contains('/') || s.contains('\\')
 }
 
 fn model_display(runtime: &Runtime) -> String {
@@ -1220,5 +1282,50 @@ mod tests {
                 ChatRow::Assistant { text: b, streaming: true, .. },
             ] if a == "Intro." && b == "Done."
         ));
+    }
+
+    #[test]
+    fn pending_change_uses_details_path_and_after_hint() {
+        let dir = std::env::temp_dir().join(format!("loop-desktop-diff-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let abs = dir.join("sort_script.py");
+        let after = "print('sorted')\n";
+        std::fs::write(&abs, after).unwrap();
+
+        let result = AgentToolResult {
+            content: vec![loop_ai::ToolResultContent::Text(TextContent {
+                text: format!("Wrote {} bytes to {}", after.len(), abs.display()),
+                text_signature: None,
+            })],
+            details: json!({
+                "path": abs,
+                "bytes": after.len(),
+                "created": true,
+                // Simulate approval having already deleted previousPath.
+                "previousPath": dir.join("missing.before"),
+            }),
+            usage: None,
+            added_tool_names: None,
+            terminate: None,
+        };
+
+        // Snapshot used a relative path previously; after_hint recovers content if needed.
+        let change = pending_change_from_write(
+            &result,
+            Some(FileEditSnapshot {
+                path: PathBuf::from("sort_script.py"),
+                before: None,
+                after_hint: Some(after.to_string()),
+            }),
+            &dir,
+        )
+        .expect("change");
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(change.added > 0, "added={}", change.added);
+        assert_eq!(change.removed, 0);
+        assert_eq!(change.after, after);
+        assert_eq!(change.before.as_deref(), Some(""));
     }
 }
