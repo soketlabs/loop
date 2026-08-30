@@ -1145,14 +1145,15 @@ fn render_composer(
         .child(
             h_flex()
                 .w_full()
-                .items_stretch()
+                .items_center()
                 .border_t_1()
                 .border_color(border)
+                .px_1()
+                .min_h(px(36.))
                 .child(composer_status_cell(
                     Button::new("model")
                         .ghost()
-                        .xsmall()
-                        .compact()
+                        .small()
                         .label(if models.is_empty() {
                             snap.model_label.clone()
                         } else {
@@ -1195,25 +1196,24 @@ fn render_composer(
                                 menu
                             }
                         }),
-                    false,
+                    true,
                     cx,
                 ))
                 .child(composer_status_cell(
                     Button::new("thinking")
                         .ghost()
-                        .xsmall()
-                        .compact()
+                        .small()
                         .label(format!("think: {}", snap.thinking_label))
                         .tooltip("Cycle thinking level")
                         .on_click(cx.listener(|this, _, _, _| {
                             this.run_command(DesktopCommand::CycleThinking);
                         })),
-                    false,
+                    true,
                     cx,
                 ))
                 .child(composer_status_cell(
                     render_context_ring(&snap.stats, cx),
-                    false,
+                    true,
                     cx,
                 ))
                 .child(composer_status_cell(
@@ -1222,7 +1222,7 @@ fn render_composer(
                         .text_color(cx.theme().muted_foreground)
                         .whitespace_nowrap()
                         .child(snap.stats.tokens_label()),
-                    true,
+                    false,
                     cx,
                 )),
         )
@@ -1230,18 +1230,17 @@ fn render_composer(
 
 fn composer_status_cell(
     content: impl IntoElement,
-    last: bool,
+    with_divider: bool,
     cx: &App,
 ) -> impl IntoElement {
     h_flex()
-        .flex_1()
+        .flex_none()
         .items_center()
         .justify_center()
-        .px_2()
-        .py_1()
-        .min_w_0()
-        .min_h(px(28.))
-        .when(!last, |el| {
+        .px_3()
+        .py_2()
+        .h_full()
+        .when(with_divider, |el| {
             el.border_r_1().border_color(cx.theme().border)
         })
         .child(content)
@@ -1268,7 +1267,6 @@ fn render_context_ring(stats: &ComposerStats, cx: &App) -> impl IntoElement {
     div()
         .id("composer-ctx-ring")
         .flex_shrink_0()
-        .px_2()
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
         .child(
             ProgressCircle::new("composer-ctx")
