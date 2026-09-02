@@ -23,6 +23,12 @@ use crate::theme::Theme;
 /// Fixed inline footer height (live + input + picker + status).
 pub const FOOTER_HEIGHT: u16 = 18;
 
+/// Prompt prefix width (`❯ ` / `  `).
+const INPUT_PREFIX_WIDTH: usize = 2;
+
+/// Hard cap on visible input body rows (top/bottom rules are extra).
+const MAX_INPUT_BODY_LINES: u16 = 10;
+
 /// Max visible rows in a picker list.
 pub const PICKER_PAGE: usize = 8;
 
@@ -670,10 +676,16 @@ pub fn draw_footer(frame: &mut Frame, opts: FooterOpts<'_>) {
         out
     };
 
-    let input_body_lines = opts.input.split('\n').count().max(1) as u16;
-    let input_h = input_body_lines + 2; // top + bottom rules
     let picker_h = picker_height(opts.picker);
     let status_h = 2u16;
+    let max_input_body = area
+        .height
+        .saturating_sub(picker_h + status_h + 2)
+        .max(1)
+        .min(MAX_INPUT_BODY_LINES);
+    let input_body_lines =
+        count_input_visual_lines(opts.input, width as usize).clamp(1, max_input_body as usize) as u16;
+    let input_h = input_body_lines + 2; // top + bottom rules
     let used = input_h + picker_h + status_h;
     let live_h = area.height.saturating_sub(used);
 
@@ -753,11 +765,10 @@ fn draw_input(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
         opts.theme,
         placeholder,
         area.width as usize,
+        chunks[1].height as usize,
     );
     frame.render_widget(
-        Paragraph::new(lines)
-            .style(opts.theme.page())
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines).style(opts.theme.page()),
         chunks[1],
     );
 }
@@ -1026,6 +1037,33 @@ fn picker_height(picker: &PickerView) -> u16 {
     }
 }
 
+fn input_content_width(term_width: usize) -> usize {
+    term_width.saturating_sub(INPUT_PREFIX_WIDTH).max(1)
+}
+
+fn count_input_visual_lines(input: &str, term_width: usize) -> usize {
+    if input.is_empty() {
+        return 1;
+    }
+    let w = input_content_width(term_width);
+    input
+        .split('\n')
+        .map(|line| soft_wrap(line, w).len().max(1))
+        .sum()
+}
+
+fn input_scroll_top(total: usize, cursor_row: usize, visible: usize) -> usize {
+    if total <= visible {
+        0
+    } else if cursor_row < visible {
+        0
+    } else {
+        (cursor_row + 1)
+            .saturating_sub(visible)
+            .min(total.saturating_sub(visible))
+    }
+}
+
 fn render_input_lines(
     input: &str,
     cursor: usize,
@@ -1033,54 +1071,100 @@ fn render_input_lines(
     theme: &Theme,
     placeholder: &str,
     width: usize,
+    visible_rows: usize,
 ) -> Vec<Line<'static>> {
     // Block caret in the theme cursor color, sitting on the page background.
     let caret_style = Style::default()
         .fg(theme.get("cursor"))
         .bg(theme.get("bg"));
-    let lines: Vec<&str> = if input.is_empty() {
+    let content_width = input_content_width(width);
+    let logical_lines: Vec<&str> = if input.is_empty() {
         vec![""]
     } else {
         input.split('\n').collect()
     };
+
+    let mut all_lines = Vec::new();
+    let mut cursor_visual_row = 0usize;
     let mut char_at = 0usize;
-    let mut out = Vec::new();
-    for (row, line) in lines.iter().enumerate() {
-        let chars: Vec<char> = line.chars().collect();
-        let line_len = chars.len();
-        let caret_here = cursor >= char_at && cursor <= char_at + line_len;
-        let mut spans = Vec::new();
-        spans.push(Span::styled(
-            if row == 0 { "❯ " } else { "  " }.to_string(),
-            theme.accent_bold(),
-        ));
-        if caret_here {
-            let col = cursor - char_at;
-            if col > 0 {
-                spans.push(Span::styled(chars[..col].iter().collect::<String>(), text_style));
-            }
-            // Block glyph + bg — reliable when the buffer is empty.
-            spans.push(Span::styled("█".to_string(), caret_style));
-            if col < line_len {
-                let after: String = chars[col + 1..].iter().collect();
-                if !after.is_empty() {
-                    spans.push(Span::styled(after, text_style));
+
+    for (row, line) in logical_lines.iter().enumerate() {
+        let line_char_len = line.chars().count();
+        let caret_on_line = cursor >= char_at && cursor <= char_at + line_char_len;
+        let cursor_col = caret_on_line.then_some(cursor - char_at);
+        let wrapped = if line.is_empty() {
+            vec![String::new()]
+        } else {
+            soft_wrap(line, content_width)
+        };
+
+        let mut caret_wrap = None;
+        if caret_on_line {
+            let col = cursor_col.unwrap_or(0);
+            let mut offset = 0usize;
+            for (i, chunk) in wrapped.iter().enumerate() {
+                let chunk_len = chunk.chars().count();
+                if col >= offset && col <= offset + chunk_len {
+                    caret_wrap = Some(i);
+                    break;
                 }
+                offset += chunk_len;
             }
-        } else if !line.is_empty() {
-            spans.push(Span::styled((*line).to_string(), text_style));
+            if caret_wrap.is_none() && !wrapped.is_empty() {
+                caret_wrap = Some(wrapped.len() - 1);
+            }
         }
-        if spans.len() == 1 {
-            spans.push(Span::styled("█".to_string(), caret_style));
+
+        for (wrap_i, chunk) in wrapped.iter().enumerate() {
+            if caret_wrap == Some(wrap_i) {
+                cursor_visual_row = all_lines.len();
+            }
+
+            let prefix = if row == 0 && wrap_i == 0 {
+                "❯ "
+            } else {
+                "  "
+            };
+            let mut spans = vec![Span::styled(prefix.to_string(), theme.accent_bold())];
+
+            let caret_here = caret_wrap == Some(wrap_i);
+            if caret_here {
+                let chunk_start: usize = wrapped[..wrap_i]
+                    .iter()
+                    .map(|s| s.chars().count())
+                    .sum();
+                let col = cursor_col.unwrap_or(0).saturating_sub(chunk_start);
+                let chars: Vec<char> = chunk.chars().collect();
+                let col = col.min(chars.len());
+                if col > 0 {
+                    spans.push(Span::styled(
+                        chars[..col].iter().collect::<String>(),
+                        text_style,
+                    ));
+                }
+                spans.push(Span::styled("█".to_string(), caret_style));
+                if col < chars.len() {
+                    spans.push(Span::styled(
+                        chars[col + 1..].iter().collect::<String>(),
+                        text_style,
+                    ));
+                }
+            } else if !chunk.is_empty() {
+                spans.push(Span::styled(chunk.clone(), text_style));
+            }
+
+            if row == 0 && wrap_i == 0 && input.is_empty() && !placeholder.is_empty() {
+                spans.push(Span::styled(placeholder.to_string(), theme.dim()));
+            }
+            all_lines.push(Line::from(spans));
         }
-        if row == 0 && input.is_empty() && !placeholder.is_empty() {
-            spans.push(Span::styled(placeholder.to_string(), theme.dim()));
-        }
-        out.push(Line::from(spans));
-        let _ = width;
-        char_at += line_len + 1;
+        char_at += line_char_len + 1;
     }
-    out
+
+    let visible = visible_rows.max(1);
+    let scroll_top = input_scroll_top(all_lines.len(), cursor_visual_row, visible);
+    let end = (scroll_top + visible).min(all_lines.len());
+    all_lines[scroll_top..end].to_vec()
 }
 
 fn line_summary(line: &str, max: usize) -> String {
@@ -1530,5 +1614,59 @@ mod tests {
             "1,000 · —/128,000"
         );
         assert_eq!(format_token_usage_line(42, None, 0), "42");
+    }
+
+    #[test]
+    fn input_visual_lines_wrap_and_count() {
+        let long = "word ".repeat(20);
+        assert_eq!(count_input_visual_lines("", 80), 1);
+        assert_eq!(count_input_visual_lines("one\ntwo", 80), 2);
+        assert!(count_input_visual_lines(&long, 20) > 1);
+    }
+
+    #[test]
+    fn input_scroll_keeps_caret_visible() {
+        assert_eq!(input_scroll_top(10, 0, 4), 0);
+        assert_eq!(input_scroll_top(10, 3, 4), 0);
+        assert_eq!(input_scroll_top(10, 5, 4), 2);
+        assert_eq!(input_scroll_top(10, 9, 4), 6);
+    }
+
+    #[test]
+    fn input_render_scrolls_long_multiline() {
+        let theme = Theme::dark();
+        let text = (0..12)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cursor = text.chars().count();
+        let lines = render_input_lines(
+            &text,
+            cursor,
+            theme.style("text"),
+            &theme,
+            "",
+            80,
+            4,
+        );
+        assert_eq!(lines.len(), 4);
+        assert!(lines.last().unwrap().to_string().contains("line 11"));
+    }
+
+    #[test]
+    fn input_render_caret_at_end_of_wrapped_line() {
+        let theme = Theme::dark();
+        let text = "word ".repeat(30);
+        let cursor = text.chars().count();
+        let lines = render_input_lines(
+            &text,
+            cursor,
+            theme.style("text"),
+            &theme,
+            "",
+            20,
+            4,
+        );
+        assert!(!lines.is_empty());
     }
 }

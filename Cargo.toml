@@ -7,7 +7,7 @@ members = [
     "crates/loop-agent",
     "crates/loop-app-core",
     "crates/loop-cli",
-    "crates/loop-desktop",
+    "crates/loop-desktop"
 ]
 
 [workspace.package]
