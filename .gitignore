@@ -5,6 +5,7 @@
 *.swp
 .DS_Store
 /docs/
+/docs-site/
 
 # Benchmark run logs (keep template + sample committed)
 /bench/runs/runs.csv
