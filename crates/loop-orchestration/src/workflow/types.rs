@@ -376,3 +376,171 @@ pub enum WorkflowError {
     #[error("{0}")]
     Other(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::planner::task_graph::*;
+
+    fn make_graph() -> TaskGraph {
+        let mut g = TaskGraph::new();
+        g.add_task(TaskNode::new(
+            "a",
+            TaskKind::AgentTurn { prompt: "do a".into(), tools: None, model: None },
+            "task a",
+        ));
+        g.add_task(TaskNode::new(
+            "b",
+            TaskKind::AgentTurn { prompt: "do b".into(), tools: None, model: None },
+            "task b",
+        ));
+        g.add_task(TaskNode::new(
+            "c",
+            TaskKind::AgentTurn { prompt: "do c".into(), tools: None, model: None },
+            "task c",
+        ));
+        g.add_dependency("b", "a");
+        g.add_dependency("c", "b");
+        g
+    }
+
+    #[test]
+    fn initial_state_all_pending() {
+        let g = make_graph();
+        let state = WorkflowState::new("wf1".into(), g);
+        assert_eq!(state.status, WorkflowStatus::Running);
+        assert!(state.task_statuses.values().all(|s| matches!(s, TaskStatus::Pending)));
+    }
+
+    #[test]
+    fn ready_tasks_returns_root_tasks() {
+        let g = make_graph();
+        let state = WorkflowState::new("wf1".into(), g);
+        let ready = state.ready_tasks();
+        assert_eq!(ready, vec!["a"]);
+    }
+
+    #[test]
+    fn completing_task_unlocks_dependents() {
+        let g = make_graph();
+        let mut state = WorkflowState::new("wf1".into(), g);
+
+        state.apply(1, &WorkflowEvent::TaskStarted {
+            task_id: "a".into(), worker_id: "w1".into(), timestamp: 0,
+        });
+        assert!(state.ready_tasks().is_empty());
+
+        state.apply(2, &WorkflowEvent::TaskCompleted {
+            task_id: "a".into(), result: TaskResult::empty(), timestamp: 1,
+        });
+        let ready = state.ready_tasks();
+        assert_eq!(ready, vec!["b"]);
+    }
+
+    #[test]
+    fn is_complete_when_all_terminal() {
+        let g = make_graph();
+        let mut state = WorkflowState::new("wf1".into(), g);
+        assert!(!state.is_complete());
+
+        state.apply(1, &WorkflowEvent::TaskCompleted {
+            task_id: "a".into(), result: TaskResult::empty(), timestamp: 0,
+        });
+        state.apply(2, &WorkflowEvent::TaskCompleted {
+            task_id: "b".into(), result: TaskResult::empty(), timestamp: 1,
+        });
+        assert!(!state.is_complete());
+
+        state.apply(3, &WorkflowEvent::TaskCompleted {
+            task_id: "c".into(), result: TaskResult::empty(), timestamp: 2,
+        });
+        assert!(state.is_complete());
+    }
+
+    #[test]
+    fn has_failures_when_task_fails() {
+        let g = make_graph();
+        let mut state = WorkflowState::new("wf1".into(), g);
+        assert!(!state.has_failures());
+
+        state.apply(1, &WorkflowEvent::TaskFailed {
+            task_id: "a".into(), error: "boom".into(), retry_count: 0, timestamp: 0,
+        });
+        assert!(state.has_failures());
+    }
+
+    #[test]
+    fn pause_and_resume() {
+        let g = make_graph();
+        let mut state = WorkflowState::new("wf1".into(), g);
+
+        state.apply(1, &WorkflowEvent::WorkflowPaused {
+            reason: "user requested".into(), timestamp: 0,
+        });
+        assert_eq!(state.status, WorkflowStatus::Paused);
+
+        state.apply(2, &WorkflowEvent::WorkflowResumed { timestamp: 1 });
+        assert_eq!(state.status, WorkflowStatus::Running);
+    }
+
+    #[test]
+    fn workflow_completed_event() {
+        let g = make_graph();
+        let mut state = WorkflowState::new("wf1".into(), g);
+
+        state.apply(1, &WorkflowEvent::WorkflowCompleted {
+            result: WorkflowResult {
+                success: true,
+                output: serde_json::Value::Null,
+                task_results: Vec::new(),
+            },
+            timestamp: 0,
+        });
+        assert_eq!(state.status, WorkflowStatus::Completed);
+    }
+
+    #[test]
+    fn cancelled_tasks_are_terminal() {
+        let mut g = TaskGraph::new();
+        g.add_task(TaskNode::new(
+            "a",
+            TaskKind::AgentTurn { prompt: "x".into(), tools: None, model: None },
+            "a",
+        ));
+        let mut state = WorkflowState::new("wf1".into(), g);
+
+        state.apply(1, &WorkflowEvent::TaskCancelled {
+            task_id: "a".into(), reason: "timeout".into(), timestamp: 0,
+        });
+        assert!(state.is_complete());
+    }
+
+    #[test]
+    fn parallel_tasks_all_ready() {
+        let mut g = TaskGraph::new();
+        g.add_task(TaskNode::new("a", TaskKind::Barrier, "sync"));
+        g.add_task(TaskNode::new("b", TaskKind::Barrier, "sync"));
+        g.add_task(TaskNode::new("c", TaskKind::Barrier, "sync"));
+        let state = WorkflowState::new("wf1".into(), g);
+        let mut ready = state.ready_tasks();
+        ready.sort();
+        assert_eq!(ready, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn task_result_serde_roundtrip() {
+        let result = TaskResult {
+            output: serde_json::json!({"key": "value"}),
+            artifacts: vec![Artifact {
+                kind: ArtifactKind::File,
+                path: Some("/tmp/out.txt".into()),
+                data: serde_json::json!("contents"),
+            }],
+            messages: vec![serde_json::json!({"role": "assistant"})],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let r2: TaskResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(r2.output, result.output);
+        assert_eq!(r2.artifacts.len(), 1);
+    }
+}

@@ -276,3 +276,166 @@ pub enum TaskStatus {
     /// Cancelled before or during execution.
     Cancelled(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent_task(id: &str, prompt: &str) -> TaskNode {
+        TaskNode::new(
+            id,
+            TaskKind::AgentTurn {
+                prompt: prompt.to_string(),
+                tools: None,
+                model: None,
+            },
+            format!("Task {id}"),
+        )
+    }
+
+    #[test]
+    fn empty_graph_is_valid() {
+        let g = TaskGraph::new();
+        assert!(g.validate().is_ok());
+        assert!(g.tasks.is_empty());
+    }
+
+    #[test]
+    fn single_task_graph() {
+        let mut g = TaskGraph::new();
+        g.add_task(agent_task("a", "do something"));
+        assert!(g.validate().is_ok());
+        assert_eq!(g.tasks.len(), 1);
+    }
+
+    #[test]
+    fn linear_dependency_chain() {
+        let mut g = TaskGraph::new();
+        g.add_task(agent_task("a", "first"));
+        g.add_task(agent_task("b", "second"));
+        g.add_task(agent_task("c", "third"));
+        g.add_dependency("b", "a");
+        g.add_dependency("c", "b");
+        assert!(g.validate().is_ok());
+        assert_eq!(g.dependencies_of("b"), vec!["a"]);
+        assert_eq!(g.dependencies_of("c"), vec!["b"]);
+        assert!(g.dependencies_of("a").is_empty());
+    }
+
+    #[test]
+    fn diamond_dependency_graph() {
+        let mut g = TaskGraph::new();
+        g.add_task(agent_task("root", "start"));
+        g.add_task(agent_task("left", "left branch"));
+        g.add_task(agent_task("right", "right branch"));
+        g.add_task(agent_task("join", "merge"));
+        g.add_dependency("left", "root");
+        g.add_dependency("right", "root");
+        g.add_dependency("join", "left");
+        g.add_dependency("join", "right");
+        assert!(g.validate().is_ok());
+
+        let join_deps = g.dependencies_of("join");
+        assert!(join_deps.contains(&"left".to_string()));
+        assert!(join_deps.contains(&"right".to_string()));
+    }
+
+    #[test]
+    fn cycle_detection() {
+        let mut g = TaskGraph::new();
+        g.add_task(agent_task("a", "first"));
+        g.add_task(agent_task("b", "second"));
+        g.add_dependency("a", "b");
+        g.add_dependency("b", "a");
+        let err = g.validate().unwrap_err();
+        assert!(err.contains("cycle"), "expected cycle error, got: {err}");
+    }
+
+    #[test]
+    fn self_cycle_detection() {
+        let mut g = TaskGraph::new();
+        g.add_task(agent_task("a", "self"));
+        g.add_dependency("a", "a");
+        assert!(g.validate().is_err());
+    }
+
+    #[test]
+    fn unknown_edge_reference_detected() {
+        let mut g = TaskGraph::new();
+        g.add_task(agent_task("a", "exists"));
+        g.add_dependency("a", "ghost");
+        let err = g.validate().unwrap_err();
+        assert!(err.contains("unknown task"));
+    }
+
+    #[test]
+    fn dependents_of() {
+        let mut g = TaskGraph::new();
+        g.add_task(agent_task("a", "root"));
+        g.add_task(agent_task("b", "child1"));
+        g.add_task(agent_task("c", "child2"));
+        g.add_dependency("b", "a");
+        g.add_dependency("c", "a");
+        let dependents = g.dependents_of("a");
+        assert!(dependents.contains(&"b".to_string()));
+        assert!(dependents.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn data_flow_edges() {
+        let mut g = TaskGraph::new();
+        g.add_task(agent_task("producer", "produce"));
+        g.add_task(agent_task("consumer", "consume"));
+        g.add_data_flow("producer", "consumer", "result");
+        assert!(g.validate().is_ok());
+        assert_eq!(g.dependencies_of("consumer"), vec!["producer"]);
+        assert_eq!(g.dependents_of("producer"), vec!["consumer"]);
+    }
+
+    #[test]
+    fn task_config_defaults() {
+        let config = TaskConfig::default();
+        assert_eq!(config.max_retries, 2);
+        assert_eq!(config.timeout_ms, 0);
+        assert_eq!(config.priority, 0);
+    }
+
+    #[test]
+    fn task_node_with_config() {
+        let node = TaskNode::new("t1", TaskKind::Barrier, "sync")
+            .with_config(TaskConfig { max_retries: 5, timeout_ms: 30000, priority: 10 });
+        assert_eq!(node.config.max_retries, 5);
+        assert_eq!(node.config.timeout_ms, 30000);
+        assert_eq!(node.config.priority, 10);
+    }
+
+    #[test]
+    fn task_graph_serde_roundtrip() {
+        let mut g = TaskGraph::new();
+        g.add_task(agent_task("a", "first"));
+        g.add_task(TaskNode::new(
+            "b",
+            TaskKind::ShellCommand { command: "echo hi".to_string() },
+            "shell task",
+        ));
+        g.add_dependency("b", "a");
+
+        let json = serde_json::to_string(&g).unwrap();
+        let g2: TaskGraph = serde_json::from_str(&json).unwrap();
+        assert_eq!(g2.tasks.len(), 2);
+        assert_eq!(g2.edges.len(), 1);
+        assert!(g2.validate().is_ok());
+    }
+
+    #[test]
+    fn three_node_cycle() {
+        let mut g = TaskGraph::new();
+        g.add_task(agent_task("a", ""));
+        g.add_task(agent_task("b", ""));
+        g.add_task(agent_task("c", ""));
+        g.add_dependency("b", "a");
+        g.add_dependency("c", "b");
+        g.add_dependency("a", "c");
+        assert!(g.validate().is_err());
+    }
+}

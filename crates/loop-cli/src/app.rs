@@ -48,6 +48,17 @@ enum UiEvent {
     CompactDone(Result<String, String>),
     /// `/sandbox` enable/disable finished.
     SandboxDone(Result<SandboxDoneOk, String>),
+    /// Multi-agent workflow progress update.
+    #[cfg(feature = "orchestration")]
+    WorkflowDone(Result<WorkflowDoneOk, String>),
+}
+
+/// Successful workflow completion info.
+#[cfg(feature = "orchestration")]
+struct WorkflowDoneOk {
+    success: bool,
+    task_count: usize,
+    summary: String,
 }
 
 /// Successful sandbox switch applied on the UI thread.
@@ -1041,6 +1052,24 @@ fn drain_ui_events(
                     }
                     Err(e) => {
                         chat.push(sys(e));
+                        *status = "ready".into();
+                    }
+                }
+            }
+            #[cfg(feature = "orchestration")]
+            UiEvent::WorkflowDone(result) => {
+                *working = false;
+                match result {
+                    Ok(info) => {
+                        let icon = if info.success { "done" } else { "failed" };
+                        chat.push(sys(format!(
+                            "workflow {icon} — {}/{} tasks completed\n{}",
+                            info.task_count, info.task_count, info.summary
+                        )));
+                        *status = "ready".into();
+                    }
+                    Err(e) => {
+                        chat.push(sys(format!("workflow error: {e}")));
                         *status = "ready".into();
                     }
                 }
@@ -3011,9 +3040,92 @@ async fn apply_effect(
                 chat.push(sys(format!("template not found: {name}")));
             }
         }
+        #[cfg(feature = "orchestration")]
+        CommandEffect::Workflow { goal, concurrency } => {
+            if agent_is_busy(runtime, *working) {
+                chat.push(sys("cannot start workflow while agent is busy"));
+            } else {
+                start_workflow(
+                    runtime,
+                    chat,
+                    status,
+                    working,
+                    tx,
+                    &goal,
+                    concurrency,
+                )
+                .await;
+            }
+        }
     }
     let _ = hide_thinking;
     Ok(false)
+}
+
+#[cfg(feature = "orchestration")]
+async fn start_workflow(
+    runtime: &CliRuntime,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    working: &mut bool,
+    tx: &tokio::sync::mpsc::UnboundedSender<UiEvent>,
+    goal: &str,
+    concurrency: Option<usize>,
+) {
+    use loop_orchestration::scheduler::SchedulerConfig;
+
+    chat.push(sys(format!("starting workflow: {goal}")));
+    *working = true;
+    *status = "workflow · planning…".into();
+
+    let harness = Arc::clone(&runtime.harness);
+    let tx = tx.clone();
+    let goal = goal.to_string();
+
+    let config = concurrency.map(|n| SchedulerConfig {
+        max_concurrency: n,
+        fail_fast: false,
+    });
+
+    tokio::spawn(async move {
+        let result = harness
+            .start_workflow_from_goal(&goal, None, config)
+            .await;
+
+        let event = match result {
+            Ok(wf_result) => {
+                let completed = wf_result
+                    .task_results
+                    .iter()
+                    .count();
+                let summary = wf_result
+                    .task_results
+                    .iter()
+                    .map(|(id, r)| {
+                        let out = match &r.output {
+                            serde_json::Value::String(s) => {
+                                if s.len() > 200 { format!("{}…", &s[..200]) } else { s.clone() }
+                            }
+                            other => {
+                                let s = other.to_string();
+                                if s.len() > 200 { format!("{}…", &s[..200]) } else { s }
+                            }
+                        };
+                        format!("  [{id}] {out}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                UiEvent::WorkflowDone(Ok(WorkflowDoneOk {
+                    success: wf_result.success,
+                    task_count: completed,
+                    summary,
+                }))
+            }
+            Err(e) => UiEvent::WorkflowDone(Err(e.to_string())),
+        };
+
+        let _ = tx.send(event);
+    });
 }
 
 async fn cycle_model(runtime: &mut CliRuntime, forward: bool, chat: &mut Vec<ChatItem>) {

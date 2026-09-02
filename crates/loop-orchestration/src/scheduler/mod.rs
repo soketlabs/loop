@@ -148,8 +148,18 @@ impl Scheduler {
                 let cancel = self.cancel.clone();
                 let wf_id = workflow_id.to_string();
                 let dep_results = self.collect_dependency_results(&state, &task_id);
+                let max_retries = task_node.config.max_retries;
+
+                let permit = {
+                    let pool_guard = pool.read().await;
+                    match pool_guard.acquire_permit().await {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    }
+                };
 
                 tokio::spawn(async move {
+                    let _permit = permit;
                     Self::execute_task(
                         engine,
                         pool,
@@ -159,6 +169,7 @@ impl Scheduler {
                         wf_id,
                         task_node,
                         dep_results,
+                        max_retries,
                     )
                     .await;
                 });
@@ -183,6 +194,29 @@ impl Scheduler {
                 results.insert(dep_id, result.clone());
             }
         }
+
+        for edge in &state.graph.edges {
+            if let crate::planner::task_graph::TaskEdge::DataFlow { from, to, key } = edge {
+                if to == task_id {
+                    if let Some(TaskStatus::Completed(result)) = state.task_statuses.get(from) {
+                        let keyed = TaskResult {
+                            output: serde_json::json!({ key: result.output }),
+                            artifacts: result.artifacts.clone(),
+                            messages: result.messages.clone(),
+                        };
+                        results
+                            .entry(from.clone())
+                            .and_modify(|existing: &mut TaskResult| {
+                                if let Some(obj) = existing.output.as_object_mut() {
+                                    obj.insert(key.clone(), result.output.clone());
+                                }
+                            })
+                            .or_insert(keyed);
+                    }
+                }
+            }
+        }
+
         results
     }
 
@@ -195,6 +229,7 @@ impl Scheduler {
         workflow_id: String,
         task_node: TaskNode,
         dependency_results: HashMap<TaskId, TaskResult>,
+        max_retries: u32,
     ) {
         let task_id = task_node.id.clone();
         let worker_id = format!("worker_{}", uuid::Uuid::now_v7());
@@ -235,49 +270,67 @@ impl Scheduler {
             }
         };
 
-        let signal_rx = engine.signal_router().register_task(&task_id).await;
-        let task_cancel = cancel.child_token();
+        let mut attempt: u32 = 0;
+        loop {
+            let signal_rx = engine.signal_router().register_task(&task_id).await;
+            let task_cancel = cancel.child_token();
+            let task_memory = Arc::new(InMemoryTaskMemory::new(task_id.clone()));
 
-        let task_memory = Arc::new(InMemoryTaskMemory::new(task_id.clone()));
+            let context = WorkerContext {
+                shared_memory: Arc::clone(&shared_memory),
+                task_memory,
+                signal_rx,
+                cancel: task_cancel.clone(),
+                artifact_store: Arc::new(ScopedArtifactAccess::new(
+                    Arc::clone(&artifact_store),
+                    task_id.clone(),
+                )),
+                dependency_results: dependency_results.clone(),
+            };
 
-        let context = WorkerContext {
-            shared_memory,
-            task_memory,
-            signal_rx,
-            cancel: task_cancel.clone(),
-            artifact_store: Arc::new(ScopedArtifactAccess::new(artifact_store, task_id.clone())),
-            dependency_results,
-        };
-
-        let timeout_ms = task_node.config.timeout_ms;
-        let result = if timeout_ms > 0 {
-            let duration = std::time::Duration::from_millis(timeout_ms);
-            match tokio::time::timeout(duration, worker.execute(&task_node, context)).await {
-                Ok(result) => result,
-                Err(_) => {
-                    task_cancel.cancel();
-                    Err(WorkerError::TimedOut)
+            let timeout_ms = task_node.config.timeout_ms;
+            let result = if timeout_ms > 0 {
+                let duration = std::time::Duration::from_millis(timeout_ms);
+                match tokio::time::timeout(duration, worker.execute(&task_node, context)).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        task_cancel.cancel();
+                        Err(WorkerError::TimedOut)
+                    }
                 }
-            }
-        } else {
-            worker.execute(&task_node, context).await
-        };
+            } else {
+                worker.execute(&task_node, context).await
+            };
 
-        match result {
-            Ok(task_result) => {
-                let _ = engine
-                    .task_completed(&workflow_id, &task_id, task_result)
-                    .await;
-            }
-            Err(WorkerError::Cancelled) => {
-                let _ = engine
-                    .task_cancelled(&workflow_id, &task_id, "cancelled".to_string())
-                    .await;
-            }
-            Err(e) => {
-                let _ = engine
-                    .task_failed(&workflow_id, &task_id, e.to_string(), 0)
-                    .await;
+            match result {
+                Ok(task_result) => {
+                    let _ = engine
+                        .task_completed(&workflow_id, &task_id, task_result)
+                        .await;
+                    return;
+                }
+                Err(WorkerError::Cancelled) => {
+                    let _ = engine
+                        .task_cancelled(&workflow_id, &task_id, "cancelled".to_string())
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    if attempt < max_retries && !cancel.is_cancelled() {
+                        attempt += 1;
+                        tracing::warn!(
+                            task_id = %task_id,
+                            attempt,
+                            max_retries,
+                            "Task failed, retrying: {e}"
+                        );
+                        continue;
+                    }
+                    let _ = engine
+                        .task_failed(&workflow_id, &task_id, e.to_string(), attempt)
+                        .await;
+                    return;
+                }
             }
         }
     }

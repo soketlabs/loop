@@ -11,10 +11,15 @@ readme = "README.md"
 name = "loop"
 path = "src/main.rs"
 
+[features]
+default = []
+orchestration = ["loop-agent/orchestration", "dep:loop-orchestration"]
+
 [dependencies]
 loop-app-core = { workspace = true }
 loop-ai = { workspace = true }
 loop-agent = { workspace = true, features = ["mcp"] }
+loop-orchestration = { workspace = true, optional = true }
 loop-mcp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
