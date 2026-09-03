@@ -61,6 +61,13 @@ pub enum ChatItem {
         output: String,
         exit_code: Option<i32>,
     },
+    /// Workflow sub-task progress card (collapsible, like tool cards).
+    WorkflowTask {
+        task_id: String,
+        description: String,
+        status: CardStatus,
+        output: String,
+    },
     System { text: String },
 }
 
@@ -136,11 +143,11 @@ pub fn item_is_committed(
 ) -> bool {
     match item {
         ChatItem::User { .. } | ChatItem::System { .. } | ChatItem::Shell { .. } => true,
-        // Keep queued messages in the live footer so Esc can still remove them.
         ChatItem::Queued { .. } => false,
         ChatItem::Assistant { .. } => streaming_assistant != Some(index),
         ChatItem::Thinking { done, .. } => *done && streaming_thinking != Some(index),
         ChatItem::Tool { status, .. } => !matches!(status, CardStatus::Pending),
+        ChatItem::WorkflowTask { status, .. } => !matches!(status, CardStatus::Pending),
     }
 }
 
@@ -517,6 +524,92 @@ pub fn format_item_lines(
                         format!("  … {} more lines truncated", detail_lines - preview)
                     } else {
                         format!("  … {} more lines · ctrl+o", detail_lines - preview)
+                    };
+                    lines.push(Line::from(Span::styled(hint, theme.dim())));
+                }
+            }
+            lines.push(Line::from(""));
+        }
+        ChatItem::WorkflowTask {
+            task_id,
+            description,
+            status,
+            output,
+        } => {
+            let (dot_key, bg) = match status {
+                CardStatus::Pending => ("warning", "toolPendingBg"),
+                CardStatus::Success => ("success", "toolSuccessBg"),
+                CardStatus::Error => ("error", "toolErrorBg"),
+            };
+            let title = if description.is_empty() {
+                task_id.clone()
+            } else {
+                description.clone()
+            };
+            let detail_lines = output.lines().count();
+            let mut head = vec![
+                Span::styled(" ● ".to_string(), theme.style(dot_key)),
+                Span::styled(
+                    title,
+                    theme.style("toolTitle").add_modifier(Modifier::BOLD),
+                ),
+            ];
+            match status {
+                CardStatus::Pending => {
+                    head.push(Span::styled(" · running…".to_string(), theme.dim()));
+                }
+                _ if output.is_empty() => {
+                    head.push(Span::styled(
+                        format!(" · {}", if matches!(status, CardStatus::Success) { "done" } else { "failed" }),
+                        theme.dim(),
+                    ));
+                }
+                _ if expanded => {
+                    head.push(Span::styled(
+                        " · ctrl+o to collapse".to_string(),
+                        theme.dim(),
+                    ));
+                }
+                _ => {
+                    head.push(Span::styled(
+                        format!(
+                            " · {detail_lines} line{} · ctrl+o",
+                            if detail_lines == 1 { "" } else { "s" }
+                        ),
+                        theme.dim(),
+                    ));
+                }
+            }
+            lines.push(bg_spans_line(theme, bg, head, w));
+
+            let preview = if expanded {
+                200
+            } else if matches!(status, CardStatus::Error) {
+                4
+            } else {
+                // Always show a short result preview so workflow output is visible
+                // after cards flush into scrollback (ctrl+o can't rewrite history).
+                12
+            };
+            if preview > 0 && !output.is_empty() {
+                let body_w = w.saturating_sub(5).max(1);
+                let fallback = theme.style("toolOutput");
+                let mut shown = 0usize;
+                for line in output.lines().take(preview) {
+                    let mut row = vec![Span::styled(
+                        "  │ ".to_string(),
+                        theme.style("borderMuted"),
+                    )];
+                    let truncated: String = line.chars().take(body_w).collect();
+                    row.push(Span::styled(truncated, fallback));
+                    lines.push(Line::from(row));
+                    shown += 1;
+                }
+                if detail_lines > shown {
+                    let hint = if expanded {
+                        format!("  … {} more lines truncated", detail_lines - shown)
+                    } else {
+                        format!("  … {} more lines · ctrl+o", detail_lines - shown)
                     };
                     lines.push(Line::from(Span::styled(hint, theme.dim())));
                 }
@@ -1301,6 +1394,12 @@ fn truncate_width(s: &str, max: usize) -> String {
 pub fn find_tool_index(chat: &[ChatItem], id: &str) -> Option<usize> {
     chat.iter()
         .position(|c| matches!(c, ChatItem::Tool { id: tid, .. } if tid == id))
+}
+
+/// Find chat index of a workflow task by task_id.
+pub fn find_workflow_task_index(chat: &[ChatItem], task_id: &str) -> Option<usize> {
+    chat.iter()
+        .position(|c| matches!(c, ChatItem::WorkflowTask { task_id: tid, .. } if tid == task_id))
 }
 
 /// Truncate tool args to a short summary.

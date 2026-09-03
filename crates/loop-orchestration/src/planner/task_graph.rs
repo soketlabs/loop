@@ -133,6 +133,75 @@ impl TaskGraph {
         }
         Ok(())
     }
+
+    /// Render the graph as a mermaid `graph TD` diagram.
+    pub fn to_mermaid(&self) -> String {
+        let mut lines = vec!["graph TD".to_string()];
+        let mut ids: Vec<_> = self.tasks.keys().cloned().collect();
+        ids.sort();
+        for id in &ids {
+            let node = &self.tasks[id];
+            let label = if node.description.is_empty() {
+                id.clone()
+            } else {
+                node.description.clone()
+            };
+            lines.push(format!(
+                "    {}[\"{}\"]",
+                mermaid_id(id),
+                mermaid_label(&label)
+            ));
+        }
+        for edge in &self.edges {
+            let (pred, succ) = match edge {
+                TaskEdge::DependsOn { from, to } => (to.as_str(), from.as_str()),
+                TaskEdge::DataFlow { from, to, .. } => (from.as_str(), to.as_str()),
+            };
+            lines.push(format!("    {} --> {}", mermaid_id(pred), mermaid_id(succ)));
+        }
+        lines.join("\n")
+    }
+
+    /// Compact outline of tasks and their dependencies, suitable for a TUI.
+    pub fn format_outline(&self) -> String {
+        let mut ids: Vec<_> = self.tasks.keys().cloned().collect();
+        ids.sort();
+        let mut lines = Vec::new();
+        for id in &ids {
+            let node = &self.tasks[id];
+            let label = if node.description.is_empty() {
+                id.clone()
+            } else {
+                format!("{id}: {}", node.description)
+            };
+            let mut deps = self.dependencies_of(id);
+            deps.sort();
+            if deps.is_empty() {
+                lines.push(format!("  ● {label}"));
+            } else {
+                lines.push(format!("  ● {label}  ← {}", deps.join(", ")));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+fn mermaid_id(id: &str) -> String {
+    let s: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if s.is_empty() {
+        "task".into()
+    } else if s.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        format!("t_{s}")
+    } else {
+        s
+    }
+}
+
+fn mermaid_label(s: &str) -> String {
+    s.replace(['"', ']'], "'").replace('\n', " ")
 }
 
 impl Default for TaskGraph {
@@ -437,5 +506,20 @@ mod tests {
         g.add_dependency("c", "b");
         g.add_dependency("a", "c");
         assert!(g.validate().is_err());
+    }
+
+    #[test]
+    fn mermaid_and_outline_include_edges() {
+        let mut g = TaskGraph::new();
+        g.add_task(agent_task("a", "first"));
+        g.add_task(agent_task("b", "second"));
+        g.add_dependency("b", "a");
+        let mermaid = g.to_mermaid();
+        assert!(mermaid.contains("graph TD"));
+        assert!(mermaid.contains("a --> b"), "{mermaid}");
+        let outline = g.format_outline();
+        assert!(outline.contains("a: Task a"), "{outline}");
+        assert!(outline.contains("b: Task b"), "{outline}");
+        assert!(outline.contains("← a"), "{outline}");
     }
 }

@@ -44,6 +44,38 @@ impl TaskResult {
             messages: Vec::new(),
         }
     }
+
+    /// Human-readable output for the UI and downstream agents.
+    /// Empty when there is nothing useful to show (`null`, empty string, empty object).
+    pub fn output_text(&self) -> String {
+        display_text(&self.output).unwrap_or_default()
+    }
+
+    /// File paths recorded as artifacts on this result.
+    pub fn artifact_paths(&self) -> Vec<String> {
+        self.artifacts
+            .iter()
+            .filter_map(|a| a.path.clone())
+            .collect()
+    }
+}
+
+/// Convert a JSON value into display text. Returns `None` for empty values.
+pub fn display_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        }
+        Value::Array(a) if a.is_empty() => None,
+        Value::Object(m) if m.is_empty() => None,
+        other => Some(serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string())),
+    }
 }
 
 /// An artifact produced by a task.
@@ -84,6 +116,32 @@ pub struct WorkflowResult {
     /// Per-task results for completed tasks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub task_results: Vec<(TaskId, TaskResult)>,
+    /// Per-task errors for failed tasks (task_id, error message).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_tasks: Vec<(TaskId, String)>,
+    /// Total number of tasks in the workflow graph.
+    #[serde(default)]
+    pub total_task_count: usize,
+}
+
+impl WorkflowResult {
+    /// Human-readable aggregate output.
+    pub fn output_text(&self) -> String {
+        display_text(&self.output).unwrap_or_default()
+    }
+
+    /// File paths recorded as artifacts across all completed tasks.
+    pub fn artifact_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+        for (_, result) in &self.task_results {
+            for path in result.artifact_paths() {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+        paths
+    }
 }
 
 /// Scope for memory operations.
@@ -493,6 +551,8 @@ mod tests {
                 success: true,
                 output: serde_json::Value::Null,
                 task_results: Vec::new(),
+                failed_tasks: Vec::new(),
+                total_task_count: 0,
             },
             timestamp: 0,
         });

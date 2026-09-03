@@ -243,7 +243,11 @@ fn build_decompose_system_prompt(context: &PlannerContext) -> String {
          - Use 'barrier' tasks as sync points when multiple tasks must complete before proceeding\n\
          - Keep tasks focused: each agent_turn should have a single clear objective\n\
          - Use shell_command for deterministic operations (build, test, lint)\n\
-         - Use agent_turn for tasks requiring reasoning or code generation\n",
+         - Use agent_turn for tasks requiring reasoning or code generation\n\
+         - Every agent_turn must produce a concrete result: a text summary in the final message, \
+           and any requested files via the write tool\n\
+         - When the goal asks to save a document or task graph, put that in an agent_turn prompt \
+           that explicitly instructs the agent to write the file\n",
     );
 
     if !context.available_tools.is_empty() {

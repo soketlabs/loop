@@ -120,6 +120,8 @@ impl Scheduler {
                     success: false,
                     output: serde_json::json!({ "error": "task failure in fail-fast mode" }),
                     task_results: Vec::new(),
+                    failed_tasks: Vec::new(),
+                    total_task_count: state.task_statuses.len(),
                 };
                 self.workflow_engine
                     .complete_workflow(workflow_id, result.clone())

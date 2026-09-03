@@ -75,6 +75,7 @@ impl Worker for SubWorkflowWorker {
             self.base_tools.clone(),
             self.default_model.clone(),
             self.system_prompt.clone(),
+            loop_ai::SimpleStreamOptions::default(),
         ));
         let shell_worker = Arc::new(ShellWorker::new(Arc::clone(&self.host_env)));
 

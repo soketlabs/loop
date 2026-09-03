@@ -1213,14 +1213,18 @@ impl AgentHarness {
     ///
     /// The harness transitions to `Workflow` phase and runs the scheduler until
     /// all tasks complete. Each `AgentTurn` task spawns an agent loop as a worker.
+    ///
+    /// If `progress_tx` is provided, workflow lifecycle events are forwarded
+    /// as `WorkflowProgressEvent` for real-time UI updates.
     pub async fn start_workflow(
         &self,
         graph: loop_orchestration::planner::TaskGraph,
         config: Option<loop_orchestration::scheduler::SchedulerConfig>,
+        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::harness::orchestration::WorkflowProgressEvent>>,
     ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
         self.acquire_idle_phase(AgentHarnessPhase::Workflow).await?;
 
-        let result = self.run_workflow_inner(graph, config).await;
+        let result = self.run_workflow_inner(graph, config, progress_tx).await;
 
         self.release_to_idle();
         result
@@ -1231,12 +1235,14 @@ impl AgentHarness {
         &self,
         graph: loop_orchestration::planner::TaskGraph,
         config: Option<loop_orchestration::scheduler::SchedulerConfig>,
+        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::harness::orchestration::WorkflowProgressEvent>>,
     ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
+        use std::collections::HashMap;
         use loop_orchestration::memory::bus::create_memory_bus;
         use loop_orchestration::memory::SharedMemory;
         use loop_orchestration::scheduler::{Scheduler, WorkerPool};
-        use loop_orchestration::workflow::{MemoryEventLog, SignalRouter, WorkflowEngine};
-        use crate::harness::orchestration::agent_worker::{AgentWorker, ShellWorker};
+        use loop_orchestration::workflow::{MemoryEventLog, SignalRouter, WorkflowEngine, WorkflowEvent};
+        use crate::harness::orchestration::{WorkflowProgressEvent, agent_worker::{AgentWorker, ShellWorker}};
 
         let workflow_id = format!("wf_{}", uuid::Uuid::now_v7());
         let scheduler_config = config.unwrap_or_default();
@@ -1250,11 +1256,24 @@ impl AgentHarness {
 
         let bus = create_memory_bus();
         let shared_memory = Arc::new(SharedMemory::new(bus));
+        shared_memory
+            .set_entry(
+                "task_graph",
+                serde_json::json!({
+                    "mermaid": graph.to_mermaid(),
+                    "outline": graph.format_outline(),
+                }),
+                &"planner".to_string(),
+            )
+            .await;
 
         let model = self.model.read().await.clone();
         let system_prompt = self.system_prompt.read().await.clone();
         let tools = self.tools.read().await.clone();
         let host_env = Arc::clone(&self.host_env);
+        let thinking_level = *self.thinking_level.read().await;
+        let mut stream_options = self.stream_options.read().await.clone();
+        stream_options.reasoning = thinking_level.to_reasoning();
 
         let agent_worker = Arc::new(AgentWorker::new(
             Arc::clone(&self.stream_fn),
@@ -1262,6 +1281,7 @@ impl AgentHarness {
             tools,
             model,
             system_prompt,
+            stream_options,
         ));
 
         let shell_worker = Arc::new(ShellWorker::new(Arc::clone(&host_env)));
@@ -1282,6 +1302,67 @@ impl AgentHarness {
         let subscribers = self.subscribers.lock().clone();
         for sub in &subscribers {
             sub(crate::types::AgentEvent::AgentStart).await;
+        }
+
+        // Build task description lookup for enriching progress events.
+        if let Some(tx) = &progress_tx {
+            let task_descs: HashMap<String, String> = graph
+                .tasks
+                .iter()
+                .map(|(id, node)| (id.clone(), node.description.clone()))
+                .collect();
+
+            let mut event_rx = engine.subscribe();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                while let Ok(event) = event_rx.recv().await {
+                    let progress = match &event {
+                        WorkflowEvent::WorkflowStarted { plan, .. } => {
+                            Some(WorkflowProgressEvent::GraphPlanned {
+                                outline: plan.format_outline(),
+                                mermaid: plan.to_mermaid(),
+                            })
+                        }
+                        WorkflowEvent::TaskStarted { task_id, .. } => {
+                            let desc = task_descs
+                                .get(task_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            Some(WorkflowProgressEvent::TaskStarted {
+                                task_id: task_id.clone(),
+                                description: desc,
+                            })
+                        }
+                        WorkflowEvent::TaskCompleted { task_id, result, .. } => {
+                            let mut output = result.output_text();
+                            let paths = result.artifact_paths();
+                            if !paths.is_empty() {
+                                if !output.is_empty() {
+                                    output.push('\n');
+                                }
+                                output.push_str("wrote: ");
+                                output.push_str(&paths.join(", "));
+                            }
+                            Some(WorkflowProgressEvent::TaskCompleted {
+                                task_id: task_id.clone(),
+                                output,
+                            })
+                        }
+                        WorkflowEvent::TaskFailed { task_id, error, .. } => {
+                            Some(WorkflowProgressEvent::TaskFailed {
+                                task_id: task_id.clone(),
+                                error: error.clone(),
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(p) = progress {
+                        if tx.send(p).is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
         }
 
         engine
@@ -1317,24 +1398,41 @@ impl AgentHarness {
     ///
     /// This is a convenience that creates an LlmPlanner, decomposes the goal,
     /// then runs the workflow.
+    ///
+    /// If `progress_tx` is provided, workflow lifecycle events are forwarded
+    /// for real-time UI updates.
     pub async fn start_workflow_from_goal(
         &self,
         goal: &str,
         context: Option<loop_orchestration::planner::PlannerContext>,
         config: Option<loop_orchestration::scheduler::SchedulerConfig>,
+        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::harness::orchestration::WorkflowProgressEvent>>,
     ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
         use loop_orchestration::planner::{LlmPlanner, Planner};
 
         let model = self.model.read().await.clone();
         let planner = LlmPlanner::new(Arc::clone(&self.stream_fn), model);
-        let ctx = context.unwrap_or_default();
+
+        let ctx = context.unwrap_or_else(|| {
+            let tool_names: Vec<String> = self
+                .tools
+                .try_read()
+                .map(|t| t.iter().map(|tool| tool.name.clone()).collect())
+                .unwrap_or_default();
+            let cwd = Some(self.host_env.cwd().to_string_lossy().to_string());
+            loop_orchestration::planner::PlannerContext {
+                cwd,
+                available_tools: tool_names,
+                ..Default::default()
+            }
+        });
 
         let graph = planner
             .decompose(goal, &ctx)
             .await
             .map_err(|e| AgentHarnessError::Other(e.to_string()))?;
 
-        self.start_workflow(graph, config).await
+        self.start_workflow(graph, config, progress_tx).await
     }
 }
 

@@ -223,6 +223,11 @@ async fn parallel_tasks_all_complete() {
 
     assert!(result.success);
     assert_eq!(result.task_results.len(), 3);
+    let output = result.output_text();
+    assert!(
+        output.contains("echo:"),
+        "expected aggregated task output, got: {output:?}"
+    );
 }
 
 #[tokio::test]

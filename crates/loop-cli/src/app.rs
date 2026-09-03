@@ -38,9 +38,11 @@ use crate::tool_approval::{
 use crate::tui::{
     chat_items_from_agent_messages, filter_files, find_at_mention, find_tool_index,
     format_item_lines, format_token_usage_line, insert_text, item_is_committed, list_files,
-    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, CommandHistory,
-    FileEntry, FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow, PickerView,
+    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem,
+    CommandHistory, FileEntry, FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow, PickerView,
 };
+#[cfg(feature = "orchestration")]
+use crate::tui::find_workflow_task_index;
 
 enum UiEvent {
     Agent(AgentEvent),
@@ -51,14 +53,29 @@ enum UiEvent {
     /// Multi-agent workflow progress update.
     #[cfg(feature = "orchestration")]
     WorkflowDone(Result<WorkflowDoneOk, String>),
+    /// Planned task graph ready to display.
+    #[cfg(feature = "orchestration")]
+    WorkflowGraph { outline: String, mermaid: String },
+    /// Workflow task started executing.
+    #[cfg(feature = "orchestration")]
+    WorkflowTaskStarted { task_id: String, description: String },
+    /// Workflow task completed.
+    #[cfg(feature = "orchestration")]
+    WorkflowTaskCompleted { task_id: String, output: String },
+    /// Workflow task failed.
+    #[cfg(feature = "orchestration")]
+    WorkflowTaskFailed { task_id: String, error: String },
 }
 
 /// Successful workflow completion info.
 #[cfg(feature = "orchestration")]
 struct WorkflowDoneOk {
     success: bool,
-    task_count: usize,
-    summary: String,
+    completed_count: usize,
+    failed_count: usize,
+    total_count: usize,
+    output: String,
+    artifacts: Vec<String>,
 }
 
 /// Successful sandbox switch applied on the UI thread.
@@ -1061,16 +1078,76 @@ fn drain_ui_events(
                 *working = false;
                 match result {
                     Ok(info) => {
-                        let icon = if info.success { "done" } else { "failed" };
-                        chat.push(sys(format!(
-                            "workflow {icon} — {}/{} tasks completed\n{}",
-                            info.task_count, info.task_count, info.summary
-                        )));
+                        let msg = if info.success {
+                            format!(
+                                "workflow done — {}/{} tasks completed",
+                                info.completed_count, info.total_count,
+                            )
+                        } else {
+                            format!(
+                                "workflow failed — {} completed, {} failed out of {} tasks",
+                                info.completed_count, info.failed_count, info.total_count,
+                            )
+                        };
+                        chat.push(sys(msg));
+                        if !info.output.is_empty() {
+                            chat.push(ChatItem::Assistant {
+                                text: info.output,
+                            });
+                        } else if info.success {
+                            chat.push(sys("workflow produced no output"));
+                        }
+                        if !info.artifacts.is_empty() {
+                            chat.push(sys(format!("wrote: {}", info.artifacts.join(", "))));
+                        }
                         *status = "ready".into();
                     }
                     Err(e) => {
                         chat.push(sys(format!("workflow error: {e}")));
                         *status = "ready".into();
+                    }
+                }
+            }
+            #[cfg(feature = "orchestration")]
+            UiEvent::WorkflowGraph { outline, mermaid } => {
+                chat.push(sys(format!(
+                    "task graph:\n{outline}\n\n```mermaid\n{mermaid}\n```"
+                )));
+            }
+            #[cfg(feature = "orchestration")]
+            UiEvent::WorkflowTaskStarted { task_id, description } => {
+                chat.push(ChatItem::WorkflowTask {
+                    task_id,
+                    description,
+                    status: CardStatus::Pending,
+                    output: String::new(),
+                });
+            }
+            #[cfg(feature = "orchestration")]
+            UiEvent::WorkflowTaskCompleted { task_id, output } => {
+                if let Some(idx) = find_workflow_task_index(chat, &task_id) {
+                    if let Some(ChatItem::WorkflowTask {
+                        status: s,
+                        output: o,
+                        ..
+                    }) = chat.get_mut(idx)
+                    {
+                        *s = CardStatus::Success;
+                        *o = output;
+                    }
+                }
+            }
+            #[cfg(feature = "orchestration")]
+            UiEvent::WorkflowTaskFailed { task_id, error } => {
+                if let Some(idx) = find_workflow_task_index(chat, &task_id) {
+                    if let Some(ChatItem::WorkflowTask {
+                        status: s,
+                        output: o,
+                        ..
+                    }) = chat.get_mut(idx)
+                    {
+                        *s = CardStatus::Error;
+                        *o = error;
                     }
                 }
             }
@@ -3072,6 +3149,7 @@ async fn start_workflow(
     goal: &str,
     concurrency: Option<usize>,
 ) {
+    use loop_agent::harness::orchestration::WorkflowProgressEvent;
     use loop_orchestration::scheduler::SchedulerConfig;
 
     chat.push(sys(format!("starting workflow: {goal}")));
@@ -3079,7 +3157,6 @@ async fn start_workflow(
     *status = "workflow · planning…".into();
 
     let harness = Arc::clone(&runtime.harness);
-    let tx = tx.clone();
     let goal = goal.to_string();
 
     let config = concurrency.map(|n| SchedulerConfig {
@@ -3087,44 +3164,53 @@ async fn start_workflow(
         fail_fast: false,
     });
 
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<WorkflowProgressEvent>();
+
+    let tx_for_progress = tx.clone();
+    tokio::spawn(async move {
+        while let Some(event) = progress_rx.recv().await {
+            let ui_event = match event {
+                WorkflowProgressEvent::GraphPlanned { outline, mermaid } => {
+                    UiEvent::WorkflowGraph { outline, mermaid }
+                }
+                WorkflowProgressEvent::TaskStarted { task_id, description } => {
+                    UiEvent::WorkflowTaskStarted { task_id, description }
+                }
+                WorkflowProgressEvent::TaskCompleted { task_id, output } => {
+                    UiEvent::WorkflowTaskCompleted { task_id, output }
+                }
+                WorkflowProgressEvent::TaskFailed { task_id, error } => {
+                    UiEvent::WorkflowTaskFailed { task_id, error }
+                }
+            };
+            if tx_for_progress.send(ui_event).is_err() {
+                break;
+            }
+        }
+    });
+
+    let tx_for_done = tx.clone();
     tokio::spawn(async move {
         let result = harness
-            .start_workflow_from_goal(&goal, None, config)
+            .start_workflow_from_goal(&goal, None, config, Some(progress_tx))
             .await;
 
         let event = match result {
             Ok(wf_result) => {
-                let completed = wf_result
-                    .task_results
-                    .iter()
-                    .count();
-                let summary = wf_result
-                    .task_results
-                    .iter()
-                    .map(|(id, r)| {
-                        let out = match &r.output {
-                            serde_json::Value::String(s) => {
-                                if s.len() > 200 { format!("{}…", &s[..200]) } else { s.clone() }
-                            }
-                            other => {
-                                let s = other.to_string();
-                                if s.len() > 200 { format!("{}…", &s[..200]) } else { s }
-                            }
-                        };
-                        format!("  [{id}] {out}")
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
                 UiEvent::WorkflowDone(Ok(WorkflowDoneOk {
                     success: wf_result.success,
-                    task_count: completed,
-                    summary,
+                    completed_count: wf_result.task_results.len(),
+                    failed_count: wf_result.failed_tasks.len(),
+                    total_count: wf_result.total_task_count,
+                    output: wf_result.output_text(),
+                    artifacts: wf_result.artifact_paths(),
                 }))
             }
             Err(e) => UiEvent::WorkflowDone(Err(e.to_string())),
         };
 
-        let _ = tx.send(event);
+        let _ = tx_for_done.send(event);
     });
 }
 
