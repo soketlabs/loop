@@ -5,11 +5,13 @@ members = [
     "crates/loop-orchestration",
     "crates/loop-mcp",
     "crates/loop-agent",
+    "crates/loop-app-core",
     "crates/loop-cli",
+    "crates/loop-desktop",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.1-ir-30080301"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/soket/loop"
@@ -18,6 +20,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 loop-ai = { path = "crates/loop-ai" }
 loop-agent = { path = "crates/loop-agent" }
+loop-app-core = { path = "crates/loop-app-core" }
 loop-orchestration = { path = "crates/loop-orchestration" }
 loop-mcp = { path = "crates/loop-mcp" }
 
@@ -63,6 +66,14 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", branch = "main", default-features = false, features = ["client", "server", "macros", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "reqwest"] }
 axum = "0.8"
 tower = "0.5"
+
+# GPUI desktop
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["x11", "wayland"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", package = "gpui-component" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", package = "gpui-component-assets" }
+async-channel = "2"
+portable-pty = "0.9"
 
 [profile.release]
 lto = true

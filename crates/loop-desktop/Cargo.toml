@@ -1,0 +1,48 @@
+[package]
+name = "loop-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Loop desktop application (GPUI)"
+publish = false
+
+[[bin]]
+name = "loop-desktop"
+path = "src/main.rs"
+
+[dependencies]
+loop-app-core = { workspace = true }
+loop-agent = { workspace = true, features = ["mcp", "sqlite"] }
+loop-ai = { workspace = true }
+gpui = { workspace = true }
+gpui_platform = { workspace = true }
+gpui-component = { workspace = true, features = [
+    "tree-sitter",
+    "tree-sitter-rust",
+    "tree-sitter-python",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    "tree-sitter-tsx",
+    "tree-sitter-bash",
+    "tree-sitter-markdown",
+    "tree-sitter-toml",
+    "tree-sitter-yaml",
+    "tree-sitter-go",
+    "tree-sitter-html",
+    "tree-sitter-css",
+    "tree-sitter-diff",
+] }
+gpui-component-assets = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+async-channel = { workspace = true }
+similar = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+uuid = { workspace = true }

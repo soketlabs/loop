@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use loop_agent::harness::ExecutionEnv;
@@ -191,6 +192,8 @@ pub struct ToolApprovalBridge {
     prompt_tx: mpsc::UnboundedSender<ApprovalPrompt>,
     env: Arc<dyn ExecutionEnv>,
     diff_editor: Arc<Mutex<Option<String>>>,
+    /// When false, skip spawning an external `--diff` editor (desktop reviews in-app).
+    open_external_diff: Arc<AtomicBool>,
     gate: Arc<Mutex<()>>,
     /// Persist auto-approve labels onto the session (optional).
     persist: Arc<SyncMutex<Option<PersistAutoApprove>>>,
@@ -218,11 +221,18 @@ impl ToolApprovalBridge {
                 prompt_tx,
                 env,
                 diff_editor: Arc::new(Mutex::new(diff_editor)),
+                open_external_diff: Arc::new(AtomicBool::new(true)),
                 gate: Arc::new(Mutex::new(())),
                 persist: Arc::new(SyncMutex::new(None)),
             },
             prompt_rx,
         )
+    }
+
+    /// Whether file-edit review should spawn an external editor with `--diff`.
+    /// Desktop disables this and shows diffs in its own panel instead.
+    pub fn set_open_external_diff(&self, open: bool) {
+        self.open_external_diff.store(open, Ordering::SeqCst);
     }
 
     /// Install a persistence callback for Accept-all labels.
@@ -480,15 +490,17 @@ impl ToolApprovalBridge {
             ));
         }
 
-        if let Some(prev) = &previous_path {
-            if let Some(editor) = self.resolve_editor().await {
-                if let Err(e) = open_diff(&editor, prev, &path) {
-                    tracing::warn!("failed to open diff editor ({editor}): {e}");
+        if self.open_external_diff.load(Ordering::SeqCst) {
+            if let Some(prev) = &previous_path {
+                if let Some(editor) = self.resolve_editor().await {
+                    if let Err(e) = open_diff(&editor, prev, &path) {
+                        tracing::warn!("failed to open diff editor ({editor}): {e}");
+                    }
+                } else {
+                    tracing::warn!(
+                        "no diff editor found (set settings.diffEditor or install cursor/code)"
+                    );
                 }
-            } else {
-                tracing::warn!(
-                    "no diff editor found (set settings.diffEditor or install cursor/code)"
-                );
             }
         }
 

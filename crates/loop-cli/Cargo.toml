@@ -12,6 +12,7 @@ name = "loop"
 path = "src/main.rs"
 
 [dependencies]
+loop-app-core = { workspace = true }
 loop-ai = { workspace = true }
 loop-agent = { workspace = true, features = ["mcp"] }
 loop-mcp = { workspace = true }

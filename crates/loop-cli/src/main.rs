@@ -3,8 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use loop_cli::config;
-use loop_cli::runtime::{bootstrap, BootstrapOpts};
+use loop_cli::{bootstrap_cli, config, BootstrapOpts};
 use tracing_subscriber::EnvFilter;
 
 /// Loop — interactive coding agent by Soket AI.
@@ -120,7 +119,7 @@ async fn real_main() -> anyhow::Result<()> {
     }
 
     let interactive = cli.print.is_none() && !cli.serve_mcp;
-    let runtime = bootstrap(BootstrapOpts {
+    let runtime = bootstrap_cli(BootstrapOpts {
         cwd,
         provider: cli.provider,
         model: cli.model,
@@ -134,7 +133,7 @@ async fn real_main() -> anyhow::Result<()> {
     .await?;
 
     if cli.serve_mcp {
-        return loop_cli::mcp_serve::run_mcp_server(runtime, cli.mcp_port, cli.mcp_token).await;
+        return loop_cli::mcp_serve::run_mcp_server(runtime.inner, cli.mcp_port, cli.mcp_token).await;
     }
 
     if let Some(prompt) = cli.print {
