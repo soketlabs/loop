@@ -3,8 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use loop_cli::{bootstrap_cli, config, BootstrapOpts};
-use tracing_subscriber::EnvFilter;
+use loop_cli::{bootstrap_cli, config, debug_log, BootstrapOpts};
 
 /// Loop — interactive coding agent by Soket AI.
 #[derive(Debug, Parser)]
@@ -46,6 +45,10 @@ struct Cli {
     #[arg(long, global = true)]
     print: Option<String>,
 
+    /// Write verbose session logs to `target/debug/logs/` (also: `LOOP_DEBUG=1`).
+    #[arg(long, global = true)]
+    debug: bool,
+
     /// Start as an MCP server (streamable HTTP) instead of interactive mode.
     #[arg(long)]
     serve_mcp: bool,
@@ -80,17 +83,14 @@ async fn main() {
 }
 
 async fn real_main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
     let cwd = cli
         .cwd
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let debug = debug_log::debug_enabled(cli.debug);
+    let interactive = cli.print.is_none() && !cli.serve_mcp && cli.command.is_none();
+    let debug_log_path = debug_log::init_tracing(debug, &cwd, interactive)?;
 
     if let Some(Commands::Config) = cli.command {
         let agent = config::paths::get_agent_dir();
@@ -119,7 +119,7 @@ async fn real_main() -> anyhow::Result<()> {
     }
 
     let interactive = cli.print.is_none() && !cli.serve_mcp;
-    let runtime = bootstrap_cli(BootstrapOpts {
+    let mut runtime = bootstrap_cli(BootstrapOpts {
         cwd,
         provider: cli.provider,
         model: cli.model,
@@ -131,6 +131,8 @@ async fn real_main() -> anyhow::Result<()> {
         session_id: cli.resume,
     })
     .await?;
+    runtime.debug = debug;
+    runtime.debug_log_path = debug_log_path;
 
     if cli.serve_mcp {
         return loop_cli::mcp_serve::run_mcp_server(runtime.inner, cli.mcp_port, cli.mcp_token).await;

@@ -418,6 +418,11 @@ pub enum AgentEvent {
         /// Messages produced by this run.
         messages: Vec<AgentMessage>,
     },
+    /// Lightweight status for UI (prep phases, waiting on model, etc.).
+    Progress {
+        /// One-line human-readable step description.
+        message: String,
+    },
     /// New turn begins.
     TurnStart,
     /// Turn completes.
@@ -483,6 +488,7 @@ impl AgentEvent {
         match self {
             Self::AgentStart => "agent_start",
             Self::AgentEnd { .. } => "agent_end",
+            Self::Progress { .. } => "progress",
             Self::TurnStart => "turn_start",
             Self::TurnEnd { .. } => "turn_end",
             Self::MessageStart { .. } => "message_start",

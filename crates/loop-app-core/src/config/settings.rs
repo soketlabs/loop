@@ -179,6 +179,12 @@ pub struct Settings {
     /// External MCP servers keyed by name.
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+    /// Max wait for the model HTTP response headers (time-to-first-byte), in ms.
+    ///
+    /// Default `60000`. Set to `0` to wait indefinitely (useful for long-running
+    /// workflows / slow models). Esc still aborts the turn.
+    #[serde(default = "default_response_header_timeout_ms")]
+    pub response_header_timeout_ms: u64,
 }
 
 fn default_provider() -> String {
@@ -208,6 +214,9 @@ fn default_file_edit_review() -> String {
 fn default_tool_permissions_settings() -> BTreeMap<String, String> {
     crate::tool_approval::default_tool_permissions()
 }
+fn default_response_header_timeout_ms() -> u64 {
+    60_000
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -233,6 +242,7 @@ impl Default for Settings {
             tool_permissions: default_tool_permissions_settings(),
             default_project_trust: default_trust(),
             mcp_servers: BTreeMap::new(),
+            response_header_timeout_ms: default_response_header_timeout_ms(),
         }
     }
 }
@@ -312,6 +322,7 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
             base.mcp_servers.insert(k, v);
         }
     }
+    base.response_header_timeout_ms = project.response_header_timeout_ms;
     base
 }
 

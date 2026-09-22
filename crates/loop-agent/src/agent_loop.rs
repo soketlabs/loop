@@ -373,6 +373,14 @@ async fn stream_assistant_response(
         options.base.cancel = Some(c.clone());
     }
 
+    emit_ev(
+        emit,
+        AgentEvent::Progress {
+            message: "waiting for model…".into(),
+        },
+    )
+    .await;
+
     let response = stream_fn(config.model.clone(), llm_context, options).await;
     let mut stream = response;
     let mut partial_message: Option<AssistantMessage> = None;

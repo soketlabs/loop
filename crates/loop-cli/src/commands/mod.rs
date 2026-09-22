@@ -117,6 +117,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: Some("[newSession|always|never]"),
         },
         SlashCommand {
+            name: "ttfb",
+            description: "Model response-header wait (off for long-running)",
+            args_hint: Some("[off|on|60s|120000]"),
+        },
+        SlashCommand {
             name: "compact",
             description: "Compact conversation context",
             args_hint: Some("[prompt]"),
@@ -316,6 +321,8 @@ pub enum CommandEffect {
     NewSession,
     /// File edit review policy.
     SetFileReview(Option<String>),
+    /// Response-header (TTFB) timeout: `None` shows current; `Some` sets it.
+    SetResponseHeaderTimeout(Option<String>),
     /// Compact.
     Compact(Option<String>),
     /// Copy last assistant.
@@ -408,6 +415,11 @@ pub fn dispatch(cmd: &ParsedCommand, skill_names: &[String], template_names: &[S
         }),
         "new" => CommandEffect::NewSession,
         "review" => CommandEffect::SetFileReview(if cmd.args.is_empty() {
+            None
+        } else {
+            Some(cmd.args.clone())
+        }),
+        "ttfb" => CommandEffect::SetResponseHeaderTimeout(if cmd.args.is_empty() {
             None
         } else {
             Some(cmd.args.clone())

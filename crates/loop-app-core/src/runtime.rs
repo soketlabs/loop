@@ -451,6 +451,9 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     harness
         .set_thinking_level(parse_thinking(&settings.default_thinking_level))
         .await;
+    harness
+        .set_response_header_timeout_ms(settings.response_header_timeout_ms)
+        .await;
 
     crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
     let ext = crate::extensions::load_extensions(&resources.extension_paths);

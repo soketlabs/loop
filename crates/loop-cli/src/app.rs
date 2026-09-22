@@ -47,6 +47,8 @@ use crate::tui::find_workflow_task_index;
 
 enum UiEvent {
     Agent(AgentEvent),
+    /// Background `prompt()` finished with an error (no AgentEnd emitted).
+    TurnFailed(String),
     /// `/compact` finished (success message or error).
     CompactDone(Result<String, String>),
     /// `/sandbox` enable/disable finished.
@@ -269,9 +271,24 @@ async fn run_loop(
 ) -> anyhow::Result<Option<String>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     let tx_agent = tx.clone();
+    let debug_log = runtime.debug_log_path.clone();
     runtime.harness.subscribe(move |ev| {
         let tx = tx_agent.clone();
+        let debug_log = debug_log.clone();
         async move {
+            if let Some(path) = &debug_log {
+                let detail = match &ev {
+                    AgentEvent::Progress { message } => format!("progress: {message}"),
+                    AgentEvent::ToolExecutionStart { tool_name, .. } => {
+                        format!("tool_start: {tool_name}")
+                    }
+                    AgentEvent::ToolExecutionEnd {
+                        tool_name, is_error, ..
+                    } => format!("tool_end: {tool_name} error={is_error}"),
+                    other => other.type_name().to_string(),
+                };
+                crate::debug_log::append_note(path, &format!("event {detail}"));
+            }
             let _ = tx.send(UiEvent::Agent(ev));
         }
     });
@@ -368,6 +385,7 @@ async fn run_loop(
     let mut last_ac_filter = String::new();
     let mut file_index: Option<Vec<FileEntry>> = None;
     let mut working = false;
+    let mut turn_step = String::new();
     let mut message_queue: VecDeque<QueuedMessage> = VecDeque::new();
     let mut spinner_frame: usize = 0;
     let mut last_spin = Instant::now();
@@ -378,6 +396,16 @@ async fn run_loop(
 
     // Welcome banner into terminal scrollback (above the footer).
     print_welcome(terminal, runtime, version)?;
+    if let Some(path) = &runtime.debug_log_path {
+        let msg = format!("debug log → {}", path.display());
+        terminal.insert_before(1, |buf| {
+            let line = ratatui::text::Line::from(ratatui::text::Span::styled(
+                format!(" {msg}"),
+                runtime.theme.muted(),
+            ));
+            render_lines_to_buffer(&[line], buf, &runtime.theme);
+        })?;
+    }
 
     let tick = Duration::from_millis(33);
     let mut should_quit = false;
@@ -565,7 +593,13 @@ async fn run_loop(
                 })
                 .count();
             let queued = message_queue.len();
-            let mut parts = vec!["Working…".to_string()];
+            // Alternate every ~1.2s between the current step and "Working…".
+            let show_step = !turn_step.is_empty() && (spinner_frame / 15) % 2 == 0;
+            let mut parts = vec![if show_step {
+                turn_step.clone()
+            } else {
+                "Working…".to_string()
+            }];
             if pending_tools > 0 {
                 parts.push(format!("{pending_tools} tool(s)"));
             }
@@ -649,12 +683,14 @@ async fn run_loop(
                 &mut active_approval,
                 &mut chat,
                 &mut status,
+                &mut turn_step,
                 &mut streaming_assistant,
                 &mut streaming_thinking,
                 &mut working,
                 &mut message_queue,
                 &mut token_bar,
                 &mut refresh_token_bar,
+                &tx,
             );
             continue;
         }
@@ -669,6 +705,7 @@ async fn run_loop(
                         &mut history,
                         &mut chat,
                         &mut status,
+                        &mut turn_step,
                         &mut clear_presses,
                         &mut last_clear,
                         &mut last_escape,
@@ -722,6 +759,7 @@ async fn run_loop(
             }
             purge_ui_events = false;
             working = false;
+            turn_step.clear();
             streaming_assistant = None;
             streaming_thinking = None;
         }
@@ -752,12 +790,14 @@ async fn run_loop(
             &mut active_approval,
             &mut chat,
             &mut status,
+            &mut turn_step,
             &mut streaming_assistant,
             &mut streaming_thinking,
             &mut working,
             &mut message_queue,
             &mut token_bar,
             &mut refresh_token_bar,
+            &tx,
         );
     }
 
@@ -1082,12 +1122,14 @@ fn drain_ui_events(
     active_approval: &mut Option<ActiveApproval>,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
+    turn_step: &mut String,
     streaming_assistant: &mut Option<usize>,
     streaming_thinking: &mut Option<usize>,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
     token_bar: &mut TokenBarState,
     refresh_token_bar: &mut bool,
+    tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
     while let Ok(ev) = rx.try_recv() {
         match ev {
@@ -1096,6 +1138,7 @@ fn drain_ui_events(
                     ev,
                     chat,
                     status,
+                    turn_step,
                     streaming_assistant,
                     streaming_thinking,
                     working,
@@ -1103,8 +1146,19 @@ fn drain_ui_events(
                     refresh_token_bar,
                 );
             }
+            UiEvent::TurnFailed(err) => {
+                *working = false;
+                turn_step.clear();
+                chat.push(sys(format!("error: {err}")));
+                *status = "error".into();
+                tracing::error!(error = %err, "turn failed");
+                if let Some(path) = &runtime.debug_log_path {
+                    crate::debug_log::append_note(path, &format!("turn_failed: {err}"));
+                }
+            }
             UiEvent::CompactDone(result) => {
                 *working = false;
+                turn_step.clear();
                 match result {
                     Ok(msg) => {
                         chat.push(sys(msg));
@@ -1121,6 +1175,7 @@ fn drain_ui_events(
             }
             UiEvent::SandboxDone(result) => {
                 *working = false;
+                turn_step.clear();
                 match result {
                     Ok(SandboxDoneOk::Off) => {
                         runtime.settings.sandbox.mode = "off".into();
@@ -1152,6 +1207,7 @@ fn drain_ui_events(
             #[cfg(feature = "orchestration")]
             UiEvent::WorkflowDone(result) => {
                 *working = false;
+                turn_step.clear();
                 match result {
                     Ok(info) => {
                         let msg = if info.success {
@@ -1246,10 +1302,12 @@ fn drain_ui_events(
         runtime,
         chat,
         status,
+        turn_step,
         streaming_assistant,
         streaming_thinking,
         working,
         message_queue,
+        tx,
     );
 }
 
@@ -1292,11 +1350,13 @@ fn start_user_turn(
     runtime: &CliRuntime,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
+    turn_step: &mut String,
     streaming_assistant: &mut Option<usize>,
     streaming_thinking: &mut Option<usize>,
     working: &mut bool,
     display: String,
     prompt: String,
+    tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
     // Keep prior turn output above this user message.
     settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
@@ -1312,6 +1372,7 @@ fn start_user_turn(
         chat.push(ChatItem::User { text: display });
     }
     *working = true;
+    *turn_step = "starting…".into();
     *streaming_assistant = None;
     if let Some(idx) = streaming_thinking.take() {
         if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
@@ -1320,8 +1381,15 @@ fn start_user_turn(
     }
     *status = "Working…".into();
     let harness = Arc::clone(&runtime.harness);
+    let tx = tx.clone();
+    if let Some(path) = &runtime.debug_log_path {
+        crate::debug_log::append_note(path, "turn: prompt submitted");
+    }
     tokio::spawn(async move {
-        let _ = harness.prompt(prompt).await;
+        if let Err(e) = harness.prompt(prompt).await {
+            tracing::error!(error = %e, "prompt failed");
+            let _ = tx.send(UiEvent::TurnFailed(e.to_string()));
+        }
     });
 }
 
@@ -1329,10 +1397,12 @@ fn try_drain_message_queue(
     runtime: &CliRuntime,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
+    turn_step: &mut String,
     streaming_assistant: &mut Option<usize>,
     streaming_thinking: &mut Option<usize>,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
+    tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
     // Wait until the harness is fully idle. AgentEnd clears `working` slightly
     // before phase flips, and Esc must be able to flush the queue in between.
@@ -1349,11 +1419,13 @@ fn try_drain_message_queue(
         runtime,
         chat,
         status,
+        turn_step,
         streaming_assistant,
         streaming_thinking,
         working,
         item.display,
         item.prompt,
+        tx,
     );
 }
 
@@ -1361,11 +1433,13 @@ fn submit_user_text(
     runtime: &CliRuntime,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
+    turn_step: &mut String,
     streaming_assistant: &mut Option<usize>,
     streaming_thinking: &mut Option<usize>,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
     text: String,
+    tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
     if agent_is_busy(runtime, *working) {
         enqueue_user_message(chat, message_queue, text.clone(), text);
@@ -1380,11 +1454,13 @@ fn submit_user_text(
             runtime,
             chat,
             status,
+            turn_step,
             streaming_assistant,
             streaming_thinking,
             working,
             text.clone(),
             text,
+            tx,
         );
     }
 }
@@ -1462,6 +1538,7 @@ async fn handle_key(
     history: &mut CommandHistory,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
+    turn_step: &mut String,
     clear_presses: &mut u8,
     last_clear: &mut Instant,
     last_escape: &mut Instant,
@@ -1861,6 +1938,7 @@ async fn handle_key(
                 }
                 if had_work || had_queue {
                     *working = false;
+                    turn_step.clear();
                     *streaming_assistant = None;
                     if let Some(idx) = streaming_thinking.take() {
                         if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
@@ -1932,6 +2010,7 @@ async fn handle_key(
                             runtime,
                             chat,
                             status,
+                            turn_step,
                             pending_login,
                             model_picker,
                             fork_picker,
@@ -1954,11 +2033,13 @@ async fn handle_key(
                         runtime,
                         chat,
                         status,
+                        turn_step,
                         streaming_assistant,
                         streaming_thinking,
                         working,
                         message_queue,
                         line,
+                        tx,
                     );
                 }
                 return Ok(());
@@ -2096,11 +2177,13 @@ async fn handle_key(
                         runtime,
                         chat,
                         status,
+                        turn_step,
                         streaming_assistant,
                         streaming_thinking,
                         working,
                         message_queue,
                         line,
+                        tx,
                     );
                 }
                 return Ok(());
@@ -2333,6 +2416,7 @@ fn handle_agent_event(
     ev: AgentEvent,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
+    turn_step: &mut String,
     streaming_assistant: &mut Option<usize>,
     streaming_thinking: &mut Option<usize>,
     working: &mut bool,
@@ -2340,11 +2424,19 @@ fn handle_agent_event(
     refresh_token_bar: &mut bool,
 ) {
     match ev {
+        AgentEvent::Progress { message } => {
+            *turn_step = message;
+            *working = true;
+        }
         AgentEvent::AgentStart => {
             *working = true;
+            if turn_step.is_empty() {
+                *turn_step = "thinking…".into();
+            }
         }
         AgentEvent::AgentEnd { .. } => {
             *working = false;
+            turn_step.clear();
             *status = "ready".into();
             *streaming_assistant = None;
             if let Some(idx) = streaming_thinking.take() {
@@ -2356,11 +2448,15 @@ fn handle_agent_event(
             settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
             *refresh_token_bar = true;
         }
+        AgentEvent::TurnStart => {
+            *turn_step = "thinking…".into();
+        }
         AgentEvent::MessageStart { message } => {
             // Assistant items are created lazily on the first text delta so that
             // thinking / tool items land in true stream order.
             if message.role() == "assistant" {
                 *streaming_assistant = None;
+                *turn_step = "waiting for model…".into();
             }
         }
         AgentEvent::MessageEnd { message } => {
@@ -2380,6 +2476,7 @@ fn handle_agent_event(
             use loop_ai::AssistantMessageEvent;
             match assistant_message_event {
                 AssistantMessageEvent::TextDelta { delta, .. } => {
+                    *turn_step = "streaming…".into();
                     let idx = match *streaming_assistant {
                         Some(idx) => idx,
                         None => {
@@ -2404,6 +2501,7 @@ fn handle_agent_event(
                     *streaming_assistant = None;
                 }
                 AssistantMessageEvent::ThinkingStart { .. } => {
+                    *turn_step = "thinking…".into();
                     *streaming_assistant = None;
                     let idx = push_before_queued(
                         chat,
@@ -2416,6 +2514,7 @@ fn handle_agent_event(
                     *streaming_thinking = Some(idx);
                 }
                 AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                    *turn_step = "thinking…".into();
                     if let Some(idx) = *streaming_thinking {
                         if let Some(ChatItem::Thinking { text, .. }) = chat.get_mut(idx) {
                             text.push_str(&delta);
@@ -2430,6 +2529,7 @@ fn handle_agent_event(
                     }
                 }
                 AssistantMessageEvent::ToolcallEnd { tool_call, .. } => {
+                    *turn_step = format!("tool · {}", tool_call.name);
                     *streaming_assistant = None;
                     let detail =
                         serde_json::to_string_pretty(&tool_call.arguments).unwrap_or_default();
@@ -2452,6 +2552,7 @@ fn handle_agent_event(
                         .unwrap_or_else(|| "error".into());
                     push_before_queued(chat, sys(format!("error: {msg}")));
                     *working = false;
+                    turn_step.clear();
                     *status = "error".into();
                 }
                 _ => {}
@@ -2463,6 +2564,7 @@ fn handle_agent_event(
             args,
             ..
         } => {
+            *turn_step = format!("tool · {tool_name}");
             let summary = tool_args_summary(&tool_name, &args);
             let detail = serde_json::to_string_pretty(&args).unwrap_or_default();
             upsert_tool(
@@ -2478,9 +2580,11 @@ fn handle_agent_event(
         }
         AgentEvent::ToolExecutionUpdate {
             tool_call_id,
+            tool_name,
             partial_result,
             ..
         } => {
+            *turn_step = format!("tool · {tool_name}");
             if let Some(idx) = find_tool_index(chat, &tool_call_id) {
                 if let Some(ChatItem::Tool { detail, status, .. }) = chat.get_mut(idx) {
                     *status = CardStatus::Pending;
@@ -2500,6 +2604,11 @@ fn handle_agent_event(
             is_error,
             ..
         } => {
+            *turn_step = if is_error {
+                format!("tool · {tool_name} failed")
+            } else {
+                "thinking…".into()
+            };
             let result_text = result
                 .content
                 .iter()
@@ -2609,6 +2718,7 @@ async fn apply_effect(
     runtime: &mut CliRuntime,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
+    turn_step: &mut String,
     pending_login: &mut Option<String>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
@@ -2904,6 +3014,44 @@ async fn apply_effect(
                 }
             }
         }
+        CommandEffect::SetResponseHeaderTimeout(arg) => {
+            match arg {
+                None => {
+                    let ms = runtime.harness.response_header_timeout_ms().await;
+                    let label = if ms == 0 {
+                        "off (unlimited)".into()
+                    } else if ms % 1000 == 0 {
+                        format!("{}s", ms / 1000)
+                    } else {
+                        format!("{ms}ms")
+                    };
+                    chat.push(sys(format!(
+                        "response header timeout (TTFB): {label}\n  /ttfb off|on|60s|120000\n  settings.responseHeaderTimeoutMs: {} (0 = unlimited)",
+                        runtime.settings.response_header_timeout_ms
+                    )));
+                }
+                Some(raw) => match parse_response_header_timeout(&raw) {
+                    Ok(ms) => {
+                        runtime.settings.response_header_timeout_ms = ms;
+                        runtime.harness.set_response_header_timeout_ms(ms).await;
+                        let _ = runtime
+                            .settings
+                            .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
+                        let label = if ms == 0 {
+                            "off (unlimited — for long-running workflows)".into()
+                        } else if ms % 1000 == 0 {
+                            format!("{}s", ms / 1000)
+                        } else {
+                            format!("{ms}ms")
+                        };
+                        chat.push(sys(format!("response header timeout → {label}")));
+                    }
+                    Err(e) => {
+                        chat.push(sys(e));
+                    }
+                },
+            }
+        }
         CommandEffect::Compact(instructions) => {
             let harness = Arc::clone(&runtime.harness);
             let tx = tx.clone();
@@ -2968,7 +3116,7 @@ async fn apply_effect(
                 perms.push_str(&format!("\n    {k}: {v}"));
             }
             chat.push(sys(format!(
-                "settings ({})\n  provider: {}\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  toolApproval: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  ui: {}",
+                "settings ({})\n  provider: {}\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  toolApproval: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  responseHeaderTimeoutMs: {}{}\n  ui: {}",
                 crate::config::paths::settings_path(&runtime.agent_dir).display(),
                 runtime.settings.default_provider,
                 runtime.settings.default_model,
@@ -2981,6 +3129,12 @@ async fn apply_effect(
                     .diff_editor
                     .as_deref()
                     .unwrap_or("(auto)"),
+                runtime.settings.response_header_timeout_ms,
+                if runtime.settings.response_header_timeout_ms == 0 {
+                    " (off)"
+                } else {
+                    ""
+                },
                 runtime.settings.ui_mode,
             )));
         }
@@ -3182,11 +3336,13 @@ async fn apply_effect(
                         runtime,
                         chat,
                         status,
+                        turn_step,
                         streaming_assistant,
                         streaming_thinking,
                         working,
                         display,
                         prompt,
+                        tx,
                     );
                 }
             } else {
@@ -3369,4 +3525,33 @@ fn external_edit(current: &str) -> anyhow::Result<String> {
         anyhow::bail!("editor exited with error");
     }
     Ok(std::fs::read_to_string(path)?)
+}
+
+/// Parse `/ttfb` args: `off`/`0` → unlimited; `on` → 60s; `60s` / `120000` → ms.
+fn parse_response_header_timeout(raw: &str) -> Result<u64, String> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return Err("usage: /ttfb off|on|60s|120000".into());
+    }
+    match s.as_str() {
+        "off" | "disable" | "disabled" | "unlimited" | "none" => Ok(0),
+        "on" | "default" => Ok(60_000),
+        _ => {
+            if let Some(secs) = s.strip_suffix('s') {
+                let secs: u64 = secs
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("invalid duration: {raw}"))?;
+                return Ok(secs.saturating_mul(1000));
+            }
+            if let Some(ms) = s.strip_suffix("ms") {
+                return ms
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("invalid duration: {raw}"));
+            }
+            s.parse::<u64>()
+                .map_err(|_| format!("usage: /ttfb off|on|60s|120000 (got {raw})"))
+        }
+    }
 }

@@ -721,8 +721,14 @@ pub struct StreamOptions {
     pub session_id: Option<String>,
     /// Extra / overriding headers (`None` value suppresses).
     pub headers: Option<ProviderHeaders>,
-    /// Request timeout in milliseconds.
+    /// Overall request timeout in milliseconds (avoid for long SSE streams).
     pub timeout_ms: Option<u64>,
+    /// Max wait for HTTP response headers (time-to-first-byte) in milliseconds.
+    ///
+    /// - `None` — use the library default (60s hang protection)
+    /// - `Some(0)` — disabled; wait indefinitely (still abortable via cancel)
+    /// - `Some(n)` — wait up to `n` ms for headers
+    pub response_header_timeout_ms: Option<u64>,
     /// Optional metadata bag.
     pub metadata: Option<HashMap<String, Value>>,
     /// Provider-scoped env overrides.

@@ -368,10 +368,12 @@ impl AgentHarness {
             SandboxMode::Disabled => Ok(None),
             SandboxMode::Enabled { sandbox } => {
                 if sandbox.status() != SandboxStatus::Ready {
+                    tracing::info!(status = %sandbox.status(), "sandbox: starting");
                     sandbox
                         .start()
                         .await
                         .map_err(|e| AgentHarnessError::Sandbox(e.to_string()))?;
+                    tracing::info!("sandbox: ready");
                 }
                 Ok(Some(sandbox))
             }
@@ -386,6 +388,22 @@ impl AgentHarness {
     /// Set thinking level.
     pub async fn set_thinking_level(&self, level: AgentThinkingLevel) {
         *self.thinking_level.write().await = level;
+    }
+
+    /// Set max wait for model response headers (`0` = wait indefinitely).
+    pub async fn set_response_header_timeout_ms(&self, ms: u64) {
+        let mut opts = self.stream_options.write().await;
+        opts.base.response_header_timeout_ms = Some(ms);
+    }
+
+    /// Current response-header timeout in ms (`0` = disabled / unlimited).
+    pub async fn response_header_timeout_ms(&self) -> u64 {
+        self.stream_options
+            .read()
+            .await
+            .base
+            .response_header_timeout_ms
+            .unwrap_or(60_000)
     }
 
     /// Set tools (rejects duplicate names).
@@ -528,6 +546,17 @@ impl AgentHarness {
         self.subscribers
             .lock()
             .push(Arc::new(move |e| Box::pin(handler(e))));
+    }
+
+    /// Notify subscribers of a lightweight progress step (prep / waiting).
+    async fn emit_progress(&self, message: impl Into<String>) {
+        let message = message.into();
+        tracing::info!(step = %message, "turn progress");
+        let event = AgentEvent::Progress { message };
+        let subscribers = self.subscribers.lock().clone();
+        for sub in &subscribers {
+            sub(event.clone()).await;
+        }
     }
 
     /// Set before-tool-call hook (optional gate / transform).
@@ -1071,9 +1100,65 @@ impl AgentHarness {
 
         let token = CancellationToken::new();
         *self.cancel.lock() = Some(token.clone());
+        tracing::info!("run_turn: started");
 
+        // Always release phase on exit so early failures (sandbox/session/hooks)
+        // cannot leave the harness stuck in `Turn` with the CLI showing Working…
+        let result = self.run_turn_inner(input, token.clone()).await;
+
+        let writes = std::mem::take(&mut *self.pending_writes.lock());
+        // Aborted turns should leave no session footprint so a follow-up prompt
+        // (or UI "stop") behaves as if the turn never ran.
+        if !token.is_cancelled() {
+            let session = self.session.lock().await;
+            let store = session.store();
+            let sid = session.metadata().id.clone();
+            for w in writes {
+                if let Err(e) = store.append_entry(&sid, w).await {
+                    tracing::error!(session_id = %sid, "session write failed: {e}");
+                }
+            }
+        }
+
+        *self.phase.lock() = AgentHarnessPhase::Idle;
+        *self.cancel.lock() = None;
+        self.idle.notify_waiters();
+        if self.shutting_down.load(Ordering::Relaxed) {
+            self.shutdown_notify.notify_waiters();
+        }
+        let _ = self.hooks.emit(HarnessHookEvent::Settled).await;
+
+        match &result {
+            Ok(_) => tracing::info!("run_turn: finished ok"),
+            Err(e) => tracing::warn!(error = %e, "run_turn: finished with error"),
+        }
+        result
+    }
+
+    async fn run_turn_inner(
+        &self,
+        input: Option<PromptInput>,
+        token: CancellationToken,
+    ) -> Result<AgentMessage, AgentHarnessError> {
+        if token.is_cancelled() {
+            return Err(AgentHarnessError::Other("aborted".into()));
+        }
+
+        {
+            let mode = self.sandbox.read().await.clone();
+            if let SandboxMode::Enabled { sandbox } = &mode {
+                if sandbox.status() != SandboxStatus::Ready {
+                    self.emit_progress("starting sandbox…").await;
+                }
+            }
+        }
+        self.emit_progress("preparing turn…").await;
         let snapshot = self.create_turn_state().await?;
+        if token.is_cancelled() {
+            return Err(AgentHarnessError::Other("aborted".into()));
+        }
 
+        self.emit_progress("running hooks…").await;
         let before_start = self
             .hooks
             .emit(HarnessHookEvent::BeforeAgentStart {
@@ -1081,9 +1166,10 @@ impl AgentHarness {
             })
             .await;
         if before_start.cancel {
-            *self.phase.lock() = AgentHarnessPhase::Idle;
-            self.idle.notify_waiters();
             return Err(AgentHarnessError::Hook("turn cancelled".into()));
+        }
+        if token.is_cancelled() {
+            return Err(AgentHarnessError::Other("aborted".into()));
         }
 
         let mut prompts = Vec::new();
@@ -1155,12 +1241,14 @@ impl AgentHarness {
                         message: message.clone(),
                     });
                 }
+                tracing::debug!(event = event.type_name(), "agent event");
                 for sub in &subscribers {
                     sub(event.clone()).await;
                 }
             })
         });
 
+        self.emit_progress("starting agent…").await;
         let result = run_agent_loop(
             prompts,
             context,
@@ -1170,28 +1258,6 @@ impl AgentHarness {
             Some(Arc::clone(&self.stream_fn)),
         )
         .await;
-
-        let writes = std::mem::take(&mut *self.pending_writes.lock());
-        // Aborted turns should leave no session footprint so a follow-up prompt
-        // (or UI "stop") behaves as if the turn never ran.
-        if !token.is_cancelled() {
-            let session = self.session.lock().await;
-            let store = session.store();
-            let sid = session.metadata().id.clone();
-            for w in writes {
-                if let Err(e) = store.append_entry(&sid, w).await {
-                    tracing::error!(session_id = %sid, "session write failed: {e}");
-                }
-            }
-        }
-
-        *self.phase.lock() = AgentHarnessPhase::Idle;
-        *self.cancel.lock() = None;
-        self.idle.notify_waiters();
-        if self.shutting_down.load(Ordering::Relaxed) {
-            self.shutdown_notify.notify_waiters();
-        }
-        let _ = self.hooks.emit(HarnessHookEvent::Settled).await;
 
         match result {
             Ok(msgs) => Ok(msgs
