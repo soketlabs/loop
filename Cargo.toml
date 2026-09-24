@@ -6,6 +6,7 @@ members = [
     "crates/loop-mcp",
     "crates/loop-agent",
     "crates/loop-app-core",
+    "crates/loop-telemetry",
     "crates/loop-cli",
     "crates/loop-desktop"
 ]
@@ -23,6 +24,7 @@ loop-agent = { path = "crates/loop-agent" }
 loop-app-core = { path = "crates/loop-app-core" }
 loop-orchestration = { path = "crates/loop-orchestration" }
 loop-mcp = { path = "crates/loop-mcp" }
+loop-telemetry = { path = "crates/loop-telemetry" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -55,6 +57,10 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 dirs = "6"
 anyhow = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
 pulldown-cmark = "0.12"
 syntect = { version = "5", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy", "dump-load"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
