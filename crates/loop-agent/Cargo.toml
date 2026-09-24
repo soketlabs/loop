@@ -16,6 +16,7 @@ orchestration = ["dep:loop-orchestration"]
 
 [dependencies]
 loop-ai = { workspace = true }
+loop-telemetry = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -46,5 +47,7 @@ rmcp = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rusqlite = { workspace = true, features = ["bundled"] }
