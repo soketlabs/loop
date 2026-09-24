@@ -11,6 +11,7 @@ readme = "README.md"
 loop-ai = { workspace = true }
 loop-agent = { workspace = true, features = ["mcp", "sqlite"] }
 loop-mcp = { workspace = true }
+loop-telemetry = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -25,3 +26,6 @@ dirs = { workspace = true }
 parking_lot = { workspace = true }
 tokio-util = { workspace = true }
 ratatui = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

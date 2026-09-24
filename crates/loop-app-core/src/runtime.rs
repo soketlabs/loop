@@ -73,6 +73,13 @@ pub struct Runtime {
     pub active_skills: Vec<String>,
 }
 
+impl Runtime {
+    /// Persist the current settings to the global settings file.
+    pub fn save_settings(&self) -> anyhow::Result<()> {
+        self.settings.save_file(&settings_path(&self.agent_dir))
+    }
+}
+
 /// CLI bootstrap flags affecting runtime.
 pub struct BootstrapOpts {
     /// Working directory.
