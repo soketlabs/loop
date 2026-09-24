@@ -8,6 +8,8 @@ pub mod commands;
 pub mod debug_log;
 pub mod keybindings;
 pub mod mcp_serve;
+pub mod print_mode;
+pub mod secret_prompt;
 pub mod tui;
 
 pub use loop_app_core::{

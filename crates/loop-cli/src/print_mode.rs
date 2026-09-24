@@ -1,0 +1,259 @@
+//! Headless `--print` runs, each recorded as one Langfuse trace.
+
+use std::collections::BTreeMap;
+use std::future::Future;
+
+use loop_agent::AgentMessage;
+use loop_ai::{AssistantContent, Message, StopReason};
+use loop_telemetry::{obs, ObservationExt, TelemetryHandle, TraceAttrs};
+use tracing::Instrument;
+
+use crate::CliRuntime;
+
+/// Name of the root observation of a print-mode trace.
+pub const ROOT_SPAN_NAME: &str = "loop.print";
+/// Prefix of the stderr line carrying the trace id, for benchmark runners.
+pub const TRACE_ID_PREFIX: &str = "loop-trace-id: ";
+
+/// Per-run trace labels for `--print` (e.g. benchmark run and task ids).
+#[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
+pub struct TraceArgs {
+    /// Langfuse trace name (default: `loop.print`).
+    #[arg(long = "trace-name", global = true)]
+    pub name: Option<String>,
+    /// Langfuse trace tag; repeatable.
+    #[arg(long = "trace-tag", global = true)]
+    pub tags: Vec<String>,
+    /// Langfuse trace metadata as `key=value`; repeatable.
+    #[arg(long = "trace-metadata", global = true, value_parser = parse_key_value)]
+    pub metadata: Vec<(String, String)>,
+    /// Langfuse session id (default: the Loop session id).
+    #[arg(long = "trace-session", global = true)]
+    pub session: Option<String>,
+    /// Langfuse environment, e.g. `benchmark`.
+    #[arg(long = "trace-env", global = true)]
+    pub environment: Option<String>,
+    /// W3C traceparent of an enclosing trace, so a runner can own the parent span.
+    #[arg(long = "trace-parent", global = true, env = "TRACEPARENT")]
+    pub parent: Option<String>,
+}
+
+impl TraceArgs {
+    /// Trace attributes for the root span.
+    pub fn trace_attrs(&self, default_session: &str) -> TraceAttrs {
+        TraceAttrs {
+            name: self.name.clone(),
+            session_id: Some(
+                self.session
+                    .clone()
+                    .unwrap_or_else(|| default_session.to_string()),
+            ),
+            user_id: None,
+            tags: self.tags.clone(),
+            metadata: self.metadata.iter().cloned().collect::<BTreeMap<_, _>>(),
+            environment: self.environment.clone(),
+            release: Some(env!("CARGO_PKG_VERSION").to_string()),
+        }
+    }
+}
+
+fn parse_key_value(raw: &str) -> Result<(String, String), String> {
+    match raw.split_once('=') {
+        Some((key, value)) if !key.trim().is_empty() => {
+            Ok((key.trim().to_string(), value.to_string()))
+        }
+        _ => Err(format!("expected key=value, got `{raw}`")),
+    }
+}
+
+/// Outcome of a traced print run.
+#[derive(Debug)]
+pub struct PrintOutcome {
+    /// Final assistant text, or why the run failed.
+    pub result: anyhow::Result<String>,
+    /// Trace id when the run was exported.
+    pub trace_id: Option<String>,
+}
+
+/// Run `prompt` through `run` inside the `loop.print` root observation.
+pub async fn traced_print<F, Fut>(
+    prompt: &str,
+    trace: &TraceArgs,
+    default_session: &str,
+    run: F,
+) -> PrintOutcome
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = anyhow::Result<AgentMessage>>,
+{
+    let root = obs::span(ROOT_SPAN_NAME);
+    if let Some(parent) = &trace.parent {
+        if !root.continue_trace(parent) {
+            tracing::warn!(target: "loop_cli", traceparent = %parent, "ignoring invalid traceparent");
+        }
+    }
+    root.record_trace(&trace.trace_attrs(default_session));
+    root.record_input(prompt);
+
+    let result = run()
+        .instrument(root.clone())
+        .await
+        .and_then(|message| final_text(&message));
+    match &result {
+        Ok(text) => root.record_output(text),
+        Err(err) => root.record_error(&format!("{err:#}")),
+    }
+    PrintOutcome {
+        result,
+        trace_id: root.trace_id(),
+    }
+}
+
+/// `loop --print`: run one prompt, print the answer, report the trace id on stderr.
+pub async fn run_print(
+    runtime: &CliRuntime,
+    prompt: String,
+    trace: &TraceArgs,
+) -> anyhow::Result<()> {
+    let harness = runtime.harness.clone();
+    let input = prompt.clone();
+    let outcome = traced_print(&input, trace, &runtime.session_id, || async move {
+        Ok(harness.prompt(prompt).await?)
+    })
+    .await;
+    if let Some(trace_id) = &outcome.trace_id {
+        eprintln!("{TRACE_ID_PREFIX}{trace_id}");
+    }
+    let text = outcome.result?;
+    println!("{text}");
+    Ok(())
+}
+
+/// Flush and stop exporting before the process exits; reports a failed last export.
+pub async fn shutdown_telemetry(telemetry: &TelemetryHandle) {
+    let handle = telemetry.clone();
+    // Shutdown blocks on the exporter; keep it off the async workers.
+    let _ = tokio::task::spawn_blocking(move || handle.shutdown()).await;
+    if let Some(err) = telemetry.status().last_error {
+        eprintln!("loop: trace export failed: {err}");
+    }
+}
+
+/// The assistant's text, or an error when the run stopped on error / abort.
+pub fn final_text(message: &AgentMessage) -> anyhow::Result<String> {
+    let Some(Message::Assistant(assistant)) = message.as_llm() else {
+        return Ok(format!("{message:?}"));
+    };
+    if matches!(
+        assistant.stop_reason,
+        StopReason::Error | StopReason::Aborted
+    ) {
+        anyhow::bail!(
+            "{}",
+            assistant
+                .error_message
+                .clone()
+                .unwrap_or_else(|| format!("assistant stopped with {:?}", assistant.stop_reason))
+        );
+    }
+    Ok(assistant
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            AssistantContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        trace: TraceArgs,
+    }
+
+    fn parse(args: &[&str]) -> Result<TraceArgs, clap::Error> {
+        Cli::try_parse_from(std::iter::once("loop").chain(args.iter().copied())).map(|c| c.trace)
+    }
+
+    #[test]
+    fn trace_flags_map_to_trace_attrs() {
+        let args = parse(&[
+            "--trace-name",
+            "swe-bench",
+            "--trace-tag",
+            "bench",
+            "--trace-tag",
+            "nightly",
+            "--trace-metadata",
+            "task_id=django-123",
+            "--trace-metadata",
+            "run=r1=a",
+            "--trace-env",
+            "benchmark",
+        ])
+        .unwrap();
+        let attrs = args.trace_attrs("sess-default");
+        assert_eq!(attrs.name.as_deref(), Some("swe-bench"));
+        assert_eq!(attrs.tags, vec!["bench", "nightly"]);
+        assert_eq!(attrs.metadata["task_id"], "django-123");
+        assert_eq!(attrs.metadata["run"], "r1=a");
+        assert_eq!(attrs.environment.as_deref(), Some("benchmark"));
+        assert_eq!(attrs.session_id.as_deref(), Some("sess-default"));
+        assert_eq!(attrs.release.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn trace_session_overrides_default() {
+        let attrs = parse(&["--trace-session", "run-7"])
+            .unwrap()
+            .trace_attrs("sess");
+        assert_eq!(attrs.session_id.as_deref(), Some("run-7"));
+    }
+
+    #[test]
+    fn malformed_metadata_is_rejected() {
+        assert!(parse(&["--trace-metadata", "novalue"]).is_err());
+        assert!(parse(&["--trace-metadata", "=x"]).is_err());
+    }
+
+    #[test]
+    fn final_text_joins_text_blocks_and_fails_on_error() {
+        let mut assistant = loop_ai::AssistantMessage {
+            content: vec![
+                AssistantContent::Text(loop_ai::TextContent {
+                    text: "hel".into(),
+                    text_signature: None,
+                }),
+                AssistantContent::Text(loop_ai::TextContent {
+                    text: "lo".into(),
+                    text_signature: None,
+                }),
+            ],
+            api: "faux".into(),
+            provider: "faux".into(),
+            model: "m".into(),
+            response_model: None,
+            response_id: None,
+            usage: Default::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            raw_stop_reason: None,
+            timestamp: 0,
+        };
+        assert_eq!(
+            final_text(&AgentMessage::assistant(assistant.clone())).unwrap(),
+            "hello"
+        );
+        assistant.stop_reason = StopReason::Error;
+        assistant.error_message = Some("rate limited".into());
+        let err = final_text(&AgentMessage::assistant(assistant)).unwrap_err();
+        assert_eq!(err.to_string(), "rate limited");
+    }
+}

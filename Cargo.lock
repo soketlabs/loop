@@ -4375,6 +4375,8 @@ dependencies = [
  "loop-app-core",
  "loop-mcp",
  "loop-orchestration",
+ "loop-telemetry",
+ "opentelemetry_sdk",
  "parking_lot",
  "pulldown-cmark",
  "ratatui",

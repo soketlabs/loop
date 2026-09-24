@@ -94,7 +94,9 @@ pub enum PickerView {
         hint: String,
     },
     Setup {
-        provider: String,
+        prompt: crate::secret_prompt::SecretPrompt,
+        /// First-run provider setup: esc quits instead of cancelling.
+        first_run: bool,
     },
     /// Accept / reject a pending tool (optional reject reason).
     FileReview {
@@ -916,32 +918,25 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
     }
     let lines = match picker {
         PickerView::None => Vec::new(),
-        PickerView::Setup { provider } => {
-            let env_hint = if provider == "soket" {
-                "SOKET_API_KEY / TENSORSTUDIO_API_KEY / LOOP_API_KEY".to_string()
-            } else {
-                format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"))
-            };
+        PickerView::Setup { prompt, first_run } => {
+            let esc = if prompt.esc_quits(*first_run) { "quit" } else { "cancel" };
             vec![
                 Line::from(vec![
                     Span::styled("  ◆ ".to_string(), theme.accent()),
                     Span::styled(
-                        format!("Connect to {provider}"),
+                        prompt.title(),
                         theme.style("text").add_modifier(Modifier::BOLD),
                     ),
                 ]),
                 Line::from(Span::styled(
-                    "    Paste your API key and press enter — input stays hidden".to_string(),
+                    format!("    {}", prompt.instructions()),
                     theme.muted(),
                 )),
                 Line::from(Span::styled(
-                    format!("    Tip: you can also set {env_hint} and restart"),
+                    format!("    Tip: you can also set {} and restart", prompt.env_hint()),
                     theme.dim(),
                 )),
-                Line::from(Span::styled(
-                    "    enter save · esc quit".to_string(),
-                    theme.dim(),
-                )),
+                Line::from(Span::styled(format!("    enter save · esc {esc}"), theme.dim())),
             ]
         }
         PickerView::Commands { rows, selected } => picker_lines(rows, *selected, theme, false),

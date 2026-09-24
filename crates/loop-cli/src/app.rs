@@ -27,7 +27,9 @@ use loop_ai::{
     ToolResultContent, Usage,
 };
 
-use crate::commands::{self, AutocompleteEntry, CommandEffect};
+use crate::commands::{self, AutocompleteEntry, CommandEffect, TracingCommand};
+use crate::config::describe_tracing_status;
+use crate::secret_prompt::SecretPrompt;
 use crate::keybindings::{hotkey_help, Action};
 use crate::{build_tools, mcp_server_entries, CliRuntime};
 use crate::theme::Theme;
@@ -373,8 +375,8 @@ async fn run_loop(
     let mut purge_ui_events = false;
     let mut last_width = terminal.size()?.width;
     let mut hide_thinking = runtime.settings.hide_thinking_block;
-    let mut pending_login: Option<String> = if runtime.needs_api_key_setup {
-        Some(SOKET_PROVIDER_ID.into())
+    let mut pending_secret: Option<SecretPrompt> = if runtime.needs_api_key_setup {
+        Some(SecretPrompt::ProviderKey(SOKET_PROVIDER_ID.into()))
     } else {
         None
     };
@@ -444,7 +446,7 @@ async fn run_loop(
 
         let ac_entries = if input.as_str().starts_with('/')
             && !input.as_str().contains(' ')
-            && pending_login.is_none()
+            && pending_secret.is_none()
             && model_picker.is_none()
             && fork_picker.is_none()
             && active_approval.is_none()
@@ -455,7 +457,7 @@ async fn run_loop(
             Vec::new()
         };
         let at_mention = if ac_entries.is_empty()
-            && pending_login.is_none()
+            && pending_secret.is_none()
             && model_picker.is_none()
             && fork_picker.is_none()
             && active_approval.is_none()
@@ -535,9 +537,10 @@ async fn run_loop(
                 hint: "Fork: edit this user message and continue (prior history kept)."
                     .into(),
             }
-        } else if let Some(provider) = &pending_login {
+        } else if let Some(prompt) = &pending_secret {
             PickerView::Setup {
-                provider: provider.clone(),
+                prompt: prompt.clone(),
+                first_run: runtime.needs_api_key_setup,
             }
         } else if !ac_entries.is_empty() {
             PickerView::Commands {
@@ -573,8 +576,8 @@ async fn run_loop(
             "↑↓ select · enter confirm · esc cancel".into()
         } else if fork_picker.is_some() {
             "↑↓ select · enter edit · esc cancel".into()
-        } else if pending_login.is_some() {
-            "setup · paste your API key · enter save".into()
+        } else if let Some(prompt) = &pending_secret {
+            prompt.status_hint().into()
         } else if !ac_entries.is_empty() {
             "↑↓ select · tab complete · enter run".into()
         } else if !file_ac_entries.is_empty() {
@@ -617,7 +620,7 @@ async fn run_loop(
         };
 
         let live: Vec<ChatItem> = chat[flushed..].to_vec();
-        let setup_mode = pending_login.is_some();
+        let setup_mode = pending_secret.is_some();
         if refresh_token_bar {
             token_bar.refresh(runtime).await;
             refresh_token_bar = false;
@@ -715,7 +718,7 @@ async fn run_loop(
                         &mut redraw_request,
                         &mut purge_ui_events,
                         &mut hide_thinking,
-                        &mut pending_login,
+                        &mut pending_secret,
                         &mut model_picker,
                         &mut fork_picker,
                         &mut active_approval,
@@ -1179,9 +1182,7 @@ fn drain_ui_events(
                 match result {
                     Ok(SandboxDoneOk::Off) => {
                         runtime.settings.sandbox.mode = "off".into();
-                        let _ = runtime.settings.save_file(
-                            &crate::config::paths::settings_path(&runtime.agent_dir),
-                        );
+                        let _ = runtime.save_settings();
                         chat.push(sys("sandbox → off"));
                         *status = "ready".into();
                     }
@@ -1192,9 +1193,7 @@ fn drain_ui_events(
                         runtime.settings.sandbox.mode = "local".into();
                         runtime.settings.sandbox.isolation = isolation.clone();
                         runtime.settings.sandbox.runtime = oci.clone();
-                        let _ = runtime.settings.save_file(
-                            &crate::config::paths::settings_path(&runtime.agent_dir),
-                        );
+                        let _ = runtime.save_settings();
                         chat.push(sys(format!("sandbox → local --{isolation} --{oci}")));
                         *status = "ready".into();
                     }
@@ -1548,7 +1547,7 @@ async fn handle_key(
     redraw_request: &mut bool,
     purge_ui_events: &mut bool,
     hide_thinking: &mut bool,
-    pending_login: &mut Option<String>,
+    pending_secret: &mut Option<SecretPrompt>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
     active_approval: &mut Option<ActiveApproval>,
@@ -1680,9 +1679,7 @@ async fn handle_key(
                             runtime.harness.set_model(m).await;
                             runtime.settings.default_provider = provider.into();
                             runtime.settings.default_model = model.into();
-                            let _ = runtime.settings.save_file(
-                                &crate::config::paths::settings_path(&runtime.agent_dir),
-                            );
+                            let _ = runtime.save_settings();
                             chat.push(sys(format!("model → {provider}/{model}")));
                         }
                     }
@@ -1828,19 +1825,22 @@ async fn handle_key(
         }
     }
 
-    if pending_login.is_some() {
+    if let Some(prompt) = pending_secret.clone() {
         if key.code == KeyCode::Esc
             || matches!(
                 runtime.keybindings.resolve(key),
                 Some(Action::Interrupt | Action::Clear)
             )
         {
-            if runtime.needs_api_key_setup {
+            if prompt.esc_quits(runtime.needs_api_key_setup) {
                 *should_quit = true;
             } else {
-                *pending_login = None;
+                *pending_secret = None;
                 input.clear();
-                *status = "login cancelled".into();
+                *status = match prompt {
+                    SecretPrompt::ProviderKey(_) => "login cancelled".into(),
+                    SecretPrompt::LangfuseSecret { .. } => "tracing setup cancelled".into(),
+                };
             }
             return Ok(());
         }
@@ -1848,33 +1848,43 @@ async fn handle_key(
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && !key.modifiers.contains(KeyModifiers::CONTROL);
         if plain_enter {
-            let provider = pending_login
-                .take()
-                .unwrap_or_else(|| SOKET_PROVIDER_ID.into());
+            *pending_secret = None;
             let key_val = input.as_str().trim().to_string();
             input.clear();
             if key_val.is_empty() {
-                *pending_login = Some(provider);
+                *pending_secret = Some(prompt);
                 *status = "empty key".into();
-            } else {
-                runtime
-                    .credentials
-                    .set(&provider, Credential::api_key(key_val));
-                let _ = runtime
-                    .models
-                    .refresh(ModelsRefreshOptions {
-                        allow_network: Some(true),
-                        force: true,
-                        provider_id: Some(provider.clone()),
-                    })
-                    .await;
-                runtime.needs_api_key_setup = false;
-                chat.clear();
-                chat.push(sys(format!(
-                    "✓ API key saved for {provider} — you're all set. Type /help for commands."
-                )));
-                *status = "ready · /help for commands".into();
+                return Ok(());
             }
+            let provider = match prompt {
+                SecretPrompt::ProviderKey(provider) => provider,
+                SecretPrompt::LangfuseSecret { host, public_key } => {
+                    let line = match runtime.setup_tracing(&host, &public_key, &key_val) {
+                        Ok(status) => format!("✓ {}", describe_tracing_status(&status)),
+                        Err(err) => format!("tracing setup failed: {err:#}"),
+                    };
+                    chat.push(sys(line));
+                    *status = "ready".into();
+                    return Ok(());
+                }
+            };
+            runtime
+                .credentials
+                .set(&provider, Credential::api_key(key_val));
+            let _ = runtime
+                .models
+                .refresh(ModelsRefreshOptions {
+                    allow_network: Some(true),
+                    force: true,
+                    provider_id: Some(provider.clone()),
+                })
+                .await;
+            runtime.needs_api_key_setup = false;
+            chat.clear();
+            chat.push(sys(format!(
+                "✓ API key saved for {provider} — you're all set. Type /help for commands."
+            )));
+            *status = "ready · /help for commands".into();
             return Ok(());
         }
         match runtime.keybindings.resolve(key) {
@@ -2011,7 +2021,7 @@ async fn handle_key(
                             chat,
                             status,
                             turn_step,
-                            pending_login,
+                            pending_secret,
                             model_picker,
                             fork_picker,
                             hide_thinking,
@@ -2713,13 +2723,40 @@ fn upsert_tool(
     }
 }
 
+/// `/tracing …`: returns the line to show in the transcript.
+fn apply_tracing_command(
+    command: TracingCommand,
+    runtime: &mut CliRuntime,
+    pending_secret: &mut Option<SecretPrompt>,
+    status: &mut String,
+) -> String {
+    let result = match command {
+        TracingCommand::Status => runtime
+            .tracing_status()
+            .ok_or_else(|| anyhow::anyhow!("tracing is not available in this mode")),
+        TracingCommand::Enable => runtime.set_tracing_enabled(true),
+        TracingCommand::Disable => runtime.set_tracing_enabled(false),
+        TracingCommand::Setup { host, public_key } => {
+            let prompt = SecretPrompt::LangfuseSecret { host, public_key };
+            *status = prompt.status_hint().into();
+            let title = prompt.title();
+            *pending_secret = Some(prompt);
+            return format!("{title} — paste the secret key below");
+        }
+    };
+    match result {
+        Ok(state) => describe_tracing_status(&state),
+        Err(err) => format!("tracing: {err:#}"),
+    }
+}
+
 async fn apply_effect(
     effect: CommandEffect,
     runtime: &mut CliRuntime,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     turn_step: &mut String,
-    pending_login: &mut Option<String>,
+    pending_secret: &mut Option<SecretPrompt>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
     hide_thinking: &mut bool,
@@ -2765,9 +2802,7 @@ async fn apply_effect(
                 Ok(t) => {
                     runtime.theme = t;
                     runtime.settings.theme = name.clone();
-                    let _ = runtime
-                        .settings
-                        .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
+                    let _ = runtime.save_settings();
                     chat.push(sys(format!("theme → {name}")));
                     // Reprint scrollback so already-flushed messages pick up the new colors.
                     *redraw_request = true;
@@ -2788,9 +2823,7 @@ async fn apply_effect(
                 runtime.harness.set_model(m).await;
                 runtime.settings.default_provider = provider.clone();
                 runtime.settings.default_model = model.clone();
-                let _ = runtime
-                    .settings
-                    .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
+                let _ = runtime.save_settings();
                 chat.push(sys(format!("model → {provider}/{model}")));
                 token_bar.sync_window(runtime);
             } else {
@@ -2900,9 +2933,12 @@ async fn apply_effect(
                 }
             }
         }
+        CommandEffect::Tracing(command) => {
+            chat.push(sys(apply_tracing_command(command, runtime, pending_secret, status)));
+        }
         CommandEffect::Login(provider) => {
             let p = provider.unwrap_or_else(|| SOKET_PROVIDER_ID.into());
-            *pending_login = Some(p.clone());
+            *pending_secret = Some(SecretPrompt::ProviderKey(p.clone()));
             *status = format!("setup · paste API key for {p}");
         }
         CommandEffect::Logout(provider) => {
@@ -3003,9 +3039,7 @@ async fn apply_effect(
                             &runtime.settings.tool_permissions,
                         ));
                     }
-                    let _ = runtime
-                        .settings
-                        .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
+                    let _ = runtime.save_settings();
                     chat.push(sys(format!(
                         "tool approval → {} (this session: {})",
                         policy.as_str(),
@@ -3034,9 +3068,7 @@ async fn apply_effect(
                     Ok(ms) => {
                         runtime.settings.response_header_timeout_ms = ms;
                         runtime.harness.set_response_header_timeout_ms(ms).await;
-                        let _ = runtime
-                            .settings
-                            .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
+                        let _ = runtime.save_settings();
                         let label = if ms == 0 {
                             "off (unlimited — for long-running workflows)".into()
                         } else if ms % 1000 == 0 {

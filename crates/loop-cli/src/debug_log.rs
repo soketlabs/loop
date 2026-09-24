@@ -5,7 +5,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use tracing_subscriber::EnvFilter;
+use loop_telemetry::TelemetryHandle;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt, EnvFilter, Layer};
 
 /// Whether debug mode is enabled via `--debug` or `LOOP_DEBUG=1`.
 pub fn debug_enabled(cli_flag: bool) -> bool {
@@ -21,8 +24,14 @@ pub fn debug_enabled(cli_flag: bool) -> bool {
 /// Initialize tracing. In debug mode, writes session logs under `cwd/target/debug/logs`.
 ///
 /// Interactive TUI mode writes **file only** (stderr would corrupt the UI). Non-interactive
-/// mode tees to stderr as well.
-pub fn init_tracing(debug: bool, cwd: &Path, interactive: bool) -> anyhow::Result<Option<PathBuf>> {
+/// mode tees to stderr as well. `telemetry`'s layer exports observation spans to Langfuse
+/// independently of the log filter.
+pub fn init_tracing(
+    debug: bool,
+    cwd: &Path,
+    interactive: bool,
+    telemetry: &TelemetryHandle,
+) -> anyhow::Result<Option<PathBuf>> {
     let default_filter = if debug {
         "info,loop_agent=debug,loop_ai=debug,loop_cli=debug,loop_app_core=debug,loop_mcp=debug"
     } else {
@@ -31,15 +40,40 @@ pub fn init_tracing(debug: bool, cwd: &Path, interactive: bool) -> anyhow::Resul
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
-    if !debug {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
+    let (log_layer, path) = if debug {
+        let (writer, path) = debug_log_writer(cwd, interactive)?;
+        let layer = fmt::layer()
+            .with_writer(Mutex::new(writer))
+            .with_ansi(false)
+            .with_target(true)
+            .with_thread_ids(true)
+            .boxed();
+        (layer, Some(path))
+    } else {
+        let layer = fmt::layer()
             .with_writer(io::stderr)
             .with_target(true)
-            .init();
-        return Ok(None);
-    }
+            .boxed();
+        (layer, None)
+    };
 
+    tracing_subscriber::registry()
+        .with(telemetry.layer())
+        .with(log_layer.with_filter(filter))
+        .init();
+
+    if let Some(path) = &path {
+        tracing::info!(
+            path = %path.display(),
+            interactive,
+            "debug logging enabled"
+        );
+    }
+    Ok(path)
+}
+
+/// Log file under `cwd/target/debug/logs`, teed to stderr when not interactive.
+fn debug_log_writer(cwd: &Path, interactive: bool) -> anyhow::Result<(Box<dyn Write + Send>, PathBuf)> {
     let log_dir = cwd.join("target").join("debug").join("logs");
     fs::create_dir_all(&log_dir)?;
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
@@ -56,21 +90,7 @@ pub fn init_tracing(debug: bool, cwd: &Path, interactive: bool) -> anyhow::Resul
             file: Mutex::new(file),
         })
     };
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(Mutex::new(writer))
-        .with_ansi(false)
-        .with_target(true)
-        .with_thread_ids(true)
-        .init();
-
-    tracing::info!(
-        path = %path.display(),
-        interactive,
-        "debug logging enabled"
-    );
-    Ok(Some(path))
+    Ok((writer, path))
 }
 
 /// Append a raw session note to an existing debug log file (best-effort).

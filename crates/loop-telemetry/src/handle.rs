@@ -33,6 +33,8 @@ pub struct TelemetryStatus {
     pub host: Option<String>,
     /// Where the installed credentials came from.
     pub source: Option<CredentialSource>,
+    /// Error from the most recent failed export, if the last export failed.
+    pub last_error: Option<String>,
 }
 
 impl TelemetryStatus {
@@ -128,6 +130,7 @@ impl TelemetryHandle {
             enabled: self.enabled.load(Ordering::Acquire),
             source: destination.as_ref().map(|(_, s)| *s),
             host: destination.map(|(h, _)| h),
+            last_error: self.slot.last_error(),
         }
     }
 
