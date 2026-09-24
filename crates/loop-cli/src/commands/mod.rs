@@ -27,6 +27,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: Some("[status|off|local [--full|--partial] [--crun|--runc|--runsc|--krun]]"),
         },
         SlashCommand {
+            name: "tracing",
+            description: "Langfuse tracing status, on/off, or setup",
+            args_hint: Some("[status|enable|disable|setup [langfuse|otlp]]"),
+        },
+        SlashCommand {
             name: "settings",
             description: "Open settings overview",
             args_hint: None,
@@ -313,6 +318,8 @@ pub enum CommandEffect {
     SelectModel(Option<String>),
     /// Sandbox mode change.
     SetSandbox(String),
+    /// Langfuse tracing control.
+    Tracing(TracingCommand),
     /// Login flow.
     Login(Option<String>),
     /// Logout.
@@ -386,6 +393,43 @@ pub enum CommandEffect {
     },
 }
 
+use loop_app_core::config::TracingBackend;
+
+/// `/tracing` subcommands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TracingCommand {
+    /// Show whether traces are exported, and where.
+    Status,
+    /// Turn exporting on (persisted).
+    Enable,
+    /// Turn exporting off (persisted).
+    Disable,
+    /// Open the setup wizard, optionally skipping the backend picker.
+    Setup {
+        /// Backend chosen on the command line.
+        backend: Option<TracingBackend>,
+    },
+}
+
+const TRACING_USAGE: &str =
+    "Usage: /tracing [status|enable|disable|setup [langfuse|otlp]] — setup opens a guided wizard";
+
+/// Parse `/tracing` arguments; `Err` carries the usage text.
+pub fn parse_tracing(args: &str) -> Result<TracingCommand, String> {
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [] | ["status"] => Ok(TracingCommand::Status),
+        ["enable" | "on"] => Ok(TracingCommand::Enable),
+        ["disable" | "off"] => Ok(TracingCommand::Disable),
+        ["setup"] => Ok(TracingCommand::Setup { backend: None }),
+        ["setup", backend] => TracingBackend::parse(backend)
+            .map(|backend| TracingCommand::Setup {
+                backend: Some(backend),
+            })
+            .ok_or_else(|| TRACING_USAGE.to_string()),
+        _ => Err(TRACING_USAGE.into()),
+    }
+}
+
 /// Dispatch a built-in or dynamic command to an effect.
 pub fn dispatch(cmd: &ParsedCommand, skill_names: &[String], template_names: &[String]) -> CommandEffect {
     match cmd.name.as_str() {
@@ -398,6 +442,10 @@ pub fn dispatch(cmd: &ParsedCommand, skill_names: &[String], template_names: &[S
             }
         }
         "sandbox" => CommandEffect::SetSandbox(cmd.args.clone()),
+        "tracing" => match parse_tracing(&cmd.args) {
+            Ok(command) => CommandEffect::Tracing(command),
+            Err(usage) => CommandEffect::Status(usage),
+        },
         "model" => CommandEffect::SelectModel(if cmd.args.is_empty() {
             None
         } else {

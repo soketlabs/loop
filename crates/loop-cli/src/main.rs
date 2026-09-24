@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use loop_cli::print_mode::{self, TraceArgs};
 use loop_cli::{bootstrap_cli, config, debug_log, BootstrapOpts};
+use loop_telemetry::TelemetryHandle;
 
 /// Loop — interactive coding agent by Soket AI.
 #[derive(Debug, Parser)]
@@ -62,6 +64,9 @@ struct Cli {
     #[arg(long)]
     mcp_token: Option<String>,
 
+    #[command(flatten)]
+    trace: TraceArgs,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -90,7 +95,9 @@ async fn real_main() -> anyhow::Result<()> {
 
     let debug = debug_log::debug_enabled(cli.debug);
     let interactive = cli.print.is_none() && !cli.serve_mcp && cli.command.is_none();
-    let debug_log_path = debug_log::init_tracing(debug, &cwd, interactive)?;
+    // Exports nothing until Langfuse credentials are attached below.
+    let telemetry = TelemetryHandle::new(env!("CARGO_PKG_VERSION"), true);
+    let debug_log_path = debug_log::init_tracing(debug, &cwd, interactive, &telemetry)?;
 
     if let Some(Commands::Config) = cli.command {
         let agent = config::paths::get_agent_dir();
@@ -133,45 +140,17 @@ async fn real_main() -> anyhow::Result<()> {
     .await?;
     runtime.debug = debug;
     runtime.debug_log_path = debug_log_path;
-
-    if cli.serve_mcp {
-        return loop_cli::mcp_serve::run_mcp_server(runtime.inner, cli.mcp_port, cli.mcp_token).await;
+    if let Err(err) = runtime.attach_telemetry(telemetry.clone()) {
+        tracing::warn!(error = %err, "Langfuse tracing disabled");
     }
 
-    if let Some(prompt) = cli.print {
-        let msg = runtime.harness.prompt(prompt).await?;
-        if let Some(a) = msg.as_assistant() {
-            if matches!(
-                a.stop_reason,
-                loop_ai::StopReason::Error | loop_ai::StopReason::Aborted
-            ) {
-                anyhow::bail!(
-                    "{}",
-                    a.error_message
-                        .clone()
-                        .unwrap_or_else(|| format!("assistant stopped with {:?}", a.stop_reason))
-                );
-            }
-        }
-        if let Some(text) = msg.as_llm().and_then(|m| match m {
-            loop_ai::Message::Assistant(a) => Some(
-                a.content
-                    .iter()
-                    .filter_map(|b| match b {
-                        loop_ai::AssistantContent::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(""),
-            ),
-            _ => None,
-        }) {
-            println!("{text}");
-        } else {
-            println!("{msg:?}");
-        }
-        return Ok(());
-    }
-
-    loop_cli::app::run(runtime).await
+    let result = if cli.serve_mcp {
+        loop_cli::mcp_serve::run_mcp_server(runtime.inner, cli.mcp_port, cli.mcp_token).await
+    } else if let Some(prompt) = cli.print {
+        print_mode::run_print(&runtime, prompt, &cli.trace).await
+    } else {
+        loop_cli::app::run(runtime).await
+    };
+    print_mode::shutdown_telemetry(&telemetry).await;
+    result
 }

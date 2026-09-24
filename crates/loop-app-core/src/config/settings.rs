@@ -6,6 +6,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::paths::{get_project_dir, settings_path};
+use super::tracing::TracingSettings;
 use loop_ai::providers::{SOKET_DEFAULT_MODEL_ID, SOKET_PROVIDER_ID};
 
 /// Compaction settings subset.
@@ -185,6 +186,9 @@ pub struct Settings {
     /// workflows / slow models). Esc still aborts the turn.
     #[serde(default = "default_response_header_timeout_ms")]
     pub response_header_timeout_ms: u64,
+    /// Langfuse tracing (global only; see [`TracingSettings`]).
+    #[serde(default)]
+    pub tracing: TracingSettings,
 }
 
 fn default_provider() -> String {
@@ -243,6 +247,7 @@ impl Default for Settings {
             default_project_trust: default_trust(),
             mcp_servers: BTreeMap::new(),
             response_header_timeout_ms: default_response_header_timeout_ms(),
+            tracing: TracingSettings::default(),
         }
     }
 }

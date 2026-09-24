@@ -21,6 +21,7 @@ loop-ai = { workspace = true }
 loop-agent = { workspace = true, features = ["mcp"] }
 loop-orchestration = { workspace = true, optional = true }
 loop-mcp = { workspace = true }
+loop-telemetry = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -57,4 +58,5 @@ rmcp = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

@@ -71,6 +71,61 @@ pub struct Runtime {
     pub mcp_client: Arc<loop_mcp::McpClientManager>,
     /// Skills activated via `/skill:name` (not yet cleared; mirrored on the harness).
     pub active_skills: Vec<String>,
+    /// Process telemetry, when the host application installed it.
+    pub telemetry: Option<loop_telemetry::TelemetryHandle>,
+}
+
+impl Runtime {
+    /// Persist the current settings to the global settings file.
+    pub fn save_settings(&self) -> anyhow::Result<()> {
+        self.settings.save_file(&settings_path(&self.agent_dir))
+    }
+
+    /// Take ownership of the process telemetry and apply saved tracing settings.
+    pub fn attach_telemetry(
+        &mut self,
+        handle: loop_telemetry::TelemetryHandle,
+    ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
+        self.telemetry = Some(handle);
+        self.tracing_control()?.apply()
+    }
+
+    /// Current tracing state, if telemetry is attached.
+    pub fn tracing_status(&self) -> Option<loop_telemetry::TelemetryStatus> {
+        self.telemetry.as_ref().map(|t| t.status())
+    }
+
+    /// `/tracing enable|disable`, persisted to global settings.
+    pub fn set_tracing_enabled(
+        &mut self,
+        enabled: bool,
+    ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
+        let status = self.tracing_control()?.set_enabled(enabled);
+        self.save_settings()?;
+        Ok(status)
+    }
+
+    /// `/tracing setup`, persisted to global settings and the credential store.
+    pub fn setup_tracing(
+        &mut self,
+        request: &crate::config::TracingSetupRequest,
+    ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
+        let status = self.tracing_control()?.setup(request)?;
+        self.save_settings()?;
+        Ok(status)
+    }
+
+    fn tracing_control(&mut self) -> anyhow::Result<crate::config::TracingControl<'_>> {
+        let handle = self
+            .telemetry
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("tracing is not available in this mode"))?;
+        Ok(crate::config::TracingControl {
+            settings: &mut self.settings.tracing,
+            store: self.credentials.as_ref(),
+            handle,
+        })
+    }
 }
 
 /// CLI bootstrap flags affecting runtime.
@@ -508,6 +563,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         tool_approval: None,
         mcp_client,
         active_skills: Vec::new(),
+        telemetry: None,
     })
 }
 

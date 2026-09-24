@@ -94,7 +94,9 @@ pub enum PickerView {
         hint: String,
     },
     Setup {
-        provider: String,
+        prompt: crate::setup_prompt::SetupPrompt,
+        /// First-run provider setup: esc quits instead of cancelling.
+        first_run: bool,
     },
     /// Accept / reject a pending tool (optional reject reason).
     FileReview {
@@ -124,6 +126,8 @@ pub struct FooterOpts<'a> {
     pub picker: &'a PickerView,
     pub setup_mode: bool,
     pub mask_input: bool,
+    /// Placeholder for the empty input line in setup mode.
+    pub setup_placeholder: &'a str,
     /// Left status (e.g. `~/loop (main)`).
     pub path_line: &'a str,
     /// Right status (e.g. `soket/qwen3-30b · medium`).
@@ -891,7 +895,7 @@ fn draw_input(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
     let placeholder = if !display.is_empty() {
         ""
     } else if opts.setup_mode {
-        " paste your API key"
+        opts.setup_placeholder
     } else {
         " Type a message · / for commands · @ for files"
     };
@@ -916,34 +920,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
     }
     let lines = match picker {
         PickerView::None => Vec::new(),
-        PickerView::Setup { provider } => {
-            let env_hint = if provider == "soket" {
-                "SOKET_API_KEY / TENSORSTUDIO_API_KEY / LOOP_API_KEY".to_string()
-            } else {
-                format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"))
-            };
-            vec![
-                Line::from(vec![
-                    Span::styled("  ◆ ".to_string(), theme.accent()),
-                    Span::styled(
-                        format!("Connect to {provider}"),
-                        theme.style("text").add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(Span::styled(
-                    "    Paste your API key and press enter — input stays hidden".to_string(),
-                    theme.muted(),
-                )),
-                Line::from(Span::styled(
-                    format!("    Tip: you can also set {env_hint} and restart"),
-                    theme.dim(),
-                )),
-                Line::from(Span::styled(
-                    "    enter save · esc quit".to_string(),
-                    theme.dim(),
-                )),
-            ]
-        }
+        PickerView::Setup { prompt, first_run } => setup_lines(prompt, *first_run, theme),
         PickerView::Commands { rows, selected } => picker_lines(rows, *selected, theme, false),
         PickerView::Models { rows, selected, hint } => {
             let mut out = vec![Line::from(Span::styled(hint.clone(), theme.style("warning")))];
@@ -993,6 +970,68 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
         }
     };
     frame.render_widget(Paragraph::new(lines).style(theme.page()), area);
+}
+
+/// Setup box: title, instructions, optional choice rows, env hint and key help.
+fn setup_lines(
+    prompt: &crate::setup_prompt::SetupPrompt,
+    first_run: bool,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  ◆ ".to_string(), theme.accent()),
+            Span::styled(
+                prompt.title(),
+                theme.style("text").add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!("    {}", prompt.instructions()),
+            theme.muted(),
+        )),
+    ];
+    if let Some((rows, selected)) = prompt.options() {
+        for (i, (label, description)) in rows.into_iter().enumerate() {
+            let (marker, label_style) = if i == selected {
+                ("  ▸ ", theme.accent().add_modifier(Modifier::BOLD))
+            } else {
+                ("    ", theme.style("text"))
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker.to_string(), theme.accent()),
+                Span::styled(format!("{label:<16}"), label_style),
+                Span::styled(description.to_string(), theme.dim()),
+            ]));
+        }
+    }
+    if let Some(env_hint) = prompt.env_hint() {
+        lines.push(Line::from(Span::styled(
+            format!("    Tip: you can also set {env_hint} and restart"),
+            theme.dim(),
+        )));
+    }
+    let esc = if prompt.esc_quits(first_run) {
+        "quit"
+    } else {
+        "cancel"
+    };
+    let keys = if prompt.options().is_some() {
+        format!("    ↑↓ choose · enter continue · esc {esc}")
+    } else if prompt.masked() {
+        // Masked prompts are the last step (API key, secret, auth header).
+        format!("    enter save · esc {esc}")
+    } else {
+        format!("    enter next · esc {esc}")
+    };
+    lines.push(Line::from(Span::styled(keys, theme.dim())));
+    lines
+}
+
+/// Height of [`setup_lines`] without rendering it.
+fn setup_line_count(prompt: &crate::setup_prompt::SetupPrompt, _first_run: bool) -> u16 {
+    let rows = prompt.options().map_or(0, |(rows, _)| rows.len());
+    (3 + rows + usize::from(prompt.env_hint().is_some())) as u16
 }
 
 fn picker_lines(
@@ -1161,7 +1200,9 @@ pub fn format_token_usage_line(
 fn picker_height(picker: &PickerView) -> u16 {
     match picker {
         PickerView::None => 0,
-        PickerView::Setup { .. } => 4,
+        PickerView::Setup { prompt, first_run } => {
+            setup_line_count(prompt, *first_run)
+        }
         PickerView::FileReview { .. } => 6,
         PickerView::Commands { rows, .. } => {
             let n = rows.len().min(PICKER_PAGE) as u16;
@@ -1850,6 +1891,67 @@ mod tests {
             lines.iter().any(|l| l.to_string().contains("thought 249")),
             "last thinking line should remain visible"
         );
+    }
+
+    #[test]
+    fn setup_box_height_matches_rendered_lines() {
+        use crate::setup_prompt::SetupPrompt;
+        use crate::tracing_setup::TracingSetup;
+        use loop_app_core::config::TracingSettings;
+
+        let theme = Theme::dark();
+        let saved = TracingSettings::default();
+        let (picker, _) = TracingSetup::start(None, &saved);
+        let host = TracingSetup::LangfuseHost;
+        let otlp = TracingSetup::OtlpEndpoint;
+        for prompt in [
+            SetupPrompt::ProviderKey("soket".into()),
+            SetupPrompt::Tracing(picker),
+            SetupPrompt::Tracing(host),
+            SetupPrompt::Tracing(otlp),
+        ] {
+            let rendered = setup_lines(&prompt, false, &theme).len() as u16;
+            assert_eq!(setup_line_count(&prompt, false), rendered, "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn tracing_picker_marks_selected_backend() {
+        use crate::setup_prompt::SetupPrompt;
+        use crate::tracing_setup::TracingSetup;
+
+        let theme = Theme::dark();
+        let lines = setup_lines(
+            &SetupPrompt::Tracing(TracingSetup::Choose { selected: 1 }),
+            false,
+            &theme,
+        );
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(text.iter().any(|l| l.contains("Langfuse") && !l.contains('▸')));
+        assert!(text.iter().any(|l| l.contains("▸") && l.contains("OTLP endpoint")));
+        assert!(text.last().unwrap().contains("↑↓ choose"));
+    }
+
+    #[test]
+    fn setup_hint_says_next_until_the_final_masked_step() {
+        use crate::setup_prompt::SetupPrompt;
+        use crate::tracing_setup::TracingSetup;
+
+        let theme = Theme::dark();
+        let last_line = |prompt: SetupPrompt| -> String {
+            let lines = setup_lines(&prompt, false, &theme);
+            lines.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        assert!(last_line(SetupPrompt::Tracing(TracingSetup::LangfuseHost)).contains("enter next"));
+        let secret = TracingSetup::LangfuseSecret {
+            host: "h".into(),
+            public_key: "p".into(),
+        };
+        assert!(last_line(SetupPrompt::Tracing(secret)).contains("enter save"));
+        assert!(last_line(SetupPrompt::ProviderKey("soket".into())).contains("enter save"));
     }
 
     #[test]
