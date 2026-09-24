@@ -17,8 +17,8 @@ use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
-use crate::credentials::{CredentialSource, TelemetryCredentials};
-use crate::exporter::{langfuse_exporter, ExporterSlot};
+use crate::credentials::{CredentialSource, TelemetryDestination};
+use crate::exporter::{otlp_exporter, ExporterSlot};
 use crate::obs::SPAN_TARGET;
 
 /// Instrumentation scope name reported to the backend.
@@ -34,8 +34,8 @@ const MAX_EXPORT_BATCH_SIZE: usize = 8;
 pub struct TelemetryStatus {
     /// User preference (`settings.tracing.enabled`).
     pub enabled: bool,
-    /// Host of the installed destination, if any.
-    pub host: Option<String>,
+    /// Description of the installed destination, if any.
+    pub destination: Option<String>,
     /// Where the installed credentials came from.
     pub source: Option<CredentialSource>,
     /// Error from the most recent failed export, if the last export failed.
@@ -45,7 +45,7 @@ pub struct TelemetryStatus {
 impl TelemetryStatus {
     /// Spans are exported only when a destination exists and the user has not disabled it.
     pub fn active(&self) -> bool {
-        self.enabled && self.host.is_some()
+        self.enabled && self.destination.is_some()
     }
 }
 
@@ -110,10 +110,10 @@ impl TelemetryHandle {
             .with_filter(self.gate.clone())
     }
 
-    /// Start exporting to a Langfuse project.
-    pub fn install(&self, creds: &TelemetryCredentials) -> anyhow::Result<()> {
-        let exporter = langfuse_exporter(creds)?;
-        self.install_exporter(exporter, creds.host.clone(), creds.source);
+    /// Start exporting to `destination`.
+    pub fn install(&self, destination: &TelemetryDestination) -> anyhow::Result<()> {
+        let exporter = otlp_exporter(destination)?;
+        self.install_exporter(exporter, destination.label.clone(), destination.source);
         Ok(())
     }
 
@@ -121,11 +121,11 @@ impl TelemetryHandle {
     pub fn install_exporter<E: SpanExporter + 'static>(
         &self,
         exporter: E,
-        host: String,
+        label: String,
         source: CredentialSource,
     ) {
         self.slot.install(exporter);
-        *self.destination.lock() = Some((host, source));
+        *self.destination.lock() = Some((label, source));
         self.refresh_gate();
     }
 
@@ -142,7 +142,7 @@ impl TelemetryHandle {
         TelemetryStatus {
             enabled: self.enabled.load(Ordering::Acquire),
             source: destination.as_ref().map(|(_, s)| *s),
-            host: destination.map(|(h, _)| h),
+            destination: destination.map(|(label, _)| label),
             last_error: self.slot.last_error(),
         }
     }

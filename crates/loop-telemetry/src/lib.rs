@@ -11,6 +11,6 @@ mod exporter;
 mod handle;
 pub mod obs;
 
-pub use credentials::{CredentialSource, TelemetryCredentials};
+pub use credentials::{CredentialSource, TelemetryCredentials, TelemetryDestination};
 pub use handle::{TelemetryHandle, TelemetryStatus};
 pub use obs::{ObservationExt, TraceAttrs};

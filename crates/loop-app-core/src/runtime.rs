@@ -108,11 +108,9 @@ impl Runtime {
     /// `/tracing setup`, persisted to global settings and the credential store.
     pub fn setup_tracing(
         &mut self,
-        host: &str,
-        public_key: &str,
-        secret_key: &str,
+        request: &crate::config::TracingSetupRequest,
     ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
-        let status = self.tracing_control()?.setup(host, public_key, secret_key)?;
+        let status = self.tracing_control()?.setup(request)?;
         self.save_settings()?;
         Ok(status)
     }

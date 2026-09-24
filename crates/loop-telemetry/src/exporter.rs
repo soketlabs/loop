@@ -16,10 +16,8 @@ use opentelemetry_sdk::trace::{SpanData, SpanExporter};
 use opentelemetry_sdk::Resource;
 use parking_lot::RwLock;
 
-use crate::credentials::TelemetryCredentials;
+use crate::credentials::TelemetryDestination;
 
-/// Langfuse ingestion API version header.
-const LANGFUSE_INGESTION_VERSION: (&str, &str) = ("x-langfuse-ingestion-version", "4");
 /// Upper bound for one export request.
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -118,21 +116,15 @@ impl ExporterSlot {
     }
 }
 
-/// Build the OTLP/HTTP (protobuf) exporter for a Langfuse project.
-pub(crate) fn langfuse_exporter(
-    creds: &TelemetryCredentials,
+/// Build the OTLP/HTTP (protobuf) exporter for a destination.
+pub(crate) fn otlp_exporter(
+    destination: &TelemetryDestination,
 ) -> Result<opentelemetry_otlp::SpanExporter, opentelemetry_otlp::ExporterBuildError> {
-    let headers = HashMap::from([
-        ("Authorization".to_string(), creds.authorization()),
-        (
-            LANGFUSE_INGESTION_VERSION.0.to_string(),
-            LANGFUSE_INGESTION_VERSION.1.to_string(),
-        ),
-    ]);
+    let headers: HashMap<String, String> = destination.headers.iter().cloned().collect();
     opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(creds.traces_endpoint())
+        .with_endpoint(destination.endpoint.clone())
         .with_headers(headers)
         .with_timeout(EXPORT_TIMEOUT)
         .build()

@@ -2,6 +2,7 @@
 
 use loop_cli::config::paths::{auth_path, settings_path, ENV_AGENT_DIR, ENV_SESSION_DIR};
 use loop_cli::config::settings::Settings;
+use loop_cli::config::TracingSetupRequest;
 use loop_cli::{bootstrap_cli, BootstrapOpts};
 use loop_telemetry::{CredentialSource, TelemetryHandle};
 
@@ -40,7 +41,7 @@ async fn tracing_commands_persist_to_settings_and_auth() {
     let status = runtime
         .attach_telemetry(TelemetryHandle::new("test", true))
         .unwrap();
-    assert!(status.host.is_none() && !status.active());
+    assert!(status.destination.is_none() && !status.active());
 
     let status = runtime.set_tracing_enabled(false).unwrap();
     assert!(!status.enabled);
@@ -48,7 +49,11 @@ async fn tracing_commands_persist_to_settings_and_auth() {
     assert!(!saved.tracing.enabled);
 
     let status = runtime
-        .setup_tracing("https://lf.example", "pk-lf-1", "sk-lf-secret")
+        .setup_tracing(&TracingSetupRequest::Langfuse {
+            host: "https://lf.example".into(),
+            public_key: "pk-lf-1".into(),
+            secret_key: "sk-lf-secret".into(),
+        })
         .unwrap();
     assert!(status.active());
     assert_eq!(status.source, Some(CredentialSource::Config));
@@ -85,6 +90,9 @@ async fn tracing_commands_persist_to_settings_and_auth() {
     let status = again
         .attach_telemetry(TelemetryHandle::new("test", true))
         .unwrap();
-    assert_eq!(status.host.as_deref(), Some("https://lf.example"));
+    assert_eq!(
+        status.destination.as_deref(),
+        Some("Langfuse · https://lf.example")
+    );
     assert!(status.active());
 }
