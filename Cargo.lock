@@ -4369,6 +4369,7 @@ dependencies = [
  "loop-ai",
  "loop-app-core",
  "loop-mcp",
+ "loop-orchestration",
  "parking_lot",
  "pulldown-cmark",
  "ratatui",

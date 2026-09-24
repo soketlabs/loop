@@ -117,6 +117,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: Some("[newSession|always|never]"),
         },
         SlashCommand {
+            name: "ttfb",
+            description: "Model response-header wait (off for long-running)",
+            args_hint: Some("[off|on|60s|120000]"),
+        },
+        SlashCommand {
             name: "compact",
             description: "Compact conversation context",
             args_hint: Some("[prompt]"),
@@ -150,6 +155,12 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             name: "help",
             description: "List commands",
             args_hint: None,
+        },
+        #[cfg(feature = "orchestration")]
+        SlashCommand {
+            name: "workflow",
+            description: "Run a multi-agent workflow from a goal",
+            args_hint: Some("<goal>"),
         },
     ]
 }
@@ -310,6 +321,8 @@ pub enum CommandEffect {
     NewSession,
     /// File edit review policy.
     SetFileReview(Option<String>),
+    /// Response-header (TTFB) timeout: `None` shows current; `Some` sets it.
+    SetResponseHeaderTimeout(Option<String>),
     /// Compact.
     Compact(Option<String>),
     /// Copy last assistant.
@@ -348,6 +361,14 @@ pub enum CommandEffect {
     CloneSession,
     /// MCP sub-command.
     Mcp(String),
+    /// Multi-agent workflow from a goal string.
+    #[cfg(feature = "orchestration")]
+    Workflow {
+        /// Goal description.
+        goal: String,
+        /// Optional concurrency override.
+        concurrency: Option<usize>,
+    },
     /// Skill invoke.
     /// Skill activate (does not send a prompt).
     Skill {
@@ -398,6 +419,11 @@ pub fn dispatch(cmd: &ParsedCommand, skill_names: &[String], template_names: &[S
         } else {
             Some(cmd.args.clone())
         }),
+        "ttfb" => CommandEffect::SetResponseHeaderTimeout(if cmd.args.is_empty() {
+            None
+        } else {
+            Some(cmd.args.clone())
+        }),
         "compact" => CommandEffect::Compact(if cmd.args.is_empty() {
             None
         } else {
@@ -435,6 +461,15 @@ pub fn dispatch(cmd: &ParsedCommand, skill_names: &[String], template_names: &[S
         "fork" => CommandEffect::Fork,
         "clone" => CommandEffect::CloneSession,
         "mcp" => CommandEffect::Mcp(cmd.args.clone()),
+        #[cfg(feature = "orchestration")]
+        "workflow" => {
+            if cmd.args.is_empty() {
+                CommandEffect::Status("Usage: /workflow <goal> — describe a multi-step task".into())
+            } else {
+                let (goal, concurrency) = parse_workflow_args(&cmd.args);
+                CommandEffect::Workflow { goal, concurrency }
+            }
+        }
         other => {
             if let Some(name) = other.strip_prefix("skill:") {
                 return CommandEffect::Skill {
@@ -477,6 +512,19 @@ pub fn help_text(extra: &[(String, String)]) -> String {
         }
     }
     lines.join("\n")
+}
+
+/// Parse `/workflow [--concurrency N] <goal>`.
+#[cfg(feature = "orchestration")]
+fn parse_workflow_args(args: &str) -> (String, Option<usize>) {
+    let parts: Vec<&str> = args.splitn(3, char::is_whitespace).collect();
+    if parts.len() >= 2 && (parts[0] == "--concurrency" || parts[0] == "-c") {
+        if let Ok(n) = parts[1].parse::<usize>() {
+            let goal = if parts.len() > 2 { parts[2].to_string() } else { String::new() };
+            return (goal, Some(n));
+        }
+    }
+    (args.to_string(), None)
 }
 
 /// Shared Arc alias for command lists in UI.

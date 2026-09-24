@@ -193,22 +193,63 @@ async fn run_stream(
         }
     }
 
-    let mut req = client.post(&url).headers(headers).json(&payload);
-    if let Some(ms) = options.timeout_ms {
-        req = req.timeout(std::time::Duration::from_millis(ms));
-    }
+    let req = client.post(&url).headers(headers).json(&payload);
+    // Do not set an overall reqwest timeout here — it would abort long SSE bodies.
+    // Bound only time-to-first-byte (headers) via `response_header_timeout_ms`.
 
     let cancel = options.cancel.clone();
     let response_fut = req.send();
-    let response = if let Some(token) = &cancel {
-        tokio::select! {
-            _ = token.cancelled() => {
-                return Err(StreamFail { message: "aborted".into(), aborted: true });
+    // None => default 60s; Some(0) => no limit; Some(n) => n ms.
+    const DEFAULT_TTFB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    let ttfb: Option<std::time::Duration> = match options.response_header_timeout_ms {
+        None => Some(DEFAULT_TTFB_TIMEOUT),
+        Some(0) => None,
+        Some(ms) => Some(std::time::Duration::from_millis(ms)),
+    };
+
+    let response = match (cancel.as_ref(), ttfb) {
+        (Some(token), Some(bound)) => {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    return Err(StreamFail { message: "aborted".into(), aborted: true });
+                }
+                res = tokio::time::timeout(bound, response_fut) => {
+                    match res {
+                        Ok(inner) => inner,
+                        Err(_) => {
+                            return Err(StreamFail {
+                                message: format!(
+                                    "timed out waiting for model response ({}s); set responseHeaderTimeoutMs to 0 for long-running waits",
+                                    bound.as_secs()
+                                ),
+                                aborted: false,
+                            });
+                        }
+                    }
+                }
             }
-            res = response_fut => res,
         }
-    } else {
-        response_fut.await
+        (Some(token), None) => {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    return Err(StreamFail { message: "aborted".into(), aborted: true });
+                }
+                res = response_fut => res,
+            }
+        }
+        (None, Some(bound)) => match tokio::time::timeout(bound, response_fut).await {
+            Ok(inner) => inner,
+            Err(_) => {
+                return Err(StreamFail {
+                    message: format!(
+                        "timed out waiting for model response ({}s); set responseHeaderTimeoutMs to 0 for long-running waits",
+                        bound.as_secs()
+                    ),
+                    aborted: false,
+                });
+            }
+        },
+        (None, None) => response_fut.await,
     }
     .map_err(|e| StreamFail {
         message: e.to_string(),

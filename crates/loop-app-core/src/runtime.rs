@@ -290,10 +290,19 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let needs_api_key_setup = ensure_soket_api_key(&credentials, opts.interactive)?;
 
     let models = build_models(&agent_dir, Arc::clone(&credentials))?;
+    // Hydrate from models-store.json before resolving a model. Without this,
+    // `--print` races the background `/v1/models` refresh and falls back to
+    // the seed id (`qwen3-30b`), which may not be available for this API key.
+    let _ = models
+        .refresh(ModelsRefreshOptions {
+            allow_network: Some(false),
+            force: false,
+            provider_id: Some(SOKET_PROVIDER_ID.into()),
+        })
+        .await;
     if !needs_api_key_setup {
-        // Spawn catalog refresh in the background so startup isn't blocked
-        // by a slow or unreachable API server. Seed / cached models are
-        // already available and will be replaced once the fetch completes.
+        // Network catalog refresh in the background so interactive startup
+        // isn't blocked by a slow API. Cached models are already in memory.
         let bg_models = Arc::clone(&models);
         tokio::spawn(async move {
             let refresh = bg_models
@@ -311,11 +320,19 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
 
     let provider = settings.default_provider.clone();
     let model_id = settings.default_model.clone();
-    let mut model = models
-        .get_model(&provider, &model_id)
-        .or_else(|| models.get_model(SOKET_PROVIDER_ID, SOKET_DEFAULT_MODEL_ID))
-        .or_else(|| models.get_models(None).into_iter().next())
-        .context("no models available")?;
+    let explicit_model = opts.model.is_some() || opts.provider.is_some();
+    let mut model = if let Some(m) = models.get_model(&provider, &model_id) {
+        m
+    } else if explicit_model {
+        anyhow::bail!(
+            "unknown model {provider}/{model_id}. Call `/v1/models` or pick a cached catalog id."
+        );
+    } else {
+        models
+            .get_model(SOKET_PROVIDER_ID, SOKET_DEFAULT_MODEL_ID)
+            .or_else(|| models.get_models(None).into_iter().next())
+            .context("no models available")?
+    };
 
     let resources = load_resources(&agent_dir, &opts.cwd, project_trusted, &settings);
     let context_files = if opts.no_context_files {
@@ -433,6 +450,9 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     }));
     harness
         .set_thinking_level(parse_thinking(&settings.default_thinking_level))
+        .await;
+    harness
+        .set_response_header_timeout_ms(settings.response_header_timeout_ms)
         .await;
 
     crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);

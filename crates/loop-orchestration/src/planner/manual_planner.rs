@@ -187,3 +187,106 @@ impl Planner for ManualPlanner {
         Ok(current_graph.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_linear_workflow() {
+        let mut p = ManualPlanner::new();
+        let t1 = p.add_agent_turn("first task", "do step 1");
+        let t2 = p.add_agent_turn("second task", "do step 2");
+        p.depends_on(&t2, &t1);
+        let graph = p.build().unwrap();
+        assert_eq!(graph.tasks.len(), 2);
+        assert_eq!(graph.dependencies_of(&t2), vec![t1]);
+    }
+
+    #[test]
+    fn build_parallel_workflow() {
+        let mut p = ManualPlanner::new();
+        let _a = p.add_agent_turn("task a", "do a");
+        let _b = p.add_shell_command("run tests", "cargo test");
+        let _c = p.add_barrier("sync point");
+        let graph = p.build().unwrap();
+        assert_eq!(graph.tasks.len(), 3);
+    }
+
+    #[test]
+    fn build_diamond_with_data_flow() {
+        let mut p = ManualPlanner::new();
+        let root = p.add_agent_turn("design", "design the API");
+        let left = p.add_agent_turn("implement", "write code");
+        let right = p.add_shell_command("scaffold", "mkdir -p src");
+        let join = p.add_barrier("merge");
+        p.depends_on(&left, &root);
+        p.depends_on(&right, &root);
+        p.depends_on(&join, &left);
+        p.depends_on(&join, &right);
+        p.data_flows(&root, &left, "api_spec");
+        let graph = p.build().unwrap();
+        assert_eq!(graph.tasks.len(), 4);
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn build_with_config() {
+        let mut p = ManualPlanner::new();
+        let t = p.add_agent_turn_with_config(
+            "important task",
+            "do it carefully",
+            Some(vec!["read".into(), "write".into()]),
+            Some("gpt-4".into()),
+            TaskConfig { max_retries: 5, timeout_ms: 60000, priority: 10 },
+        );
+        let graph = p.build().unwrap();
+        let node = graph.tasks.get(&t).unwrap();
+        assert_eq!(node.config.max_retries, 5);
+        assert_eq!(node.config.timeout_ms, 60000);
+    }
+
+    #[test]
+    fn build_custom_task() {
+        let mut p = ManualPlanner::new();
+        let _t = p.add_custom("deploy", "kubernetes", serde_json::json!({"replicas": 3}));
+        let graph = p.build().unwrap();
+        assert_eq!(graph.tasks.len(), 1);
+    }
+
+    #[test]
+    fn cycle_in_manual_planner_fails() {
+        let mut p = ManualPlanner::new();
+        let a = p.add_agent_turn("a", "a");
+        let b = p.add_agent_turn("b", "b");
+        p.depends_on(&a, &b);
+        p.depends_on(&b, &a);
+        assert!(p.build().is_err());
+    }
+
+    #[tokio::test]
+    async fn decompose_returns_built_graph() {
+        let mut p = ManualPlanner::new();
+        p.add_agent_turn("task", "hello");
+        let graph = p.decompose("any goal", &PlannerContext::default()).await.unwrap();
+        assert_eq!(graph.tasks.len(), 1);
+    }
+
+    #[test]
+    fn auto_id_generation() {
+        let mut p = ManualPlanner::new();
+        let t1 = p.add_agent_turn("a", "a");
+        let t2 = p.add_agent_turn("b", "b");
+        assert_eq!(t1, "task_1");
+        assert_eq!(t2, "task_2");
+    }
+
+    #[test]
+    fn add_task_with_explicit_id() {
+        let mut p = ManualPlanner::new();
+        let id = p.add_task_with_id("my_custom_id", TaskKind::Barrier, "sync");
+        assert_eq!(id, "my_custom_id");
+        let graph = p.build().unwrap();
+        assert!(graph.tasks.contains_key("my_custom_id"));
+    }
+}

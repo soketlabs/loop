@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use loop_ai::now_ms;
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 
 use super::event_log::EventLog;
 use super::signals::SignalRouter;
@@ -11,22 +11,25 @@ use super::types::{
     Signal, TaskResult, WorkflowError, WorkflowEvent, WorkflowId, WorkflowResult, WorkflowState,
     WorkflowStatus,
 };
-use crate::planner::task_graph::{TaskGraph, TaskId, TaskNode, TaskStatus};
+use crate::planner::task_graph::{TaskGraph, TaskId, TaskKind, TaskNode, TaskStatus};
 
 /// The workflow engine manages workflow lifecycle via event sourcing.
 pub struct WorkflowEngine {
     event_log: Arc<dyn EventLog>,
     signal_router: Arc<SignalRouter>,
     progress_notify: Arc<Notify>,
+    event_tx: broadcast::Sender<WorkflowEvent>,
 }
 
 impl WorkflowEngine {
     /// Create a new workflow engine backed by the given event log.
     pub fn new(event_log: Arc<dyn EventLog>) -> Self {
+        let (event_tx, _) = broadcast::channel(256);
         Self {
             event_log,
             signal_router: Arc::new(SignalRouter::new()),
             progress_notify: Arc::new(Notify::new()),
+            event_tx,
         }
     }
 
@@ -46,6 +49,11 @@ impl WorkflowEngine {
         Arc::clone(&self.progress_notify)
     }
 
+    /// Subscribe to workflow events as they are appended.
+    pub fn subscribe(&self) -> broadcast::Receiver<WorkflowEvent> {
+        self.event_tx.subscribe()
+    }
+
     /// Start a new workflow from a task graph.
     pub async fn start_workflow(
         &self,
@@ -59,6 +67,7 @@ impl WorkflowEngine {
             plan: graph.clone(),
             timestamp: now_ms(),
         };
+        let _ = self.event_tx.send(event.clone());
         self.event_log.append(&workflow_id, event).await?;
 
         for task_id in graph.tasks.keys() {
@@ -86,6 +95,7 @@ impl WorkflowEngine {
             worker_id: worker_id.to_string(),
             timestamp: now_ms(),
         };
+        let _ = self.event_tx.send(event.clone());
         self.event_log.append(workflow_id, event).await?;
         self.progress_notify.notify_waiters();
         Ok(())
@@ -103,6 +113,7 @@ impl WorkflowEngine {
             result,
             timestamp: now_ms(),
         };
+        let _ = self.event_tx.send(event.clone());
         self.event_log.append(workflow_id, event).await?;
         self.signal_router.unregister_task(task_id).await;
         self.progress_notify.notify_waiters();
@@ -123,6 +134,7 @@ impl WorkflowEngine {
             retry_count,
             timestamp: now_ms(),
         };
+        let _ = self.event_tx.send(event.clone());
         self.event_log.append(workflow_id, event).await?;
         self.signal_router.unregister_task(task_id).await;
         self.progress_notify.notify_waiters();
@@ -141,6 +153,7 @@ impl WorkflowEngine {
             reason,
             timestamp: now_ms(),
         };
+        let _ = self.event_tx.send(event.clone());
         self.event_log.append(workflow_id, event).await?;
         self.signal_router.unregister_task(task_id).await;
         self.progress_notify.notify_waiters();
@@ -157,6 +170,7 @@ impl WorkflowEngine {
             result,
             timestamp: now_ms(),
         };
+        let _ = self.event_tx.send(event.clone());
         self.event_log.append(workflow_id, event).await?;
         self.progress_notify.notify_waiters();
         Ok(())
@@ -238,23 +252,29 @@ impl WorkflowEngine {
     /// Get the final workflow result (only valid after completion).
     pub async fn result(&self, workflow_id: &str) -> Result<WorkflowResult, WorkflowError> {
         let state = self.state(workflow_id).await?;
-        let task_results: Vec<(TaskId, TaskResult)> = state
-            .task_statuses
-            .iter()
-            .filter_map(|(id, status)| {
-                if let TaskStatus::Completed(r) = status {
-                    Some((id.clone(), r.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut task_results: Vec<(TaskId, TaskResult)> = Vec::new();
+        let mut failed_tasks: Vec<(TaskId, String)> = Vec::new();
 
-        let success = !state.has_failures();
+        for (id, status) in &state.task_statuses {
+            match status {
+                TaskStatus::Completed(r) => {
+                    task_results.push((id.clone(), r.clone()));
+                }
+                TaskStatus::Failed(err) => {
+                    failed_tasks.push((id.clone(), err.clone()));
+                }
+                _ => {}
+            }
+        }
+
+        let total_task_count = state.task_statuses.len();
+        let success = failed_tasks.is_empty();
         Ok(WorkflowResult {
             success,
-            output: serde_json::Value::Null,
+            output: aggregate_output(&state),
             task_results,
+            failed_tasks,
+            total_task_count,
         })
     }
 
@@ -273,5 +293,90 @@ impl WorkflowEngine {
         self.event_log.append(workflow_id, event).await?;
         self.progress_notify.notify_waiters();
         Ok(())
+    }
+}
+
+/// Prefer sink-task outputs (no dependents). If the only sinks are barriers,
+/// use the tasks that feed them. Skip empty/null values.
+fn aggregate_output(state: &WorkflowState) -> serde_json::Value {
+    let is_barrier = |id: &str| {
+        matches!(
+            state.graph.tasks.get(id).map(|n| &n.kind),
+            Some(TaskKind::Barrier)
+        )
+    };
+
+    let mut sink_ids: Vec<String> = state
+        .graph
+        .tasks
+        .keys()
+        .filter(|id| state.graph.dependents_of(id).is_empty())
+        .cloned()
+        .collect();
+
+    if !sink_ids.is_empty() && sink_ids.iter().all(|id| is_barrier(id)) {
+        let mut deps = Vec::new();
+        for id in &sink_ids {
+            deps.extend(state.graph.dependencies_of(id));
+        }
+        deps.sort();
+        deps.dedup();
+        if !deps.is_empty() {
+            sink_ids = deps;
+        }
+    } else {
+        sink_ids.retain(|id| !is_barrier(id));
+    }
+    sink_ids.sort();
+
+    let mut parts = Vec::new();
+    let mut artifact_paths = Vec::new();
+
+    for id in &sink_ids {
+        if let Some(TaskStatus::Completed(result)) = state.task_statuses.get(id) {
+            let text = result.output_text();
+            if !text.is_empty() {
+                let title = state
+                    .graph
+                    .tasks
+                    .get(id)
+                    .map(|n| n.description.as_str())
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or(id);
+                parts.push(format!("### {title}\n\n{text}"));
+            }
+            for path in result.artifact_paths() {
+                if !artifact_paths.contains(&path) {
+                    artifact_paths.push(path);
+                }
+            }
+        }
+    }
+
+    for status in state.task_statuses.values() {
+        if let TaskStatus::Completed(result) = status {
+            for path in result.artifact_paths() {
+                if !artifact_paths.contains(&path) {
+                    artifact_paths.push(path);
+                }
+            }
+        }
+    }
+
+    let mut body = parts.join("\n\n");
+    if !artifact_paths.is_empty() {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str("Artifacts:\n");
+        for path in artifact_paths {
+            body.push_str(&format!("- {path}\n"));
+        }
+    }
+
+    if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(body)
     }
 }

@@ -5,6 +5,7 @@
 pub mod app;
 pub mod clipboard;
 pub mod commands;
+pub mod debug_log;
 pub mod keybindings;
 pub mod mcp_serve;
 pub mod tui;
@@ -20,6 +21,10 @@ pub struct CliRuntime {
     pub inner: Runtime,
     /// Terminal keybindings.
     pub keybindings: keybindings::Keybindings,
+    /// Debug session logging enabled.
+    pub debug: bool,
+    /// Path to the active debug log file, if any.
+    pub debug_log_path: Option<std::path::PathBuf>,
 }
 
 impl std::ops::Deref for CliRuntime {
@@ -41,5 +46,10 @@ pub async fn bootstrap_cli(opts: BootstrapOpts) -> anyhow::Result<CliRuntime> {
     let inner = bootstrap(opts).await?;
     let keybindings =
         keybindings::Keybindings::load(&config::paths::keybindings_path(&inner.agent_dir))?;
-    Ok(CliRuntime { inner, keybindings })
+    Ok(CliRuntime {
+        inner,
+        keybindings,
+        debug: false,
+        debug_log_path: None,
+    })
 }

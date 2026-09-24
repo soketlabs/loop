@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use loop_ai::Model;
+use loop_ai::{AssistantContent, Model, SimpleStreamOptions};
 use loop_orchestration::planner::task_graph::{TaskKind, TaskNode};
 use loop_orchestration::scheduler::worker::{Worker, WorkerContext, WorkerError};
 use loop_orchestration::workflow::types::{Signal, TaskResult};
@@ -16,18 +16,17 @@ use crate::harness::types::ExecutionEnv;
 use crate::messages::convert_to_llm;
 use crate::stream_fn::StreamFn;
 use crate::types::{
-    AgentContext, AgentEvent, AgentEventSink, AgentLoopConfig, AgentMessage, AgentTool,
-    AgentToolResult,
+    AgentContext, AgentEventSink, AgentLoopConfig, AgentMessage, AgentTool, AgentToolResult,
 };
 
 /// Worker that executes `AgentTurn` tasks by running the agent loop.
 pub struct AgentWorker {
     stream_fn: StreamFn,
-    #[allow(dead_code)]
     host_env: Arc<dyn ExecutionEnv>,
     base_tools: Vec<AgentTool>,
     default_model: Model,
     system_prompt: String,
+    stream_options: SimpleStreamOptions,
 }
 
 impl AgentWorker {
@@ -38,6 +37,7 @@ impl AgentWorker {
         base_tools: Vec<AgentTool>,
         default_model: Model,
         system_prompt: String,
+        stream_options: SimpleStreamOptions,
     ) -> Self {
         Self {
             stream_fn,
@@ -45,14 +45,21 @@ impl AgentWorker {
             base_tools,
             default_model,
             system_prompt,
+            stream_options,
         }
     }
 
     fn build_system_prompt(&self, task: &TaskNode) -> String {
         format!(
-            "{}\n\n## Current Task\n\nTask ID: {}\nDescription: {}\n\nYou are one agent in a multi-agent workflow. \
-             Use the memory tools to coordinate with other agents. \
-             Write important findings to shared memory so other agents can access them.",
+            "{}\n\n## Current Task\n\nTask ID: {}\nDescription: {}\n\n\
+             You are one agent in a multi-agent workflow.\n\
+             Your final message MUST contain the result of this task as plain text \
+             (a summary of findings). Shared memory is extra coordination, not a substitute \
+             for that final message.\n\
+             If the task asks you to write a file, use the write tool and confirm the path \
+             in your final message.\n\
+             A mermaid diagram of this workflow is in shared memory under the key `task_graph` \
+             (scope: shared). Read it if you need to include the task graph in a document.",
             self.system_prompt, task.id, task.description
         )
     }
@@ -79,11 +86,19 @@ impl Worker for AgentWorker {
         };
 
         let mut agent_tools: Vec<AgentTool> = if let Some(filter) = tool_filter {
-            self.base_tools
+            let filtered: Vec<AgentTool> = self
+                .base_tools
                 .iter()
                 .filter(|t| filter.contains(&t.name))
                 .cloned()
-                .collect()
+                .collect();
+            if filtered.is_empty() {
+                // Filter matched no base tools — include all so the agent
+                // retains filesystem access (read/write/edit/bash).
+                self.base_tools.clone()
+            } else {
+                filtered
+            }
         } else {
             self.base_tools.clone()
         };
@@ -108,16 +123,17 @@ impl Worker for AgentWorker {
                 .dependency_results
                 .iter()
                 .map(|(id, result)| {
-                    format!(
-                        "- Task '{}': {}",
-                        id,
-                        serde_json::to_string(&result.output).unwrap_or_default()
-                    )
+                    let text = result.output_text();
+                    if text.is_empty() {
+                        format!("- Task '{id}': (no text output)")
+                    } else {
+                        format!("- Task '{id}':\n{text}")
+                    }
                 })
                 .collect();
             initial_messages.push(AgentMessage::user_text(format!(
                 "Context from completed dependency tasks:\n{}",
-                dep_summary.join("\n")
+                dep_summary.join("\n\n")
             )));
         }
 
@@ -130,6 +146,9 @@ impl Worker for AgentWorker {
         let model = self.default_model.clone();
         let mut config = AgentLoopConfig::new(model);
         config.convert_to_llm = Arc::new(|msgs| Box::pin(async move { convert_to_llm(&msgs) }));
+        config.stream_options = self.stream_options.clone();
+        // Isolate parallel workers from the parent chat session and each other.
+        config.stream_options.base.session_id = Some(format!("wf-task-{}", task.id));
 
         let signal_rx = Arc::new(tokio::sync::Mutex::new(ctx.signal_rx));
         let steer_rx = Arc::clone(&signal_rx);
@@ -149,16 +168,7 @@ impl Worker for AgentWorker {
             })
         }));
 
-        let collected_messages = Arc::new(tokio::sync::Mutex::new(Vec::<AgentMessage>::new()));
-        let msgs_for_emit = Arc::clone(&collected_messages);
-        let emit: AgentEventSink = Arc::new(move |event| {
-            let msgs = Arc::clone(&msgs_for_emit);
-            Box::pin(async move {
-                if let AgentEvent::MessageEnd { message } = &event {
-                    msgs.lock().await.push(message.clone());
-                }
-            })
-        });
+        let emit: AgentEventSink = Arc::new(|_| Box::pin(async {}));
 
         let prompts = vec![AgentMessage::user_text(prompt.clone())];
         let cancel_token = ctx.cancel.clone();
@@ -179,14 +189,30 @@ impl Worker for AgentWorker {
 
         match result {
             Ok(messages) => {
-                let output = extract_output_from_messages(&messages);
+                let mut artifacts = Vec::new();
+                collect_file_artifacts(&messages, &*self.host_env, &mut artifacts).await;
+
+                let mut output = extract_output_from_messages(&messages);
+                if output_is_empty(&output) && !artifacts.is_empty() {
+                    let paths: Vec<&str> = artifacts
+                        .iter()
+                        .filter_map(|a| a.path.as_deref())
+                        .collect();
+                    output = serde_json::Value::String(format!("Wrote: {}", paths.join(", ")));
+                }
+
+                if let Some(reason) = detect_task_failure(&output) {
+                    return Err(WorkerError::ExecutionFailed(reason));
+                }
+
                 let serialized_messages: Vec<serde_json::Value> = messages
                     .iter()
                     .filter_map(|m| serde_json::to_value(m).ok())
                     .collect();
+
                 Ok(TaskResult {
                     output,
-                    artifacts: Vec::new(),
+                    artifacts,
                     messages: serialized_messages,
                 })
             }
@@ -259,21 +285,113 @@ impl Worker for ShellWorker {
 }
 
 fn extract_output_from_messages(messages: &[AgentMessage]) -> serde_json::Value {
-    let last_assistant = messages.iter().rev().find_map(|m| m.as_assistant());
-    match last_assistant {
-        Some(msg) => {
-            let text: String = msg
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    loop_ai::AssistantContent::Text(t) => Some(t.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            serde_json::Value::String(text)
+    let mut texts = Vec::new();
+    let mut thinking = Vec::new();
+    for msg in messages {
+        let Some(asst) = msg.as_assistant() else {
+            continue;
+        };
+        for content in &asst.content {
+            match content {
+                AssistantContent::Text(t) => {
+                    if !t.text.trim().is_empty() {
+                        texts.push(t.text.clone());
+                    }
+                }
+                AssistantContent::Thinking(t) => {
+                    if !t.thinking.trim().is_empty() {
+                        thinking.push(t.thinking.clone());
+                    }
+                }
+                _ => {}
+            }
         }
-        None => serde_json::Value::Null,
+    }
+    if !texts.is_empty() {
+        serde_json::Value::String(texts.join("\n\n"))
+    } else if let Some(last) = thinking.last() {
+        serde_json::Value::String(last.clone())
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+fn output_is_empty(output: &serde_json::Value) -> bool {
+    match output {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.trim().is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(m) => m.is_empty(),
+        _ => false,
+    }
+}
+
+const FAILURE_INDICATORS: &[&str] = &[
+    "blocked:",
+    "could not complete",
+    "cannot complete",
+    "task blocked",
+    "no filesystem tools",
+    "no file-access tools",
+    "tools are all unavailable",
+    "inaccessible",
+    "could not be produced",
+];
+
+/// Scan task output text for signals that the agent reported failure despite
+/// the loop returning `Ok`. Returns a trimmed reason string if detected.
+fn detect_task_failure(output: &serde_json::Value) -> Option<String> {
+    let text = output.as_str()?;
+    let lower = text.to_lowercase();
+    for &indicator in FAILURE_INDICATORS {
+        if lower.contains(indicator) {
+            let reason = text
+                .lines()
+                .find(|l| l.to_lowercase().contains(indicator))
+                .unwrap_or("agent reported task blocked / unable to complete")
+                .trim();
+            return Some(reason.to_string());
+        }
+    }
+    None
+}
+
+/// Walk agent messages to find successful `write` / `bash` tool calls that
+/// produced file paths, then verify they exist on disk. Each verified path
+/// is recorded as an `Artifact`.
+async fn collect_file_artifacts(
+    messages: &[AgentMessage],
+    env: &dyn ExecutionEnv,
+    artifacts: &mut Vec<loop_orchestration::workflow::types::Artifact>,
+) {
+    use loop_ai::Message;
+    use loop_orchestration::workflow::types::{Artifact, ArtifactKind};
+    use std::path::Path;
+
+    for msg in messages {
+        let tr = match msg.as_llm() {
+            Some(Message::ToolResult(tr)) => tr,
+            _ => continue,
+        };
+        for content in &tr.content {
+            let text = match content {
+                loop_ai::ToolResultContent::Text(t) => &t.text,
+                _ => continue,
+            };
+            // Detect "Wrote N bytes to <path>" from the write tool
+            if let Some(path_str) = text.strip_prefix("Wrote ") {
+                if let Some(idx) = path_str.find(" bytes to ") {
+                    let path = path_str[idx + " bytes to ".len()..].trim();
+                    if env.file_info(Path::new(path)).await.is_ok() {
+                        artifacts.push(Artifact {
+                            kind: ArtifactKind::File,
+                            path: Some(path.to_string()),
+                            data: serde_json::Value::Null,
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -358,4 +476,66 @@ pub fn create_spawn_task_tool(
             }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loop_ai::{
+        AssistantMessage, StopReason, TextContent, ThinkingContent, Usage,
+    };
+
+    fn asst(text: Option<&str>, thinking: Option<&str>) -> AgentMessage {
+        let mut content = Vec::new();
+        if let Some(t) = thinking {
+            content.push(AssistantContent::Thinking(ThinkingContent {
+                thinking: t.into(),
+                thinking_signature: None,
+                redacted: None,
+            }));
+        }
+        if let Some(t) = text {
+            content.push(AssistantContent::Text(TextContent {
+                text: t.into(),
+                text_signature: None,
+            }));
+        }
+        AgentMessage::assistant(AssistantMessage {
+            content,
+            api: "test".into(),
+            provider: "test".into(),
+            model: "test".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            raw_stop_reason: None,
+            timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn extract_joins_all_assistant_text() {
+        let messages = vec![
+            asst(Some("part one"), None),
+            asst(Some("part two"), None),
+        ];
+        let out = extract_output_from_messages(&messages);
+        assert_eq!(out.as_str(), Some("part one\n\npart two"));
+    }
+
+    #[test]
+    fn extract_falls_back_to_thinking() {
+        let messages = vec![asst(None, Some("reasoned summary"))];
+        let out = extract_output_from_messages(&messages);
+        assert_eq!(out.as_str(), Some("reasoned summary"));
+    }
+
+    #[test]
+    fn extract_prefers_text_over_thinking() {
+        let messages = vec![asst(Some("final"), Some("scratch"))];
+        let out = extract_output_from_messages(&messages);
+        assert_eq!(out.as_str(), Some("final"));
+    }
 }

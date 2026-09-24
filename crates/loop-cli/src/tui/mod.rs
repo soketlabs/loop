@@ -23,6 +23,12 @@ use crate::theme::Theme;
 /// Fixed inline footer height (live + input + picker + status).
 pub const FOOTER_HEIGHT: u16 = 18;
 
+/// Prompt prefix width (`❯ ` / `  `).
+const INPUT_PREFIX_WIDTH: usize = 2;
+
+/// Hard cap on visible input body rows (top/bottom rules are extra).
+const MAX_INPUT_BODY_LINES: u16 = 10;
+
 /// Max visible rows in a picker list.
 pub const PICKER_PAGE: usize = 8;
 
@@ -54,6 +60,13 @@ pub enum ChatItem {
         command: String,
         output: String,
         exit_code: Option<i32>,
+    },
+    /// Workflow sub-task progress card (collapsible, like tool cards).
+    WorkflowTask {
+        task_id: String,
+        description: String,
+        status: CardStatus,
+        output: String,
     },
     System { text: String },
 }
@@ -100,17 +113,15 @@ pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 /// Options for drawing the inline footer.
 pub struct FooterOpts<'a> {
     pub theme: &'a Theme,
-    /// Unflushed / streaming items shown above the input.
-    pub live: &'a [ChatItem],
+    /// Unflushed / streaming lines shown above the input.
+    /// Overflow above this viewport is spilled into native scrollback by the app loop.
+    pub live_lines: &'a [Line<'static>],
     pub input: &'a str,
     pub cursor: usize,
     pub working: bool,
     pub spinner_frame: usize,
     pub status: &'a str,
     pub picker: &'a PickerView,
-    /// Global tools/thinking expand state (pi-style single flag).
-    pub expanded: bool,
-    pub hide_thinking: bool,
     pub setup_mode: bool,
     pub mask_input: bool,
     /// Left status (e.g. `~/loop (main)`).
@@ -130,11 +141,11 @@ pub fn item_is_committed(
 ) -> bool {
     match item {
         ChatItem::User { .. } | ChatItem::System { .. } | ChatItem::Shell { .. } => true,
-        // Keep queued messages in the live footer so Esc can still remove them.
         ChatItem::Queued { .. } => false,
         ChatItem::Assistant { .. } => streaming_assistant != Some(index),
         ChatItem::Thinking { done, .. } => *done && streaming_thinking != Some(index),
         ChatItem::Tool { status, .. } => !matches!(status, CardStatus::Pending),
+        ChatItem::WorkflowTask { status, .. } => !matches!(status, CardStatus::Pending),
     }
 }
 
@@ -395,21 +406,12 @@ pub fn format_item_lines(
                     Span::styled("  ctrl+o to collapse".to_string(), theme.dim()),
                 ]));
                 let body_w = w.saturating_sub(4).max(1);
-                let mut shown = 0usize;
-                'outer: for l in text.lines() {
+                for l in text.lines() {
                     for part in soft_wrap(l, body_w) {
-                        if shown >= 200 {
-                            lines.push(Line::from(vec![
-                                Span::styled("  │ ".to_string(), theme.style("borderMuted")),
-                                Span::styled("…".to_string(), theme.dim()),
-                            ]));
-                            break 'outer;
-                        }
                         lines.push(Line::from(vec![
                             Span::styled("  │ ".to_string(), theme.style("borderMuted")),
                             Span::styled(part, think),
                         ]));
-                        shown += 1;
                     }
                 }
             } else {
@@ -487,32 +489,125 @@ pub fn format_item_lines(
             lines.push(bg_spans_line(theme, bg, head, w));
 
             // Body: full detail when expanded; error previews stay visible.
-            let preview = if expanded {
-                200
+            let max_body: Option<usize> = if expanded {
+                None
             } else if matches!(status, CardStatus::Error) {
-                4
+                Some(4)
             } else {
-                0
+                Some(0)
             };
-            if preview > 0 && !detail.is_empty() {
+            if max_body != Some(0) && !detail.is_empty() {
                 let body_w = w.saturating_sub(5).max(1);
                 let fallback = theme.style("toolOutput");
                 let highlighted = highlight_tool_detail(name, summary, detail, theme, fallback);
-                for spans in highlighted.into_iter().take(preview) {
+                let total = highlighted.len();
+                let take_n = max_body.unwrap_or(usize::MAX);
+                let mut shown = 0usize;
+                for spans in highlighted.into_iter().take(take_n) {
                     let mut row = vec![Span::styled(
                         "  │ ".to_string(),
                         theme.style("borderMuted"),
                     )];
                     row.extend(highlight::truncate_spans(spans, body_w));
                     lines.push(Line::from(row));
+                    shown += 1;
                 }
-                if detail_lines > preview {
-                    let hint = if expanded {
-                        format!("  … {} more lines truncated", detail_lines - preview)
-                    } else {
-                        format!("  … {} more lines · ctrl+o", detail_lines - preview)
-                    };
-                    lines.push(Line::from(Span::styled(hint, theme.dim())));
+                if total > shown {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  … {} more lines · ctrl+o",
+                            total.saturating_sub(shown)
+                        ),
+                        theme.dim(),
+                    )));
+                }
+            }
+            lines.push(Line::from(""));
+        }
+        ChatItem::WorkflowTask {
+            task_id,
+            description,
+            status,
+            output,
+        } => {
+            let (dot_key, bg) = match status {
+                CardStatus::Pending => ("warning", "toolPendingBg"),
+                CardStatus::Success => ("success", "toolSuccessBg"),
+                CardStatus::Error => ("error", "toolErrorBg"),
+            };
+            let title = if description.is_empty() {
+                task_id.clone()
+            } else {
+                description.clone()
+            };
+            let detail_lines = output.lines().count();
+            let mut head = vec![
+                Span::styled(" ● ".to_string(), theme.style(dot_key)),
+                Span::styled(
+                    title,
+                    theme.style("toolTitle").add_modifier(Modifier::BOLD),
+                ),
+            ];
+            match status {
+                CardStatus::Pending => {
+                    head.push(Span::styled(" · running…".to_string(), theme.dim()));
+                }
+                _ if output.is_empty() => {
+                    head.push(Span::styled(
+                        format!(" · {}", if matches!(status, CardStatus::Success) { "done" } else { "failed" }),
+                        theme.dim(),
+                    ));
+                }
+                _ if expanded => {
+                    head.push(Span::styled(
+                        " · ctrl+o to collapse".to_string(),
+                        theme.dim(),
+                    ));
+                }
+                _ => {
+                    head.push(Span::styled(
+                        format!(
+                            " · {detail_lines} line{} · ctrl+o",
+                            if detail_lines == 1 { "" } else { "s" }
+                        ),
+                        theme.dim(),
+                    ));
+                }
+            }
+            lines.push(bg_spans_line(theme, bg, head, w));
+
+            let max_body: Option<usize> = if expanded {
+                None
+            } else if matches!(status, CardStatus::Error) {
+                Some(4)
+            } else {
+                // Always show a short result preview so workflow output is visible
+                // after cards flush into scrollback (ctrl+o can't rewrite history).
+                Some(12)
+            };
+            if max_body != Some(0) && !output.is_empty() {
+                let body_w = w.saturating_sub(5).max(1);
+                let fallback = theme.style("toolOutput");
+                let take_n = max_body.unwrap_or(usize::MAX);
+                let mut shown = 0usize;
+                for line in output.lines().take(take_n) {
+                    let mut row = vec![Span::styled(
+                        "  │ ".to_string(),
+                        theme.style("borderMuted"),
+                    )];
+                    let truncated: String = line.chars().take(body_w).collect();
+                    row.push(Span::styled(truncated, fallback));
+                    lines.push(Line::from(row));
+                    shown += 1;
+                }
+                if detail_lines > shown {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  … {} more lines · ctrl+o",
+                            detail_lines.saturating_sub(shown)
+                        ),
+                        theme.dim(),
+                    )));
                 }
             }
             lines.push(Line::from(""));
@@ -643,57 +738,111 @@ pub fn render_lines_to_buffer(lines: &[Line<'static>], buf: &mut Buffer, theme: 
         .render(buf.area, buf);
 }
 
+/// Layout of the inline footer (live stream + input + picker + status).
+struct FooterLayout {
+    live_h: u16,
+    input_h: u16,
+    picker_h: u16,
+    status_h: u16,
+}
+
+fn footer_layout(area_height: u16, area_width: u16, input: &str, picker: &PickerView) -> FooterLayout {
+    let picker_h = picker_height(picker);
+    let status_h = 2u16;
+    let max_input_body = area_height
+        .saturating_sub(picker_h + status_h + 2)
+        .max(1)
+        .min(MAX_INPUT_BODY_LINES);
+    let input_body_lines = count_input_visual_lines(input, area_width.max(1) as usize)
+        .clamp(1, max_input_body as usize) as u16;
+    let input_h = input_body_lines + 2; // top + bottom rules
+    let used = input_h + picker_h + status_h;
+    FooterLayout {
+        live_h: area_height.saturating_sub(used),
+        input_h,
+        picker_h,
+        status_h,
+    }
+}
+
+/// Rows available for live/streaming content in the inline footer.
+pub fn footer_live_height(
+    area_height: u16,
+    area_width: u16,
+    input: &str,
+    picker: &PickerView,
+) -> u16 {
+    footer_layout(area_height, area_width, input, picker).live_h
+}
+
+/// Format uncommitted transcript items (plus a spinner when idle-working).
+pub fn format_live_lines(
+    live: &[ChatItem],
+    theme: &Theme,
+    expanded: bool,
+    hide_thinking: bool,
+    width: u16,
+    working: bool,
+    spinner_frame: usize,
+    status: &str,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for item in live {
+        out.extend(format_item_lines(
+            item,
+            theme,
+            expanded,
+            hide_thinking,
+            width,
+        ));
+    }
+    if working && out.is_empty() {
+        let spin = SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()];
+        out.push(Line::from(Span::styled(
+            format!(" {spin} {status}"),
+            theme.muted(),
+        )));
+    }
+    out
+}
+
+/// How many live lines belong in native scrollback (above the footer viewport).
+pub fn live_overflow_count(total_lines: usize, live_h: usize) -> usize {
+    total_lines.saturating_sub(live_h)
+}
+
+/// After committing an item with `item_lines` visual lines, skip already-spilled
+/// prefix lines and return the frozen count for whatever is still live.
+pub fn consume_frozen_lines(live_frozen: usize, item_lines: usize) -> (usize, usize) {
+    let skip = live_frozen.min(item_lines);
+    (skip, live_frozen.saturating_sub(item_lines))
+}
+
 /// Draw the inline footer (live stream + input + picker + status).
 pub fn draw_footer(frame: &mut Frame, opts: FooterOpts<'_>) {
     let area = frame.area();
     frame.buffer_mut().set_style(area, opts.theme.page());
     let width = area.width.max(1);
-
-    let live_lines = {
-        let mut out = Vec::new();
-        for item in opts.live {
-            out.extend(format_item_lines(
-                item,
-                opts.theme,
-                opts.expanded,
-                opts.hide_thinking,
-                width,
-            ));
-        }
-        if opts.working && out.is_empty() {
-            let spin = SPINNER_FRAMES[opts.spinner_frame % SPINNER_FRAMES.len()];
-            out.push(Line::from(Span::styled(
-                format!(" {spin} {}", opts.status),
-                opts.theme.muted(),
-            )));
-        }
-        out
-    };
-
-    let input_body_lines = opts.input.split('\n').count().max(1) as u16;
-    let input_h = input_body_lines + 2; // top + bottom rules
-    let picker_h = picker_height(opts.picker);
-    let status_h = 2u16;
-    let used = input_h + picker_h + status_h;
-    let live_h = area.height.saturating_sub(used);
+    let layout = footer_layout(area.height, width, opts.input, opts.picker);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(live_h),
-            Constraint::Length(input_h),
-            Constraint::Length(picker_h),
-            Constraint::Length(status_h),
+            Constraint::Length(layout.live_h),
+            Constraint::Length(layout.input_h),
+            Constraint::Length(layout.picker_h),
+            Constraint::Length(layout.status_h),
         ])
         .split(area);
 
-    // Live / spacer
-    if live_h > 0 {
-        let visible = if live_lines.len() as u16 > live_h {
-            let skip = live_lines.len() - live_h as usize;
-            live_lines[skip..].to_vec()
+    // Live / spacer. Overflow has already been spilled into scrollback; keep a
+    // tail-slice as a safety net if the layout shrank this frame.
+    if layout.live_h > 0 {
+        let visible = if opts.live_lines.len() as u16 > layout.live_h {
+            let skip = opts.live_lines.len() - layout.live_h as usize;
+            opts.live_lines[skip..].to_vec()
         } else {
-            live_lines
+            opts.live_lines.to_vec()
         };
         frame.render_widget(
             Paragraph::new(visible)
@@ -753,11 +902,10 @@ fn draw_input(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
         opts.theme,
         placeholder,
         area.width as usize,
+        chunks[1].height as usize,
     );
     frame.render_widget(
-        Paragraph::new(lines)
-            .style(opts.theme.page())
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines).style(opts.theme.page()),
         chunks[1],
     );
 }
@@ -1026,6 +1174,33 @@ fn picker_height(picker: &PickerView) -> u16 {
     }
 }
 
+fn input_content_width(term_width: usize) -> usize {
+    term_width.saturating_sub(INPUT_PREFIX_WIDTH).max(1)
+}
+
+fn count_input_visual_lines(input: &str, term_width: usize) -> usize {
+    if input.is_empty() {
+        return 1;
+    }
+    let w = input_content_width(term_width);
+    input
+        .split('\n')
+        .map(|line| soft_wrap(line, w).len().max(1))
+        .sum()
+}
+
+fn input_scroll_top(total: usize, cursor_row: usize, visible: usize) -> usize {
+    if total <= visible {
+        0
+    } else if cursor_row < visible {
+        0
+    } else {
+        (cursor_row + 1)
+            .saturating_sub(visible)
+            .min(total.saturating_sub(visible))
+    }
+}
+
 fn render_input_lines(
     input: &str,
     cursor: usize,
@@ -1033,54 +1208,100 @@ fn render_input_lines(
     theme: &Theme,
     placeholder: &str,
     width: usize,
+    visible_rows: usize,
 ) -> Vec<Line<'static>> {
     // Block caret in the theme cursor color, sitting on the page background.
     let caret_style = Style::default()
         .fg(theme.get("cursor"))
         .bg(theme.get("bg"));
-    let lines: Vec<&str> = if input.is_empty() {
+    let content_width = input_content_width(width);
+    let logical_lines: Vec<&str> = if input.is_empty() {
         vec![""]
     } else {
         input.split('\n').collect()
     };
+
+    let mut all_lines = Vec::new();
+    let mut cursor_visual_row = 0usize;
     let mut char_at = 0usize;
-    let mut out = Vec::new();
-    for (row, line) in lines.iter().enumerate() {
-        let chars: Vec<char> = line.chars().collect();
-        let line_len = chars.len();
-        let caret_here = cursor >= char_at && cursor <= char_at + line_len;
-        let mut spans = Vec::new();
-        spans.push(Span::styled(
-            if row == 0 { "❯ " } else { "  " }.to_string(),
-            theme.accent_bold(),
-        ));
-        if caret_here {
-            let col = cursor - char_at;
-            if col > 0 {
-                spans.push(Span::styled(chars[..col].iter().collect::<String>(), text_style));
-            }
-            // Block glyph + bg — reliable when the buffer is empty.
-            spans.push(Span::styled("█".to_string(), caret_style));
-            if col < line_len {
-                let after: String = chars[col + 1..].iter().collect();
-                if !after.is_empty() {
-                    spans.push(Span::styled(after, text_style));
+
+    for (row, line) in logical_lines.iter().enumerate() {
+        let line_char_len = line.chars().count();
+        let caret_on_line = cursor >= char_at && cursor <= char_at + line_char_len;
+        let cursor_col = caret_on_line.then_some(cursor - char_at);
+        let wrapped = if line.is_empty() {
+            vec![String::new()]
+        } else {
+            soft_wrap(line, content_width)
+        };
+
+        let mut caret_wrap = None;
+        if caret_on_line {
+            let col = cursor_col.unwrap_or(0);
+            let mut offset = 0usize;
+            for (i, chunk) in wrapped.iter().enumerate() {
+                let chunk_len = chunk.chars().count();
+                if col >= offset && col <= offset + chunk_len {
+                    caret_wrap = Some(i);
+                    break;
                 }
+                offset += chunk_len;
             }
-        } else if !line.is_empty() {
-            spans.push(Span::styled((*line).to_string(), text_style));
+            if caret_wrap.is_none() && !wrapped.is_empty() {
+                caret_wrap = Some(wrapped.len() - 1);
+            }
         }
-        if spans.len() == 1 {
-            spans.push(Span::styled("█".to_string(), caret_style));
+
+        for (wrap_i, chunk) in wrapped.iter().enumerate() {
+            if caret_wrap == Some(wrap_i) {
+                cursor_visual_row = all_lines.len();
+            }
+
+            let prefix = if row == 0 && wrap_i == 0 {
+                "❯ "
+            } else {
+                "  "
+            };
+            let mut spans = vec![Span::styled(prefix.to_string(), theme.accent_bold())];
+
+            let caret_here = caret_wrap == Some(wrap_i);
+            if caret_here {
+                let chunk_start: usize = wrapped[..wrap_i]
+                    .iter()
+                    .map(|s| s.chars().count())
+                    .sum();
+                let col = cursor_col.unwrap_or(0).saturating_sub(chunk_start);
+                let chars: Vec<char> = chunk.chars().collect();
+                let col = col.min(chars.len());
+                if col > 0 {
+                    spans.push(Span::styled(
+                        chars[..col].iter().collect::<String>(),
+                        text_style,
+                    ));
+                }
+                spans.push(Span::styled("█".to_string(), caret_style));
+                if col < chars.len() {
+                    spans.push(Span::styled(
+                        chars[col + 1..].iter().collect::<String>(),
+                        text_style,
+                    ));
+                }
+            } else if !chunk.is_empty() {
+                spans.push(Span::styled(chunk.clone(), text_style));
+            }
+
+            if row == 0 && wrap_i == 0 && input.is_empty() && !placeholder.is_empty() {
+                spans.push(Span::styled(placeholder.to_string(), theme.dim()));
+            }
+            all_lines.push(Line::from(spans));
         }
-        if row == 0 && input.is_empty() && !placeholder.is_empty() {
-            spans.push(Span::styled(placeholder.to_string(), theme.dim()));
-        }
-        out.push(Line::from(spans));
-        let _ = width;
-        char_at += line_len + 1;
+        char_at += line_char_len + 1;
     }
-    out
+
+    let visible = visible_rows.max(1);
+    let scroll_top = input_scroll_top(all_lines.len(), cursor_visual_row, visible);
+    let end = (scroll_top + visible).min(all_lines.len());
+    all_lines[scroll_top..end].to_vec()
 }
 
 fn line_summary(line: &str, max: usize) -> String {
@@ -1217,6 +1438,12 @@ fn truncate_width(s: &str, max: usize) -> String {
 pub fn find_tool_index(chat: &[ChatItem], id: &str) -> Option<usize> {
     chat.iter()
         .position(|c| matches!(c, ChatItem::Tool { id: tid, .. } if tid == id))
+}
+
+/// Find chat index of a workflow task by task_id.
+pub fn find_workflow_task_index(chat: &[ChatItem], task_id: &str) -> Option<usize> {
+    chat.iter()
+        .position(|c| matches!(c, ChatItem::WorkflowTask { task_id: tid, .. } if tid == task_id))
 }
 
 /// Truncate tool args to a short summary.
@@ -1530,5 +1757,105 @@ mod tests {
             "1,000 · —/128,000"
         );
         assert_eq!(format_token_usage_line(42, None, 0), "42");
+    }
+
+    #[test]
+    fn input_visual_lines_wrap_and_count() {
+        let long = "word ".repeat(20);
+        assert_eq!(count_input_visual_lines("", 80), 1);
+        assert_eq!(count_input_visual_lines("one\ntwo", 80), 2);
+        assert!(count_input_visual_lines(&long, 20) > 1);
+    }
+
+    #[test]
+    fn input_scroll_keeps_caret_visible() {
+        assert_eq!(input_scroll_top(10, 0, 4), 0);
+        assert_eq!(input_scroll_top(10, 3, 4), 0);
+        assert_eq!(input_scroll_top(10, 5, 4), 2);
+        assert_eq!(input_scroll_top(10, 9, 4), 6);
+    }
+
+    #[test]
+    fn input_render_scrolls_long_multiline() {
+        let theme = Theme::dark();
+        let text = (0..12)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cursor = text.chars().count();
+        let lines = render_input_lines(
+            &text,
+            cursor,
+            theme.style("text"),
+            &theme,
+            "",
+            80,
+            4,
+        );
+        assert_eq!(lines.len(), 4);
+        assert!(lines.last().unwrap().to_string().contains("line 11"));
+    }
+
+    #[test]
+    fn input_render_caret_at_end_of_wrapped_line() {
+        let theme = Theme::dark();
+        let text = "word ".repeat(30);
+        let cursor = text.chars().count();
+        let lines = render_input_lines(
+            &text,
+            cursor,
+            theme.style("text"),
+            &theme,
+            "",
+            20,
+            4,
+        );
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn live_overflow_spills_prefix_above_viewport() {
+        assert_eq!(live_overflow_count(10, 10), 0);
+        assert_eq!(live_overflow_count(10, 4), 6);
+        assert_eq!(live_overflow_count(3, 8), 0);
+        assert_eq!(live_overflow_count(0, 8), 0);
+    }
+
+    #[test]
+    fn consume_frozen_covers_prefix_then_rest() {
+        assert_eq!(consume_frozen_lines(0, 10), (0, 0));
+        assert_eq!(consume_frozen_lines(4, 10), (4, 0));
+        assert_eq!(consume_frozen_lines(10, 10), (10, 0));
+        assert_eq!(consume_frozen_lines(15, 10), (10, 5));
+    }
+
+    #[test]
+    fn expanded_thinking_keeps_all_lines() {
+        let theme = Theme::dark();
+        let text = (0..250)
+            .map(|i| format!("thought {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let item = ChatItem::Thinking {
+            text,
+            done: true,
+        };
+        let lines = format_item_lines(&item, &theme, true, false, 80);
+        assert!(
+            lines.len() > 250,
+            "expanded thinking should not cap body lines, got {}",
+            lines.len()
+        );
+        assert!(
+            lines.iter().any(|l| l.to_string().contains("thought 249")),
+            "last thinking line should remain visible"
+        );
+    }
+
+    #[test]
+    fn footer_live_height_leaves_room_for_chrome() {
+        let h = footer_live_height(FOOTER_HEIGHT, 80, "", &PickerView::None);
+        assert!(h > 0);
+        assert!(h < FOOTER_HEIGHT);
     }
 }
