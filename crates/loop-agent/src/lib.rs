@@ -10,6 +10,7 @@ pub mod agent_loop;
 pub mod harness;
 pub mod messages;
 pub mod stream_fn;
+mod telemetry;
 pub mod types;
 
 #[cfg(feature = "proxy")]
