@@ -9,7 +9,8 @@ pub mod debug_log;
 pub mod keybindings;
 pub mod mcp_serve;
 pub mod print_mode;
-pub mod secret_prompt;
+pub mod setup_prompt;
+pub mod tracing_setup;
 pub mod tui;
 
 pub use loop_app_core::{

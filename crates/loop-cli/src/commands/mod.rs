@@ -29,7 +29,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand {
             name: "tracing",
             description: "Langfuse tracing status, on/off, or setup",
-            args_hint: Some("[status|enable|disable|setup <host> <public-key>]"),
+            args_hint: Some("[status|enable|disable|setup [langfuse|otlp]]"),
         },
         SlashCommand {
             name: "settings",
@@ -393,6 +393,8 @@ pub enum CommandEffect {
     },
 }
 
+use loop_app_core::config::TracingBackend;
+
 /// `/tracing` subcommands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TracingCommand {
@@ -402,17 +404,15 @@ pub enum TracingCommand {
     Enable,
     /// Turn exporting off (persisted).
     Disable,
-    /// Save Langfuse host + public key; the secret key is then read via masked input.
+    /// Open the setup wizard, optionally skipping the backend picker.
     Setup {
-        /// Langfuse base URL.
-        host: String,
-        /// Project public key.
-        public_key: String,
+        /// Backend chosen on the command line.
+        backend: Option<TracingBackend>,
     },
 }
 
 const TRACING_USAGE: &str =
-    "Usage: /tracing [status|enable|disable|setup <host> <public-key>] — setup then asks for the secret key";
+    "Usage: /tracing [status|enable|disable|setup [langfuse|otlp]] — setup opens a guided wizard";
 
 /// Parse `/tracing` arguments; `Err` carries the usage text.
 pub fn parse_tracing(args: &str) -> Result<TracingCommand, String> {
@@ -420,10 +420,12 @@ pub fn parse_tracing(args: &str) -> Result<TracingCommand, String> {
         [] | ["status"] => Ok(TracingCommand::Status),
         ["enable" | "on"] => Ok(TracingCommand::Enable),
         ["disable" | "off"] => Ok(TracingCommand::Disable),
-        ["setup", host, public_key] => Ok(TracingCommand::Setup {
-            host: (*host).to_string(),
-            public_key: (*public_key).to_string(),
-        }),
+        ["setup"] => Ok(TracingCommand::Setup { backend: None }),
+        ["setup", backend] => TracingBackend::parse(backend)
+            .map(|backend| TracingCommand::Setup {
+                backend: Some(backend),
+            })
+            .ok_or_else(|| TRACING_USAGE.to_string()),
         _ => Err(TRACING_USAGE.into()),
     }
 }

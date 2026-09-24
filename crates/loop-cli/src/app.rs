@@ -29,7 +29,8 @@ use loop_ai::{
 
 use crate::commands::{self, AutocompleteEntry, CommandEffect, TracingCommand};
 use crate::config::describe_tracing_status;
-use crate::secret_prompt::SecretPrompt;
+use crate::setup_prompt::SetupPrompt;
+use crate::tracing_setup::{TracingSetup, Transition};
 use crate::keybindings::{hotkey_help, Action};
 use crate::{build_tools, mcp_server_entries, CliRuntime};
 use crate::theme::Theme;
@@ -375,8 +376,8 @@ async fn run_loop(
     let mut purge_ui_events = false;
     let mut last_width = terminal.size()?.width;
     let mut hide_thinking = runtime.settings.hide_thinking_block;
-    let mut pending_secret: Option<SecretPrompt> = if runtime.needs_api_key_setup {
-        Some(SecretPrompt::ProviderKey(SOKET_PROVIDER_ID.into()))
+    let mut pending_setup: Option<SetupPrompt> = if runtime.needs_api_key_setup {
+        Some(SetupPrompt::ProviderKey(SOKET_PROVIDER_ID.into()))
     } else {
         None
     };
@@ -446,7 +447,7 @@ async fn run_loop(
 
         let ac_entries = if input.as_str().starts_with('/')
             && !input.as_str().contains(' ')
-            && pending_secret.is_none()
+            && pending_setup.is_none()
             && model_picker.is_none()
             && fork_picker.is_none()
             && active_approval.is_none()
@@ -457,7 +458,7 @@ async fn run_loop(
             Vec::new()
         };
         let at_mention = if ac_entries.is_empty()
-            && pending_secret.is_none()
+            && pending_setup.is_none()
             && model_picker.is_none()
             && fork_picker.is_none()
             && active_approval.is_none()
@@ -537,7 +538,7 @@ async fn run_loop(
                 hint: "Fork: edit this user message and continue (prior history kept)."
                     .into(),
             }
-        } else if let Some(prompt) = &pending_secret {
+        } else if let Some(prompt) = &pending_setup {
             PickerView::Setup {
                 prompt: prompt.clone(),
                 first_run: runtime.needs_api_key_setup,
@@ -576,7 +577,7 @@ async fn run_loop(
             "↑↓ select · enter confirm · esc cancel".into()
         } else if fork_picker.is_some() {
             "↑↓ select · enter edit · esc cancel".into()
-        } else if let Some(prompt) = &pending_secret {
+        } else if let Some(prompt) = &pending_setup {
             prompt.status_hint().into()
         } else if !ac_entries.is_empty() {
             "↑↓ select · tab complete · enter run".into()
@@ -620,7 +621,7 @@ async fn run_loop(
         };
 
         let live: Vec<ChatItem> = chat[flushed..].to_vec();
-        let setup_mode = pending_secret.is_some();
+        let setup_mode = pending_setup.is_some();
         if refresh_token_bar {
             token_bar.refresh(runtime).await;
             refresh_token_bar = false;
@@ -668,7 +669,10 @@ async fn run_loop(
                     status: &status_line,
                     picker: &picker,
                     setup_mode,
-                    mask_input: setup_mode,
+                    mask_input: pending_setup.as_ref().is_some_and(SetupPrompt::masked),
+                    setup_placeholder: pending_setup
+                        .as_ref()
+                        .map_or("", SetupPrompt::placeholder),
                     path_line: &path_line,
                     model_line: &model_line,
                     usage_line: &usage_line,
@@ -718,7 +722,7 @@ async fn run_loop(
                         &mut redraw_request,
                         &mut purge_ui_events,
                         &mut hide_thinking,
-                        &mut pending_secret,
+                        &mut pending_setup,
                         &mut model_picker,
                         &mut fork_picker,
                         &mut active_approval,
@@ -1547,7 +1551,7 @@ async fn handle_key(
     redraw_request: &mut bool,
     purge_ui_events: &mut bool,
     hide_thinking: &mut bool,
-    pending_secret: &mut Option<SecretPrompt>,
+    pending_setup: &mut Option<SetupPrompt>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
     active_approval: &mut Option<ActiveApproval>,
@@ -1825,7 +1829,7 @@ async fn handle_key(
         }
     }
 
-    if let Some(prompt) = pending_secret.clone() {
+    if let Some(prompt) = pending_setup.clone() {
         if key.code == KeyCode::Esc
             || matches!(
                 runtime.keybindings.resolve(key),
@@ -1835,39 +1839,46 @@ async fn handle_key(
             if prompt.esc_quits(runtime.needs_api_key_setup) {
                 *should_quit = true;
             } else {
-                *pending_secret = None;
+                *pending_setup = None;
                 input.clear();
-                *status = match prompt {
-                    SecretPrompt::ProviderKey(_) => "login cancelled".into(),
-                    SecretPrompt::LangfuseSecret { .. } => "tracing setup cancelled".into(),
-                };
+                *status = prompt.cancelled_message().into();
             }
             return Ok(());
+        }
+        if let SetupPrompt::Tracing(mut step) = prompt.clone() {
+            if step.options().is_some() {
+                // Backend picker: arrows move, enter confirms, other keys are ignored.
+                match key.code {
+                    KeyCode::Up => step.move_selection(-1),
+                    KeyCode::Down => step.move_selection(1),
+                    KeyCode::Enter => {}
+                    _ => return Ok(()),
+                }
+                if key.code != KeyCode::Enter {
+                    *pending_setup = Some(SetupPrompt::Tracing(step));
+                    return Ok(());
+                }
+            }
         }
         let plain_enter = key.code == KeyCode::Enter
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && !key.modifiers.contains(KeyModifiers::CONTROL);
         if plain_enter {
-            *pending_secret = None;
             let key_val = input.as_str().trim().to_string();
             input.clear();
-            if key_val.is_empty() {
-                *pending_secret = Some(prompt);
-                *status = "empty key".into();
-                return Ok(());
-            }
             let provider = match prompt {
-                SecretPrompt::ProviderKey(provider) => provider,
-                SecretPrompt::LangfuseSecret { host, public_key } => {
-                    let line = match runtime.setup_tracing(&host, &public_key, &key_val) {
-                        Ok(status) => format!("✓ {}", describe_tracing_status(&status)),
-                        Err(err) => format!("tracing setup failed: {err:#}"),
-                    };
-                    chat.push(sys(line));
-                    *status = "ready".into();
+                SetupPrompt::ProviderKey(provider) => provider,
+                SetupPrompt::Tracing(step) => {
+                    advance_tracing_setup(step, &key_val, runtime, pending_setup, input, chat, status);
                     return Ok(());
                 }
             };
+            if key_val.is_empty() {
+                *pending_setup = Some(SetupPrompt::ProviderKey(provider));
+                *status = "empty key".into();
+                return Ok(());
+            }
+            *pending_setup = None;
             runtime
                 .credentials
                 .set(&provider, Credential::api_key(key_val));
@@ -2021,7 +2032,7 @@ async fn handle_key(
                             chat,
                             status,
                             turn_step,
-                            pending_secret,
+                            pending_setup,
                             model_picker,
                             fork_picker,
                             hide_thinking,
@@ -2723,12 +2734,45 @@ fn upsert_tool(
     }
 }
 
+/// Feed one answer to the `/tracing setup` wizard and apply the result.
+fn advance_tracing_setup(
+    step: TracingSetup,
+    value: &str,
+    runtime: &mut CliRuntime,
+    pending_setup: &mut Option<SetupPrompt>,
+    input: &mut InputBuffer,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+) {
+    match step.submit(value, &runtime.settings.tracing) {
+        Transition::Next { step, prefill } => {
+            input.set(prefill);
+            *pending_setup = Some(SetupPrompt::Tracing(step));
+        }
+        Transition::Retry { step, error } => {
+            if !step.masked() {
+                input.set(value);
+            }
+            chat.push(sys(format!("tracing setup: {error}")));
+            *pending_setup = Some(SetupPrompt::Tracing(step));
+        }
+        Transition::Done(request) => {
+            *pending_setup = None;
+            chat.push(sys(match runtime.setup_tracing(&request) {
+                Ok(state) => format!("✓ {}", describe_tracing_status(&state)),
+                Err(err) => format!("tracing setup failed: {err:#}"),
+            }));
+            *status = "ready".into();
+        }
+    }
+}
+
 /// `/tracing …`: returns the line to show in the transcript.
 fn apply_tracing_command(
     command: TracingCommand,
     runtime: &mut CliRuntime,
-    pending_secret: &mut Option<SecretPrompt>,
-    status: &mut String,
+    pending_setup: &mut Option<SetupPrompt>,
+    input: &mut InputBuffer,
 ) -> String {
     let result = match command {
         TracingCommand::Status => runtime
@@ -2736,12 +2780,11 @@ fn apply_tracing_command(
             .ok_or_else(|| anyhow::anyhow!("tracing is not available in this mode")),
         TracingCommand::Enable => runtime.set_tracing_enabled(true),
         TracingCommand::Disable => runtime.set_tracing_enabled(false),
-        TracingCommand::Setup { host, public_key } => {
-            let prompt = SecretPrompt::LangfuseSecret { host, public_key };
-            *status = prompt.status_hint().into();
-            let title = prompt.title();
-            *pending_secret = Some(prompt);
-            return format!("{title} — paste the secret key below");
+        TracingCommand::Setup { backend } => {
+            let (step, prefill) = TracingSetup::start(backend, &runtime.settings.tracing);
+            input.set(prefill);
+            *pending_setup = Some(SetupPrompt::Tracing(step));
+            return "tracing setup — follow the prompts below · esc cancels".into();
         }
     };
     match result {
@@ -2756,7 +2799,7 @@ async fn apply_effect(
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     turn_step: &mut String,
-    pending_secret: &mut Option<SecretPrompt>,
+    pending_setup: &mut Option<SetupPrompt>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
     hide_thinking: &mut bool,
@@ -2934,11 +2977,11 @@ async fn apply_effect(
             }
         }
         CommandEffect::Tracing(command) => {
-            chat.push(sys(apply_tracing_command(command, runtime, pending_secret, status)));
+            chat.push(sys(apply_tracing_command(command, runtime, pending_setup, input)));
         }
         CommandEffect::Login(provider) => {
             let p = provider.unwrap_or_else(|| SOKET_PROVIDER_ID.into());
-            *pending_secret = Some(SecretPrompt::ProviderKey(p.clone()));
+            *pending_setup = Some(SetupPrompt::ProviderKey(p.clone()));
             *status = format!("setup · paste API key for {p}");
         }
         CommandEffect::Logout(provider) => {

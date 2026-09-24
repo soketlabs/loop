@@ -1,5 +1,6 @@
 //! `/tracing` slash command parsing and dispatch.
 
+use loop_app_core::config::TracingBackend;
 use loop_cli::commands::{self, CommandEffect, TracingCommand};
 
 fn dispatch(line: &str) -> CommandEffect {
@@ -36,12 +37,21 @@ fn enable_and_disable_with_aliases() {
 }
 
 #[test]
-fn setup_takes_host_and_public_key_only() {
+fn setup_opens_wizard_with_optional_backend() {
     assert_eq!(
-        tracing("/tracing setup https://lf.example pk-lf-1"),
+        tracing("/tracing setup"),
+        TracingCommand::Setup { backend: None }
+    );
+    assert_eq!(
+        tracing("/tracing setup langfuse"),
         TracingCommand::Setup {
-            host: "https://lf.example".into(),
-            public_key: "pk-lf-1".into(),
+            backend: Some(TracingBackend::Langfuse)
+        }
+    );
+    assert_eq!(
+        tracing("/tracing setup otlp"),
+        TracingCommand::Setup {
+            backend: Some(TracingBackend::Otlp)
         }
     );
 }
@@ -50,9 +60,8 @@ fn setup_takes_host_and_public_key_only() {
 fn bad_input_shows_usage() {
     for line in [
         "/tracing nope",
-        "/tracing setup",
-        "/tracing setup https://lf.example",
-        "/tracing setup https://lf.example pk sk-should-not-be-typed-here",
+        "/tracing setup jaeger",
+        "/tracing setup https://lf.example pk-lf-1",
         "/tracing enable now",
     ] {
         match dispatch(line) {

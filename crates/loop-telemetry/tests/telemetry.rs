@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
 use loop_telemetry::obs::{self, keys};
-use loop_telemetry::{CredentialSource, ObservationExt, TelemetryHandle, TraceAttrs};
+use loop_telemetry::{
+    CredentialSource, ObservationExt, TelemetryDestination, TelemetryHandle, TraceAttrs,
+};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SpanData};
 use tracing::Dispatch;
 use tracing_subscriber::layer::SubscriberExt;
@@ -273,14 +275,17 @@ fn invalid_traceparent_is_rejected() {
     });
 }
 
-/// Real OTLP/HTTP exporter against a local listener: checks path and Langfuse headers.
-#[test]
-fn langfuse_exporter_posts_protobuf_with_auth_headers() {
+/// Request head lines and body captured by [`capture_one_request`].
+type CapturedRequest = std::thread::JoinHandle<(Vec<String>, Vec<u8>)>;
+
+/// Accepts one HTTP request on a local port; returns the base URL and a join handle
+/// yielding the request head lines and body.
+fn capture_one_request() -> (String, CapturedRequest) {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let host = format!("http://{}", listener.local_addr().unwrap());
+    let base = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -305,8 +310,31 @@ fn langfuse_exporter_posts_protobuf_with_auth_headers() {
             .unwrap();
         (head, body)
     });
+    (base, server)
+}
 
+/// Export one `loop.run` span to `destination` and return the captured request.
+fn export_one_span(
+    destination: &TelemetryDestination,
+    server: CapturedRequest,
+) -> (TelemetryHandle, Vec<String>, Vec<u8>) {
     let handle = TelemetryHandle::new("test-release", true);
+    handle.install(destination).unwrap();
+    let dispatch = Dispatch::new(tracing_subscriber::registry().with(handle.layer()));
+    tracing::dispatcher::with_default(&dispatch, || {
+        let _ = obs::agent("loop.run").entered();
+    });
+    handle.flush();
+    let (head, body) = server.join().unwrap();
+    let lower = head.iter().map(|l| l.to_ascii_lowercase()).collect();
+    assert!(body.windows(b"loop.run".len()).any(|w| w == b"loop.run"));
+    (handle, lower, body)
+}
+
+/// Real OTLP/HTTP exporter against a local listener: checks path and Langfuse headers.
+#[test]
+fn langfuse_exporter_posts_protobuf_with_auth_headers() {
+    let (host, server) = capture_one_request();
     let creds = loop_telemetry::TelemetryCredentials::from_parts(
         Some(host.clone()),
         Some("pk-lf-1".into()),
@@ -314,21 +342,27 @@ fn langfuse_exporter_posts_protobuf_with_auth_headers() {
         CredentialSource::Env,
     )
     .unwrap();
-    handle.install(&creds).unwrap();
-    let dispatch = Dispatch::new(tracing_subscriber::registry().with(handle.layer()));
-    tracing::dispatcher::with_default(&dispatch, || {
-        let _ = obs::agent("loop.run").entered();
-    });
-    handle.flush();
+    let (handle, head, _) = export_one_span(&creds.destination(), server);
+    assert_eq!(head[0], "post /api/public/otel/v1/traces http/1.1");
+    assert!(head.contains(&"authorization: basic cgstbgytmtpzay1szi0y".to_string()));
+    assert!(head.contains(&"x-langfuse-ingestion-version: 4".to_string()));
+    assert!(head.contains(&"content-type: application/x-protobuf".to_string()));
+    assert_eq!(
+        handle.status().destination,
+        Some(format!("Langfuse · {host}"))
+    );
+}
 
-    let (head, body) = server.join().unwrap();
-    let lower: Vec<String> = head.iter().map(|l| l.to_ascii_lowercase()).collect();
-    assert_eq!(head[0], "POST /api/public/otel/v1/traces HTTP/1.1");
-    assert!(lower.contains(&"authorization: basic cgstbgytmtpzay1szi0y".to_string()));
-    assert!(lower.contains(&"x-langfuse-ingestion-version: 4".to_string()));
-    assert!(lower.contains(&"content-type: application/x-protobuf".to_string()));
-    assert!(body.windows(b"loop.run".len()).any(|w| w == b"loop.run"));
-    assert_eq!(handle.status().host.as_deref(), Some(host.as_str()));
+/// Generic OTLP collector: standard `/v1/traces` path and optional Authorization.
+#[test]
+fn otlp_exporter_posts_to_collector_with_optional_auth() {
+    let (base, server) = capture_one_request();
+    let destination =
+        TelemetryDestination::otlp(&base, Some("Bearer tok"), CredentialSource::Config).unwrap();
+    let (_, head, _) = export_one_span(&destination, server);
+    assert_eq!(head[0], "post /v1/traces http/1.1");
+    assert!(head.contains(&"authorization: bearer tok".to_string()));
+    assert!(!head.iter().any(|h| h.starts_with("x-langfuse")));
 }
 
 #[test]
@@ -340,14 +374,13 @@ fn failed_export_is_reported_in_status() {
         .unwrap()
         .port();
     let handle = TelemetryHandle::new("test-release", true);
-    let creds = loop_telemetry::TelemetryCredentials::from_parts(
-        Some(format!("http://127.0.0.1:{port}")),
-        Some("pk".into()),
-        Some("sk".into()),
+    let destination = TelemetryDestination::otlp(
+        &format!("http://127.0.0.1:{port}"),
+        None,
         CredentialSource::Config,
     )
     .unwrap();
-    handle.install(&creds).unwrap();
+    handle.install(&destination).unwrap();
     assert!(handle.status().last_error.is_none());
     let dispatch = Dispatch::new(tracing_subscriber::registry().with(handle.layer()));
     tracing::dispatcher::with_default(&dispatch, || {
