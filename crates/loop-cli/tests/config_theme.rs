@@ -63,8 +63,8 @@ fn parse_local_sandbox_flags_defaults_and_options() {
 #[test]
 fn settings_defaults_soket() {
     let s = Settings::default();
-    assert_eq!(s.default_provider, "soket");
-    assert_eq!(s.default_model, "qwen3-30b");
+    // No model is chosen for the user; `/model` sets one.
+    assert_eq!(s.selected_model(), None);
     assert_eq!(s.theme, "dark");
     assert_eq!(s.file_edit_review, "newSession");
     assert_eq!(s.tool_permissions.get("bash").map(String::as_str), Some("ask"));
