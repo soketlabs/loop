@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use super::paths::{get_project_dir, settings_path};
 use super::providers::CustomProviderEntry;
 use super::tracing::TracingSettings;
-use loop_ai::providers::{SOKET_DEFAULT_MODEL_ID, SOKET_PROVIDER_ID};
 
 /// Compaction settings subset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,11 +117,11 @@ impl SandboxSettings {
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     /// Default provider id.
-    #[serde(default = "default_provider")]
-    pub default_provider: String,
-    /// Default model id.
-    #[serde(default = "default_model")]
-    pub default_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    /// Selected model id; `None` until the user picks one with `/model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
     /// Default thinking level (`off`, `low`, …).
     #[serde(default = "default_thinking")]
     pub default_thinking_level: String,
@@ -195,12 +194,6 @@ pub struct Settings {
     pub providers: Vec<CustomProviderEntry>,
 }
 
-fn default_provider() -> String {
-    SOKET_PROVIDER_ID.into()
-}
-fn default_model() -> String {
-    SOKET_DEFAULT_MODEL_ID.into()
-}
 fn default_thinking() -> String {
     "off".into()
 }
@@ -229,8 +222,8 @@ fn default_response_header_timeout_ms() -> u64 {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            default_provider: default_provider(),
-            default_model: default_model(),
+            default_provider: None,
+            default_model: None,
             default_thinking_level: default_thinking(),
             theme: default_theme(),
             compaction: CompactionSettingsJson::default(),
@@ -258,6 +251,28 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The saved `(provider, model id)`, when both are set.
+    pub fn selected_model(&self) -> Option<(&str, &str)> {
+        Some((self.default_provider.as_deref()?, self.default_model.as_deref()?))
+    }
+
+    /// `provider/model id` of the saved selection.
+    pub fn selected_model_spec(&self) -> Option<String> {
+        self.selected_model().map(|(p, m)| format!("{p}/{m}"))
+    }
+
+    /// Remember a model selection.
+    pub fn set_selected_model(&mut self, provider: &str, model: &str) {
+        self.default_provider = Some(provider.into());
+        self.default_model = Some(model.into());
+    }
+
+    /// Forget the model selection.
+    pub fn clear_selected_model(&mut self) {
+        self.default_provider = None;
+        self.default_model = None;
+    }
+
     /// Load from a JSON file, or defaults if missing.
     pub fn load_file(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
@@ -292,8 +307,10 @@ impl Settings {
 
 fn project_overlay(mut base: Settings, project: Settings) -> Settings {
     // Prefer project values when the project settings file was loaded (non-default merge).
-    base.default_provider = project.default_provider;
-    base.default_model = project.default_model;
+    if let (Some(provider), Some(model)) = (project.default_provider, project.default_model) {
+        base.default_provider = Some(provider);
+        base.default_model = Some(model);
+    }
     base.default_thinking_level = project.default_thinking_level;
     base.theme = project.theme;
     base.compaction = project.compaction;

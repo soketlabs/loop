@@ -28,7 +28,7 @@ async fn make_harness(
 
     AgentHarness::new(AgentHarnessOptions {
         models,
-        model,
+        model: Some(model),
         session,
         host_env: host,
         tools: vec![],
@@ -132,7 +132,7 @@ async fn navigate_tree_moves_leaf() {
     let host = Arc::new(HostExecutionEnv::new(std::env::temp_dir()));
     let harness = AgentHarness::new(AgentHarnessOptions {
         models,
-        model,
+        model: Some(model),
         session,
         host_env: host,
         tools: vec![],
