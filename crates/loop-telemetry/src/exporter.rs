@@ -69,6 +69,7 @@ pub(crate) struct ExporterSlot {
 struct SlotState {
     exporter: Option<Arc<dyn DynExporter>>,
     resource: Option<Resource>,
+    last_error: Option<String>,
 }
 
 impl fmt::Debug for ExporterSlot {
@@ -90,6 +91,16 @@ impl ExporterSlot {
             let _ = previous.shutdown();
         }
         state.exporter = Some(Arc::new(Adapter(parking_lot::Mutex::new(Some(exporter)))));
+        state.last_error = None;
+    }
+
+    /// Error from the most recent failed export, cleared by the next success.
+    pub(crate) fn last_error(&self) -> Option<String> {
+        self.inner.read().last_error.clone()
+    }
+
+    fn record_result(&self, result: &OTelSdkResult) {
+        self.inner.write().last_error = result.as_ref().err().map(ToString::to_string);
     }
 
     /// Whether a destination is installed.
@@ -134,12 +145,14 @@ pub(crate) struct SlotExporter(ExporterSlot);
 
 impl SpanExporter for SlotExporter {
     fn export(&self, batch: Vec<SpanData>) -> impl Future<Output = OTelSdkResult> + Send {
-        let current = self.0.current();
+        let slot = self.0.clone();
         async move {
-            match current {
-                Some(exporter) => exporter.export(batch).await,
-                None => Ok(()),
-            }
+            let Some(exporter) = slot.current() else {
+                return Ok(());
+            };
+            let result = exporter.export(batch).await;
+            slot.record_result(&result);
+            result
         }
     }
 

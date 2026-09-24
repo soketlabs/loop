@@ -6,7 +6,7 @@
 //! unless the user turned it off with `/tracing disable`.
 
 use loop_ai::auth::{Credential, CredentialStore};
-use loop_telemetry::{CredentialSource, TelemetryCredentials};
+use loop_telemetry::{CredentialSource, TelemetryCredentials, TelemetryHandle, TelemetryStatus};
 use serde::{Deserialize, Serialize};
 
 /// Credential store id holding the Langfuse secret key.
@@ -99,6 +99,87 @@ pub fn store_tracing_credentials(
     );
 }
 
+/// Applies tracing settings and credentials to a live [`TelemetryHandle`].
+///
+/// Callers persist `settings` afterwards (see `Runtime::save_settings`).
+pub struct TracingControl<'a> {
+    /// Global tracing settings.
+    pub settings: &'a mut TracingSettings,
+    /// Credential store holding the Langfuse secret key.
+    pub store: &'a dyn CredentialStore,
+    /// Process telemetry.
+    pub handle: &'a TelemetryHandle,
+}
+
+impl TracingControl<'_> {
+    /// Startup: install resolved credentials (if any) and apply the saved preference.
+    pub fn apply(&mut self) -> anyhow::Result<TelemetryStatus> {
+        let creds = resolve_tracing_credentials(self.settings, self.store);
+        self.apply_credentials(creds.as_ref())
+    }
+
+    fn apply_credentials(
+        &mut self,
+        creds: Option<&TelemetryCredentials>,
+    ) -> anyhow::Result<TelemetryStatus> {
+        if let Some(creds) = creds {
+            self.handle.install(creds)?;
+        }
+        Ok(self.handle.set_enabled(self.settings.enabled))
+    }
+
+    /// `/tracing enable|disable`.
+    pub fn set_enabled(&mut self, enabled: bool) -> TelemetryStatus {
+        self.settings.enabled = enabled;
+        self.handle.set_enabled(enabled)
+    }
+
+    /// `/tracing setup`: save credentials and start exporting with them now.
+    pub fn setup(
+        &mut self,
+        host: &str,
+        public_key: &str,
+        secret_key: &str,
+    ) -> anyhow::Result<TelemetryStatus> {
+        let creds = TelemetryCredentials::from_parts(
+            Some(host.into()),
+            Some(public_key.into()),
+            Some(secret_key.into()),
+            CredentialSource::Config,
+        )
+        .ok_or_else(|| anyhow::anyhow!("host, public key and secret key are all required"))?;
+        if !(creds.host.starts_with("http://") || creds.host.starts_with("https://")) {
+            anyhow::bail!("Langfuse host must start with http:// or https://");
+        }
+        self.handle.install(&creds)?;
+        store_tracing_credentials(self.settings, self.store, &creds);
+        Ok(self.set_enabled(true))
+    }
+}
+
+/// One-line summary for `/tracing status` and startup messages.
+pub fn describe_tracing_status(status: &TelemetryStatus) -> String {
+    let Some(host) = &status.host else {
+        return "tracing: not configured · run /tracing setup <host> <public-key>, or set \
+                LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY"
+            .into();
+    };
+    let state = if status.enabled {
+        "on"
+    } else {
+        "off (/tracing enable)"
+    };
+    let source = status
+        .source
+        .map(CredentialSource::as_str)
+        .unwrap_or("unknown");
+    let mut line = format!("tracing: {state} · {host} · credentials from {source}");
+    if let Some(err) = &status.last_error {
+        line.push_str(&format!(" · last export failed: {err}"));
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -132,6 +213,100 @@ mod tests {
         .unwrap();
         store_tracing_credentials(&mut settings, store, &creds);
         settings
+    }
+
+    fn control<'a>(
+        settings: &'a mut TracingSettings,
+        store: &'a InMemoryCredentialStore,
+        handle: &'a TelemetryHandle,
+    ) -> TracingControl<'a> {
+        TracingControl {
+            settings,
+            store,
+            handle,
+        }
+    }
+
+    #[test]
+    fn apply_without_credentials_is_inactive() {
+        let (mut settings, store) = (
+            TracingSettings::default(),
+            InMemoryCredentialStore::default(),
+        );
+        let handle = TelemetryHandle::new("t", true);
+        let status = control(&mut settings, &store, &handle)
+            .apply_credentials(None)
+            .unwrap();
+        assert!(!status.active());
+        assert!(describe_tracing_status(&status).contains("not configured"));
+    }
+
+    #[test]
+    fn apply_with_saved_credentials_honours_disabled_preference() {
+        let store = InMemoryCredentialStore::default();
+        let mut settings = saved(&store);
+        settings.enabled = false;
+        let handle = TelemetryHandle::new("t", true);
+        let creds = resolve_with_env(&settings, &store, env_of(&[]));
+        let status = control(&mut settings, &store, &handle)
+            .apply_credentials(creds.as_ref())
+            .unwrap();
+        assert_eq!(status.host.as_deref(), Some("https://cfg.example"));
+        assert!(!status.enabled && !status.active());
+        assert!(describe_tracing_status(&status).contains("off"));
+    }
+
+    #[test]
+    fn set_enabled_updates_settings_and_handle() {
+        let (mut settings, store) = (
+            TracingSettings::default(),
+            InMemoryCredentialStore::default(),
+        );
+        let handle = TelemetryHandle::new("t", true);
+        let status = control(&mut settings, &store, &handle).set_enabled(false);
+        assert!(!status.enabled);
+        assert!(!settings.enabled);
+        assert!(!handle.status().enabled);
+    }
+
+    #[test]
+    fn setup_stores_credentials_and_activates() {
+        let (mut settings, store) = (
+            TracingSettings::default(),
+            InMemoryCredentialStore::default(),
+        );
+        settings.enabled = false;
+        let handle = TelemetryHandle::new("t", true);
+        let status = control(&mut settings, &store, &handle)
+            .setup("https://lf.example/", "pk-1", "sk-1")
+            .unwrap();
+        assert!(status.active());
+        assert_eq!(status.source, Some(CredentialSource::Config));
+        assert!(settings.enabled);
+        assert_eq!(
+            settings.langfuse_host.as_deref(),
+            Some("https://lf.example/")
+        );
+        assert_eq!(settings.langfuse_public_key.as_deref(), Some("pk-1"));
+        assert!(matches!(
+            store.get(LANGFUSE_CREDENTIAL_ID),
+            Some(Credential::ApiKey { key }) if key == "sk-1"
+        ));
+        assert!(describe_tracing_status(&status).contains("tracing: on · https://lf.example"));
+    }
+
+    #[test]
+    fn setup_rejects_incomplete_or_non_http_input() {
+        let (mut settings, store) = (
+            TracingSettings::default(),
+            InMemoryCredentialStore::default(),
+        );
+        let handle = TelemetryHandle::new("t", true);
+        let mut c = control(&mut settings, &store, &handle);
+        assert!(c.setup("https://h", "pk", " ").is_err());
+        assert!(c.setup("lf.example", "pk", "sk").is_err());
+        assert!(store.get(LANGFUSE_CREDENTIAL_ID).is_none());
+        assert!(!handle.status().active());
     }
 
     #[test]

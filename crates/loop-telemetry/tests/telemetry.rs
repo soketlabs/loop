@@ -330,3 +330,29 @@ fn langfuse_exporter_posts_protobuf_with_auth_headers() {
     assert!(body.windows(b"loop.run".len()).any(|w| w == b"loop.run"));
     assert_eq!(handle.status().host.as_deref(), Some(host.as_str()));
 }
+
+#[test]
+fn failed_export_is_reported_in_status() {
+    // Bind then drop a listener so the port is closed and connections are refused.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let handle = TelemetryHandle::new("test-release", true);
+    let creds = loop_telemetry::TelemetryCredentials::from_parts(
+        Some(format!("http://127.0.0.1:{port}")),
+        Some("pk".into()),
+        Some("sk".into()),
+        CredentialSource::Config,
+    )
+    .unwrap();
+    handle.install(&creds).unwrap();
+    assert!(handle.status().last_error.is_none());
+    let dispatch = Dispatch::new(tracing_subscriber::registry().with(handle.layer()));
+    tracing::dispatcher::with_default(&dispatch, || {
+        let _ = obs::agent("loop.run").entered();
+    });
+    handle.flush();
+    assert!(handle.status().last_error.is_some());
+}
