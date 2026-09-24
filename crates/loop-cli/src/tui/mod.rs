@@ -69,6 +69,19 @@ pub enum ChatItem {
         output: String,
     },
     System { text: String },
+    /// A failure the user should notice (model/API errors, rejected setup input).
+    Error { text: String },
+}
+
+/// Error line for an assistant message that ended in an error. Aborts (the user's own
+/// esc) stay quiet.
+pub fn assistant_error_item(message: &loop_ai::AssistantMessage) -> Option<ChatItem> {
+    if message.stop_reason != loop_ai::StopReason::Error {
+        return None;
+    }
+    message.failure().map(|error| ChatItem::Error {
+        text: format!("error: {error}"),
+    })
 }
 
 /// One row in a navigable picker (commands / models).
@@ -144,7 +157,10 @@ pub fn item_is_committed(
     streaming_thinking: Option<usize>,
 ) -> bool {
     match item {
-        ChatItem::User { .. } | ChatItem::System { .. } | ChatItem::Shell { .. } => true,
+        ChatItem::User { .. }
+        | ChatItem::System { .. }
+        | ChatItem::Error { .. }
+        | ChatItem::Shell { .. } => true,
         ChatItem::Queued { .. } => false,
         ChatItem::Assistant { .. } => streaming_assistant != Some(index),
         ChatItem::Thinking { done, .. } => *done && streaming_thinking != Some(index),
@@ -626,6 +642,12 @@ pub fn format_item_lines(
         ChatItem::System { text } => {
             for l in text.lines() {
                 lines.extend(wrap_plain(l, theme.dim(), w));
+            }
+            lines.push(Line::from(""));
+        }
+        ChatItem::Error { text } => {
+            for l in text.lines() {
+                lines.extend(wrap_plain(l, theme.error(), w));
             }
             lines.push(Line::from(""));
         }
@@ -1590,13 +1612,7 @@ pub fn chat_items_from_agent_messages(
                         }
                     }
                 }
-                if let Some(err) = &a.error_message {
-                    if !err.is_empty() {
-                        chat.push(ChatItem::System {
-                            text: format!("error: {err}"),
-                        });
-                    }
-                }
+                chat.extend(assistant_error_item(a));
             }
             AgentMessage::Llm(Message::ToolResult(tr)) => {
                 let result_text = tool_result_text(tr);
@@ -1891,6 +1907,51 @@ mod tests {
             lines.iter().any(|l| l.to_string().contains("thought 249")),
             "last thinking line should remain visible"
         );
+    }
+
+    #[test]
+    fn resumed_sessions_show_past_errors_but_not_aborts() {
+        use loop_agent::types::AgentMessage;
+        use loop_ai::StopReason;
+
+        let model = loop_ai::providers::soket_seed_models().remove(0);
+        let mut failed = loop_ai::AssistantMessage::pending(&model);
+        failed.stop_reason = StopReason::Error;
+        failed.error_message = Some("HTTP 401 Unauthorized: Invalid API key".into());
+        let mut aborted = failed.clone();
+        aborted.stop_reason = StopReason::Aborted;
+        aborted.error_message = Some("Operation aborted".into());
+
+        let chat = chat_items_from_agent_messages(&[
+            AgentMessage::assistant(failed),
+            AgentMessage::assistant(aborted),
+        ]);
+        let errors: Vec<_> = chat
+            .iter()
+            .filter_map(|c| match c {
+                ChatItem::Error { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors, ["error: HTTP 401 Unauthorized: Invalid API key"]);
+    }
+
+    #[test]
+    fn error_items_render_in_the_error_color() {
+        let theme = Theme::dark();
+        let lines = format_item_lines(
+            &ChatItem::Error {
+                text: "error: HTTP 502 Bad Gateway".into(),
+            },
+            &theme,
+            false,
+            false,
+            80,
+        );
+        let span = &lines[0].spans[0];
+        assert!(span.content.contains("HTTP 502"));
+        assert_eq!(span.style.fg, theme.error().fg);
+        assert_ne!(theme.error().fg, theme.dim().fg);
     }
 
     #[test]

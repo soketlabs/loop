@@ -276,7 +276,7 @@ async fn run_stream(
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         return Err(StreamFail {
-            message: format!("HTTP {}: {}", status.as_u16(), body),
+            message: crate::utils::summarize_http_error(status.as_u16(), &body),
             aborted: false,
         });
     }

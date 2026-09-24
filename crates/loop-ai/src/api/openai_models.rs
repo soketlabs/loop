@@ -12,7 +12,7 @@ pub enum ListModelsError {
     #[error("list models http: {0}")]
     Http(#[from] reqwest::Error),
     /// Non-success status.
-    #[error("list models status {status}: {body}")]
+    #[error("{}", crate::utils::summarize_http_error(*status, body))]
     Status {
         /// HTTP status.
         status: u16,

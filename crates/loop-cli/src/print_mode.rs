@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 
 use loop_agent::AgentMessage;
-use loop_ai::{AssistantContent, Message, StopReason};
+use loop_ai::{AssistantContent, Message};
 use loop_telemetry::{obs, ObservationExt, TelemetryHandle, TraceAttrs};
 use tracing::Instrument;
 
@@ -144,17 +144,8 @@ pub fn final_text(message: &AgentMessage) -> anyhow::Result<String> {
     let Some(Message::Assistant(assistant)) = message.as_llm() else {
         return Ok(format!("{message:?}"));
     };
-    if matches!(
-        assistant.stop_reason,
-        StopReason::Error | StopReason::Aborted
-    ) {
-        anyhow::bail!(
-            "{}",
-            assistant
-                .error_message
-                .clone()
-                .unwrap_or_else(|| format!("assistant stopped with {:?}", assistant.stop_reason))
-        );
+    if let Some(failure) = assistant.failure() {
+        anyhow::bail!("{failure}");
     }
     Ok(assistant
         .content
@@ -169,6 +160,7 @@ pub fn final_text(message: &AgentMessage) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use loop_ai::StopReason;
 
     use super::*;
 
