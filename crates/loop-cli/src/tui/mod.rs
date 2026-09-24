@@ -226,7 +226,7 @@ pub fn welcome_lines(
     let (dot_style, status_text) = if needs_setup {
         (
             theme.style("warning"),
-            "setup — paste your API key to begin".to_string(),
+            "setup — connect a model provider to begin (/login)".to_string(),
         )
     } else {
         (
@@ -1905,7 +1905,8 @@ mod tests {
         let host = TracingSetup::LangfuseHost;
         let otlp = TracingSetup::OtlpEndpoint;
         for prompt in [
-            SetupPrompt::ProviderKey("soket".into()),
+            SetupPrompt::Provider(crate::provider_setup::ProviderSetup::start(None).unwrap()),
+            SetupPrompt::Provider(crate::provider_setup::ProviderSetup::start(Some("soket")).unwrap()),
             SetupPrompt::Tracing(picker),
             SetupPrompt::Tracing(host),
             SetupPrompt::Tracing(otlp),
@@ -1951,7 +1952,10 @@ mod tests {
             public_key: "p".into(),
         };
         assert!(last_line(SetupPrompt::Tracing(secret)).contains("enter save"));
-        assert!(last_line(SetupPrompt::ProviderKey("soket".into())).contains("enter save"));
+        let key = crate::provider_setup::ProviderSetup::start(Some("soket")).unwrap();
+        assert!(last_line(SetupPrompt::Provider(key)).contains("enter save"));
+        let name = crate::provider_setup::ProviderSetup::start(Some("custom")).unwrap();
+        assert!(last_line(SetupPrompt::Provider(name)).contains("enter next"));
     }
 
     #[test]

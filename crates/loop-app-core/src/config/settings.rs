@@ -6,6 +6,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::paths::{get_project_dir, settings_path};
+use super::providers::CustomProviderEntry;
 use super::tracing::TracingSettings;
 use loop_ai::providers::{SOKET_DEFAULT_MODEL_ID, SOKET_PROVIDER_ID};
 
@@ -189,6 +190,9 @@ pub struct Settings {
     /// Langfuse tracing (global only; see [`TracingSettings`]).
     #[serde(default)]
     pub tracing: TracingSettings,
+    /// Custom OpenAI-compatible providers added with `/login` (global only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<CustomProviderEntry>,
 }
 
 fn default_provider() -> String {
@@ -248,6 +252,7 @@ impl Default for Settings {
             mcp_servers: BTreeMap::new(),
             response_header_timeout_ms: default_response_header_timeout_ms(),
             tracing: TracingSettings::default(),
+            providers: Vec::new(),
         }
     }
 }

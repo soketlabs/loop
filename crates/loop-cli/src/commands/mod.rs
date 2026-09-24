@@ -103,13 +103,13 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "login",
-            description: "Save API key for a provider",
-            args_hint: Some("[provider]"),
+            description: "Connect a model provider (Soket, OpenRouter, OpenAI, custom)",
+            args_hint: Some("[soket|openrouter|openai|custom]"),
         },
         SlashCommand {
             name: "logout",
-            description: "Remove stored credentials",
-            args_hint: Some("[provider]"),
+            description: "Disconnect a model provider",
+            args_hint: Some("<provider>"),
         },
         SlashCommand {
             name: "new",
