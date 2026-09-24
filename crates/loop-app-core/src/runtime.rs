@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context};
+use anyhow::bail;
 
 use loop_agent::harness::{
     create_bash_tool, create_edit_tool, create_read_tool, create_session_repository,
@@ -14,7 +14,6 @@ use loop_agent::harness::{
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
 use loop_ai::providers::{
     custom_provider, CustomModelSpec, CustomProviderConfig,
-    SOKET_DEFAULT_MODEL_ID, SOKET_PROVIDER_ID,
 };
 use loop_ai::{
     CreateModelsOptions, FileModelsStore, Models, ModelsRefreshOptions,
@@ -28,6 +27,7 @@ use crate::config::paths::{
 };
 use crate::config::settings::{load_settings, McpServerConfig, Settings};
 use crate::config::trust::TrustStore;
+use crate::model_selection::StartupModel;
 use crate::config::paths::{trust_path};
 use crate::resources::{load_resources, LoadedResources};
 use crate::system_prompt::{
@@ -64,8 +64,12 @@ pub struct Runtime {
     pub session_id: String,
     /// True when started with `--resume <id>` (transcript hydrated from store).
     pub resumed: bool,
-    /// When true, TUI should show the first-run API key setup box.
+    /// When true, the TUI opens the first-run provider setup (`/login`).
     pub needs_provider_setup: bool,
+    /// The model prompts go to (mirrors the harness; change it via [`Runtime::select_model`]).
+    pub selected_model: Option<loop_ai::Model>,
+    /// Why no model is selected, when a saved one could not be used.
+    pub model_note: Option<String>,
     /// Interactive tool approval bridge (set by the TUI).
     pub tool_approval: Option<std::sync::Arc<crate::tool_approval::ToolApprovalBridge>>,
     /// MCP client manager for external tool servers.
@@ -142,8 +146,9 @@ impl Runtime {
         })
     }
 
-    /// `/logout`: forget the provider's key; custom providers are removed entirely.
-    pub fn disconnect_provider(&mut self, id: &str) -> anyhow::Result<String> {
+    /// `/logout`: forget the provider's key; custom providers are removed entirely. A
+    /// selected model from that provider is deselected.
+    pub async fn disconnect_provider(&mut self, id: &str) -> anyhow::Result<String> {
         let id = id.trim().to_ascii_lowercase();
         let custom_index = self.settings.providers.iter().position(|p| p.id == id);
         let preset = loop_ai::providers::provider_preset(&id);
@@ -161,7 +166,35 @@ impl Runtime {
             }
             None => preset.map_or_else(|| id.clone(), |p| p.name.to_string()),
         };
+        if self.selected_model.as_ref().is_some_and(|m| m.provider == id) {
+            self.model_note = self.selected_model_spec().map(|spec| format!("{spec} was disconnected"));
+            self.selected_model = None;
+            self.harness.clear_model().await;
+            self.settings.clear_selected_model();
+            self.save_settings()?;
+        }
         Ok(name)
+    }
+
+    /// Select `provider/id` for this and future runs (harness + saved settings).
+    pub async fn select_model(&mut self, provider: &str, id: &str) -> anyhow::Result<loop_ai::Model> {
+        let model = self
+            .models
+            .get_model(provider, id)
+            .ok_or_else(|| anyhow::anyhow!("model not found: {provider}/{id}"))?;
+        self.harness.set_model(model.clone()).await;
+        self.settings.set_selected_model(provider, id);
+        self.selected_model = Some(model.clone());
+        self.model_note = None;
+        self.save_settings()?;
+        Ok(model)
+    }
+
+    /// `provider/id` of the selected model.
+    pub fn selected_model_spec(&self) -> Option<String> {
+        self.selected_model
+            .as_ref()
+            .map(|m| format!("{}/{}", m.provider, m.id))
     }
 
     /// Models of connected providers, in picker order (Soket first).
@@ -446,12 +479,6 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     if let Some(t) = &opts.theme {
         settings.theme = t.clone();
     }
-    if let Some(p) = &opts.provider {
-        settings.default_provider = p.clone();
-    }
-    if let Some(m) = &opts.model {
-        settings.default_model = m.clone();
-    }
 
     let credentials = Arc::new(FileCredentialStore::open(auth_path(&agent_dir))?);
     let needs_provider_setup =
@@ -486,21 +513,18 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         });
     }
 
-    let provider = settings.default_provider.clone();
-    let model_id = settings.default_model.clone();
-    let explicit_model = opts.model.is_some() || opts.provider.is_some();
-    let mut model = if let Some(m) = models.get_model(&provider, &model_id) {
-        m
-    } else if explicit_model {
-        anyhow::bail!(
-            "unknown model {provider}/{model_id}. Call `/v1/models` or pick a cached catalog id."
-        );
-    } else {
-        models
-            .get_model(SOKET_PROVIDER_ID, SOKET_DEFAULT_MODEL_ID)
-            .or_else(|| models.get_models(None).into_iter().next())
-            .context("no models available")?
+    let (mut model, mut model_note) = match crate::model_selection::resolve_startup_model(
+        &models,
+        settings.selected_model(),
+        opts.provider.as_deref(),
+        opts.model.as_deref(),
+    )? {
+        StartupModel::Selected(model) => (Some(*model), None),
+        StartupModel::NotSelected { reason } => (None, reason),
     };
+    if let Some(m) = &model {
+        settings.set_selected_model(&m.provider, &m.id);
+    }
 
     let resources = load_resources(&agent_dir, &opts.cwd, project_trusted, &settings);
     let context_files = if opts.no_context_files {
@@ -546,9 +570,9 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
             if opts.provider.is_none() && opts.model.is_none() {
                 if let Some((p, m)) = &ctx.model {
                     if let Some(resolved) = models.get_model(p, m) {
-                        settings.default_provider = p.clone();
-                        settings.default_model = m.clone();
-                        model = resolved;
+                        settings.set_selected_model(p, m);
+                        model = Some(resolved);
+                        model_note = None;
                     }
                 }
             }
@@ -605,7 +629,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let session_id = session.metadata().id.clone();
     let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
         models: Arc::clone(&models),
-        model,
+        model: model.clone(),
         session,
         host_env: host,
         tools,
@@ -673,6 +697,8 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         session_id,
         resumed,
         needs_provider_setup,
+        selected_model: model,
+        model_note,
         tool_approval: None,
         mcp_client,
         active_skills: Vec::new(),

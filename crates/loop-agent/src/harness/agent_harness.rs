@@ -58,8 +58,9 @@ type Sub = Arc<dyn Fn(AgentEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + 
 pub struct AgentHarnessOptions {
     /// Models collection.
     pub models: Arc<Models>,
-    /// Initial model.
-    pub model: Model,
+    /// Initial model; `None` until the user picks one (prompts fail with
+    /// [`AgentHarnessError::NoModelSelected`]).
+    pub model: Option<Model>,
     /// Session.
     pub session: Session,
     /// Host execution env.
@@ -100,7 +101,7 @@ pub struct AgentHarness {
     stream_fn: StreamFn,
     session: Arc<tokio::sync::Mutex<Session>>,
     host_env: Arc<dyn ExecutionEnv>,
-    model: RwLock<Model>,
+    model: RwLock<Option<Model>>,
     thinking_level: RwLock<AgentThinkingLevel>,
     tools: RwLock<Vec<AgentTool>>,
     active_tool_names: RwLock<Option<Vec<String>>>,
@@ -382,7 +383,23 @@ impl AgentHarness {
 
     /// Set model.
     pub async fn set_model(&self, model: Model) {
-        *self.model.write().await = model;
+        *self.model.write().await = Some(model);
+    }
+
+    /// Forget the selected model.
+    pub async fn clear_model(&self) {
+        *self.model.write().await = None;
+    }
+
+    /// The selected model, if any.
+    pub async fn model(&self) -> Option<Model> {
+        self.model.read().await.clone()
+    }
+
+    /// The selected model, or [`AgentHarnessError::NoModelSelected`]. Every path that
+    /// calls a model goes through here.
+    async fn require_model(&self) -> Result<Model, AgentHarnessError> {
+        self.model().await.ok_or(AgentHarnessError::NoModelSelected)
     }
 
     /// Set thinking level.
@@ -770,7 +787,7 @@ impl AgentHarness {
             (meta, all_entries, branch_entries, ctx.messages)
         };
 
-        let model = self.model.read().await.clone();
+        let model = self.require_model().await?;
         let system_prompt = self.system_prompt.read().await.clone();
         let tools = self.tools.read().await.clone();
         let llm_tools: Vec<loop_ai::Tool> = tools.iter().map(|t| t.to_llm_tool()).collect();
@@ -1010,12 +1027,7 @@ impl AgentHarness {
 
     /// Create turn snapshot.
     pub async fn create_turn_state(&self) -> Result<TurnSnapshot, AgentHarnessError> {
-        let sandbox = self.ensure_sandbox_ready().await?;
-        let tool_env = if let Some(sb) = sandbox {
-            sb.env()
-        } else {
-            Arc::clone(&self.host_env)
-        };
+        let tool_env = self.tool_env().await?;
 
         let ctx = {
             let session = self.session.lock().await;
@@ -1059,7 +1071,7 @@ impl AgentHarness {
         Ok(TurnSnapshot {
             messages: ctx.messages,
             system_prompt,
-            model: self.model.read().await.clone(),
+            model: self.require_model().await?,
             thinking_level: *self.thinking_level.read().await,
             tools,
             stream_options,
@@ -1090,6 +1102,8 @@ impl AgentHarness {
         &self,
         input: Option<PromptInput>,
     ) -> Result<AgentMessage, AgentHarnessError> {
+        // Fail before touching phase or session, so nothing is recorded for the prompt.
+        self.require_model().await?;
         {
             let mut phase = self.phase.lock();
             if *phase != AgentHarnessPhase::Idle {
@@ -1270,8 +1284,12 @@ impl AgentHarness {
     }
 
     /// Tool env that the current sandbox/host would provide (for rebuilding tools).
+    /// Starts the sandbox if needed; needs no model.
     pub async fn tool_env(&self) -> Result<Arc<dyn ExecutionEnv>, AgentHarnessError> {
-        Ok(self.create_turn_state().await?.tool_env)
+        Ok(match self.ensure_sandbox_ready().await? {
+            Some(sandbox) => sandbox.env(),
+            None => Arc::clone(&self.host_env),
+        })
     }
 
     #[cfg(feature = "orchestration")]
@@ -1333,7 +1351,7 @@ impl AgentHarness {
             )
             .await;
 
-        let model = self.model.read().await.clone();
+        let model = self.require_model().await?;
         let system_prompt = self.system_prompt.read().await.clone();
         let tools = self.tools.read().await.clone();
         let host_env = Arc::clone(&self.host_env);
@@ -1476,7 +1494,7 @@ impl AgentHarness {
     ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
         use loop_orchestration::planner::{LlmPlanner, Planner};
 
-        let model = self.model.read().await.clone();
+        let model = self.require_model().await?;
         let planner = LlmPlanner::new(Arc::clone(&self.stream_fn), model);
 
         let ctx = context.unwrap_or_else(|| {

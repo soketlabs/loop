@@ -45,12 +45,7 @@ pub async fn generate_session_title(
         (Some(p), Some(m)) => runtime.models.get_model(p, m),
         _ => None,
     }
-    .or_else(|| {
-        runtime.models.get_model(
-            &runtime.settings.default_provider,
-            &runtime.settings.default_model,
-        )
-    })?;
+    .or_else(|| runtime.selected_model.clone())?;
     let context = Context {
         system_prompt: Some(TITLE_SYSTEM.into()),
         messages: vec![Message::user_text(first_message)],

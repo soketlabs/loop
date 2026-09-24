@@ -152,13 +152,9 @@ struct TokenBarState {
 impl TokenBarState {
     fn from_model(runtime: &CliRuntime) -> Self {
         let context_window = runtime
-            .models
-            .get_model(
-                &runtime.settings.default_provider,
-                &runtime.settings.default_model,
-            )
-            .map(|m| m.context_window)
-            .unwrap_or(0);
+            .selected_model
+            .as_ref()
+            .map_or(0, |m| m.context_window);
         Self {
             total_tokens: 0,
             context_tokens: Some(0),
@@ -184,10 +180,7 @@ impl TokenBarState {
     }
 
     fn sync_window(&mut self, runtime: &CliRuntime) {
-        if let Some(m) = runtime.models.get_model(
-            &runtime.settings.default_provider,
-            &runtime.settings.default_model,
-        ) {
+        if let Some(m) = &runtime.selected_model {
             self.context_window = m.context_window;
         }
     }
@@ -350,6 +343,8 @@ async fn run_loop(
     let mut history = CommandHistory::load(crate::config::paths::history_path(&runtime.agent_dir));
     let mut status: String = if runtime.needs_provider_setup {
         "login · connect a model provider to begin".into()
+    } else if runtime.selected_model.is_none() {
+        NO_MODEL_LABEL.into()
     } else if runtime.resumed {
         if chat.is_empty() {
             "resumed · empty session · /help for commands".into()
@@ -438,14 +433,10 @@ async fn run_loop(
             hide_thinking,
         )?;
 
-        let model_label = format!(
-            "{}/{}",
-            runtime.settings.default_provider, runtime.settings.default_model
-        );
-        let model_line = format!(
-            "{model_label} · {}",
-            runtime.settings.default_thinking_level
-        );
+        let model_line = match runtime.selected_model_spec() {
+            Some(spec) => format!("{spec} · {}", runtime.settings.default_thinking_level),
+            None => NO_MODEL_LABEL.to_string(),
+        };
 
         let ac_entries = if input.as_str().starts_with('/')
             && !input.as_str().contains(' ')
@@ -496,10 +487,7 @@ async fn run_loop(
         let picker = if let Some(review) = &active_approval {
             review.into_picker()
         } else if let Some(p) = &model_picker {
-            let current = format!(
-                "{}/{}",
-                runtime.settings.default_provider, runtime.settings.default_model
-            );
+            let current = runtime.selected_model_spec().unwrap_or_default();
             PickerView::Models {
                 rows: p
                     .filtered
@@ -964,8 +952,8 @@ fn print_welcome(
     let lines = welcome_lines(
         &runtime.theme,
         version,
-        &runtime.settings.default_provider,
-        &runtime.settings.default_model,
+        runtime.selected_model.as_ref(),
+        runtime.model_note.as_deref(),
         &endpoint,
         &runtime.session_id,
         runtime.resources.skills.len(),
@@ -1453,6 +1441,14 @@ fn submit_user_text(
     text: String,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
+    if runtime.selected_model.is_none() {
+        // Nothing can answer; don't queue or record the message.
+        chat.push(error_item(
+            loop_agent::harness::AgentHarnessError::NoModelSelected.to_string(),
+        ));
+        *status = NO_MODEL_LABEL.into();
+        return;
+    }
     if agent_is_busy(runtime, *working) {
         enqueue_user_message(chat, message_queue, text.clone(), text);
         let n = message_queue.len();
@@ -1688,13 +1684,7 @@ async fn handle_key(
             KeyCode::Enter => {
                 if let Some(id) = picker.filtered.get(picker.selected).cloned() {
                     if let Some((provider, model)) = id.split_once('/') {
-                        if let Some(m) = runtime.models.get_model(provider, model) {
-                            runtime.harness.set_model(m).await;
-                            runtime.settings.default_provider = provider.into();
-                            runtime.settings.default_model = model.into();
-                            let _ = runtime.save_settings();
-                            chat.push(sys(format!("model → {provider}/{model}")));
-                        }
+                        choose_model(runtime, token_bar, provider, model, chat).await;
                     }
                 }
                 *model_picker = None;
@@ -2138,6 +2128,7 @@ async fn handle_key(
             Action::ModelCycleForward | Action::ModelCycleBackward => {
                 cycle_model(
                     runtime,
+                    token_bar,
                     action == Action::ModelCycleForward,
                     chat,
                 )
@@ -2412,12 +2403,9 @@ async fn adopt_forked_session(
 
 fn endpoint_for(runtime: &CliRuntime) -> String {
     runtime
-        .models
-        .get_model(
-            &runtime.settings.default_provider,
-            &runtime.settings.default_model,
-        )
-        .map(|m| m.base_url)
+        .selected_model
+        .as_ref()
+        .map(|m| m.base_url.clone())
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| SOKET_BASE_URL.to_string())
 }
@@ -2823,7 +2811,7 @@ async fn advance_provider_setup(
 }
 
 /// `/logout [provider]`: returns the line to show in the transcript.
-fn apply_logout(provider: Option<String>, runtime: &mut CliRuntime) -> String {
+async fn apply_logout(provider: Option<String>, runtime: &mut CliRuntime) -> String {
     let Some(provider) = provider else {
         let connected = runtime.connected_providers();
         return if connected.is_empty() {
@@ -2832,7 +2820,7 @@ fn apply_logout(provider: Option<String>, runtime: &mut CliRuntime) -> String {
             format!("Usage: /logout <provider> · connected: {}", connected.join(", "))
         };
     };
-    match runtime.disconnect_provider(&provider) {
+    match runtime.disconnect_provider(&provider).await {
         Ok(name) => format!("logged out: {name}"),
         Err(err) => format!("logout: {err:#}"),
     }
@@ -2929,21 +2917,11 @@ async fn apply_effect(
             *model_picker = Some(ModelPickerState::new(runtime.available_models().await));
         }
         CommandEffect::SelectModel(Some(spec)) => {
-            let (provider, model) = spec
-                .split_once('/')
-                .map(|(p, m)| (p.to_string(), m.to_string()))
-                .unwrap_or_else(|| (runtime.settings.default_provider.clone(), spec));
-            if let Some(m) = runtime.models.get_model(&provider, &model) {
-                runtime.harness.set_model(m).await;
-                runtime.settings.default_provider = provider.clone();
-                runtime.settings.default_model = model.clone();
-                let _ = runtime.save_settings();
-                chat.push(sys(format!("model → {provider}/{model}")));
-                token_bar.sync_window(runtime);
-            } else {
-                chat.push(sys(format!(
-                    "model not found: {provider}/{model} — try /model or refresh"
-                )));
+            match loop_app_core::model_selection::resolve_model_spec(&runtime.models, &spec) {
+                Ok(m) => {
+                    choose_model(runtime, token_bar, &m.provider, &m.id, chat).await;
+                }
+                Err(err) => chat.push(error_item(format!("{err:#}"))),
             }
         }
         CommandEffect::SetSandbox(mode) => {
@@ -3059,7 +3037,7 @@ async fn apply_effect(
             Err(usage) => chat.push(sys(usage)),
         },
         CommandEffect::Logout(provider) => {
-            chat.push(sys(apply_logout(provider, runtime)));
+            chat.push(sys(apply_logout(provider, runtime).await));
         }
         CommandEffect::NewSession => {
             // Drop queued prompts and live stream markers before swapping sessions.
@@ -3236,20 +3214,18 @@ async fn apply_effect(
                     let mut report =
                         loop_agent::harness::format_session_stats(&stats);
                     report.push_str(&format!(
-                        "\nEnvironment\n  Sessions DB: {}\n  Theme: {}\n  Trusted: {}\n  Settings model: {}/{}\n",
+                        "\nEnvironment\n  Sessions DB: {}\n  Theme: {}\n  Trusted: {}\n  Model: {}\n",
                         runtime.sessions_db.display(),
                         runtime.theme.name,
                         runtime.project_trusted,
-                        runtime.settings.default_provider,
-                        runtime.settings.default_model,
+                        runtime.selected_model_spec().unwrap_or_else(|| "none".into()),
                     ));
                     chat.push(sys(report));
                 }
                 Err(e) => {
                     chat.push(sys(format!(
-                        "provider/model: {}/{}\nsessions db: {}\ntheme: {}\ntrusted: {}\n(stats error: {e})",
-                        runtime.settings.default_provider,
-                        runtime.settings.default_model,
+                        "model: {}\nsessions db: {}\ntheme: {}\ntrusted: {}\n(stats error: {e})",
+                        runtime.selected_model_spec().unwrap_or_else(|| "none".into()),
                         runtime.sessions_db.display(),
                         runtime.theme.name,
                         runtime.project_trusted
@@ -3263,10 +3239,9 @@ async fn apply_effect(
                 perms.push_str(&format!("\n    {k}: {v}"));
             }
             chat.push(sys(format!(
-                "settings ({})\n  provider: {}\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  toolApproval: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  responseHeaderTimeoutMs: {}{}\n  ui: {}",
+                "settings ({})\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  toolApproval: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  responseHeaderTimeoutMs: {}{}\n  ui: {}",
                 crate::config::paths::settings_path(&runtime.agent_dir).display(),
-                runtime.settings.default_provider,
-                runtime.settings.default_model,
+                runtime.selected_model_spec().unwrap_or_else(|| "none".into()),
                 runtime.settings.theme,
                 runtime.settings.default_thinking_level,
                 runtime.settings.sandbox.display(),
@@ -3593,29 +3568,47 @@ async fn start_workflow(
     });
 }
 
-async fn cycle_model(runtime: &mut CliRuntime, forward: bool, chat: &mut Vec<ChatItem>) {
+async fn cycle_model(
+    runtime: &mut CliRuntime,
+    token_bar: &mut TokenBarState,
+    forward: bool,
+    chat: &mut Vec<ChatItem>,
+) {
     let models = runtime.available_models().await;
     if models.is_empty() {
         return;
     }
-    let current = format!(
-        "{}/{}",
-        runtime.settings.default_provider, runtime.settings.default_model
-    );
-    let idx = models
+    let current = runtime.selected_model_spec().unwrap_or_default();
+    let next = match models
         .iter()
         .position(|m| format!("{}/{}", m.provider, m.id) == current)
-        .unwrap_or(0);
-    let next = if forward {
-        (idx + 1) % models.len()
-    } else {
-        (idx + models.len() - 1) % models.len()
+    {
+        Some(idx) if forward => (idx + 1) % models.len(),
+        Some(idx) => (idx + models.len() - 1) % models.len(),
+        None => 0,
     };
-    let m = &models[next];
-    runtime.harness.set_model(m.clone()).await;
-    runtime.settings.default_provider = m.provider.clone();
-    runtime.settings.default_model = m.id.clone();
-    chat.push(sys(format!("model → {}/{}", m.provider, m.id)));
+    let m = models[next].clone();
+    choose_model(runtime, token_bar, &m.provider, &m.id, chat).await;
+}
+
+/// Footer text when no model is selected.
+const NO_MODEL_LABEL: &str = "no model · /model to choose";
+
+/// Select a model (harness, saved settings, token bar) and report it in the transcript.
+async fn choose_model(
+    runtime: &mut CliRuntime,
+    token_bar: &mut TokenBarState,
+    provider: &str,
+    id: &str,
+    chat: &mut Vec<ChatItem>,
+) {
+    match runtime.select_model(provider, id).await {
+        Ok(model) => {
+            token_bar.sync_window(runtime);
+            chat.push(sys(format!("model → {}/{}", model.provider, model.id)));
+        }
+        Err(err) => chat.push(error_item(format!("{err:#}"))),
+    }
 }
 
 async fn cycle_thinking(runtime: &mut CliRuntime, chat: &mut Vec<ChatItem>) {
