@@ -29,11 +29,103 @@ struct ModelsResponse {
     data: Vec<RemoteModel>,
 }
 
-#[derive(Debug, Deserialize)]
+/// One entry of a `/models` response. Only `id` is standard; the rest are optional
+/// extensions (OpenRouter publishes context, limits, pricing and modalities).
+#[derive(Debug, Default, Deserialize)]
 struct RemoteModel {
     id: String,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    context_length: Option<u64>,
+    #[serde(default)]
+    top_provider: Option<RemoteTopProvider>,
+    #[serde(default)]
+    pricing: Option<RemotePricing>,
+    #[serde(default)]
+    architecture: Option<RemoteArchitecture>,
+    #[serde(default)]
+    supported_parameters: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RemoteTopProvider {
+    #[serde(default)]
+    max_completion_tokens: Option<u64>,
+}
+
+/// USD per token, as decimal strings (OpenRouter).
+#[derive(Debug, Default, Deserialize)]
+struct RemotePricing {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    completion: Option<String>,
+    #[serde(default)]
+    input_cache_read: Option<String>,
+    #[serde(default)]
+    input_cache_write: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RemoteArchitecture {
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
+}
+
+impl RemoteModel {
+    /// Map into a loop [`Model`], preferring published metadata over `opts` defaults.
+    fn to_model(&self, opts: &MapRemoteModelOptions) -> Model {
+        let mut model = map_remote_model(&self.id, self.name.as_deref(), opts);
+        if let Some(context) = self.context_length.filter(|c| *c > 0) {
+            model.context_window = context;
+        }
+        if let Some(max) = self
+            .top_provider
+            .as_ref()
+            .and_then(|t| t.max_completion_tokens)
+            .filter(|m| *m > 0)
+        {
+            model.max_tokens = max;
+        }
+        if let Some(pricing) = &self.pricing {
+            model.cost = pricing.to_cost();
+        }
+        if let Some(modalities) = self
+            .architecture
+            .as_ref()
+            .and_then(|a| a.input_modalities.as_ref())
+        {
+            if modalities.iter().any(|m| m == "image") {
+                model.input = vec![InputModality::Text, InputModality::Image];
+            }
+        }
+        if let Some(params) = &self.supported_parameters {
+            model.reasoning = params
+                .iter()
+                .any(|p| p == "reasoning" || p == "include_reasoning");
+        }
+        model
+    }
+}
+
+impl RemotePricing {
+    /// Per-token USD strings → per-million [`ModelCost`] (unparseable or negative = 0).
+    fn to_cost(&self) -> ModelCost {
+        let per_million = |v: &Option<String>| {
+            v.as_deref()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|p| p.is_finite() && *p > 0.0)
+                .map_or(0.0, |p| p * 1_000_000.0)
+        };
+        ModelCost {
+            input: per_million(&self.prompt),
+            output: per_million(&self.completion),
+            cache_read: per_million(&self.input_cache_read),
+            cache_write: per_million(&self.input_cache_write),
+            tiers: None,
+        }
+    }
 }
 
 /// Options for mapping a remote id into a [`Model`].
@@ -106,11 +198,26 @@ pub async fn list_openai_models(
         });
     }
     let parsed: ModelsResponse = serde_json::from_str(&body)?;
-    Ok(parsed
-        .data
-        .into_iter()
-        .map(|m| map_remote_model(&m.id, m.name.as_deref(), map))
-        .collect())
+    Ok(parsed.data.iter().map(|m| m.to_model(map)).collect())
+}
+
+/// Check an API key against an authenticated endpoint (`GET {base}{path}`, bearer auth).
+/// Needed where `/models` is public and so can't tell a bad key from a good one.
+pub async fn verify_api_key(base_url: &str, path: &str, api_key: &str) -> Result<(), ListModelsError> {
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let resp = super::http::http_client()
+        .get(&url)
+        .bearer_auth(api_key)
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(ListModelsError::Status {
+        status: status.as_u16(),
+        body: resp.text().await.unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -128,6 +235,59 @@ mod tests {
         assert_eq!(m.id, "qwen3-30b");
         assert_eq!(m.provider, "soket");
         assert_eq!(m.api, API_OPENAI_COMPLETIONS);
+    }
+
+    fn opts() -> MapRemoteModelOptions {
+        MapRemoteModelOptions {
+            provider: "openrouter".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn maps_openrouter_metadata() {
+        let body = r#"{"data":[{
+            "id":"anthropic/claude-sonnet-4.5","name":"Anthropic: Claude Sonnet 4.5",
+            "context_length":1000000,
+            "top_provider":{"max_completion_tokens":64000},
+            "pricing":{"prompt":"0.000003","completion":"0.000015","input_cache_read":"0.0000003","request":"0"},
+            "architecture":{"input_modalities":["text","image"]},
+            "supported_parameters":["tools","reasoning","max_tokens"]
+        }]}"#;
+        let parsed: ModelsResponse = serde_json::from_str(body).unwrap();
+        let m = parsed.data[0].to_model(&opts());
+        assert_eq!(m.id, "anthropic/claude-sonnet-4.5");
+        assert_eq!(m.name, "Anthropic: Claude Sonnet 4.5");
+        assert_eq!(m.context_window, 1_000_000);
+        assert_eq!(m.max_tokens, 64_000);
+        assert!((m.cost.input - 3.0).abs() < 1e-9);
+        assert!((m.cost.output - 15.0).abs() < 1e-9);
+        assert!((m.cost.cache_read - 0.3).abs() < 1e-9);
+        assert_eq!(m.input, vec![InputModality::Text, InputModality::Image]);
+        assert!(m.reasoning);
+    }
+
+    #[test]
+    fn plain_openai_entries_keep_defaults() {
+        let body = r#"{"data":[{"id":"gpt-4o","object":"model","owned_by":"openai"}]}"#;
+        let parsed: ModelsResponse = serde_json::from_str(body).unwrap();
+        let o = opts();
+        let m = parsed.data[0].to_model(&o);
+        assert_eq!(m.context_window, o.context_window);
+        assert_eq!(m.max_tokens, o.max_tokens);
+        assert_eq!(m.cost, ModelCost::default());
+        assert_eq!(m.reasoning, o.reasoning);
+    }
+
+    #[test]
+    fn bad_pricing_strings_become_zero() {
+        let pricing = RemotePricing {
+            prompt: Some("-1".into()),
+            completion: Some("abc".into()),
+            ..Default::default()
+        };
+        assert_eq!(pricing.to_cost(), ModelCost::default());
     }
 
     #[test]

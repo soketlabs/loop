@@ -21,9 +21,9 @@ use loop_agent::harness::{
     SessionForkPoint, SessionForkSelection,
 };
 use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel};
-use loop_ai::providers::{SOKET_BASE_URL, SOKET_PROVIDER_ID};
+use loop_ai::providers::SOKET_BASE_URL;
 use loop_ai::{
-    calculate_context_tokens, Credential, CredentialStore, Message, ModelsRefreshOptions,
+    calculate_context_tokens, Message, ModelsRefreshOptions,
     ToolResultContent, Usage,
 };
 
@@ -32,9 +32,10 @@ use crate::commands::{self, AutocompleteEntry, CommandEffect};
 use crate::commands::TracingCommand;
 #[cfg(feature = "telemetry")]
 use crate::config::describe_tracing_status;
+use crate::provider_setup::ProviderSetup;
 use crate::setup_prompt::SetupPrompt;
 #[cfg(feature = "telemetry")]
-use crate::tracing_setup::{TracingSetup, Transition};
+use crate::tracing_setup::TracingSetup;
 use crate::keybindings::{hotkey_help, Action};
 use crate::{build_tools, mcp_server_entries, CliRuntime};
 use crate::theme::Theme;
@@ -350,8 +351,8 @@ async fn run_loop(
     let mut live_frozen = 0usize;
     let mut input = InputBuffer::new();
     let mut history = CommandHistory::load(crate::config::paths::history_path(&runtime.agent_dir));
-    let mut status: String = if runtime.needs_api_key_setup {
-        "setup · paste your API key · enter save".into()
+    let mut status: String = if runtime.needs_provider_setup {
+        "login · connect a model provider to begin".into()
     } else if runtime.resumed {
         if chat.is_empty() {
             "resumed · empty session · /help for commands".into()
@@ -380,8 +381,8 @@ async fn run_loop(
     let mut purge_ui_events = false;
     let mut last_width = terminal.size()?.width;
     let mut hide_thinking = runtime.settings.hide_thinking_block;
-    let mut pending_setup: Option<SetupPrompt> = if runtime.needs_api_key_setup {
-        Some(SetupPrompt::ProviderKey(SOKET_PROVIDER_ID.into()))
+    let mut pending_setup: Option<SetupPrompt> = if runtime.needs_provider_setup {
+        ProviderSetup::start(None).ok().map(SetupPrompt::Provider)
     } else {
         None
     };
@@ -545,7 +546,7 @@ async fn run_loop(
         } else if let Some(prompt) = &pending_setup {
             PickerView::Setup {
                 prompt: prompt.clone(),
-                first_run: runtime.needs_api_key_setup,
+                first_run: runtime.needs_provider_setup,
             }
         } else if !ac_entries.is_empty() {
             PickerView::Commands {
@@ -582,7 +583,7 @@ async fn run_loop(
         } else if fork_picker.is_some() {
             "↑↓ select · enter edit · esc cancel".into()
         } else if let Some(prompt) = &pending_setup {
-            prompt.status_hint().into()
+            prompt.status_hint(runtime.needs_provider_setup)
         } else if !ac_entries.is_empty() {
             "↑↓ select · tab complete · enter run".into()
         } else if !file_ac_entries.is_empty() {
@@ -972,7 +973,7 @@ fn print_welcome(
         &runtime.session_id,
         runtime.resources.skills.len(),
         runtime.resources.prompts.len(),
-        runtime.needs_api_key_setup,
+        runtime.needs_provider_setup,
         width,
     );
     terminal.insert_before(lines.len() as u16, |buf| {
@@ -1840,7 +1841,7 @@ async fn handle_key(
                 Some(Action::Interrupt | Action::Clear)
             )
         {
-            if prompt.esc_quits(runtime.needs_api_key_setup) {
+            if prompt.esc_quits(runtime.needs_provider_setup) {
                 *should_quit = true;
             } else {
                 *pending_setup = None;
@@ -1849,61 +1850,38 @@ async fn handle_key(
             }
             return Ok(());
         }
-        #[cfg(feature = "telemetry")]
-        if let SetupPrompt::Tracing(mut step) = prompt.clone() {
-            if step.options().is_some() {
-                // Backend picker: arrows move, enter confirms, other keys are ignored.
-                match key.code {
-                    KeyCode::Up => step.move_selection(-1),
-                    KeyCode::Down => step.move_selection(1),
-                    KeyCode::Enter => {}
-                    _ => return Ok(()),
-                }
-                if key.code != KeyCode::Enter {
-                    *pending_setup = Some(SetupPrompt::Tracing(step));
-                    return Ok(());
-                }
+        if prompt.options().is_some() {
+            // Choice step: arrows move, enter confirms, other keys are ignored.
+            let delta = match key.code {
+                KeyCode::Up => -1,
+                KeyCode::Down => 1,
+                KeyCode::Enter => 0,
+                _ => return Ok(()),
+            };
+            if delta != 0 {
+                let mut moved = prompt;
+                moved.move_selection(delta);
+                *pending_setup = Some(moved);
+                return Ok(());
             }
         }
         let plain_enter = key.code == KeyCode::Enter
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && !key.modifiers.contains(KeyModifiers::CONTROL);
         if plain_enter {
-            let key_val = input.as_str().trim().to_string();
+            let value = input.as_str().trim().to_string();
             input.clear();
-            // Without `telemetry` the provider key is the only setup prompt.
-            #[cfg_attr(not(feature = "telemetry"), allow(clippy::infallible_destructuring_match))]
-            let provider = match prompt {
-                SetupPrompt::ProviderKey(provider) => provider,
+            *pending_setup = None;
+            match prompt {
+                SetupPrompt::Provider(step) => {
+                    advance_provider_setup(step, &value, runtime, pending_setup, input, chat, status)
+                        .await;
+                }
                 #[cfg(feature = "telemetry")]
                 SetupPrompt::Tracing(step) => {
-                    advance_tracing_setup(step, &key_val, runtime, pending_setup, input, chat, status);
-                    return Ok(());
+                    advance_tracing_setup(step, &value, runtime, pending_setup, input, chat, status);
                 }
-            };
-            if key_val.is_empty() {
-                *pending_setup = Some(SetupPrompt::ProviderKey(provider));
-                *status = "empty key".into();
-                return Ok(());
             }
-            *pending_setup = None;
-            runtime
-                .credentials
-                .set(&provider, Credential::api_key(key_val));
-            let _ = runtime
-                .models
-                .refresh(ModelsRefreshOptions {
-                    allow_network: Some(true),
-                    force: true,
-                    provider_id: Some(provider.clone()),
-                })
-                .await;
-            runtime.needs_api_key_setup = false;
-            chat.clear();
-            chat.push(sys(format!(
-                "✓ API key saved for {provider} — you're all set. Type /help for commands."
-            )));
-            *status = "ready · /help for commands".into();
             return Ok(());
         }
         match runtime.keybindings.resolve(key) {
@@ -2147,7 +2125,7 @@ async fn handle_key(
             }
             Action::ModelSelect => {
                 *fork_picker = None;
-                *model_picker = Some(ModelPickerState::new(&runtime.models));
+                *model_picker = Some(ModelPickerState::new(runtime.available_models().await));
                 return Ok(());
             }
             Action::SessionFork => {
@@ -2267,9 +2245,9 @@ struct ModelPickerState {
 }
 
 impl ModelPickerState {
-    fn new(models: &loop_ai::Models) -> Self {
+    /// `models` in picker order (see `Runtime::available_models`).
+    fn new(models: Vec<loop_ai::Model>) -> Self {
         let all: Vec<String> = models
-            .get_models(None)
             .into_iter()
             .map(|m| format!("{}/{}", m.provider, m.id))
             .collect();
@@ -2742,6 +2720,36 @@ fn upsert_tool(
     }
 }
 
+/// Apply a wizard `Next`/`Retry`: show the next step (or the same one with its error)
+/// in the setup box. Returns the request once the wizard is done.
+fn step_wizard<Step, Request>(
+    transition: crate::wizard::Transition<Step, Request>,
+    into_prompt: fn(Step) -> SetupPrompt,
+    value: &str,
+    pending_setup: &mut Option<SetupPrompt>,
+    input: &mut InputBuffer,
+    chat: &mut Vec<ChatItem>,
+) -> Option<Request> {
+    use crate::wizard::Transition;
+    match transition {
+        Transition::Next { step, prefill } => {
+            input.set(prefill);
+            *pending_setup = Some(into_prompt(step));
+            None
+        }
+        Transition::Retry { step, error } => {
+            let prompt = into_prompt(step);
+            if !prompt.masked() {
+                input.set(value);
+            }
+            chat.push(sys(format!("{}: {error}", prompt.error_prefix())));
+            *pending_setup = Some(prompt);
+            None
+        }
+        Transition::Done(request) => Some(request),
+    }
+}
+
 /// Feed one answer to the `/tracing setup` wizard and apply the result.
 #[cfg(feature = "telemetry")]
 fn advance_tracing_setup(
@@ -2753,26 +2761,75 @@ fn advance_tracing_setup(
     chat: &mut Vec<ChatItem>,
     status: &mut String,
 ) {
-    match step.submit(value, &runtime.settings.tracing) {
-        Transition::Next { step, prefill } => {
-            input.set(prefill);
-            *pending_setup = Some(SetupPrompt::Tracing(step));
+    let transition = step.submit(value, &runtime.settings.tracing);
+    let Some(request) = step_wizard(
+        transition,
+        SetupPrompt::Tracing,
+        value,
+        pending_setup,
+        input,
+        chat,
+    ) else {
+        return;
+    };
+    chat.push(sys(match runtime.setup_tracing(&request) {
+        Ok(state) => format!("✓ {}", describe_tracing_status(&state)),
+        Err(err) => format!("tracing setup failed: {err:#}"),
+    }));
+    *status = "ready".into();
+}
+
+/// Feed one answer to the `/login` wizard; on the last step, connect the provider.
+async fn advance_provider_setup(
+    step: ProviderSetup,
+    value: &str,
+    runtime: &mut CliRuntime,
+    pending_setup: &mut Option<SetupPrompt>,
+    input: &mut InputBuffer,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+) {
+    let Some(request) = step_wizard(
+        step.submit(value),
+        SetupPrompt::Provider,
+        value,
+        pending_setup,
+        input,
+        chat,
+    ) else {
+        return;
+    };
+    *status = format!("login · connecting {}…", request.display_name());
+    match runtime.connect_provider(&request).await {
+        Ok(connected) => {
+            chat.push(sys(format!(
+                "✓ Connected {} · {} models — /model to choose one",
+                connected.name, connected.model_count
+            )));
+            *status = "ready · /help for commands".into();
         }
-        Transition::Retry { step, error } => {
-            if !step.masked() {
-                input.set(value);
-            }
-            chat.push(sys(format!("tracing setup: {error}")));
-            *pending_setup = Some(SetupPrompt::Tracing(step));
+        Err(err) => {
+            // Keep the wizard open on the key step so the user can try again.
+            chat.push(sys(format!("login: {err:#}")));
+            *pending_setup = Some(SetupPrompt::Provider(ProviderSetup::retry_key(&request)));
+            *status = "login · check the key and try again".into();
         }
-        Transition::Done(request) => {
-            *pending_setup = None;
-            chat.push(sys(match runtime.setup_tracing(&request) {
-                Ok(state) => format!("✓ {}", describe_tracing_status(&state)),
-                Err(err) => format!("tracing setup failed: {err:#}"),
-            }));
-            *status = "ready".into();
-        }
+    }
+}
+
+/// `/logout [provider]`: returns the line to show in the transcript.
+fn apply_logout(provider: Option<String>, runtime: &mut CliRuntime) -> String {
+    let Some(provider) = provider else {
+        let connected = runtime.connected_providers();
+        return if connected.is_empty() {
+            "Usage: /logout <provider> · no providers are connected".into()
+        } else {
+            format!("Usage: /logout <provider> · connected: {}", connected.join(", "))
+        };
+    };
+    match runtime.disconnect_provider(&provider) {
+        Ok(name) => format!("logged out: {name}"),
+        Err(err) => format!("logout: {err:#}"),
     }
 }
 
@@ -2865,7 +2922,7 @@ async fn apply_effect(
         }
         CommandEffect::SelectModel(None) => {
             *fork_picker = None;
-            *model_picker = Some(ModelPickerState::new(&runtime.models));
+            *model_picker = Some(ModelPickerState::new(runtime.available_models().await));
         }
         CommandEffect::SelectModel(Some(spec)) => {
             let (provider, model) = spec
@@ -2990,15 +3047,16 @@ async fn apply_effect(
         CommandEffect::Tracing(command) => {
             chat.push(sys(apply_tracing_command(command, runtime, pending_setup, input)));
         }
-        CommandEffect::Login(provider) => {
-            let p = provider.unwrap_or_else(|| SOKET_PROVIDER_ID.into());
-            *pending_setup = Some(SetupPrompt::ProviderKey(p.clone()));
-            *status = format!("setup · paste API key for {p}");
-        }
+        CommandEffect::Login(provider) => match ProviderSetup::start(provider.as_deref()) {
+            Ok(step) => {
+                *pending_setup = Some(SetupPrompt::Provider(step));
+                input.clear();
+                chat.push(sys("login — follow the prompts below · esc cancels"));
+            }
+            Err(usage) => chat.push(sys(usage)),
+        },
         CommandEffect::Logout(provider) => {
-            let p = provider.unwrap_or_else(|| SOKET_PROVIDER_ID.into());
-            runtime.credentials.remove(&p);
-            chat.push(sys(format!("logged out: {p}")));
+            chat.push(sys(apply_logout(provider, runtime)));
         }
         CommandEffect::NewSession => {
             // Drop queued prompts and live stream markers before swapping sessions.
@@ -3533,7 +3591,7 @@ async fn start_workflow(
 }
 
 async fn cycle_model(runtime: &mut CliRuntime, forward: bool, chat: &mut Vec<ChatItem>) {
-    let models = runtime.models.get_models(None);
+    let models = runtime.available_models().await;
     if models.is_empty() {
         return;
     }

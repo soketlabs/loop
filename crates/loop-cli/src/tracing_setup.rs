@@ -10,6 +10,8 @@ use loop_app_core::config::{
     validate_http_url, TracingBackend, TracingSettings, TracingSetupRequest,
 };
 
+use crate::wizard::{wrap_selection, WizardView};
+
 /// Current step of the wizard.
 #[derive(Clone, PartialEq, Eq)]
 pub enum TracingSetup {
@@ -55,26 +57,8 @@ impl std::fmt::Debug for TracingSetup {
     }
 }
 
-/// Result of submitting the input line at a step.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Transition {
-    /// Show `step`, with the input line pre-filled.
-    Next {
-        /// Next step.
-        step: TracingSetup,
-        /// Suggested input (saved value or default).
-        prefill: String,
-    },
-    /// Input rejected; stay on `step` and show `error`.
-    Retry {
-        /// Same step.
-        step: TracingSetup,
-        /// Why the input was rejected.
-        error: String,
-    },
-    /// All fields collected.
-    Done(TracingSetupRequest),
-}
+/// Result of submitting an answer to the tracing wizard.
+pub type Transition = crate::wizard::Transition<TracingSetup, TracingSetupRequest>;
 
 impl TracingSetup {
     /// Start the wizard; `backend` skips the picker (`/tracing setup langfuse`).
@@ -107,14 +91,6 @@ impl TracingSetup {
                     .clone()
                     .unwrap_or_else(|| DEFAULT_OTLP_ENDPOINT.into()),
             ),
-        }
-    }
-
-    /// Move the picker highlight (wraps); no-op outside the picker.
-    pub fn move_selection(&mut self, delta: isize) {
-        if let Self::Choose { selected } = self {
-            let n = TracingBackend::ALL.len() as isize;
-            *selected = (*selected as isize + delta).rem_euclid(n) as usize;
         }
     }
 
@@ -170,14 +146,16 @@ impl TracingSetup {
     fn retry(self, error: String) -> Transition {
         Transition::Retry { step: self, error }
     }
+}
 
+impl WizardView for TracingSetup {
     /// Whether the input line must be hidden.
-    pub fn masked(&self) -> bool {
+    fn masked(&self) -> bool {
         matches!(self, Self::LangfuseSecret { .. } | Self::OtlpAuth { .. })
     }
 
     /// Heading of the setup box.
-    pub fn title(&self) -> String {
+    fn title(&self) -> String {
         let (backend, step, of) = match self {
             Self::Choose { .. } => return "Set up tracing".into(),
             Self::LangfuseHost => ("Langfuse", 1, 3),
@@ -190,7 +168,7 @@ impl TracingSetup {
     }
 
     /// What to enter at this step.
-    pub fn instructions(&self) -> String {
+    fn instructions(&self) -> String {
         match self {
             Self::Choose { .. } => "Choose where Loop sends traces".into(),
             Self::LangfuseHost => {
@@ -210,7 +188,7 @@ impl TracingSetup {
     }
 
     /// Placeholder shown while the input line is empty.
-    pub fn placeholder(&self) -> &'static str {
+    fn placeholder(&self) -> &'static str {
         match self {
             Self::Choose { .. } => " ↑↓ to choose, enter to continue",
             Self::LangfuseHost => " https://cloud.langfuse.com",
@@ -222,7 +200,7 @@ impl TracingSetup {
     }
 
     /// Picker rows `(label, description)` and the highlighted index, at the first step.
-    pub fn options(&self) -> Option<(Vec<(&'static str, &'static str)>, usize)> {
+    fn options(&self) -> Option<(Vec<(&'static str, &'static str)>, usize)> {
         match self {
             Self::Choose { selected } => Some((
                 TracingBackend::ALL
@@ -236,7 +214,7 @@ impl TracingSetup {
     }
 
     /// Env var alternative, where one exists.
-    pub fn env_hint(&self) -> Option<String> {
+    fn env_hint(&self) -> Option<String> {
         match self {
             Self::LangfuseHost | Self::LangfusePublicKey { .. } | Self::LangfuseSecret { .. } => {
                 Some(format!(
@@ -244,6 +222,12 @@ impl TracingSetup {
                 ))
             }
             _ => None,
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if let Self::Choose { selected } = self {
+            *selected = wrap_selection(*selected, delta, TracingBackend::ALL.len());
         }
     }
 }
