@@ -4,6 +4,7 @@ use loop_telemetry::obs::{self, keys};
 use loop_telemetry::{
     CredentialSource, ObservationExt, TelemetryDestination, TelemetryHandle, TraceAttrs,
 };
+use loop_test_support::{FakeHttpServer, FakeResponse, RecordedRequest};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SpanData};
 use tracing::Dispatch;
 use tracing_subscriber::layer::SubscriberExt;
@@ -275,49 +276,16 @@ fn invalid_traceparent_is_rejected() {
     });
 }
 
-/// Request head lines and body captured by [`capture_one_request`].
-type CapturedRequest = std::thread::JoinHandle<(Vec<String>, Vec<u8>)>;
-
-/// Accepts one HTTP request on a local port; returns the base URL and a join handle
-/// yielding the request head lines and body.
-fn capture_one_request() -> (String, CapturedRequest) {
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut head = Vec::new();
-        let mut content_length = 0usize;
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            if line == "\r\n" {
-                break;
-            }
-            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                content_length = v.trim().parse().unwrap();
-            }
-            head.push(line.trim_end().to_string());
-        }
-        let mut body = vec![0; content_length];
-        reader.read_exact(&mut body).unwrap();
-        let mut stream = stream;
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\ncontent-length: 0\r\n\r\n")
-            .unwrap();
-        (head, body)
-    });
-    (base, server)
+/// Local OTLP receiver that accepts everything.
+fn otlp_receiver() -> FakeHttpServer {
+    FakeHttpServer::always(FakeResponse::new(200, "application/x-protobuf", Vec::new()))
 }
 
-/// Export one `loop.run` span to `destination` and return the captured request.
+/// Export one `loop.run` span to `destination` and return the request `server` received.
 fn export_one_span(
     destination: &TelemetryDestination,
-    server: CapturedRequest,
-) -> (TelemetryHandle, Vec<String>, Vec<u8>) {
+    server: &FakeHttpServer,
+) -> (TelemetryHandle, RecordedRequest) {
     let handle = TelemetryHandle::new("test-release", true);
     handle.install(destination).unwrap();
     let dispatch = Dispatch::new(tracing_subscriber::registry().with(handle.layer()));
@@ -325,16 +293,16 @@ fn export_one_span(
         let _ = obs::agent("loop.run").entered();
     });
     handle.flush();
-    let (head, body) = server.join().unwrap();
-    let lower = head.iter().map(|l| l.to_ascii_lowercase()).collect();
-    assert!(body.windows(b"loop.run".len()).any(|w| w == b"loop.run"));
-    (handle, lower, body)
+    let request = server.requests().pop().expect("one export request");
+    assert!(request.body.windows(b"loop.run".len()).any(|w| w == b"loop.run"));
+    (handle, request)
 }
 
 /// Real OTLP/HTTP exporter against a local listener: checks path and Langfuse headers.
 #[test]
 fn langfuse_exporter_posts_protobuf_with_auth_headers() {
-    let (host, server) = capture_one_request();
+    let server = otlp_receiver();
+    let host = server.base_url().to_string();
     let creds = loop_telemetry::TelemetryCredentials::from_parts(
         Some(host.clone()),
         Some("pk-lf-1".into()),
@@ -342,11 +310,14 @@ fn langfuse_exporter_posts_protobuf_with_auth_headers() {
         CredentialSource::Env,
     )
     .unwrap();
-    let (handle, head, _) = export_one_span(&creds.destination(), server);
-    assert_eq!(head[0], "post /api/public/otel/v1/traces http/1.1");
-    assert!(head.contains(&"authorization: basic cgstbgytmtpzay1szi0y".to_string()));
-    assert!(head.contains(&"x-langfuse-ingestion-version: 4".to_string()));
-    assert!(head.contains(&"content-type: application/x-protobuf".to_string()));
+    let (handle, request) = export_one_span(&creds.destination(), &server);
+    assert_eq!(
+        (request.method.as_str(), request.path.as_str()),
+        ("POST", "/api/public/otel/v1/traces")
+    );
+    assert_eq!(request.header("authorization"), Some("Basic cGstbGYtMTpzay1sZi0y"));
+    assert_eq!(request.header("x-langfuse-ingestion-version"), Some("4"));
+    assert_eq!(request.header("content-type"), Some("application/x-protobuf"));
     assert_eq!(
         handle.status().destination,
         Some(format!("Langfuse · {host}"))
@@ -356,13 +327,14 @@ fn langfuse_exporter_posts_protobuf_with_auth_headers() {
 /// Generic OTLP collector: standard `/v1/traces` path and optional Authorization.
 #[test]
 fn otlp_exporter_posts_to_collector_with_optional_auth() {
-    let (base, server) = capture_one_request();
+    let server = otlp_receiver();
     let destination =
-        TelemetryDestination::otlp(&base, Some("Bearer tok"), CredentialSource::Config).unwrap();
-    let (_, head, _) = export_one_span(&destination, server);
-    assert_eq!(head[0], "post /v1/traces http/1.1");
-    assert!(head.contains(&"authorization: bearer tok".to_string()));
-    assert!(!head.iter().any(|h| h.starts_with("x-langfuse")));
+        TelemetryDestination::otlp(server.base_url(), Some("Bearer tok"), CredentialSource::Config)
+            .unwrap();
+    let (_, request) = export_one_span(&destination, &server);
+    assert_eq!(request.path, "/v1/traces");
+    assert_eq!(request.header("authorization"), Some("Bearer tok"));
+    assert!(request.header("x-langfuse-ingestion-version").is_none());
 }
 
 #[test]

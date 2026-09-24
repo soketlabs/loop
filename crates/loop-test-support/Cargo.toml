@@ -1,0 +1,10 @@
+[package]
+name = "loop-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Test helpers shared across Loop crates (dev-dependency only)"
+publish = false
+
+[dependencies]

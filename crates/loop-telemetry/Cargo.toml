@@ -22,6 +22,7 @@ opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
+loop-test-support = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true }
 opentelemetry = { workspace = true }
