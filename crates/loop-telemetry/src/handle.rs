@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
-use opentelemetry_sdk::trace::{SdkTracerProvider, SpanExporter};
+use opentelemetry_sdk::trace::{
+    BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider, SpanExporter,
+};
 use opentelemetry_sdk::Resource;
 use parking_lot::Mutex;
 use tracing::metadata::LevelFilter;
@@ -23,6 +25,9 @@ use crate::obs::SPAN_TARGET;
 const TRACER_NAME: &str = "loop";
 /// Service name resource attribute.
 const SERVICE_NAME: &str = "loop";
+/// Spans per OTLP request. Generations carry the full context, so a long run's spans
+/// can reach megabytes each; small batches keep requests under ingestion body limits.
+const MAX_EXPORT_BATCH_SIZE: usize = 8;
 
 /// Snapshot shown by `/tracing status`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +80,15 @@ impl TelemetryHandle {
                     .with_attribute(KeyValue::new("service.version", release.to_string()))
                     .build(),
             )
-            .with_batch_exporter(slot.sdk_exporter())
+            .with_span_processor(
+                BatchSpanProcessor::builder(slot.sdk_exporter())
+                    .with_batch_config(
+                        BatchConfigBuilder::default()
+                            .with_max_export_batch_size(MAX_EXPORT_BATCH_SIZE)
+                            .build(),
+                    )
+                    .build(),
+            )
             .build();
         Self {
             provider,

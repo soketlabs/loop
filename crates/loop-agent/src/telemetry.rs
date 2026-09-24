@@ -66,7 +66,13 @@ impl RunObserver {
         self.span.record_metadata("tool_calls", &summary.tool_calls);
         self.span
             .record_metadata("tool_errors", &summary.tool_errors);
-        self.span.record_usage(&summary.usage);
+        // Totals go in metadata, not usage/cost details, so Langfuse's trace-level
+        // aggregation over generations does not count them twice.
+        self.span
+            .record_metadata("total_tokens", &summary.usage.total_tokens);
+        self.span
+            .record_metadata("total_cost", &summary.usage.cost.total);
+        self.span.record_metadata("usage", &summary.usage);
     }
 }
 

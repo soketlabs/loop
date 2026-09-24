@@ -174,6 +174,13 @@ async fn text_turn_produces_run_turn_generation_tree() {
     assert_eq!(metadata(run, "tool_calls").as_deref(), Some("0"));
     assert_eq!(metadata(run, "stop_reason").as_deref(), Some("stop"));
     assert!(attr(run, keys::INPUT).unwrap().contains("hi"));
+    assert!(metadata(run, "total_tokens").is_some());
+    assert!(metadata(run, "total_cost").is_some());
+    assert!(
+        attr(run, keys::USAGE_DETAILS).is_none(),
+        "run totals must not be usage details"
+    );
+    assert!(attr(run, keys::COST_DETAILS).is_none());
 
     assert_eq!(
         attr(generation, keys::OBSERVATION_TYPE).as_deref(),
@@ -364,4 +371,52 @@ async fn nested_run_leaves_trace_attrs_to_enclosing_root() {
     let (root, run) = (spans.one("loop.print"), spans.one("loop.run"));
     assert_child(&spans, root, run);
     assert!(attr(run, keys::SESSION_ID).is_none());
+}
+
+/// The real `--print` path goes through `AgentHarness::prompt`; its run must stay in the
+/// caller's trace so the printed trace id points at the generations.
+#[tokio::test]
+async fn harness_prompt_nests_under_callers_span() {
+    use loop_agent::harness::{
+        create_in_memory_session_store, create_session_repository, AgentHarness,
+        AgentHarnessOptions, HostExecutionEnv, SandboxMode,
+    };
+    use tracing::Instrument;
+
+    let capture = Capture::new(true);
+    let script = FauxScript::new();
+    script.push(FauxResponse::Text("harness-ok".into()));
+    let models = Arc::new(Models::new());
+    models.set_provider(faux_provider(script));
+    let model = models.get_model("faux", "faux-model").unwrap();
+    let repo = create_session_repository(create_in_memory_session_store(), None);
+    let session = repo.create(None, Some("h".into())).await.unwrap();
+    let harness = AgentHarness::new(AgentHarnessOptions {
+        models,
+        model,
+        session,
+        host_env: Arc::new(HostExecutionEnv::new(std::env::temp_dir())),
+        tools: vec![],
+        system_prompt: "sys".into(),
+        sandbox: SandboxMode::Disabled,
+        resources: Default::default(),
+    });
+
+    let root = loop_telemetry::obs::span("loop.print");
+    harness
+        .prompt("hello")
+        .instrument(root.clone())
+        .await
+        .unwrap();
+    drop(root);
+    harness.wait_for_idle().await;
+
+    let spans = capture.spans();
+    let (root, run) = (spans.one("loop.print"), spans.one("loop.run"));
+    assert_child(&spans, root, run);
+    let generation = spans.one("llm.generate");
+    assert_eq!(
+        generation.span_context.trace_id(),
+        root.span_context.trace_id()
+    );
 }
