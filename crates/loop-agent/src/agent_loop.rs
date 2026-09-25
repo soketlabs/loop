@@ -202,31 +202,85 @@ async fn run_loop(
                 }
             }
 
-            let message =
-                stream_assistant_response(current_context, &config, cancel, emit, stream_fn).await;
-            new_messages.push(AgentMessage::assistant(message.clone()));
+            let message = {
+                let mut attempt = 0u32;
+                loop {
+                    let msg = stream_assistant_response(
+                        current_context, &config, cancel, emit, stream_fn,
+                    )
+                    .await;
 
-            if matches!(
-                message.stop_reason,
-                StopReason::Error | StopReason::Aborted
-            ) {
-                emit_ev(
-                    emit,
-                    AgentEvent::TurnEnd {
-                        message: AgentMessage::assistant(message),
-                        tool_results: vec![],
-                    },
-                )
-                .await;
-                emit_ev(
-                    emit,
-                    AgentEvent::AgentEnd {
-                        messages: new_messages.clone(),
-                    },
-                )
-                .await;
-                return Ok(());
-            }
+                    if msg.stop_reason == StopReason::Aborted {
+                        // User-initiated abort — never retry.
+                        new_messages.push(AgentMessage::assistant(msg.clone()));
+                        emit_ev(emit, AgentEvent::TurnEnd {
+                            message: AgentMessage::assistant(msg),
+                            tool_results: vec![],
+                        }).await;
+                        emit_ev(emit, AgentEvent::AgentEnd {
+                            messages: new_messages.clone(),
+                        }).await;
+                        return Ok(());
+                    }
+
+                    if msg.stop_reason == StopReason::Error {
+                        let retryable = is_retryable_error(msg.error_message.as_deref());
+                        if retryable && attempt < MAX_STREAM_RETRIES {
+                            attempt += 1;
+                            // Remove the failed partial from context (stream_assistant_response
+                            // already appended it).
+                            if current_context.messages.last().map(|m| m.role())
+                                == Some("assistant")
+                            {
+                                current_context.messages.pop();
+                            }
+                            let delay = retry_delay(attempt);
+                            let err_summary = msg
+                                .error_message
+                                .as_deref()
+                                .unwrap_or("unknown error");
+                            tracing::warn!(
+                                attempt,
+                                error = err_summary,
+                                delay_ms = delay.as_millis() as u64,
+                                "retryable model error — will retry",
+                            );
+                            emit_ev(emit, AgentEvent::Progress {
+                                message: format!(
+                                    "model error, retrying ({attempt}/{MAX_STREAM_RETRIES})…",
+                                ),
+                            }).await;
+                            tokio::time::sleep(delay).await;
+                            if cancel.map(|c| c.is_cancelled()).unwrap_or(false) {
+                                new_messages.push(AgentMessage::assistant(msg.clone()));
+                                emit_ev(emit, AgentEvent::TurnEnd {
+                                    message: AgentMessage::assistant(msg),
+                                    tool_results: vec![],
+                                }).await;
+                                emit_ev(emit, AgentEvent::AgentEnd {
+                                    messages: new_messages.clone(),
+                                }).await;
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        // Non-retryable or exhausted retries — propagate error.
+                        new_messages.push(AgentMessage::assistant(msg.clone()));
+                        emit_ev(emit, AgentEvent::TurnEnd {
+                            message: AgentMessage::assistant(msg),
+                            tool_results: vec![],
+                        }).await;
+                        emit_ev(emit, AgentEvent::AgentEnd {
+                            messages: new_messages.clone(),
+                        }).await;
+                        return Ok(());
+                    }
+
+                    // Success — break out with the message.
+                    break msg;
+                }
+            };
+            new_messages.push(AgentMessage::assistant(message.clone()));
 
             let tool_calls: Vec<ToolCall> = message
                 .content
@@ -1056,4 +1110,61 @@ where
 #[allow(dead_code)]
 fn _msg_role(m: &Message) -> &str {
     m.role()
+}
+
+// ---------------------------------------------------------------------------
+// Transient-error retry helpers
+// ---------------------------------------------------------------------------
+
+/// Maximum number of automatic retries for transient model errors (timeouts,
+/// server stalls, network hiccups) before surfacing the error to the user.
+const MAX_STREAM_RETRIES: u32 = 3;
+
+/// Exponential back-off: 2s → 4s → 8s (capped).
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    let secs = 2u64.saturating_pow(attempt).min(8);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Decide whether an error from `stream_assistant_response` is worth retrying.
+///
+/// We retry on: SSE idle timeouts, TTFB timeouts, server-side 5xx errors,
+/// connection resets, and similar transient failures.
+/// We do **not** retry on: auth failures (401/403), bad requests (400),
+/// rate-limits (429 — the provider already told us to back off), or
+/// content-filter rejections.
+fn is_retryable_error(error_message: Option<&str>) -> bool {
+    let Some(msg) = error_message else {
+        return false;
+    };
+    let lower = msg.to_lowercase();
+
+    // Definite non-retryable patterns.
+    if lower.contains("http 400")
+        || lower.contains("http 401")
+        || lower.contains("http 403")
+        || lower.contains("http 404")
+        || lower.contains("http 422")
+        || lower.contains("http 429")
+        || lower.contains("content_filter")
+        || lower.contains("invalid api key")
+    {
+        return false;
+    }
+
+    // Positive retryable signals.
+    lower.contains("stopped responding")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("no data for")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+        || lower.contains("connection refused")
+        || lower.contains("broken pipe")
+        || lower.contains("eof")
+        || lower.contains("http 500")
+        || lower.contains("http 502")
+        || lower.contains("http 503")
+        || lower.contains("http 504")
+        || lower.contains("sse error")
 }
