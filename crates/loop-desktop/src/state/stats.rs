@@ -16,13 +16,9 @@ pub struct ComposerStats {
 impl ComposerStats {
     pub fn from_runtime(runtime: &Runtime) -> Self {
         let context_window = runtime
-            .models
-            .get_model(
-                &runtime.settings.default_provider,
-                &runtime.settings.default_model,
-            )
-            .map(|m| m.context_window)
-            .unwrap_or(0);
+            .selected_model
+            .as_ref()
+            .map_or(0, |m| m.context_window);
         Self {
             context_window,
             ..Default::default()
@@ -30,10 +26,7 @@ impl ComposerStats {
     }
 
     pub async fn refresh(&mut self, runtime: &Runtime) {
-        if let Some(m) = runtime.models.get_model(
-            &runtime.settings.default_provider,
-            &runtime.settings.default_model,
-        ) {
+        if let Some(m) = &runtime.selected_model {
             self.context_window = m.context_window;
         }
         if let Ok(stats) = runtime.harness.session_stats().await {

@@ -194,8 +194,8 @@ const BANNER_GRADIENT: [(u8, u8, u8); 6] = [
 pub fn welcome_lines(
     theme: &Theme,
     version: &str,
-    provider: &str,
-    model: &str,
+    model: Option<&loop_ai::Model>,
+    model_note: Option<&str>,
     endpoint: &str,
     session_id: &str,
     skills: usize,
@@ -233,16 +233,28 @@ pub fn welcome_lines(
 
     // Info card
     let border = theme.style("border");
-    let rows: Vec<(&str, String)> = vec![
-        ("Provider", provider.to_string()),
-        ("Model", model.to_string()),
-        ("Endpoint", endpoint.to_string()),
-        ("Session", session_id.to_string()),
-    ];
+    let rows: Vec<(&str, String)> = match model {
+        Some(model) => vec![
+            ("Provider", model.provider.clone()),
+            ("Model", model.id.clone()),
+            ("Endpoint", endpoint.to_string()),
+            ("Session", session_id.to_string()),
+        ],
+        None => vec![
+            ("Model", "none — run /model".to_string()),
+            ("Session", session_id.to_string()),
+        ],
+    };
     let (dot_style, status_text) = if needs_setup {
         (
             theme.style("warning"),
             "setup — connect a model provider to begin (/login)".to_string(),
+        )
+    } else if model.is_none() {
+        let why = model_note.map_or_else(String::new, |note| format!("{note} — "));
+        (
+            theme.style("warning"),
+            format!("{why}choose a model with /model to begin"),
         )
     } else {
         (
@@ -1907,6 +1919,33 @@ mod tests {
             lines.iter().any(|l| l.to_string().contains("thought 249")),
             "last thinking line should remain visible"
         );
+    }
+
+    fn banner_text(model: Option<&loop_ai::Model>, note: Option<&str>) -> String {
+        welcome_lines(&Theme::dark(), "v", model, note, "http://e", "sess", 0, 0, false, 120)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn banner_shows_no_model_and_why() {
+        let text = banner_text(None, None);
+        assert!(text.contains("none — run /model"), "{text}");
+        assert!(text.contains("choose a model with /model to begin"));
+        assert!(!text.contains("Provider"));
+
+        let text = banner_text(None, Some("saved model soket/qwen3-30b is not available"));
+        assert!(text.contains("saved model soket/qwen3-30b is not available — choose a model"));
+    }
+
+    #[test]
+    fn banner_shows_the_selected_model() {
+        let model = loop_ai::providers::soket_seed_models().remove(0);
+        let text = banner_text(Some(&model), None);
+        assert!(text.contains("soket") && text.contains("qwen3-30b"));
+        assert!(text.contains("ready — type /help to begin"));
     }
 
     #[test]

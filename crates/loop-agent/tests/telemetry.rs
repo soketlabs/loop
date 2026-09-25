@@ -393,7 +393,7 @@ async fn harness_prompt_nests_under_callers_span() {
     let session = repo.create(None, Some("h".into())).await.unwrap();
     let harness = AgentHarness::new(AgentHarnessOptions {
         models,
-        model,
+        model: Some(model),
         session,
         host_env: Arc::new(HostExecutionEnv::new(std::env::temp_dir())),
         tools: vec![],

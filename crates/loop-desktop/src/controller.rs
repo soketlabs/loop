@@ -1398,10 +1398,9 @@ fn looks_like_path(s: &str) -> bool {
 }
 
 fn model_display(runtime: &Runtime) -> String {
-    format!(
-        "{}/{}",
-        runtime.settings.default_provider, runtime.settings.default_model
-    )
+    runtime
+        .selected_model_spec()
+        .unwrap_or_else(|| "no model selected".into())
 }
 
 fn tool_result_text(result: &AgentToolResult) -> String {

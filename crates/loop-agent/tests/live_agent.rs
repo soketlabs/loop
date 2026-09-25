@@ -197,7 +197,7 @@ async fn live_harness_sqlite_persist_and_search() {
     let host = Arc::new(HostExecutionEnv::new(std::env::temp_dir()));
     let harness = AgentHarness::new(AgentHarnessOptions {
         models: Arc::clone(&models),
-        model: model.clone(),
+        model: Some(model.clone()),
         session,
         host_env: host,
         tools: vec![],
