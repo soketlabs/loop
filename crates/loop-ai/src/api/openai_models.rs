@@ -74,6 +74,15 @@ struct RemoteArchitecture {
 }
 
 impl RemoteModel {
+    /// Loop always sends its tools, so a model the provider says can't take them would
+    /// fail every prompt. Providers that don't publish `supported_parameters` (OpenAI,
+    /// most self-hosted servers) are assumed to support tools.
+    fn supports_tools(&self) -> bool {
+        self.supported_parameters
+            .as_ref()
+            .is_none_or(|params| params.iter().any(|p| p == "tools"))
+    }
+
     /// Map into a loop [`Model`], preferring published metadata over `opts` defaults.
     fn to_model(&self, opts: &MapRemoteModelOptions) -> Model {
         let mut model = map_remote_model(&self.id, self.name.as_deref(), opts);
@@ -198,7 +207,12 @@ pub async fn list_openai_models(
         });
     }
     let parsed: ModelsResponse = serde_json::from_str(&body)?;
-    Ok(parsed.data.iter().map(|m| m.to_model(map)).collect())
+    Ok(parsed
+        .data
+        .iter()
+        .filter(|m| m.supports_tools())
+        .map(|m| m.to_model(map))
+        .collect())
 }
 
 /// Check an API key against an authenticated endpoint (`GET {base}{path}`, bearer auth).
@@ -266,6 +280,23 @@ mod tests {
         assert!((m.cost.cache_read - 0.3).abs() < 1e-9);
         assert_eq!(m.input, vec![InputModality::Text, InputModality::Image]);
         assert!(m.reasoning);
+    }
+
+    #[test]
+    fn models_that_cannot_take_tools_are_dropped() {
+        let body = r#"{"data":[
+            {"id":"with-tools","supported_parameters":["tools","max_tokens"]},
+            {"id":"z-ai/glm-5.2:free","supported_parameters":["max_tokens","temperature"]},
+            {"id":"unpublished"}
+        ]}"#;
+        let parsed: ModelsResponse = serde_json::from_str(body).unwrap();
+        let kept: Vec<_> = parsed
+            .data
+            .iter()
+            .filter(|m| m.supports_tools())
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(kept, ["with-tools", "unpublished"]);
     }
 
     #[test]
