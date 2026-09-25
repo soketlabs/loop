@@ -43,7 +43,8 @@ use crate::tui::{
     chat_items_from_agent_messages, consume_frozen_lines, filter_files, find_at_mention,
     find_tool_index, footer_live_height, format_item_lines, format_live_lines,
     format_token_usage_line, insert_text, item_is_committed, list_files, live_overflow_count,
-    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem,
+    assistant_error_item, render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus,
+    ChatItem,
     CommandHistory, FileEntry, FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow, PickerView,
 };
 #[cfg(feature = "orchestration")]
@@ -1042,6 +1043,13 @@ fn sys(text: impl Into<String>) -> ChatItem {
     ChatItem::System { text: text.into() }
 }
 
+/// An error line, rendered in the theme's error color.
+fn error_item(text: impl Into<String>) -> ChatItem {
+    ChatItem::Error { text: text.into() }
+}
+
+
+
 /// Index of the first queued bubble, or `chat.len()` if none.
 /// Agent stream items must be inserted here so they stay above the queue.
 fn first_queued_index(chat: &[ChatItem]) -> usize {
@@ -1157,7 +1165,7 @@ fn drain_ui_events(
             UiEvent::TurnFailed(err) => {
                 *working = false;
                 turn_step.clear();
-                chat.push(sys(format!("error: {err}")));
+                chat.push(error_item(format!("error: {err}")));
                 *status = "error".into();
                 tracing::error!(error = %err, "turn failed");
                 if let Some(path) = &runtime.debug_log_path {
@@ -2436,10 +2444,20 @@ fn handle_agent_event(
                 *turn_step = "thinking…".into();
             }
         }
-        AgentEvent::AgentEnd { .. } => {
+        AgentEvent::AgentEnd { messages } => {
             *working = false;
             turn_step.clear();
-            *status = "ready".into();
+            let failed = messages
+                .iter()
+                .rev()
+                .find_map(AgentMessage::as_assistant)
+                .and_then(assistant_error_item)
+                .is_some();
+            *status = if failed {
+                "error · see above".into()
+            } else {
+                "ready".into()
+            };
             *streaming_assistant = None;
             if let Some(idx) = streaming_thinking.take() {
                 if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
@@ -2462,6 +2480,9 @@ fn handle_agent_event(
             }
         }
         AgentEvent::MessageEnd { message } => {
+            if let Some(item) = message.as_assistant().and_then(assistant_error_item) {
+                push_before_queued(chat, item);
+            }
             token_bar.apply_message(&message);
             *streaming_assistant = None;
             if let Some(idx) = streaming_thinking.take() {
@@ -2546,16 +2567,6 @@ fn handle_agent_event(
                         detail,
                         CardStatus::Pending,
                     );
-                }
-                AssistantMessageEvent::Error { error, .. } => {
-                    let msg = error
-                        .error_message
-                        .clone()
-                        .unwrap_or_else(|| "error".into());
-                    push_before_queued(chat, sys(format!("error: {msg}")));
-                    *working = false;
-                    turn_step.clear();
-                    *status = "error".into();
                 }
                 _ => {}
             }
@@ -2737,7 +2748,7 @@ fn step_wizard<Step, Request>(
             if !prompt.masked() {
                 input.set(value);
             }
-            chat.push(sys(format!("{}: {error}", prompt.error_prefix())));
+            chat.push(error_item(format!("{}: {error}", prompt.error_prefix())));
             *pending_setup = Some(prompt);
             None
         }
@@ -2766,10 +2777,10 @@ fn advance_tracing_setup(
     ) else {
         return;
     };
-    chat.push(sys(match runtime.setup_tracing(&request) {
-        Ok(state) => format!("✓ {}", describe_tracing_status(&state)),
-        Err(err) => format!("tracing setup failed: {err:#}"),
-    }));
+    chat.push(match runtime.setup_tracing(&request) {
+        Ok(state) => sys(format!("✓ {}", describe_tracing_status(&state))),
+        Err(err) => error_item(format!("tracing setup failed: {err:#}")),
+    });
     *status = "ready".into();
 }
 
@@ -2804,7 +2815,7 @@ async fn advance_provider_setup(
         }
         Err(err) => {
             // Keep the wizard open on the key step so the user can try again.
-            chat.push(sys(format!("login: {err:#}")));
+            chat.push(error_item(format!("login: {err:#}")));
             *pending_setup = Some(SetupPrompt::Provider(ProviderSetup::retry_key(&request)));
             *status = "login · check the key and try again".into();
         }
@@ -3689,5 +3700,89 @@ fn parse_response_header_timeout(raw: &str) -> Result<u64, String> {
             s.parse::<u64>()
                 .map_err(|_| format!("usage: /ttfb off|on|60s|120000 (got {raw})"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use loop_agent::{run_agent_loop, stream_fn_from_models, AgentContext, AgentLoopConfig};
+    use loop_ai::providers::{faux_provider, FauxResponse, FauxScript};
+
+    use super::*;
+
+    /// Run one prompt through the real agent loop with a scripted provider and replay
+    /// its events into the TUI's handler, as the app loop does.
+    async fn replay(response: FauxResponse) -> (Vec<ChatItem>, String) {
+        let script = FauxScript::new();
+        script.push(response);
+        let models = loop_ai::Models::new();
+        models.set_provider(faux_provider(script));
+        let model = models.get_model("faux", "faux-model").unwrap();
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        run_agent_loop(
+            vec![AgentMessage::user_text("hi")],
+            AgentContext::default(),
+            AgentLoopConfig::new(model),
+            Arc::new(move |ev: AgentEvent| {
+                sink.lock().push(ev);
+                Box::pin(async {})
+            }),
+            None,
+            Some(stream_fn_from_models(Arc::new(models))),
+        )
+        .await
+        .unwrap();
+
+        let (mut chat, mut status, mut step) = (Vec::new(), String::new(), String::new());
+        let (mut assistant, mut thinking, mut working) = (None, None, false);
+        let mut token_bar = TokenBarState {
+            total_tokens: 0,
+            context_tokens: None,
+            context_window: 0,
+        };
+        let mut refresh = false;
+        for ev in events.lock().drain(..) {
+            handle_agent_event(
+                ev,
+                &mut chat,
+                &mut status,
+                &mut step,
+                &mut assistant,
+                &mut thinking,
+                &mut working,
+                &mut token_bar,
+                &mut refresh,
+            );
+        }
+        (chat, status)
+    }
+
+    fn errors(chat: &[ChatItem]) -> Vec<String> {
+        chat.iter()
+            .filter_map(|item| match item {
+                ChatItem::Error { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn failed_model_call_shows_an_error_and_keeps_error_status() {
+        let (chat, status) = replay(FauxResponse::Error("HTTP 502 Bad Gateway".into())).await;
+        assert_eq!(errors(&chat), ["error: HTTP 502 Bad Gateway"]);
+        assert_eq!(status, "error · see above");
+    }
+
+    #[tokio::test]
+    async fn successful_turn_shows_no_error() {
+        let (chat, status) = replay(FauxResponse::Text("hello".into())).await;
+        assert!(errors(&chat).is_empty());
+        assert_eq!(status, "ready");
+        assert!(chat
+            .iter()
+            .any(|item| matches!(item, ChatItem::Assistant { text } if text == "hello")));
     }
 }

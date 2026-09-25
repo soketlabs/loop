@@ -6,7 +6,7 @@
 use chrono::Utc;
 use loop_ai::{
     AssistantMessage, AssistantMessageEvent, Context, Message, Model, SimpleStreamOptions,
-    StopReason, ToolCall, ToolResultContent, Usage,
+    ToolCall, ToolResultContent, Usage,
 };
 use loop_telemetry::obs;
 use loop_telemetry::{ObservationExt, TraceAttrs};
@@ -58,8 +58,8 @@ impl RunObserver {
         if let Some(last) = &summary.last_assistant {
             self.span.record_output(last);
             self.span.record_metadata("stop_reason", &last.stop_reason);
-            if matches!(last.stop_reason, StopReason::Error | StopReason::Aborted) {
-                self.span.record_error(&stop_message(last));
+            if let Some(failure) = last.failure() {
+                self.span.record_error(&failure);
             }
         }
         self.span.record_metadata("turns", &summary.turns);
@@ -188,17 +188,10 @@ impl GenerationObserver {
         if let Some(response_id) = &message.response_id {
             self.span.record_metadata("response_id", response_id);
         }
-        if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
-            self.span.record_error(&stop_message(message));
+        if let Some(failure) = message.failure() {
+            self.span.record_error(&failure);
         }
     }
-}
-
-fn stop_message(message: &AssistantMessage) -> String {
-    message
-        .error_message
-        .clone()
-        .unwrap_or_else(|| format!("stopped with {:?}", message.stop_reason))
 }
 
 /// `tool.preflight`: argument validation and the before-tool-call hook.
@@ -238,7 +231,7 @@ fn tool_result_text(result: &AgentToolResult) -> String {
 
 #[cfg(test)]
 mod tests {
-    use loop_ai::{Cost, ToolResultMessage};
+    use loop_ai::{Cost, StopReason, ToolResultMessage};
 
     use super::*;
 

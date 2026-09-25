@@ -368,6 +368,16 @@ pub struct AssistantMessage {
 }
 
 impl AssistantMessage {
+    /// Why the turn did not complete (`Error` or `Aborted`), or `None` when it did.
+    pub fn failure(&self) -> Option<String> {
+        matches!(self.stop_reason, StopReason::Error | StopReason::Aborted).then(|| {
+            self.error_message
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| format!("assistant stopped with {:?}", self.stop_reason))
+        })
+    }
+
     /// Create a pending assistant skeleton for streaming.
     pub fn pending(model: &Model) -> Self {
         Self {
@@ -884,6 +894,24 @@ impl AssistantMessageEvent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failure_is_reported_for_error_and_abort_only() {
+        let model = crate::providers::soket_seed_models().remove(0);
+        let mut message = AssistantMessage::pending(&model);
+        for reason in [StopReason::Stop, StopReason::Length, StopReason::ToolUse] {
+            message.stop_reason = reason;
+            assert_eq!(message.failure(), None, "{reason:?}");
+        }
+        message.stop_reason = StopReason::Error;
+        message.error_message = Some("HTTP 502 Bad Gateway".into());
+        assert_eq!(message.failure().as_deref(), Some("HTTP 502 Bad Gateway"));
+        message.error_message = Some("  ".into());
+        assert_eq!(message.failure().as_deref(), Some("assistant stopped with Error"));
+        message.stop_reason = StopReason::Aborted;
+        message.error_message = None;
+        assert_eq!(message.failure().as_deref(), Some("assistant stopped with Aborted"));
+    }
+
     use super::*;
 
     #[test]

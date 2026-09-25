@@ -57,10 +57,7 @@ impl ProviderPreset {
         match self.key_check_path {
             Some(path) => crate::api::verify_api_key(self.base_url, path, api_key)
                 .await
-                .map_err(|e| match e {
-                    crate::api::ListModelsError::Status { status, .. } => format!("HTTP {status}"),
-                    other => other.to_string(),
-                }),
+                .map_err(|e| e.to_string()),
             None => Ok(()),
         }
     }
