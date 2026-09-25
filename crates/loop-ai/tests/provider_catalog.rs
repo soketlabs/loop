@@ -163,3 +163,21 @@ async fn chat_requests_carry_key_and_provider_headers() {
     let body: serde_json::Value = serde_json::from_slice(&chat.body).unwrap();
     assert_eq!(body["model"], "alpha");
 }
+
+#[tokio::test]
+async fn listing_skips_models_without_tool_support() {
+    let server = FakeHttpServer::always(FakeResponse::json(
+        r#"{"data":[
+            {"id":"agentic","supported_parameters":["tools"]},
+            {"id":"chat-only:free","supported_parameters":["temperature"]}
+        ]}"#,
+    ));
+    let models = models_with(gateway(server.base_url(), vec![]), None);
+    refresh(&models).await;
+    let ids: Vec<_> = models
+        .get_models(Some("gateway"))
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(ids, ["agentic"]);
+}
