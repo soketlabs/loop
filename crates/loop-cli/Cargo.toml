@@ -58,5 +58,6 @@ rmcp = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+loop-test-support = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
