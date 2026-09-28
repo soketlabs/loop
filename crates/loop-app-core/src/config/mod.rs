@@ -9,8 +9,9 @@ pub mod trust;
 pub use auth::{provider_has_key, FileCredentialStore};
 pub use paths::*;
 pub use settings::{load_settings, Settings};
+pub use tracing::{validate_http_url, TracingBackend, TracingSettings};
+#[cfg(feature = "telemetry")]
 pub use tracing::{
-    describe_tracing_status, resolve_tracing_destination, validate_http_url, TracingBackend,
-    TracingControl, TracingSettings, TracingSetupRequest,
+    describe_tracing_status, resolve_tracing_destination, TracingControl, TracingSetupRequest,
 };
 pub use trust::TrustStore;

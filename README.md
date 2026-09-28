@@ -27,6 +27,16 @@ cargo test -p loop-agent
 cargo test -p loop-cli
 ```
 
+### Tracing (optional `telemetry` feature)
+
+OpenTelemetry tracing to Langfuse or any OTLP collector is off by default, so the standard build carries no OpenTelemetry dependencies. Build with the feature to get `/tracing` in the TUI and the `--trace-*` flags for benchmark runs with `--print`:
+
+```bash
+cargo build -p loop-cli --release --features telemetry
+cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli \
+  --features loop-agent/telemetry,loop-app-core/telemetry,loop-cli/telemetry
+```
+
 ### CI vs releases
 
 - **CI** (`.github/workflows/ci.yml`) runs on every PR and push to `main`, plus manual **Run workflow**. It builds and tests; it does **not** publish a release.

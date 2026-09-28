@@ -35,3 +35,9 @@ jobs:
 
       - name: Test
         run: cargo test -p loop-ai -p loop-agent -p loop-mcp -p loop-orchestration -p loop-app-core -p loop-cli --locked
+
+      - name: Build (telemetry)
+        run: cargo build -p loop-cli --features telemetry --locked
+
+      - name: Test (telemetry)
+        run: cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli --features loop-agent/telemetry,loop-app-core/telemetry,loop-cli/telemetry --locked

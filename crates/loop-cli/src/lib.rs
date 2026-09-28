@@ -10,6 +10,7 @@ pub mod keybindings;
 pub mod mcp_serve;
 pub mod print_mode;
 pub mod setup_prompt;
+#[cfg(feature = "telemetry")]
 pub mod tracing_setup;
 pub mod tui;
 

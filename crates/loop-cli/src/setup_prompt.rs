@@ -1,5 +1,6 @@
 //! Guided input in the TUI setup box: provider API keys and the tracing wizard.
 
+#[cfg(feature = "telemetry")]
 use crate::tracing_setup::TracingSetup;
 
 /// What the setup box is collecting.
@@ -8,6 +9,7 @@ pub enum SetupPrompt {
     /// API key for a model provider (`/login`, first-run setup).
     ProviderKey(String),
     /// `/tracing setup` wizard.
+    #[cfg(feature = "telemetry")]
     Tracing(TracingSetup),
 }
 
@@ -16,6 +18,7 @@ impl SetupPrompt {
     pub fn title(&self) -> String {
         match self {
             Self::ProviderKey(provider) => format!("Connect to {provider}"),
+            #[cfg(feature = "telemetry")]
             Self::Tracing(step) => step.title(),
         }
     }
@@ -26,6 +29,7 @@ impl SetupPrompt {
             Self::ProviderKey(_) => {
                 "Paste your API key and press enter — input stays hidden".into()
             }
+            #[cfg(feature = "telemetry")]
             Self::Tracing(step) => step.instructions(),
         }
     }
@@ -40,6 +44,7 @@ impl SetupPrompt {
                 "{}_API_KEY",
                 provider.to_uppercase().replace('-', "_")
             )),
+            #[cfg(feature = "telemetry")]
             Self::Tracing(step) => step.env_hint(),
         }
     }
@@ -48,6 +53,7 @@ impl SetupPrompt {
     pub fn options(&self) -> Option<(Vec<(&'static str, &'static str)>, usize)> {
         match self {
             Self::ProviderKey(_) => None,
+            #[cfg(feature = "telemetry")]
             Self::Tracing(step) => step.options(),
         }
     }
@@ -56,6 +62,7 @@ impl SetupPrompt {
     pub fn masked(&self) -> bool {
         match self {
             Self::ProviderKey(_) => true,
+            #[cfg(feature = "telemetry")]
             Self::Tracing(step) => step.masked(),
         }
     }
@@ -64,6 +71,7 @@ impl SetupPrompt {
     pub fn placeholder(&self) -> &'static str {
         match self {
             Self::ProviderKey(_) => " paste your API key",
+            #[cfg(feature = "telemetry")]
             Self::Tracing(step) => step.placeholder(),
         }
     }
@@ -72,9 +80,11 @@ impl SetupPrompt {
     pub fn status_hint(&self) -> &'static str {
         match self {
             Self::ProviderKey(_) => "setup · paste your API key · enter save",
+            #[cfg(feature = "telemetry")]
             Self::Tracing(step) if step.options().is_some() => {
                 "tracing setup · ↑↓ choose · enter continue · esc cancel"
             }
+            #[cfg(feature = "telemetry")]
             Self::Tracing(_) => "tracing setup · enter next · esc cancel",
         }
     }
@@ -83,6 +93,7 @@ impl SetupPrompt {
     pub fn cancelled_message(&self) -> &'static str {
         match self {
             Self::ProviderKey(_) => "login cancelled",
+            #[cfg(feature = "telemetry")]
             Self::Tracing(_) => "tracing setup cancelled",
         }
     }
@@ -95,8 +106,6 @@ impl SetupPrompt {
 
 #[cfg(test)]
 mod tests {
-    use loop_app_core::config::TracingSettings;
-
     use super::*;
 
     #[test]
@@ -110,8 +119,11 @@ mod tests {
         assert!(!prompt.esc_quits(false));
     }
 
+    #[cfg(feature = "telemetry")]
     #[test]
     fn tracing_prompt_delegates_to_wizard() {
+        use loop_app_core::config::TracingSettings;
+
         let (step, _) = TracingSetup::start(None, &TracingSettings::default());
         let prompt = SetupPrompt::Tracing(step);
         assert_eq!(prompt.title(), "Set up tracing");

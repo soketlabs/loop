@@ -5,10 +5,12 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use loop_telemetry::TelemetryHandle;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, EnvFilter, Layer};
+use tracing_subscriber::{fmt, EnvFilter, Layer, Registry};
+
+/// A layer installed next to the log layer, e.g. the trace exporter.
+pub type ExportLayer = Box<dyn Layer<Registry> + Send + Sync>;
 
 /// Whether debug mode is enabled via `--debug` or `LOOP_DEBUG=1`.
 pub fn debug_enabled(cli_flag: bool) -> bool {
@@ -24,13 +26,13 @@ pub fn debug_enabled(cli_flag: bool) -> bool {
 /// Initialize tracing. In debug mode, writes session logs under `cwd/target/debug/logs`.
 ///
 /// Interactive TUI mode writes **file only** (stderr would corrupt the UI). Non-interactive
-/// mode tees to stderr as well. `telemetry`'s layer exports observation spans to Langfuse
-/// independently of the log filter.
+/// mode tees to stderr as well. `export_layer` (the telemetry exporter, when built with
+/// the `telemetry` feature) sees observation spans independently of the log filter.
 pub fn init_tracing(
     debug: bool,
     cwd: &Path,
     interactive: bool,
-    telemetry: &TelemetryHandle,
+    export_layer: Option<ExportLayer>,
 ) -> anyhow::Result<Option<PathBuf>> {
     let default_filter = if debug {
         "info,loop_agent=debug,loop_ai=debug,loop_cli=debug,loop_app_core=debug,loop_mcp=debug"
@@ -58,7 +60,7 @@ pub fn init_tracing(
     };
 
     tracing_subscriber::registry()
-        .with(telemetry.layer())
+        .with(export_layer)
         .with(log_layer.with_filter(filter))
         .init();
 

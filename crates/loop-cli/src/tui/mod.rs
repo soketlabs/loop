@@ -1893,6 +1893,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "telemetry")]
     #[test]
     fn setup_box_height_matches_rendered_lines() {
         use crate::setup_prompt::SetupPrompt;
@@ -1915,6 +1916,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "telemetry")]
     #[test]
     fn tracing_picker_marks_selected_backend() {
         use crate::setup_prompt::SetupPrompt;
@@ -1935,6 +1937,7 @@ mod tests {
         assert!(text.last().unwrap().contains("↑↓ choose"));
     }
 
+    #[cfg(feature = "telemetry")]
     #[test]
     fn setup_hint_says_next_until_the_final_masked_step() {
         use crate::setup_prompt::SetupPrompt;

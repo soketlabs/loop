@@ -27,9 +27,13 @@ use loop_ai::{
     ToolResultContent, Usage,
 };
 
-use crate::commands::{self, AutocompleteEntry, CommandEffect, TracingCommand};
+use crate::commands::{self, AutocompleteEntry, CommandEffect};
+#[cfg(feature = "telemetry")]
+use crate::commands::TracingCommand;
+#[cfg(feature = "telemetry")]
 use crate::config::describe_tracing_status;
 use crate::setup_prompt::SetupPrompt;
+#[cfg(feature = "telemetry")]
 use crate::tracing_setup::{TracingSetup, Transition};
 use crate::keybindings::{hotkey_help, Action};
 use crate::{build_tools, mcp_server_entries, CliRuntime};
@@ -1845,6 +1849,7 @@ async fn handle_key(
             }
             return Ok(());
         }
+        #[cfg(feature = "telemetry")]
         if let SetupPrompt::Tracing(mut step) = prompt.clone() {
             if step.options().is_some() {
                 // Backend picker: arrows move, enter confirms, other keys are ignored.
@@ -1866,8 +1871,11 @@ async fn handle_key(
         if plain_enter {
             let key_val = input.as_str().trim().to_string();
             input.clear();
+            // Without `telemetry` the provider key is the only setup prompt.
+            #[cfg_attr(not(feature = "telemetry"), allow(clippy::infallible_destructuring_match))]
             let provider = match prompt {
                 SetupPrompt::ProviderKey(provider) => provider,
+                #[cfg(feature = "telemetry")]
                 SetupPrompt::Tracing(step) => {
                     advance_tracing_setup(step, &key_val, runtime, pending_setup, input, chat, status);
                     return Ok(());
@@ -2735,6 +2743,7 @@ fn upsert_tool(
 }
 
 /// Feed one answer to the `/tracing setup` wizard and apply the result.
+#[cfg(feature = "telemetry")]
 fn advance_tracing_setup(
     step: TracingSetup,
     value: &str,
@@ -2768,6 +2777,7 @@ fn advance_tracing_setup(
 }
 
 /// `/tracing …`: returns the line to show in the transcript.
+#[cfg(feature = "telemetry")]
 fn apply_tracing_command(
     command: TracingCommand,
     runtime: &mut CliRuntime,
@@ -2976,6 +2986,7 @@ async fn apply_effect(
                 }
             }
         }
+        #[cfg(feature = "telemetry")]
         CommandEffect::Tracing(command) => {
             chat.push(sys(apply_tracing_command(command, runtime, pending_setup, input)));
         }

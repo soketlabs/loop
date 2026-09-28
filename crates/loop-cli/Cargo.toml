@@ -14,6 +14,8 @@ path = "src/main.rs"
 [features]
 default = []
 orchestration = ["loop-agent/orchestration", "dep:loop-orchestration"]
+# Langfuse / OTLP tracing: `/tracing`, `--trace-*` flags. Off by default.
+telemetry = ["loop-agent/telemetry", "loop-app-core/telemetry", "dep:loop-telemetry"]
 
 [dependencies]
 loop-app-core = { workspace = true }
@@ -21,7 +23,7 @@ loop-ai = { workspace = true }
 loop-agent = { workspace = true, features = ["mcp"] }
 loop-orchestration = { workspace = true, optional = true }
 loop-mcp = { workspace = true }
-loop-telemetry = { workspace = true }
+loop-telemetry = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -55,6 +57,18 @@ tempfile = { workspace = true }
 regex = { workspace = true }
 axum = { workspace = true }
 rmcp = { workspace = true }
+
+[[test]]
+name = "print_trace"
+required-features = ["telemetry"]
+
+[[test]]
+name = "tracing_command"
+required-features = ["telemetry"]
+
+[[test]]
+name = "tracing_runtime"
+required-features = ["telemetry"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
