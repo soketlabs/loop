@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use loop_cli::print_mode::{self, TraceArgs};
 use loop_cli::{bootstrap_cli, config, debug_log, BootstrapOpts};
+#[cfg(feature = "telemetry")]
 use loop_telemetry::TelemetryHandle;
+#[cfg(feature = "telemetry")]
+use tracing_subscriber::Layer;
 
 /// Loop — interactive coding agent by Soket AI.
 #[derive(Debug, Parser)]
@@ -96,8 +99,13 @@ async fn real_main() -> anyhow::Result<()> {
     let debug = debug_log::debug_enabled(cli.debug);
     let interactive = cli.print.is_none() && !cli.serve_mcp && cli.command.is_none();
     // Exports nothing until Langfuse credentials are attached below.
+    #[cfg(feature = "telemetry")]
     let telemetry = TelemetryHandle::new(env!("CARGO_PKG_VERSION"), true);
-    let debug_log_path = debug_log::init_tracing(debug, &cwd, interactive, &telemetry)?;
+    #[cfg(feature = "telemetry")]
+    let export_layer = Some(telemetry.layer().boxed());
+    #[cfg(not(feature = "telemetry"))]
+    let export_layer = None;
+    let debug_log_path = debug_log::init_tracing(debug, &cwd, interactive, export_layer)?;
 
     if let Some(Commands::Config) = cli.command {
         let agent = config::paths::get_agent_dir();
@@ -140,6 +148,7 @@ async fn real_main() -> anyhow::Result<()> {
     .await?;
     runtime.debug = debug;
     runtime.debug_log_path = debug_log_path;
+    #[cfg(feature = "telemetry")]
     if let Err(err) = runtime.attach_telemetry(telemetry.clone()) {
         tracing::warn!(error = %err, "Langfuse tracing disabled");
     }
@@ -151,6 +160,7 @@ async fn real_main() -> anyhow::Result<()> {
     } else {
         loop_cli::app::run(runtime).await
     };
+    #[cfg(feature = "telemetry")]
     print_mode::shutdown_telemetry(&telemetry).await;
     result
 }

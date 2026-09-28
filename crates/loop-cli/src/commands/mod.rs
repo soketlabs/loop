@@ -26,6 +26,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             description: "Show or change sandbox mode",
             args_hint: Some("[status|off|local [--full|--partial] [--crun|--runc|--runsc|--krun]]"),
         },
+        #[cfg(feature = "telemetry")]
         SlashCommand {
             name: "tracing",
             description: "Langfuse tracing status, on/off, or setup",
@@ -319,6 +320,7 @@ pub enum CommandEffect {
     /// Sandbox mode change.
     SetSandbox(String),
     /// Langfuse tracing control.
+    #[cfg(feature = "telemetry")]
     Tracing(TracingCommand),
     /// Login flow.
     Login(Option<String>),
@@ -393,9 +395,11 @@ pub enum CommandEffect {
     },
 }
 
+#[cfg(feature = "telemetry")]
 use loop_app_core::config::TracingBackend;
 
 /// `/tracing` subcommands.
+#[cfg(feature = "telemetry")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TracingCommand {
     /// Show whether traces are exported, and where.
@@ -411,10 +415,12 @@ pub enum TracingCommand {
     },
 }
 
+#[cfg(feature = "telemetry")]
 const TRACING_USAGE: &str =
     "Usage: /tracing [status|enable|disable|setup [langfuse|otlp]] — setup opens a guided wizard";
 
 /// Parse `/tracing` arguments; `Err` carries the usage text.
+#[cfg(feature = "telemetry")]
 pub fn parse_tracing(args: &str) -> Result<TracingCommand, String> {
     match args.split_whitespace().collect::<Vec<_>>().as_slice() {
         [] | ["status"] => Ok(TracingCommand::Status),
@@ -442,6 +448,7 @@ pub fn dispatch(cmd: &ParsedCommand, skill_names: &[String], template_names: &[S
             }
         }
         "sandbox" => CommandEffect::SetSandbox(cmd.args.clone()),
+        #[cfg(feature = "telemetry")]
         "tracing" => match parse_tracing(&cmd.args) {
             Ok(command) => CommandEffect::Tracing(command),
             Err(usage) => CommandEffect::Status(usage),

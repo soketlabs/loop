@@ -1,21 +1,32 @@
-//! Headless `--print` runs, each recorded as one Langfuse trace.
+//! Headless `--print` runs, each recorded as one Langfuse trace when built with the
+//! `telemetry` feature.
 
+#[cfg(feature = "telemetry")]
 use std::collections::BTreeMap;
 use std::future::Future;
 
 use loop_agent::AgentMessage;
 use loop_ai::{AssistantContent, Message, StopReason};
+#[cfg(feature = "telemetry")]
 use loop_telemetry::{obs, ObservationExt, TelemetryHandle, TraceAttrs};
+#[cfg(feature = "telemetry")]
 use tracing::Instrument;
 
 use crate::CliRuntime;
 
 /// Name of the root observation of a print-mode trace.
+#[cfg(feature = "telemetry")]
 pub const ROOT_SPAN_NAME: &str = "loop.print";
 /// Prefix of the stderr line carrying the trace id, for benchmark runners.
 pub const TRACE_ID_PREFIX: &str = "loop-trace-id: ";
 
+/// Per-run trace labels for `--print`; without the `telemetry` feature there are none.
+#[cfg(not(feature = "telemetry"))]
+#[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
+pub struct TraceArgs {}
+
 /// Per-run trace labels for `--print` (e.g. benchmark run and task ids).
+#[cfg(feature = "telemetry")]
 #[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
 pub struct TraceArgs {
     /// Langfuse trace name (default: `loop.print`).
@@ -38,6 +49,7 @@ pub struct TraceArgs {
     pub parent: Option<String>,
 }
 
+#[cfg(feature = "telemetry")]
 impl TraceArgs {
     /// Trace attributes for the root span.
     pub fn trace_attrs(&self, default_session: &str) -> TraceAttrs {
@@ -57,6 +69,7 @@ impl TraceArgs {
     }
 }
 
+#[cfg(feature = "telemetry")]
 fn parse_key_value(raw: &str) -> Result<(String, String), String> {
     match raw.split_once('=') {
         Some((key, value)) if !key.trim().is_empty() => {
@@ -75,7 +88,26 @@ pub struct PrintOutcome {
     pub trace_id: Option<String>,
 }
 
+/// Run `prompt` through `run`; untraced without the `telemetry` feature.
+#[cfg(not(feature = "telemetry"))]
+pub async fn traced_print<F, Fut>(
+    _prompt: &str,
+    _trace: &TraceArgs,
+    _default_session: &str,
+    run: F,
+) -> PrintOutcome
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = anyhow::Result<AgentMessage>>,
+{
+    PrintOutcome {
+        result: run().await.and_then(|message| final_text(&message)),
+        trace_id: None,
+    }
+}
+
 /// Run `prompt` through `run` inside the `loop.print` root observation.
+#[cfg(feature = "telemetry")]
 pub async fn traced_print<F, Fut>(
     prompt: &str,
     trace: &TraceArgs,
@@ -130,6 +162,7 @@ pub async fn run_print(
 }
 
 /// Flush and stop exporting before the process exits; reports a failed last export.
+#[cfg(feature = "telemetry")]
 pub async fn shutdown_telemetry(telemetry: &TelemetryHandle) {
     let handle = telemetry.clone();
     // Shutdown blocks on the exporter; keep it off the async workers.
@@ -168,20 +201,24 @@ pub fn final_text(message: &AgentMessage) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "telemetry")]
     use clap::Parser;
 
     use super::*;
 
+    #[cfg(feature = "telemetry")]
     #[derive(Parser)]
     struct Cli {
         #[command(flatten)]
         trace: TraceArgs,
     }
 
+    #[cfg(feature = "telemetry")]
     fn parse(args: &[&str]) -> Result<TraceArgs, clap::Error> {
         Cli::try_parse_from(std::iter::once("loop").chain(args.iter().copied())).map(|c| c.trace)
     }
 
+    #[cfg(feature = "telemetry")]
     #[test]
     fn trace_flags_map_to_trace_attrs() {
         let args = parse(&[
@@ -209,6 +246,7 @@ mod tests {
         assert_eq!(attrs.release.as_deref(), Some(env!("CARGO_PKG_VERSION")));
     }
 
+    #[cfg(feature = "telemetry")]
     #[test]
     fn trace_session_overrides_default() {
         let attrs = parse(&["--trace-session", "run-7"])
@@ -217,6 +255,7 @@ mod tests {
         assert_eq!(attrs.session_id.as_deref(), Some("run-7"));
     }
 
+    #[cfg(feature = "telemetry")]
     #[test]
     fn malformed_metadata_is_rejected() {
         assert!(parse(&["--trace-metadata", "novalue"]).is_err());

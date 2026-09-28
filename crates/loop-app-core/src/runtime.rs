@@ -72,6 +72,7 @@ pub struct Runtime {
     /// Skills activated via `/skill:name` (not yet cleared; mirrored on the harness).
     pub active_skills: Vec<String>,
     /// Process telemetry, when the host application installed it.
+    #[cfg(feature = "telemetry")]
     pub telemetry: Option<loop_telemetry::TelemetryHandle>,
 }
 
@@ -80,7 +81,10 @@ impl Runtime {
     pub fn save_settings(&self) -> anyhow::Result<()> {
         self.settings.save_file(&settings_path(&self.agent_dir))
     }
+}
 
+#[cfg(feature = "telemetry")]
+impl Runtime {
     /// Take ownership of the process telemetry and apply saved tracing settings.
     pub fn attach_telemetry(
         &mut self,
@@ -563,6 +567,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         tool_approval: None,
         mcp_client,
         active_skills: Vec::new(),
+        #[cfg(feature = "telemetry")]
         telemetry: None,
     })
 }
