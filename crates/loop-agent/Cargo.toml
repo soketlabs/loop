@@ -13,6 +13,8 @@ sqlite = ["dep:rusqlite"]
 proxy = ["dep:reqwest", "dep:eventsource-stream", "dep:bytes"]
 mcp = ["dep:loop-mcp", "dep:rmcp"]
 orchestration = ["dep:loop-orchestration"]
+# Langfuse / OTLP observations from the agent loop. Off by default.
+telemetry = ["dep:loop-telemetry"]
 
 [dependencies]
 loop-ai = { workspace = true }
@@ -42,9 +44,16 @@ eventsource-stream = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 loop-orchestration = { workspace = true, optional = true }
 loop-mcp = { workspace = true, optional = true }
+loop-telemetry = { workspace = true, optional = true }
 rmcp = { workspace = true, optional = true }
+
+[[test]]
+name = "telemetry"
+required-features = ["telemetry"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rusqlite = { workspace = true, features = ["bundled"] }

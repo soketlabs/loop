@@ -21,13 +21,21 @@ use loop_agent::harness::{
     SessionForkPoint, SessionForkSelection,
 };
 use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel};
-use loop_ai::providers::{SOKET_BASE_URL, SOKET_PROVIDER_ID};
+use loop_ai::providers::SOKET_BASE_URL;
 use loop_ai::{
-    calculate_context_tokens, Credential, CredentialStore, Message, ModelsRefreshOptions,
+    calculate_context_tokens, Message, ModelsRefreshOptions,
     ToolResultContent, Usage,
 };
 
 use crate::commands::{self, AutocompleteEntry, CommandEffect};
+#[cfg(feature = "telemetry")]
+use crate::commands::TracingCommand;
+#[cfg(feature = "telemetry")]
+use crate::config::describe_tracing_status;
+use crate::provider_setup::ProviderSetup;
+use crate::setup_prompt::SetupPrompt;
+#[cfg(feature = "telemetry")]
+use crate::tracing_setup::TracingSetup;
 use crate::keybindings::{hotkey_help, Action};
 use crate::{build_tools, mcp_server_entries, CliRuntime};
 use crate::theme::Theme;
@@ -39,7 +47,8 @@ use crate::tui::{
     chat_items_from_agent_messages, consume_frozen_lines, filter_files, find_at_mention,
     find_tool_index, footer_live_height, format_item_lines, format_live_lines,
     format_token_usage_line, insert_text, item_is_committed, list_files, live_overflow_count,
-    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem,
+    assistant_error_item, render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus,
+    ChatItem,
     CommandHistory, FileEntry, FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow, PickerView,
 };
 #[cfg(feature = "orchestration")]
@@ -147,13 +156,9 @@ struct TokenBarState {
 impl TokenBarState {
     fn from_model(runtime: &CliRuntime) -> Self {
         let context_window = runtime
-            .models
-            .get_model(
-                &runtime.settings.default_provider,
-                &runtime.settings.default_model,
-            )
-            .map(|m| m.context_window)
-            .unwrap_or(0);
+            .selected_model
+            .as_ref()
+            .map_or(0, |m| m.context_window);
         Self {
             total_tokens: 0,
             context_tokens: Some(0),
@@ -179,10 +184,7 @@ impl TokenBarState {
     }
 
     fn sync_window(&mut self, runtime: &CliRuntime) {
-        if let Some(m) = runtime.models.get_model(
-            &runtime.settings.default_provider,
-            &runtime.settings.default_model,
-        ) {
+        if let Some(m) = &runtime.selected_model {
             self.context_window = m.context_window;
         }
     }
@@ -343,8 +345,10 @@ async fn run_loop(
     let mut live_frozen = 0usize;
     let mut input = InputBuffer::new();
     let mut history = CommandHistory::load(crate::config::paths::history_path(&runtime.agent_dir));
-    let mut status: String = if runtime.needs_api_key_setup {
-        "setup · paste your API key · enter save".into()
+    let mut status: String = if runtime.needs_provider_setup {
+        "login · connect a model provider to begin".into()
+    } else if runtime.selected_model.is_none() {
+        NO_MODEL_LABEL.into()
     } else if runtime.resumed {
         if chat.is_empty() {
             "resumed · empty session · /help for commands".into()
@@ -373,8 +377,8 @@ async fn run_loop(
     let mut purge_ui_events = false;
     let mut last_width = terminal.size()?.width;
     let mut hide_thinking = runtime.settings.hide_thinking_block;
-    let mut pending_login: Option<String> = if runtime.needs_api_key_setup {
-        Some(SOKET_PROVIDER_ID.into())
+    let mut pending_setup: Option<SetupPrompt> = if runtime.needs_provider_setup {
+        ProviderSetup::start(None).ok().map(SetupPrompt::Provider)
     } else {
         None
     };
@@ -433,18 +437,14 @@ async fn run_loop(
             hide_thinking,
         )?;
 
-        let model_label = format!(
-            "{}/{}",
-            runtime.settings.default_provider, runtime.settings.default_model
-        );
-        let model_line = format!(
-            "{model_label} · {}",
-            runtime.settings.default_thinking_level
-        );
+        let model_line = match runtime.selected_model_spec() {
+            Some(spec) => format!("{spec} · {}", runtime.settings.default_thinking_level),
+            None => NO_MODEL_LABEL.to_string(),
+        };
 
         let ac_entries = if input.as_str().starts_with('/')
             && !input.as_str().contains(' ')
-            && pending_login.is_none()
+            && pending_setup.is_none()
             && model_picker.is_none()
             && fork_picker.is_none()
             && active_approval.is_none()
@@ -455,7 +455,7 @@ async fn run_loop(
             Vec::new()
         };
         let at_mention = if ac_entries.is_empty()
-            && pending_login.is_none()
+            && pending_setup.is_none()
             && model_picker.is_none()
             && fork_picker.is_none()
             && active_approval.is_none()
@@ -491,10 +491,7 @@ async fn run_loop(
         let picker = if let Some(review) = &active_approval {
             review.into_picker()
         } else if let Some(p) = &model_picker {
-            let current = format!(
-                "{}/{}",
-                runtime.settings.default_provider, runtime.settings.default_model
-            );
+            let current = runtime.selected_model_spec().unwrap_or_default();
             PickerView::Models {
                 rows: p
                     .filtered
@@ -535,9 +532,10 @@ async fn run_loop(
                 hint: "Fork: edit this user message and continue (prior history kept)."
                     .into(),
             }
-        } else if let Some(provider) = &pending_login {
+        } else if let Some(prompt) = &pending_setup {
             PickerView::Setup {
-                provider: provider.clone(),
+                prompt: prompt.clone(),
+                first_run: runtime.needs_provider_setup,
             }
         } else if !ac_entries.is_empty() {
             PickerView::Commands {
@@ -573,8 +571,8 @@ async fn run_loop(
             "↑↓ select · enter confirm · esc cancel".into()
         } else if fork_picker.is_some() {
             "↑↓ select · enter edit · esc cancel".into()
-        } else if pending_login.is_some() {
-            "setup · paste your API key · enter save".into()
+        } else if let Some(prompt) = &pending_setup {
+            prompt.status_hint(runtime.needs_provider_setup)
         } else if !ac_entries.is_empty() {
             "↑↓ select · tab complete · enter run".into()
         } else if !file_ac_entries.is_empty() {
@@ -617,7 +615,7 @@ async fn run_loop(
         };
 
         let live: Vec<ChatItem> = chat[flushed..].to_vec();
-        let setup_mode = pending_login.is_some();
+        let setup_mode = pending_setup.is_some();
         if refresh_token_bar {
             token_bar.refresh(runtime).await;
             refresh_token_bar = false;
@@ -665,7 +663,10 @@ async fn run_loop(
                     status: &status_line,
                     picker: &picker,
                     setup_mode,
-                    mask_input: setup_mode,
+                    mask_input: pending_setup.as_ref().is_some_and(SetupPrompt::masked),
+                    setup_placeholder: pending_setup
+                        .as_ref()
+                        .map_or("", SetupPrompt::placeholder),
                     path_line: &path_line,
                     model_line: &model_line,
                     usage_line: &usage_line,
@@ -715,7 +716,7 @@ async fn run_loop(
                         &mut redraw_request,
                         &mut purge_ui_events,
                         &mut hide_thinking,
-                        &mut pending_login,
+                        &mut pending_setup,
                         &mut model_picker,
                         &mut fork_picker,
                         &mut active_approval,
@@ -955,13 +956,13 @@ fn print_welcome(
     let lines = welcome_lines(
         &runtime.theme,
         version,
-        &runtime.settings.default_provider,
-        &runtime.settings.default_model,
+        runtime.selected_model.as_ref(),
+        runtime.model_note.as_deref(),
         &endpoint,
         &runtime.session_id,
         runtime.resources.skills.len(),
         runtime.resources.prompts.len(),
-        runtime.needs_api_key_setup,
+        runtime.needs_provider_setup,
         width,
     );
     terminal.insert_before(lines.len() as u16, |buf| {
@@ -1033,6 +1034,13 @@ fn git_branch(cwd: &Path) -> Option<String> {
 fn sys(text: impl Into<String>) -> ChatItem {
     ChatItem::System { text: text.into() }
 }
+
+/// An error line, rendered in the theme's error color.
+fn error_item(text: impl Into<String>) -> ChatItem {
+    ChatItem::Error { text: text.into() }
+}
+
+
 
 /// Index of the first queued bubble, or `chat.len()` if none.
 /// Agent stream items must be inserted here so they stay above the queue.
@@ -1149,7 +1157,7 @@ fn drain_ui_events(
             UiEvent::TurnFailed(err) => {
                 *working = false;
                 turn_step.clear();
-                chat.push(sys(format!("error: {err}")));
+                chat.push(error_item(format!("error: {err}")));
                 *status = "error".into();
                 tracing::error!(error = %err, "turn failed");
                 if let Some(path) = &runtime.debug_log_path {
@@ -1179,9 +1187,7 @@ fn drain_ui_events(
                 match result {
                     Ok(SandboxDoneOk::Off) => {
                         runtime.settings.sandbox.mode = "off".into();
-                        let _ = runtime.settings.save_file(
-                            &crate::config::paths::settings_path(&runtime.agent_dir),
-                        );
+                        let _ = runtime.save_settings();
                         chat.push(sys("sandbox → off"));
                         *status = "ready".into();
                     }
@@ -1192,9 +1198,7 @@ fn drain_ui_events(
                         runtime.settings.sandbox.mode = "local".into();
                         runtime.settings.sandbox.isolation = isolation.clone();
                         runtime.settings.sandbox.runtime = oci.clone();
-                        let _ = runtime.settings.save_file(
-                            &crate::config::paths::settings_path(&runtime.agent_dir),
-                        );
+                        let _ = runtime.save_settings();
                         chat.push(sys(format!("sandbox → local --{isolation} --{oci}")));
                         *status = "ready".into();
                     }
@@ -1441,6 +1445,14 @@ fn submit_user_text(
     text: String,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
+    if runtime.selected_model.is_none() {
+        // Nothing can answer; don't queue or record the message.
+        chat.push(error_item(
+            loop_agent::harness::AgentHarnessError::NoModelSelected.to_string(),
+        ));
+        *status = NO_MODEL_LABEL.into();
+        return;
+    }
     if agent_is_busy(runtime, *working) {
         enqueue_user_message(chat, message_queue, text.clone(), text);
         let n = message_queue.len();
@@ -1548,7 +1560,7 @@ async fn handle_key(
     redraw_request: &mut bool,
     purge_ui_events: &mut bool,
     hide_thinking: &mut bool,
-    pending_login: &mut Option<String>,
+    pending_setup: &mut Option<SetupPrompt>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
     active_approval: &mut Option<ActiveApproval>,
@@ -1676,15 +1688,7 @@ async fn handle_key(
             KeyCode::Enter => {
                 if let Some(id) = picker.filtered.get(picker.selected).cloned() {
                     if let Some((provider, model)) = id.split_once('/') {
-                        if let Some(m) = runtime.models.get_model(provider, model) {
-                            runtime.harness.set_model(m).await;
-                            runtime.settings.default_provider = provider.into();
-                            runtime.settings.default_model = model.into();
-                            let _ = runtime.settings.save_file(
-                                &crate::config::paths::settings_path(&runtime.agent_dir),
-                            );
-                            chat.push(sys(format!("model → {provider}/{model}")));
-                        }
+                        choose_model(runtime, token_bar, provider, model, chat).await;
                     }
                 }
                 *model_picker = None;
@@ -1828,52 +1832,53 @@ async fn handle_key(
         }
     }
 
-    if pending_login.is_some() {
+    if let Some(prompt) = pending_setup.clone() {
         if key.code == KeyCode::Esc
             || matches!(
                 runtime.keybindings.resolve(key),
                 Some(Action::Interrupt | Action::Clear)
             )
         {
-            if runtime.needs_api_key_setup {
+            if prompt.esc_quits(runtime.needs_provider_setup) {
                 *should_quit = true;
             } else {
-                *pending_login = None;
+                *pending_setup = None;
                 input.clear();
-                *status = "login cancelled".into();
+                *status = prompt.cancelled_message().into();
             }
             return Ok(());
+        }
+        if prompt.options().is_some() {
+            // Choice step: arrows move, enter confirms, other keys are ignored.
+            let delta = match key.code {
+                KeyCode::Up => -1,
+                KeyCode::Down => 1,
+                KeyCode::Enter => 0,
+                _ => return Ok(()),
+            };
+            if delta != 0 {
+                let mut moved = prompt;
+                moved.move_selection(delta);
+                *pending_setup = Some(moved);
+                return Ok(());
+            }
         }
         let plain_enter = key.code == KeyCode::Enter
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && !key.modifiers.contains(KeyModifiers::CONTROL);
         if plain_enter {
-            let provider = pending_login
-                .take()
-                .unwrap_or_else(|| SOKET_PROVIDER_ID.into());
-            let key_val = input.as_str().trim().to_string();
+            let value = input.as_str().trim().to_string();
             input.clear();
-            if key_val.is_empty() {
-                *pending_login = Some(provider);
-                *status = "empty key".into();
-            } else {
-                runtime
-                    .credentials
-                    .set(&provider, Credential::api_key(key_val));
-                let _ = runtime
-                    .models
-                    .refresh(ModelsRefreshOptions {
-                        allow_network: Some(true),
-                        force: true,
-                        provider_id: Some(provider.clone()),
-                    })
-                    .await;
-                runtime.needs_api_key_setup = false;
-                chat.clear();
-                chat.push(sys(format!(
-                    "✓ API key saved for {provider} — you're all set. Type /help for commands."
-                )));
-                *status = "ready · /help for commands".into();
+            *pending_setup = None;
+            match prompt {
+                SetupPrompt::Provider(step) => {
+                    advance_provider_setup(step, &value, runtime, pending_setup, input, chat, status)
+                        .await;
+                }
+                #[cfg(feature = "telemetry")]
+                SetupPrompt::Tracing(step) => {
+                    advance_tracing_setup(step, &value, runtime, pending_setup, input, chat, status);
+                }
             }
             return Ok(());
         }
@@ -2011,7 +2016,7 @@ async fn handle_key(
                             chat,
                             status,
                             turn_step,
-                            pending_login,
+                            pending_setup,
                             model_picker,
                             fork_picker,
                             hide_thinking,
@@ -2118,7 +2123,7 @@ async fn handle_key(
             }
             Action::ModelSelect => {
                 *fork_picker = None;
-                *model_picker = Some(ModelPickerState::new(&runtime.models));
+                *model_picker = Some(ModelPickerState::new(runtime.available_models().await));
                 return Ok(());
             }
             Action::SessionFork => {
@@ -2128,6 +2133,7 @@ async fn handle_key(
             Action::ModelCycleForward | Action::ModelCycleBackward => {
                 cycle_model(
                     runtime,
+                    token_bar,
                     action == Action::ModelCycleForward,
                     chat,
                 )
@@ -2238,9 +2244,9 @@ struct ModelPickerState {
 }
 
 impl ModelPickerState {
-    fn new(models: &loop_ai::Models) -> Self {
+    /// `models` in picker order (see `Runtime::available_models`).
+    fn new(models: Vec<loop_ai::Model>) -> Self {
         let all: Vec<String> = models
-            .get_models(None)
             .into_iter()
             .map(|m| format!("{}/{}", m.provider, m.id))
             .collect();
@@ -2402,12 +2408,9 @@ async fn adopt_forked_session(
 
 fn endpoint_for(runtime: &CliRuntime) -> String {
     runtime
-        .models
-        .get_model(
-            &runtime.settings.default_provider,
-            &runtime.settings.default_model,
-        )
-        .map(|m| m.base_url)
+        .selected_model
+        .as_ref()
+        .map(|m| m.base_url.clone())
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| SOKET_BASE_URL.to_string())
 }
@@ -2434,10 +2437,20 @@ fn handle_agent_event(
                 *turn_step = "thinking…".into();
             }
         }
-        AgentEvent::AgentEnd { .. } => {
+        AgentEvent::AgentEnd { messages } => {
             *working = false;
             turn_step.clear();
-            *status = "ready".into();
+            let failed = messages
+                .iter()
+                .rev()
+                .find_map(AgentMessage::as_assistant)
+                .and_then(assistant_error_item)
+                .is_some();
+            *status = if failed {
+                "error · see above".into()
+            } else {
+                "ready".into()
+            };
             *streaming_assistant = None;
             if let Some(idx) = streaming_thinking.take() {
                 if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
@@ -2460,6 +2473,9 @@ fn handle_agent_event(
             }
         }
         AgentEvent::MessageEnd { message } => {
+            if let Some(item) = message.as_assistant().and_then(assistant_error_item) {
+                push_before_queued(chat, item);
+            }
             token_bar.apply_message(&message);
             *streaming_assistant = None;
             if let Some(idx) = streaming_thinking.take() {
@@ -2544,16 +2560,6 @@ fn handle_agent_event(
                         detail,
                         CardStatus::Pending,
                     );
-                }
-                AssistantMessageEvent::Error { error, .. } => {
-                    let msg = error
-                        .error_message
-                        .clone()
-                        .unwrap_or_else(|| "error".into());
-                    push_before_queued(chat, sys(format!("error: {msg}")));
-                    *working = false;
-                    turn_step.clear();
-                    *status = "error".into();
                 }
                 _ => {}
             }
@@ -2713,13 +2719,153 @@ fn upsert_tool(
     }
 }
 
+/// Apply a wizard `Next`/`Retry`: show the next step (or the same one with its error)
+/// in the setup box. Returns the request once the wizard is done.
+fn step_wizard<Step, Request>(
+    transition: crate::wizard::Transition<Step, Request>,
+    into_prompt: fn(Step) -> SetupPrompt,
+    value: &str,
+    pending_setup: &mut Option<SetupPrompt>,
+    input: &mut InputBuffer,
+    chat: &mut Vec<ChatItem>,
+) -> Option<Request> {
+    use crate::wizard::Transition;
+    match transition {
+        Transition::Next { step, prefill } => {
+            input.set(prefill);
+            *pending_setup = Some(into_prompt(step));
+            None
+        }
+        Transition::Retry { step, error } => {
+            let prompt = into_prompt(step);
+            if !prompt.masked() {
+                input.set(value);
+            }
+            chat.push(error_item(format!("{}: {error}", prompt.error_prefix())));
+            *pending_setup = Some(prompt);
+            None
+        }
+        Transition::Done(request) => Some(request),
+    }
+}
+
+/// Feed one answer to the `/tracing setup` wizard and apply the result.
+#[cfg(feature = "telemetry")]
+fn advance_tracing_setup(
+    step: TracingSetup,
+    value: &str,
+    runtime: &mut CliRuntime,
+    pending_setup: &mut Option<SetupPrompt>,
+    input: &mut InputBuffer,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+) {
+    let transition = step.submit(value, &runtime.settings.tracing);
+    let Some(request) = step_wizard(
+        transition,
+        SetupPrompt::Tracing,
+        value,
+        pending_setup,
+        input,
+        chat,
+    ) else {
+        return;
+    };
+    chat.push(match runtime.setup_tracing(&request) {
+        Ok(state) => sys(format!("✓ {}", describe_tracing_status(&state))),
+        Err(err) => error_item(format!("tracing setup failed: {err:#}")),
+    });
+    *status = "ready".into();
+}
+
+/// Feed one answer to the `/login` wizard; on the last step, connect the provider.
+async fn advance_provider_setup(
+    step: ProviderSetup,
+    value: &str,
+    runtime: &mut CliRuntime,
+    pending_setup: &mut Option<SetupPrompt>,
+    input: &mut InputBuffer,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+) {
+    let Some(request) = step_wizard(
+        step.submit(value),
+        SetupPrompt::Provider,
+        value,
+        pending_setup,
+        input,
+        chat,
+    ) else {
+        return;
+    };
+    *status = format!("login · connecting {}…", request.display_name());
+    match runtime.connect_provider(&request).await {
+        Ok(connected) => {
+            chat.push(sys(format!(
+                "✓ Connected {} · {} models — /model to choose one",
+                connected.name, connected.model_count
+            )));
+            *status = "ready · /help for commands".into();
+        }
+        Err(err) => {
+            // Keep the wizard open on the key step so the user can try again.
+            chat.push(error_item(format!("login: {err:#}")));
+            *pending_setup = Some(SetupPrompt::Provider(ProviderSetup::retry_key(&request)));
+            *status = "login · check the key and try again".into();
+        }
+    }
+}
+
+/// `/logout [provider]`: returns the line to show in the transcript.
+async fn apply_logout(provider: Option<String>, runtime: &mut CliRuntime) -> String {
+    let Some(provider) = provider else {
+        let connected = runtime.connected_providers();
+        return if connected.is_empty() {
+            "Usage: /logout <provider> · no providers are connected".into()
+        } else {
+            format!("Usage: /logout <provider> · connected: {}", connected.join(", "))
+        };
+    };
+    match runtime.disconnect_provider(&provider).await {
+        Ok(name) => format!("logged out: {name}"),
+        Err(err) => format!("logout: {err:#}"),
+    }
+}
+
+/// `/tracing …`: returns the line to show in the transcript.
+#[cfg(feature = "telemetry")]
+fn apply_tracing_command(
+    command: TracingCommand,
+    runtime: &mut CliRuntime,
+    pending_setup: &mut Option<SetupPrompt>,
+    input: &mut InputBuffer,
+) -> String {
+    let result = match command {
+        TracingCommand::Status => runtime
+            .tracing_status()
+            .ok_or_else(|| anyhow::anyhow!("tracing is not available in this mode")),
+        TracingCommand::Enable => runtime.set_tracing_enabled(true),
+        TracingCommand::Disable => runtime.set_tracing_enabled(false),
+        TracingCommand::Setup { backend } => {
+            let (step, prefill) = TracingSetup::start(backend, &runtime.settings.tracing);
+            input.set(prefill);
+            *pending_setup = Some(SetupPrompt::Tracing(step));
+            return "tracing setup — follow the prompts below · esc cancels".into();
+        }
+    };
+    match result {
+        Ok(state) => describe_tracing_status(&state),
+        Err(err) => format!("tracing: {err:#}"),
+    }
+}
+
 async fn apply_effect(
     effect: CommandEffect,
     runtime: &mut CliRuntime,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
     turn_step: &mut String,
-    pending_login: &mut Option<String>,
+    pending_setup: &mut Option<SetupPrompt>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
     hide_thinking: &mut bool,
@@ -2765,9 +2911,7 @@ async fn apply_effect(
                 Ok(t) => {
                     runtime.theme = t;
                     runtime.settings.theme = name.clone();
-                    let _ = runtime
-                        .settings
-                        .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
+                    let _ = runtime.save_settings();
                     chat.push(sys(format!("theme → {name}")));
                     // Reprint scrollback so already-flushed messages pick up the new colors.
                     *redraw_request = true;
@@ -2777,26 +2921,14 @@ async fn apply_effect(
         }
         CommandEffect::SelectModel(None) => {
             *fork_picker = None;
-            *model_picker = Some(ModelPickerState::new(&runtime.models));
+            *model_picker = Some(ModelPickerState::new(runtime.available_models().await));
         }
         CommandEffect::SelectModel(Some(spec)) => {
-            let (provider, model) = spec
-                .split_once('/')
-                .map(|(p, m)| (p.to_string(), m.to_string()))
-                .unwrap_or_else(|| (runtime.settings.default_provider.clone(), spec));
-            if let Some(m) = runtime.models.get_model(&provider, &model) {
-                runtime.harness.set_model(m).await;
-                runtime.settings.default_provider = provider.clone();
-                runtime.settings.default_model = model.clone();
-                let _ = runtime
-                    .settings
-                    .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
-                chat.push(sys(format!("model → {provider}/{model}")));
-                token_bar.sync_window(runtime);
-            } else {
-                chat.push(sys(format!(
-                    "model not found: {provider}/{model} — try /model or refresh"
-                )));
+            match loop_app_core::model_selection::resolve_model_spec(&runtime.models, &spec) {
+                Ok(m) => {
+                    choose_model(runtime, token_bar, &m.provider, &m.id, chat).await;
+                }
+                Err(err) => chat.push(error_item(format!("{err:#}"))),
             }
         }
         CommandEffect::SetSandbox(mode) => {
@@ -2900,15 +3032,20 @@ async fn apply_effect(
                 }
             }
         }
-        CommandEffect::Login(provider) => {
-            let p = provider.unwrap_or_else(|| SOKET_PROVIDER_ID.into());
-            *pending_login = Some(p.clone());
-            *status = format!("setup · paste API key for {p}");
+        #[cfg(feature = "telemetry")]
+        CommandEffect::Tracing(command) => {
+            chat.push(sys(apply_tracing_command(command, runtime, pending_setup, input)));
         }
+        CommandEffect::Login(provider) => match ProviderSetup::start(provider.as_deref()) {
+            Ok(step) => {
+                *pending_setup = Some(SetupPrompt::Provider(step));
+                input.clear();
+                chat.push(sys("login — follow the prompts below · esc cancels"));
+            }
+            Err(usage) => chat.push(sys(usage)),
+        },
         CommandEffect::Logout(provider) => {
-            let p = provider.unwrap_or_else(|| SOKET_PROVIDER_ID.into());
-            runtime.credentials.remove(&p);
-            chat.push(sys(format!("logged out: {p}")));
+            chat.push(sys(apply_logout(provider, runtime).await));
         }
         CommandEffect::NewSession => {
             // Drop queued prompts and live stream markers before swapping sessions.
@@ -3003,9 +3140,7 @@ async fn apply_effect(
                             &runtime.settings.tool_permissions,
                         ));
                     }
-                    let _ = runtime
-                        .settings
-                        .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
+                    let _ = runtime.save_settings();
                     chat.push(sys(format!(
                         "tool approval → {} (this session: {})",
                         policy.as_str(),
@@ -3034,9 +3169,7 @@ async fn apply_effect(
                     Ok(ms) => {
                         runtime.settings.response_header_timeout_ms = ms;
                         runtime.harness.set_response_header_timeout_ms(ms).await;
-                        let _ = runtime
-                            .settings
-                            .save_file(&crate::config::paths::settings_path(&runtime.agent_dir));
+                        let _ = runtime.save_settings();
                         let label = if ms == 0 {
                             "off (unlimited — for long-running workflows)".into()
                         } else if ms % 1000 == 0 {
@@ -3089,20 +3222,18 @@ async fn apply_effect(
                     let mut report =
                         loop_agent::harness::format_session_stats(&stats);
                     report.push_str(&format!(
-                        "\nEnvironment\n  Sessions DB: {}\n  Theme: {}\n  Trusted: {}\n  Settings model: {}/{}\n",
+                        "\nEnvironment\n  Sessions DB: {}\n  Theme: {}\n  Trusted: {}\n  Model: {}\n",
                         runtime.sessions_db.display(),
                         runtime.theme.name,
                         runtime.project_trusted,
-                        runtime.settings.default_provider,
-                        runtime.settings.default_model,
+                        runtime.selected_model_spec().unwrap_or_else(|| "none".into()),
                     ));
                     chat.push(sys(report));
                 }
                 Err(e) => {
                     chat.push(sys(format!(
-                        "provider/model: {}/{}\nsessions db: {}\ntheme: {}\ntrusted: {}\n(stats error: {e})",
-                        runtime.settings.default_provider,
-                        runtime.settings.default_model,
+                        "model: {}\nsessions db: {}\ntheme: {}\ntrusted: {}\n(stats error: {e})",
+                        runtime.selected_model_spec().unwrap_or_else(|| "none".into()),
                         runtime.sessions_db.display(),
                         runtime.theme.name,
                         runtime.project_trusted
@@ -3116,10 +3247,9 @@ async fn apply_effect(
                 perms.push_str(&format!("\n    {k}: {v}"));
             }
             chat.push(sys(format!(
-                "settings ({})\n  provider: {}\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  toolApproval: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  responseHeaderTimeoutMs: {}{}\n  ui: {}",
+                "settings ({})\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  toolApproval: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  responseHeaderTimeoutMs: {}{}\n  ui: {}",
                 crate::config::paths::settings_path(&runtime.agent_dir).display(),
-                runtime.settings.default_provider,
-                runtime.settings.default_model,
+                runtime.selected_model_spec().unwrap_or_else(|| "none".into()),
                 runtime.settings.theme,
                 runtime.settings.default_thinking_level,
                 runtime.settings.sandbox.display(),
@@ -3446,29 +3576,47 @@ async fn start_workflow(
     });
 }
 
-async fn cycle_model(runtime: &mut CliRuntime, forward: bool, chat: &mut Vec<ChatItem>) {
-    let models = runtime.models.get_models(None);
+async fn cycle_model(
+    runtime: &mut CliRuntime,
+    token_bar: &mut TokenBarState,
+    forward: bool,
+    chat: &mut Vec<ChatItem>,
+) {
+    let models = runtime.available_models().await;
     if models.is_empty() {
         return;
     }
-    let current = format!(
-        "{}/{}",
-        runtime.settings.default_provider, runtime.settings.default_model
-    );
-    let idx = models
+    let current = runtime.selected_model_spec().unwrap_or_default();
+    let next = match models
         .iter()
         .position(|m| format!("{}/{}", m.provider, m.id) == current)
-        .unwrap_or(0);
-    let next = if forward {
-        (idx + 1) % models.len()
-    } else {
-        (idx + models.len() - 1) % models.len()
+    {
+        Some(idx) if forward => (idx + 1) % models.len(),
+        Some(idx) => (idx + models.len() - 1) % models.len(),
+        None => 0,
     };
-    let m = &models[next];
-    runtime.harness.set_model(m.clone()).await;
-    runtime.settings.default_provider = m.provider.clone();
-    runtime.settings.default_model = m.id.clone();
-    chat.push(sys(format!("model → {}/{}", m.provider, m.id)));
+    let m = models[next].clone();
+    choose_model(runtime, token_bar, &m.provider, &m.id, chat).await;
+}
+
+/// Footer text when no model is selected.
+const NO_MODEL_LABEL: &str = "no model · /model to choose";
+
+/// Select a model (harness, saved settings, token bar) and report it in the transcript.
+async fn choose_model(
+    runtime: &mut CliRuntime,
+    token_bar: &mut TokenBarState,
+    provider: &str,
+    id: &str,
+    chat: &mut Vec<ChatItem>,
+) {
+    match runtime.select_model(provider, id).await {
+        Ok(model) => {
+            token_bar.sync_window(runtime);
+            chat.push(sys(format!("model → {}/{}", model.provider, model.id)));
+        }
+        Err(err) => chat.push(error_item(format!("{err:#}"))),
+    }
 }
 
 async fn cycle_thinking(runtime: &mut CliRuntime, chat: &mut Vec<ChatItem>) {
@@ -3553,5 +3701,89 @@ fn parse_response_header_timeout(raw: &str) -> Result<u64, String> {
             s.parse::<u64>()
                 .map_err(|_| format!("usage: /ttfb off|on|60s|120000 (got {raw})"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use loop_agent::{run_agent_loop, stream_fn_from_models, AgentContext, AgentLoopConfig};
+    use loop_ai::providers::{faux_provider, FauxResponse, FauxScript};
+
+    use super::*;
+
+    /// Run one prompt through the real agent loop with a scripted provider and replay
+    /// its events into the TUI's handler, as the app loop does.
+    async fn replay(response: FauxResponse) -> (Vec<ChatItem>, String) {
+        let script = FauxScript::new();
+        script.push(response);
+        let models = loop_ai::Models::new();
+        models.set_provider(faux_provider(script));
+        let model = models.get_model("faux", "faux-model").unwrap();
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        run_agent_loop(
+            vec![AgentMessage::user_text("hi")],
+            AgentContext::default(),
+            AgentLoopConfig::new(model),
+            Arc::new(move |ev: AgentEvent| {
+                sink.lock().push(ev);
+                Box::pin(async {})
+            }),
+            None,
+            Some(stream_fn_from_models(Arc::new(models))),
+        )
+        .await
+        .unwrap();
+
+        let (mut chat, mut status, mut step) = (Vec::new(), String::new(), String::new());
+        let (mut assistant, mut thinking, mut working) = (None, None, false);
+        let mut token_bar = TokenBarState {
+            total_tokens: 0,
+            context_tokens: None,
+            context_window: 0,
+        };
+        let mut refresh = false;
+        for ev in events.lock().drain(..) {
+            handle_agent_event(
+                ev,
+                &mut chat,
+                &mut status,
+                &mut step,
+                &mut assistant,
+                &mut thinking,
+                &mut working,
+                &mut token_bar,
+                &mut refresh,
+            );
+        }
+        (chat, status)
+    }
+
+    fn errors(chat: &[ChatItem]) -> Vec<String> {
+        chat.iter()
+            .filter_map(|item| match item {
+                ChatItem::Error { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn failed_model_call_shows_an_error_and_keeps_error_status() {
+        let (chat, status) = replay(FauxResponse::Error("HTTP 502 Bad Gateway".into())).await;
+        assert_eq!(errors(&chat), ["error: HTTP 502 Bad Gateway"]);
+        assert_eq!(status, "error · see above");
+    }
+
+    #[tokio::test]
+    async fn successful_turn_shows_no_error() {
+        let (chat, status) = replay(FauxResponse::Text("hello".into())).await;
+        assert!(errors(&chat).is_empty());
+        assert_eq!(status, "ready");
+        assert!(chat
+            .iter()
+            .any(|item| matches!(item, ChatItem::Assistant { text } if text == "hello")));
     }
 }

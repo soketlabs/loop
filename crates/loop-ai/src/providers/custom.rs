@@ -1,10 +1,7 @@
 //! OpenAI-compatible custom provider builder.
 
-use std::sync::Arc;
-
-use crate::api::openai_completions::OpenAICompletionsAdapter;
-use crate::auth::{env_api_key_auth, ProviderAuth};
-use crate::models::{create_provider, CreateProviderApi, CreateProviderOptions, Provider};
+use super::openai_compatible::{openai_compatible_provider, ModelDefaults, OpenAiCompatibleConfig};
+use crate::models::Provider;
 use crate::types::{
     InputModality, Model, ModelCost, OpenAICompletionsCompat, API_OPENAI_COMPLETIONS,
 };
@@ -69,50 +66,50 @@ pub struct CustomProviderConfig {
     pub base_url: String,
     /// Env vars to try for the API key. Empty / omitted → keyless.
     pub api_key_env: Vec<String>,
-    /// Models to register.
+    /// Pinned models (optional; the rest are listed from `/models`).
     pub models: Vec<CustomModelSpec>,
     /// Default headers.
     pub headers: Option<std::collections::HashMap<String, String>>,
 }
 
-/// Build a provider wired to the OpenAI Completions adapter.
+impl CustomModelSpec {
+    fn into_model(self, provider_id: &str, base_url: &str) -> Model {
+        let defaults = ModelDefaults::default();
+        Model {
+            name: self.name.unwrap_or_else(|| self.id.clone()),
+            id: self.id,
+            api: API_OPENAI_COMPLETIONS.to_string(),
+            provider: provider_id.into(),
+            base_url: base_url.into(),
+            reasoning: self.reasoning,
+            thinking_level_map: None,
+            input: self.input.unwrap_or_else(|| vec![InputModality::Text]),
+            cost: self.cost.unwrap_or_default(),
+            context_window: self.context_window.unwrap_or(defaults.context_window),
+            max_tokens: self.max_tokens.unwrap_or(defaults.max_tokens),
+            headers: None,
+            compat: self.compat,
+        }
+    }
+}
+
+/// Build a custom OpenAI-compatible provider. Listed models come from its `/models`
+/// endpoint; `models` are pinned (always shown, and their metadata wins).
 pub fn custom_provider(config: CustomProviderConfig) -> Provider {
-    let provider_id = config.id.clone();
-    let models: Vec<Model> = config
+    let pinned = config
         .models
         .into_iter()
-        .map(|spec| Model {
-            id: spec.id.clone(),
-            name: spec.name.unwrap_or_else(|| spec.id.clone()),
-            api: API_OPENAI_COMPLETIONS.to_string(),
-            provider: provider_id.clone(),
-            base_url: config.base_url.clone(),
-            reasoning: spec.reasoning,
-            thinking_level_map: None,
-            input: spec.input.unwrap_or_else(|| vec![InputModality::Text]),
-            cost: spec.cost.unwrap_or_default(),
-            context_window: spec.context_window.unwrap_or(128_000),
-            max_tokens: spec.max_tokens.unwrap_or(16_384),
-            headers: None,
-            compat: spec.compat,
-        })
+        .map(|spec| spec.into_model(&config.id, &config.base_url))
         .collect();
-
-    let auth = if config.api_key_env.is_empty() {
-        ProviderAuth::keyless(format!("{} (keyless)", provider_id))
-    } else {
-        let refs: Vec<&str> = config.api_key_env.iter().map(|s| s.as_str()).collect();
-        ProviderAuth::api_key(env_api_key_auth(format!("{provider_id} API key"), &refs))
-    };
-
-    create_provider(CreateProviderOptions {
-        id: provider_id,
-        name: config.name,
-        base_url: Some(config.base_url),
+    openai_compatible_provider(OpenAiCompatibleConfig {
+        name: config.name.unwrap_or_else(|| config.id.clone()),
+        id: config.id,
+        base_url: config.base_url,
+        api_key_env: config.api_key_env,
         headers: config.headers,
-        auth,
-        models,
-        api: CreateProviderApi::Single(Arc::new(OpenAICompletionsAdapter::new())),
-        fetch_models: None,
+        defaults: ModelDefaults::default(),
+        pinned,
+        fallback: vec![],
+        model_filter: None,
     })
 }

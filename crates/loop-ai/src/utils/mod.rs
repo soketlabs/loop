@@ -2,12 +2,14 @@
 
 pub mod cost;
 pub mod estimate;
+pub mod http_error;
 pub mod id;
 pub mod overflow;
 pub mod partial_json;
 pub mod validate;
 
 pub use cost::calculate_cost;
+pub use http_error::summarize_http_error;
 pub use estimate::{calculate_context_tokens, estimate_context_tokens, estimate_message_tokens};
 pub use id::{now_ms, new_id};
 pub use overflow::is_context_overflow;

@@ -7,10 +7,16 @@ rust-version.workspace = true
 description = "Shared bootstrap, config, and runtime wiring for Loop applications"
 readme = "README.md"
 
+[features]
+default = []
+# Tracing control (`TracingControl`, `Runtime::attach_telemetry`). Off by default.
+telemetry = ["loop-agent/telemetry", "dep:loop-telemetry"]
+
 [dependencies]
 loop-ai = { workspace = true }
 loop-agent = { workspace = true, features = ["mcp", "sqlite"] }
 loop-mcp = { workspace = true }
+loop-telemetry = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -25,3 +31,6 @@ dirs = { workspace = true }
 parking_lot = { workspace = true }
 tokio-util = { workspace = true }
 ratatui = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

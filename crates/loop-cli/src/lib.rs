@@ -8,7 +8,13 @@ pub mod commands;
 pub mod debug_log;
 pub mod keybindings;
 pub mod mcp_serve;
+pub mod print_mode;
+pub mod provider_setup;
+pub mod setup_prompt;
+#[cfg(feature = "telemetry")]
+pub mod tracing_setup;
 pub mod tui;
+pub mod wizard;
 
 pub use loop_app_core::{
     self as config, bootstrap, build_models, build_tools, extensions, hooks_load, mcp_server_entries,

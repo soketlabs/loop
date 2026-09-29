@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context};
+use anyhow::bail;
 
 use loop_agent::harness::{
     create_bash_tool, create_edit_tool, create_read_tool, create_session_repository,
@@ -13,20 +13,21 @@ use loop_agent::harness::{
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
 use loop_ai::providers::{
-    custom_provider, soket_provider, CustomModelSpec, CustomProviderConfig, SOKET_API_KEY_ENVS,
-    SOKET_DEFAULT_MODEL_ID, SOKET_PROVIDER_ID,
+    custom_provider, CustomModelSpec, CustomProviderConfig,
 };
 use loop_ai::{
     CreateModelsOptions, FileModelsStore, Models, ModelsRefreshOptions,
 };
 
-use crate::config::auth::{provider_has_key, FileCredentialStore};
+use crate::config::auth::FileCredentialStore;
+use loop_ai::CredentialStore;
 use crate::config::paths::{
     auth_path, ensure_agent_dirs, get_agent_dir, models_json_path, models_store_path,
     sessions_db_path, settings_path,
 };
 use crate::config::settings::{load_settings, McpServerConfig, Settings};
 use crate::config::trust::TrustStore;
+use crate::model_selection::StartupModel;
 use crate::config::paths::{trust_path};
 use crate::resources::{load_resources, LoadedResources};
 use crate::system_prompt::{
@@ -63,14 +64,213 @@ pub struct Runtime {
     pub session_id: String,
     /// True when started with `--resume <id>` (transcript hydrated from store).
     pub resumed: bool,
-    /// When true, TUI should show the first-run API key setup box.
-    pub needs_api_key_setup: bool,
+    /// When true, the TUI opens the first-run provider setup (`/login`).
+    pub needs_provider_setup: bool,
+    /// The model prompts go to (mirrors the harness; change it via [`Runtime::select_model`]).
+    pub selected_model: Option<loop_ai::Model>,
+    /// Why no model is selected, when a saved one could not be used.
+    pub model_note: Option<String>,
     /// Interactive tool approval bridge (set by the TUI).
     pub tool_approval: Option<std::sync::Arc<crate::tool_approval::ToolApprovalBridge>>,
     /// MCP client manager for external tool servers.
     pub mcp_client: Arc<loop_mcp::McpClientManager>,
     /// Skills activated via `/skill:name` (not yet cleared; mirrored on the harness).
     pub active_skills: Vec<String>,
+    /// Process telemetry, when the host application installed it.
+    #[cfg(feature = "telemetry")]
+    pub telemetry: Option<loop_telemetry::TelemetryHandle>,
+}
+
+impl Runtime {
+    /// Persist the current settings to the global settings file.
+    pub fn save_settings(&self) -> anyhow::Result<()> {
+        self.settings.save_file(&settings_path(&self.agent_dir))
+    }
+
+    /// `/login`: save the key (and custom entry), register the provider and list its
+    /// models. Nothing is kept if the key is rejected or the listing fails.
+    pub async fn connect_provider(
+        &mut self,
+        request: &crate::config::ProviderLoginRequest,
+    ) -> anyhow::Result<ConnectedProvider> {
+        use crate::config::providers::{replace_api_key, restore_api_key, upsert_custom_provider};
+
+        request.validate()?;
+        let (id, name) = (request.provider_id(), request.display_name());
+        if let (Some(preset), Some(key)) = (request.preset(), request.api_key()) {
+            preset
+                .verify_key(key)
+                .await
+                .map_err(|e| anyhow::anyhow!("{name} rejected the key: {e}"))?;
+        }
+        let previous_key = replace_api_key(self.credentials.as_ref(), &id, request.api_key());
+        let entry = request.custom_entry();
+        let previous_provider = self.models.get_provider(&id);
+        if let Some(entry) = &entry {
+            self.models.set_provider(entry.provider());
+        }
+
+        let refresh = self
+            .models
+            .refresh(ModelsRefreshOptions {
+                allow_network: Some(true),
+                force: true,
+                provider_id: Some(id.clone()),
+            })
+            .await;
+        let model_count = self.models.get_models(Some(&id)).len();
+        let failure = refresh.errors.get(&id).cloned().or_else(|| {
+            (model_count == 0).then(|| "no models were listed".to_string())
+        });
+        if let Some(err) = failure {
+            restore_api_key(self.credentials.as_ref(), &id, previous_key);
+            if entry.is_some() {
+                match previous_provider {
+                    Some(provider) => self.models.set_provider(provider),
+                    None => {
+                        self.models.remove_provider(&id);
+                    }
+                }
+            }
+            anyhow::bail!("could not list {name} models: {err}");
+        }
+
+        if let Some(entry) = entry {
+            upsert_custom_provider(&mut self.settings.providers, entry);
+            self.save_settings()?;
+        }
+        self.needs_provider_setup = false;
+        Ok(ConnectedProvider {
+            id,
+            name,
+            model_count,
+        })
+    }
+
+    /// `/logout`: forget the provider's key; custom providers are removed entirely. A
+    /// selected model from that provider is deselected.
+    pub async fn disconnect_provider(&mut self, id: &str) -> anyhow::Result<String> {
+        let id = id.trim().to_ascii_lowercase();
+        let custom_index = self.settings.providers.iter().position(|p| p.id == id);
+        let preset = loop_ai::providers::provider_preset(&id);
+        let had_key = self.credentials.get(&id).is_some();
+        if custom_index.is_none() && !had_key {
+            anyhow::bail!("{id} is not connected");
+        }
+        self.credentials.remove(&id);
+        let name = match custom_index {
+            Some(index) => {
+                let entry = self.settings.providers.remove(index);
+                self.models.remove_provider(&id);
+                self.save_settings()?;
+                entry.name
+            }
+            None => preset.map_or_else(|| id.clone(), |p| p.name.to_string()),
+        };
+        if self.selected_model.as_ref().is_some_and(|m| m.provider == id) {
+            self.model_note = self.selected_model_spec().map(|spec| format!("{spec} was disconnected"));
+            self.selected_model = None;
+            self.harness.clear_model().await;
+            self.settings.clear_selected_model();
+            self.save_settings()?;
+        }
+        Ok(name)
+    }
+
+    /// Select `provider/id` for this and future runs (harness + saved settings).
+    pub async fn select_model(&mut self, provider: &str, id: &str) -> anyhow::Result<loop_ai::Model> {
+        let model = self
+            .models
+            .get_model(provider, id)
+            .ok_or_else(|| anyhow::anyhow!("model not found: {provider}/{id}"))?;
+        self.harness.set_model(model.clone()).await;
+        self.settings.set_selected_model(provider, id);
+        self.selected_model = Some(model.clone());
+        self.model_note = None;
+        self.save_settings()?;
+        Ok(model)
+    }
+
+    /// `provider/id` of the selected model.
+    pub fn selected_model_spec(&self) -> Option<String> {
+        self.selected_model
+            .as_ref()
+            .map(|m| format!("{}/{}", m.provider, m.id))
+    }
+
+    /// Models of connected providers, in picker order (Soket first).
+    pub async fn available_models(&self) -> Vec<loop_ai::Model> {
+        crate::config::providers::sort_models_for_picker(self.models.get_available().await)
+    }
+
+    /// Ids of providers usable right now (presets with a key, then custom providers).
+    pub fn connected_providers(&self) -> Vec<String> {
+        crate::config::providers::connected_providers(
+            self.credentials.as_ref(),
+            &self.settings.providers,
+            |k| std::env::var(k).ok(),
+        )
+    }
+}
+
+#[cfg(feature = "telemetry")]
+impl Runtime {
+    /// Take ownership of the process telemetry and apply saved tracing settings.
+    pub fn attach_telemetry(
+        &mut self,
+        handle: loop_telemetry::TelemetryHandle,
+    ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
+        self.telemetry = Some(handle);
+        self.tracing_control()?.apply()
+    }
+
+    /// Current tracing state, if telemetry is attached.
+    pub fn tracing_status(&self) -> Option<loop_telemetry::TelemetryStatus> {
+        self.telemetry.as_ref().map(|t| t.status())
+    }
+
+    /// `/tracing enable|disable`, persisted to global settings.
+    pub fn set_tracing_enabled(
+        &mut self,
+        enabled: bool,
+    ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
+        let status = self.tracing_control()?.set_enabled(enabled);
+        self.save_settings()?;
+        Ok(status)
+    }
+
+    /// `/tracing setup`, persisted to global settings and the credential store.
+    pub fn setup_tracing(
+        &mut self,
+        request: &crate::config::TracingSetupRequest,
+    ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
+        let status = self.tracing_control()?.setup(request)?;
+        self.save_settings()?;
+        Ok(status)
+    }
+
+    fn tracing_control(&mut self) -> anyhow::Result<crate::config::TracingControl<'_>> {
+        let handle = self
+            .telemetry
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("tracing is not available in this mode"))?;
+        Ok(crate::config::TracingControl {
+            settings: &mut self.settings.tracing,
+            store: self.credentials.as_ref(),
+            handle,
+        })
+    }
+}
+
+/// Result of a successful `/login`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectedProvider {
+    /// Provider id.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Models listed after connecting.
+    pub model_count: usize,
 }
 
 /// CLI bootstrap flags affecting runtime.
@@ -105,36 +305,40 @@ pub fn build_tools(env: Arc<dyn loop_agent::harness::ExecutionEnv>) -> Vec<Agent
     ]
 }
 
-/// Ensure a Soket API key exists, or defer prompting to the TUI when interactive.
+/// Ensure at least one LLM provider is connected, or defer to the TUI's `/login` wizard.
 ///
-/// Returns `true` when the TUI should show the first-run setup box.
-pub fn ensure_soket_api_key(
+/// Returns `true` when the TUI should open the first-run provider setup.
+pub fn ensure_provider_connected(
     store: &FileCredentialStore,
+    custom: &[crate::config::CustomProviderEntry],
     interactive: bool,
 ) -> anyhow::Result<bool> {
-    if provider_has_key(store, SOKET_PROVIDER_ID, SOKET_API_KEY_ENVS) {
+    let connected =
+        crate::config::providers::connected_providers(store, custom, |k| std::env::var(k).ok());
+    if !connected.is_empty() {
         return Ok(false);
     }
     if !interactive {
         bail!(
-            "Soket API key not set. Set SOKET_API_KEY / TENSORSTUDIO_API_KEY / LOOP_API_KEY or run interactively to enter a key."
+            "No LLM provider connected. Set SOKET_API_KEY, OPENROUTER_API_KEY or OPENAI_API_KEY, \
+             or run `loop` and use /login."
         );
     }
-    // Defer to the welcome/setup UI inside the TUI.
     Ok(true)
 }
 
-/// Build models with Soket + optional models.json customs.
+/// Build models with every preset, saved custom providers and `models.json` customs.
 pub fn build_models(
     agent_dir: &Path,
     credentials: Arc<FileCredentialStore>,
+    custom: &[crate::config::CustomProviderEntry],
 ) -> anyhow::Result<Arc<Models>> {
     let store = Arc::new(FileModelsStore::new(models_store_path(agent_dir)));
     let models = Arc::new(Models::create(CreateModelsOptions {
         credentials: Some(credentials),
         models_store: Some(store),
     }));
-    models.set_provider(soket_provider());
+    crate::config::providers::register_providers(&models, custom);
     load_custom_models_json(agent_dir, &models)?;
     Ok(models)
 }
@@ -279,28 +483,22 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     if let Some(t) = &opts.theme {
         settings.theme = t.clone();
     }
-    if let Some(p) = &opts.provider {
-        settings.default_provider = p.clone();
-    }
-    if let Some(m) = &opts.model {
-        settings.default_model = m.clone();
-    }
 
     let credentials = Arc::new(FileCredentialStore::open(auth_path(&agent_dir))?);
-    let needs_api_key_setup = ensure_soket_api_key(&credentials, opts.interactive)?;
+    let needs_provider_setup =
+        ensure_provider_connected(&credentials, &settings.providers, opts.interactive)?;
 
-    let models = build_models(&agent_dir, Arc::clone(&credentials))?;
-    // Hydrate from models-store.json before resolving a model. Without this,
-    // `--print` races the background `/v1/models` refresh and falls back to
-    // the seed id (`qwen3-30b`), which may not be available for this API key.
+    let models = build_models(&agent_dir, Arc::clone(&credentials), &settings.providers)?;
+    // Hydrate every provider from models-store.json before resolving a model. Without
+    // this, `--print` races the background `/v1/models` refresh.
     let _ = models
         .refresh(ModelsRefreshOptions {
             allow_network: Some(false),
             force: false,
-            provider_id: Some(SOKET_PROVIDER_ID.into()),
+            provider_id: None,
         })
         .await;
-    if !needs_api_key_setup {
+    if !needs_provider_setup {
         // Network catalog refresh in the background so interactive startup
         // isn't blocked by a slow API. Cached models are already in memory.
         let bg_models = Arc::clone(&models);
@@ -309,7 +507,8 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
                 .refresh(ModelsRefreshOptions {
                     allow_network: Some(true),
                     force: true,
-                    provider_id: Some(SOKET_PROVIDER_ID.into()),
+                    // Providers without a key stay on their cache (see the fetcher).
+                    provider_id: None,
                 })
                 .await;
             for (pid, err) in &refresh.errors {
@@ -318,21 +517,18 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         });
     }
 
-    let provider = settings.default_provider.clone();
-    let model_id = settings.default_model.clone();
-    let explicit_model = opts.model.is_some() || opts.provider.is_some();
-    let mut model = if let Some(m) = models.get_model(&provider, &model_id) {
-        m
-    } else if explicit_model {
-        anyhow::bail!(
-            "unknown model {provider}/{model_id}. Call `/v1/models` or pick a cached catalog id."
-        );
-    } else {
-        models
-            .get_model(SOKET_PROVIDER_ID, SOKET_DEFAULT_MODEL_ID)
-            .or_else(|| models.get_models(None).into_iter().next())
-            .context("no models available")?
+    let (mut model, mut model_note) = match crate::model_selection::resolve_startup_model(
+        &models,
+        settings.selected_model(),
+        opts.provider.as_deref(),
+        opts.model.as_deref(),
+    )? {
+        StartupModel::Selected(model) => (Some(*model), None),
+        StartupModel::NotSelected { reason } => (None, reason),
     };
+    if let Some(m) = &model {
+        settings.set_selected_model(&m.provider, &m.id);
+    }
 
     let resources = load_resources(&agent_dir, &opts.cwd, project_trusted, &settings);
     let context_files = if opts.no_context_files {
@@ -378,9 +574,9 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
             if opts.provider.is_none() && opts.model.is_none() {
                 if let Some((p, m)) = &ctx.model {
                     if let Some(resolved) = models.get_model(p, m) {
-                        settings.default_provider = p.clone();
-                        settings.default_model = m.clone();
-                        model = resolved;
+                        settings.set_selected_model(p, m);
+                        model = Some(resolved);
+                        model_note = None;
                     }
                 }
             }
@@ -437,7 +633,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let session_id = session.metadata().id.clone();
     let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
         models: Arc::clone(&models),
-        model,
+        model: model.clone(),
         session,
         host_env: host,
         tools,
@@ -504,10 +700,14 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         sessions_db,
         session_id,
         resumed,
-        needs_api_key_setup,
+        needs_provider_setup,
+        selected_model: model,
+        model_note,
         tool_approval: None,
         mcp_client,
         active_skills: Vec::new(),
+        #[cfg(feature = "telemetry")]
+        telemetry: None,
     })
 }
 

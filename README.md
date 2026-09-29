@@ -16,7 +16,7 @@ Production-grade AI harness in Rust by **Soket AI**: unified LLM API, stateful a
 cargo run -p loop-cli
 ```
 
-First run prompts for a Soket API key (or set `SOKET_API_KEY` / `TENSORSTUDIO_API_KEY` / `LOOP_API_KEY`). Config lives under `~/.loop/agent/`. See [`crates/loop-cli/README.md`](crates/loop-cli/README.md).
+First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, or any OpenAI-compatible API (`/login` later to add more). Alternatively set `SOKET_API_KEY`, `OPENROUTER_API_KEY` or `OPENAI_API_KEY`. Config lives under `~/.loop/agent/`. See [`crates/loop-cli/README.md`](crates/loop-cli/README.md).
 
 ## Build / test
 
@@ -25,6 +25,16 @@ cargo build
 cargo test -p loop-ai
 cargo test -p loop-agent
 cargo test -p loop-cli
+```
+
+### Tracing (optional `telemetry` feature)
+
+OpenTelemetry tracing to Langfuse or any OTLP collector is off by default, so the standard build carries no OpenTelemetry dependencies. Build with the feature to get `/tracing` in the TUI and the `--trace-*` flags for benchmark runs with `--print`:
+
+```bash
+cargo build -p loop-cli --release --features telemetry
+cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli \
+  --features loop-agent/telemetry,loop-app-core/telemetry,loop-cli/telemetry
 ```
 
 ### CI vs releases

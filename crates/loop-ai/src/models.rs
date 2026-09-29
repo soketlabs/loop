@@ -351,10 +351,16 @@ impl Models {
         result
     }
 
-    /// Register or replace a provider.
-    pub fn set_provider(&self, provider: Provider) {
+    /// Register or replace a provider (a `Provider` or an `Arc` from [`Self::get_provider`]).
+    pub fn set_provider(&self, provider: impl Into<Arc<Provider>>) {
+        let provider = provider.into();
         let id = provider.id.clone();
-        self.providers.write().insert(id, Arc::new(provider));
+        self.providers.write().insert(id, provider);
+    }
+
+    /// Unregister a provider; returns whether it existed.
+    pub fn remove_provider(&self, id: &str) -> bool {
+        self.providers.write().remove(id).is_some()
     }
 
     /// All providers.

@@ -13,7 +13,16 @@ cargo install --path crates/loop-cli
 loop
 ```
 
-On first start, Loop prompts for your **Soket API key** (unless `SOKET_API_KEY`, `TENSORSTUDIO_API_KEY`, or `LOOP_API_KEY` is set). Keys are stored in `~/.loop/agent/auth.json` (mode `0600`).
+On first start, Loop asks you to **connect a model provider** (unless a provider key is already set in the environment). Use `/login` any time to connect more:
+
+| Provider | `/login` | Env var |
+|---|---|---|
+| Soket | `/login soket` | `SOKET_API_KEY` / `TENSORSTUDIO_API_KEY` / `LOOP_API_KEY` |
+| OpenRouter | `/login openrouter` | `OPENROUTER_API_KEY` |
+| OpenAI | `/login openai` | `OPENAI_API_KEY` |
+| Any OpenAI-compatible API (Together, Groq, vLLM, Ollama, LM Studio, …) | `/login custom` (name, base URL, optional key) | — |
+
+Models are listed from each provider's `/models` endpoint; `/model` shows Soket first, then other connected providers. `/logout <provider>` disconnects one. Keys are stored in `~/.loop/agent/auth.json` (mode `0600`); custom providers are saved in `settings.json`.
 
 Default provider/model: **`soket` / `qwen3-30b`** at `https://api.tensorstudio.ai/v1`. The model catalog is refreshed from `GET /v1/models` and cached in `models-store.json`.
 
@@ -23,7 +32,7 @@ Default provider/model: **`soket` / `qwen3-30b`** at `https://api.tensorstudio.a
 |------|---------|
 | `~/.loop/agent/settings.json` | Defaults (model, theme, sandbox, skills…) |
 | `~/.loop/agent/auth.json` | API keys |
-| `~/.loop/agent/models.json` | Extra OpenAI-compat providers |
+| `~/.loop/agent/models.json` | Extra OpenAI-compat providers (hand-written; `models` optional — listed from `/models`) |
 | `~/.loop/agent/models-store.json` | Dynamic catalog cache |
 | `~/.loop/agent/themes/*.json` | Custom themes (pi-compatible tokens) |
 | `~/.loop/agent/skills/` | Agent Skills (`SKILL.md`) |
