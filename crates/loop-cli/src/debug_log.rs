@@ -23,10 +23,39 @@ pub fn debug_enabled(cli_flag: bool) -> bool {
     )
 }
 
-/// Initialize tracing. In debug mode, writes session logs under `cwd/target/debug/logs`.
+/// Where log lines go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSink {
+    /// `--debug`: a session log under `cwd/target/debug/logs` (teed to stderr when not
+    /// interactive).
+    DebugSession,
+    /// Interactive TUI without `--debug`: appended to [`warn_log_path`]. Never the
+    /// terminal, where log lines would be drawn over the UI.
+    WarnFile,
+    /// `--print`, MCP serve and other non-interactive modes.
+    Stderr,
+}
+
+impl LogSink {
+    /// Pick the sink for this run.
+    pub fn for_run(debug: bool, interactive: bool) -> Self {
+        match (debug, interactive) {
+            (true, _) => Self::DebugSession,
+            (false, true) => Self::WarnFile,
+            (false, false) => Self::Stderr,
+        }
+    }
+}
+
+/// Log file for warnings from interactive sessions: `<agent dir>/logs/loop.log`.
+pub fn warn_log_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("logs").join("loop.log")
+}
+
+/// Initialize tracing; see [`LogSink`] for where log lines go.
 ///
-/// Interactive TUI mode writes **file only** (stderr would corrupt the UI). Non-interactive
-/// mode tees to stderr as well. `export_layer` (the telemetry exporter, when built with
+/// Interactive TUI mode never writes to the terminal (it would corrupt the UI).
+/// Non-interactive debug mode tees to stderr as well. `export_layer` (the telemetry exporter, when built with
 /// the `telemetry` feature) sees observation spans independently of the log filter.
 pub fn init_tracing(
     debug: bool,
@@ -42,21 +71,39 @@ pub fn init_tracing(
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
-    let (log_layer, path) = if debug {
-        let (writer, path) = debug_log_writer(cwd, interactive)?;
-        let layer = fmt::layer()
-            .with_writer(Mutex::new(writer))
-            .with_ansi(false)
-            .with_target(true)
-            .with_thread_ids(true)
-            .boxed();
-        (layer, Some(path))
-    } else {
-        let layer = fmt::layer()
-            .with_writer(io::stderr)
-            .with_target(true)
-            .boxed();
-        (layer, None)
+    let (log_layer, path) = match LogSink::for_run(debug, interactive) {
+        LogSink::DebugSession => {
+            let (writer, path) = debug_log_writer(cwd, interactive)?;
+            let layer = fmt::layer()
+                .with_writer(Mutex::new(writer))
+                .with_ansi(false)
+                .with_target(true)
+                .with_thread_ids(true)
+                .boxed();
+            (layer, Some(path))
+        }
+        LogSink::WarnFile => {
+            let path = warn_log_path(&crate::config::paths::get_agent_dir());
+            // Best effort: if the file can't be opened, drop log lines rather than
+            // print them over the TUI.
+            let writer: Box<dyn Write + Send> = match open_append(&path) {
+                Ok(file) => Box::new(file),
+                Err(_) => Box::new(io::sink()),
+            };
+            let layer = fmt::layer()
+                .with_writer(Mutex::new(writer))
+                .with_ansi(false)
+                .with_target(true)
+                .boxed();
+            (layer, None)
+        }
+        LogSink::Stderr => {
+            let layer = fmt::layer()
+                .with_writer(io::stderr)
+                .with_target(true)
+                .boxed();
+            (layer, None)
+        }
     };
 
     tracing_subscriber::registry()
@@ -80,10 +127,7 @@ fn debug_log_writer(cwd: &Path, interactive: bool) -> anyhow::Result<(Box<dyn Wr
     fs::create_dir_all(&log_dir)?;
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let path = log_dir.join(format!("loop-{ts}.log"));
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    let file = open_append(&path)?;
 
     let writer: Box<dyn Write + Send> = if interactive {
         Box::new(file)
@@ -93,6 +137,14 @@ fn debug_log_writer(cwd: &Path, interactive: bool) -> anyhow::Result<(Box<dyn Wr
         })
     };
     Ok((writer, path))
+}
+
+/// Open `path` for appending, creating it and its parent directory.
+fn open_append(path: &Path) -> io::Result<File> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    OpenOptions::new().create(true).append(true).open(path)
 }
 
 /// Append a raw session note to an existing debug log file (best-effort).
@@ -123,5 +175,39 @@ impl Write for TeeWriter {
             .lock()
             .map_err(|_| io::Error::other("debug log lock poisoned"))?
             .flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_runs_never_log_to_the_terminal() {
+        assert_eq!(LogSink::for_run(false, true), LogSink::WarnFile);
+        assert_eq!(LogSink::for_run(true, true), LogSink::DebugSession);
+    }
+
+    #[test]
+    fn non_interactive_runs_log_to_stderr_unless_debug() {
+        assert_eq!(LogSink::for_run(false, false), LogSink::Stderr);
+        assert_eq!(LogSink::for_run(true, false), LogSink::DebugSession);
+    }
+
+    #[test]
+    fn warn_log_lives_under_the_agent_dir() {
+        assert_eq!(
+            warn_log_path(Path::new("/home/u/.loop/agent")),
+            PathBuf::from("/home/u/.loop/agent/logs/loop.log")
+        );
+    }
+
+    #[test]
+    fn open_append_creates_missing_dirs_and_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = warn_log_path(dir.path());
+        writeln!(open_append(&path).unwrap(), "one").unwrap();
+        writeln!(open_append(&path).unwrap(), "two").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one\ntwo\n");
     }
 }
