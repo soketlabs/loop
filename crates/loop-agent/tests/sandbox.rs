@@ -224,6 +224,7 @@ impl PodmanClient for FakePodman {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn krun_full_fs_via_exec() {
     let dir = tempfile::tempdir().unwrap();
