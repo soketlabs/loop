@@ -205,6 +205,95 @@ fn normalize_key(s: &str) -> String {
         .replace("opt+", "alt+")
 }
 
+/// Clipboard text for the composer. `\r\n` and `\r` become `\n`, and one trailing
+/// newline is dropped so a pasted paragraph does not gain a blank line.
+pub fn normalize_pasted_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Paste text for a single-line field (API key, picker query).
+pub fn pasted_single_line(text: &str) -> String {
+    normalize_pasted_text(text).replace('\n', "")
+}
+
+/// Join a burst of ordinary keypresses when a newline is followed by more
+/// pasted text. A line typed and submitted on its own stays `None` so Enter
+/// still sends.
+pub fn multiline_paste_text(keys: &[KeyEvent]) -> Option<String> {
+    if keys.len() < 2 || !keys.iter().all(is_unbracketed_paste_key) {
+        return None;
+    }
+    let mut buf = String::new();
+    let mut saw_newline = false;
+    let mut text_after_newline = false;
+    for key in keys {
+        let ch = paste_key_char(key);
+        if saw_newline && ch != '\n' {
+            text_after_newline = true;
+        }
+        if ch == '\n' {
+            saw_newline = true;
+        }
+        buf.push(ch);
+    }
+    if !text_after_newline {
+        return None;
+    }
+    let text = normalize_pasted_text(&buf);
+    (!text.is_empty()).then_some(text)
+}
+
+/// True when this burst ends on a newline and more pasted lines may still be
+/// arriving. Callers can wait briefly before treating that newline as Enter.
+pub fn paste_burst_pending(keys: &[KeyEvent]) -> bool {
+    if keys.len() < 2 || !keys.iter().all(is_unbracketed_paste_key) {
+        return false;
+    }
+    matches!(keys.last().map(paste_key_char), Some('\n'))
+        && keys.iter().any(|key| paste_key_char(key) != '\n')
+}
+
+fn is_unbracketed_paste_key(key: &KeyEvent) -> bool {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return false;
+    }
+    match key.code {
+        KeyCode::Enter | KeyCode::Tab => true,
+        KeyCode::Char(c) => !c.is_control() || c == '\n' || c == '\r' || c == '\t',
+        _ => false,
+    }
+}
+
+fn paste_key_char(key: &KeyEvent) -> char {
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => '\n',
+        KeyCode::Tab | KeyCode::Char('\t') => '\t',
+        KeyCode::Char(c) => c,
+        _ => '\0',
+    }
+}
+
 fn key_to_string(key: KeyEvent) -> Option<String> {
     let mut parts = Vec::new();
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -275,4 +364,67 @@ pub fn hotkey_help() -> Vec<(&'static str, &'static str)> {
         ("/", "Slash commands"),
         ("!command", "Run shell locally (not sent to the model)"),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn chars(text: &str) -> Vec<KeyEvent> {
+        text.chars()
+            .map(|c| {
+                if c == '\n' {
+                    key(KeyCode::Enter)
+                } else {
+                    key(KeyCode::Char(c))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn normalize_pasted_paragraph_is_one_block() {
+        assert_eq!(
+            normalize_pasted_text("one\r\ntwo\r\nthree\r\n"),
+            "one\ntwo\nthree"
+        );
+        assert_eq!(
+            normalize_pasted_text("one\ntwo\n\nthree\n"),
+            "one\ntwo\n\nthree"
+        );
+        assert_eq!(pasted_single_line("sk-\r\nsecret\n"), "sk-secret");
+    }
+
+    #[test]
+    fn multiline_paste_keeps_internal_newlines() {
+        assert_eq!(
+            multiline_paste_text(&chars("one\ntwo\nthree\n")).as_deref(),
+            Some("one\ntwo\nthree")
+        );
+        assert_eq!(
+            multiline_paste_text(&chars("one\ntwo")).as_deref(),
+            Some("one\ntwo")
+        );
+    }
+
+    #[test]
+    fn single_line_enter_is_not_a_paste() {
+        let keys = chars("hello\n");
+        assert!(multiline_paste_text(&keys).is_none());
+        assert!(paste_burst_pending(&keys));
+    }
+
+    #[test]
+    fn modified_keys_are_not_a_paste() {
+        let mut keys = chars("hello\nworld");
+        keys.push(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(multiline_paste_text(&keys).is_none());
+        assert!(!paste_burst_pending(&keys));
+    }
 }
