@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -36,7 +37,10 @@ use crate::provider_setup::ProviderSetup;
 use crate::setup_prompt::SetupPrompt;
 #[cfg(feature = "telemetry")]
 use crate::tracing_setup::TracingSetup;
-use crate::keybindings::{hotkey_help, Action};
+use crate::keybindings::{
+    hotkey_help, multiline_paste_text, normalize_pasted_text, paste_burst_pending,
+    pasted_single_line, Action,
+};
 use crate::{build_tools, mcp_server_entries, CliRuntime};
 use crate::theme::Theme;
 use crate::tool_approval::{
@@ -229,6 +233,7 @@ pub async fn run(mut runtime: CliRuntime) -> anyhow::Result<()> {
     let mut stdout = io::stdout();
     let _ = execute!(
         stdout,
+        EnableBracketedPaste,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
@@ -252,7 +257,11 @@ pub async fn run(mut runtime: CliRuntime) -> anyhow::Result<()> {
     let result = run_loop(&mut terminal, &mut runtime).await;
 
     disable_raw_mode()?;
-    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        PopKeyboardEnhancementFlags
+    );
     // Clear the inline footer so the shell prompt lands cleanly.
     let _ = terminal.clear();
     terminal.show_cursor()?;
@@ -697,52 +706,96 @@ async fn run_loop(
         }
 
         loop {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    handle_key(
-                        key,
+            // A multiline paste arrives as one bracketed `Event::Paste`, or — when
+            // the terminal does not bracket it — as a burst of keys whose newlines
+            // would otherwise each submit. Hold that burst as one composer block.
+            let batch = read_input_batch()?;
+            if let Some(keys) = unbracketed_paste_keys(&batch) {
+                if let Some(text) = multiline_paste_text(&keys) {
+                    insert_pasted_text(
+                        &text,
                         runtime,
                         &mut input,
-                        &mut history,
-                        &mut chat,
-                        &mut status,
-                        &mut turn_step,
-                        &mut clear_presses,
-                        &mut last_clear,
-                        &mut last_escape,
-                        &mut streaming_assistant,
-                        &mut streaming_thinking,
-                        &mut expand_details,
-                        &mut redraw_request,
-                        &mut purge_ui_events,
-                        &mut hide_thinking,
-                        &mut pending_setup,
+                        &pending_setup,
                         &mut model_picker,
                         &mut fork_picker,
                         &mut active_approval,
-                        &mut working,
-                        &mut message_queue,
-                        &mut should_quit,
-                        &ac_entries,
-                        &file_ac_entries,
-                        at_mention.as_ref(),
-                        &mut ac_selected,
-                        &tx,
-                        &mut token_bar,
-                        &mut refresh_token_bar,
-                    )
-                    .await?;
-                    token_bar.sync_window(runtime);
-                }
-                Event::Resize(w, _) => {
-                    let _ = terminal.autoresize();
-                    // Re-wrapping invalidates the whole transcript (pi does the same).
-                    if w != last_width {
-                        last_width = w;
-                        redraw_request = true;
+                    );
+                    for ev in &batch {
+                        if let Event::Resize(w, _) = ev {
+                            note_terminal_resize(
+                                terminal,
+                                *w,
+                                &mut last_width,
+                                &mut redraw_request,
+                            );
+                        }
                     }
+                    token_bar.sync_window(runtime);
+                    if should_quit || !event::poll(Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
                 }
-                _ => {}
+            }
+            for ev in batch {
+                match ev {
+                    Event::Paste(text) => {
+                        insert_pasted_text(
+                            &text,
+                            runtime,
+                            &mut input,
+                            &pending_setup,
+                            &mut model_picker,
+                            &mut fork_picker,
+                            &mut active_approval,
+                        );
+                        token_bar.sync_window(runtime);
+                    }
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        handle_key(
+                            key,
+                            runtime,
+                            &mut input,
+                            &mut history,
+                            &mut chat,
+                            &mut status,
+                            &mut turn_step,
+                            &mut clear_presses,
+                            &mut last_clear,
+                            &mut last_escape,
+                            &mut streaming_assistant,
+                            &mut streaming_thinking,
+                            &mut expand_details,
+                            &mut redraw_request,
+                            &mut purge_ui_events,
+                            &mut hide_thinking,
+                            &mut pending_setup,
+                            &mut model_picker,
+                            &mut fork_picker,
+                            &mut active_approval,
+                            &mut working,
+                            &mut message_queue,
+                            &mut should_quit,
+                            &ac_entries,
+                            &file_ac_entries,
+                            at_mention.as_ref(),
+                            &mut ac_selected,
+                            &tx,
+                            &mut token_bar,
+                            &mut refresh_token_bar,
+                        )
+                        .await?;
+                        token_bar.sync_window(runtime);
+                    }
+                    Event::Resize(w, _) => {
+                        note_terminal_resize(terminal, w, &mut last_width, &mut redraw_request);
+                    }
+                    _ => {}
+                }
+                if should_quit {
+                    break;
+                }
             }
             if should_quit || !event::poll(Duration::from_millis(0))? {
                 break;
@@ -1541,6 +1594,109 @@ async fn run_bang_command(
     let idx = push_before_queued(chat, item);
     bump_stream_index(streaming_assistant, idx);
     bump_stream_index(streaming_thinking, idx);
+}
+
+/// Gap after a burst that ends on Enter, in case the rest of a paste is still arriving.
+const PASTE_BURST_GAP: Duration = Duration::from_millis(10);
+
+fn read_input_batch() -> io::Result<Vec<Event>> {
+    let mut batch = Vec::new();
+    let mut waits = 0u8;
+    loop {
+        batch.push(event::read()?);
+        while event::poll(Duration::from_millis(0))? {
+            batch.push(event::read()?);
+        }
+        let extend = waits < 20
+            && unbracketed_paste_keys(&batch).is_some_and(|keys| paste_burst_pending(&keys))
+            && event::poll(PASTE_BURST_GAP)?;
+        if !extend {
+            break;
+        }
+        waits += 1;
+    }
+    Ok(batch)
+}
+
+/// Keypresses in `events` when every event could belong to an unbracketed paste.
+/// `None` when the batch contains a real paste event or anything else we should
+/// dispatch normally.
+fn unbracketed_paste_keys(events: &[Event]) -> Option<Vec<KeyEvent>> {
+    let mut keys = Vec::new();
+    for ev in events {
+        match ev {
+            Event::Key(key) if key.kind == KeyEventKind::Press => keys.push(*key),
+            Event::Key(_) | Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
+            _ => return None,
+        }
+    }
+    Some(keys)
+}
+
+fn note_terminal_resize(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    width: u16,
+    last_width: &mut u16,
+    redraw_request: &mut bool,
+) {
+    let _ = terminal.autoresize();
+    // Re-wrapping invalidates the whole transcript (pi does the same).
+    if width != *last_width {
+        *last_width = width;
+        *redraw_request = true;
+    }
+}
+
+/// Insert pasted text without submitting. Newlines stay in the composer so one
+/// Enter sends the whole paragraph.
+fn insert_pasted_text(
+    text: &str,
+    runtime: &CliRuntime,
+    input: &mut InputBuffer,
+    pending_setup: &Option<SetupPrompt>,
+    model_picker: &mut Option<ModelPickerState>,
+    fork_picker: &mut Option<ForkPickerState>,
+    active_approval: &mut Option<ActiveApproval>,
+) {
+    if let Some(review) = active_approval.as_mut() {
+        if review.reason_focused {
+            let line = pasted_single_line(text);
+            if !line.is_empty() {
+                review.reason.push_str(&line);
+            }
+        }
+        return;
+    }
+    if let Some(picker) = model_picker.as_mut() {
+        let line = pasted_single_line(text);
+        if !line.is_empty() {
+            picker.query.push_str(&line);
+            picker.refilter(&runtime.models);
+        }
+        return;
+    }
+    if let Some(picker) = fork_picker.as_mut() {
+        let line = pasted_single_line(text);
+        if !line.is_empty() {
+            picker.query.push_str(&line);
+            picker.refilter();
+        }
+        return;
+    }
+    if let Some(prompt) = pending_setup.as_ref() {
+        if prompt.options().is_some() {
+            return;
+        }
+        let line = pasted_single_line(text);
+        if !line.is_empty() {
+            input.insert_str(&line);
+        }
+        return;
+    }
+    let block = normalize_pasted_text(text);
+    if !block.is_empty() {
+        input.insert_str(&block);
+    }
 }
 
 async fn handle_key(
