@@ -10,6 +10,11 @@ pub mod agent_loop;
 pub mod harness;
 pub mod messages;
 pub mod stream_fn;
+#[cfg(feature = "telemetry")]
+mod telemetry;
+#[cfg(not(feature = "telemetry"))]
+#[path = "telemetry_noop.rs"]
+mod telemetry;
 pub mod types;
 
 #[cfg(feature = "proxy")]

@@ -288,6 +288,9 @@ pub enum AgentHarnessError {
     /// Agent loop error (preserves structured error from the inner turn loop).
     #[error("agent loop: {0}")]
     AgentLoop(#[from] crate::agent_loop::AgentLoopError),
+    /// No model is selected yet.
+    #[error("No model selected — run /model to choose one (or pass --provider and --model)")]
+    NoModelSelected,
     /// Other.
     #[error("{0}")]
     Other(String),

@@ -8,8 +8,12 @@ use loop_ai::{
     Context, Message, StopReason, TextContent, Tool, ToolCall, ToolResultContent, ToolResultMessage,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::stream_fn::{resolve_stream_fn, StreamFn};
+use crate::telemetry::{
+    preflight_span, record_tool_result, tool_span, turn_span, GenerationObserver, RunObserver,
+};
 use crate::types::{
     AgentContext, AgentEvent, AgentEventSink, AgentLoopConfig, AgentLoopTurnUpdate, AgentMessage,
     AgentTool, AgentToolResult, AgentToolUpdateCallback, BeforeToolCallContext, BeforeToolCallResult,
@@ -37,7 +41,8 @@ pub fn agent_loop(
             })
         });
         let _ = run_agent_loop(prompts, context, config, emit, cancel, Some(stream_fn)).await;
-    });
+    }
+    .in_current_span());
     tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
 }
 
@@ -58,7 +63,8 @@ pub fn agent_loop_continue(
             })
         });
         let _ = run_agent_loop_continue(context, config, emit, cancel, Some(stream_fn)).await;
-    });
+    }
+    .in_current_span());
     tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
 }
 
@@ -96,7 +102,8 @@ pub async fn run_agent_loop(
         .await;
     }
 
-    run_loop(
+    run_loop_observed(
+        &prompts,
         &mut current_context,
         &mut new_messages,
         config,
@@ -132,7 +139,9 @@ pub async fn run_agent_loop_continue(
     emit(AgentEvent::AgentStart).await;
     emit(AgentEvent::TurnStart).await;
 
-    run_loop(
+    let resumed_from: Vec<AgentMessage> = current_context.messages.last().cloned().into_iter().collect();
+    run_loop_observed(
+        &resumed_from,
         &mut current_context,
         &mut new_messages,
         config,
@@ -156,6 +165,28 @@ async fn emit_ev(emit: &AgentEventSink, event: AgentEvent) {
     emit(event).await;
 }
 
+/// [`run_loop`] inside a `loop.run` observation; `input` is what started the run.
+async fn run_loop_observed(
+    input: &[AgentMessage],
+    current_context: &mut AgentContext,
+    new_messages: &mut Vec<AgentMessage>,
+    config: AgentLoopConfig,
+    cancel: Option<&CancellationToken>,
+    emit: &AgentEventSink,
+    stream_fn: &StreamFn,
+) -> Result<(), AgentLoopError> {
+    let run = RunObserver::start(
+        &config.model,
+        input,
+        config.stream_options.base.session_id.as_deref(),
+    );
+    let result = run_loop(current_context, new_messages, config, cancel, emit, stream_fn)
+        .instrument(run.span().clone())
+        .await;
+    run.finish(new_messages);
+    result
+}
+
 async fn run_loop(
     current_context: &mut AgentContext,
     new_messages: &mut Vec<AgentMessage>,
@@ -165,6 +196,7 @@ async fn run_loop(
     stream_fn: &StreamFn,
 ) -> Result<(), AgentLoopError> {
     let mut first_turn = true;
+    let mut turn_index = 0u64;
     let mut pending_messages = if let Some(getter) = &config.get_steering_messages {
         getter().await
     } else {
@@ -175,6 +207,8 @@ async fn run_loop(
         let mut has_more_tool_calls = true;
 
         while has_more_tool_calls || !pending_messages.is_empty() {
+            turn_index += 1;
+            let turn = turn_span(turn_index);
             if !first_turn {
                 emit_ev(emit, AgentEvent::TurnStart).await;
             } else {
@@ -203,7 +237,9 @@ async fn run_loop(
             }
 
             let message =
-                stream_assistant_response(current_context, &config, cancel, emit, stream_fn).await;
+                stream_assistant_response(current_context, &config, cancel, emit, stream_fn)
+                    .instrument(turn.clone())
+                    .await;
             new_messages.push(AgentMessage::assistant(message.clone()));
 
             if matches!(
@@ -240,11 +276,15 @@ async fn run_loop(
             let mut tool_results = Vec::new();
             has_more_tool_calls = false;
             if !tool_calls.is_empty() {
-                let batch = if message.stop_reason == StopReason::Length {
-                    fail_tool_calls_from_truncated(&tool_calls, emit).await
-                } else {
-                    execute_tool_calls(current_context, &message, &config, cancel, emit).await
-                };
+                let batch = async {
+                    if message.stop_reason == StopReason::Length {
+                        fail_tool_calls_from_truncated(&tool_calls, emit).await
+                    } else {
+                        execute_tool_calls(current_context, &message, &config, cancel, emit).await
+                    }
+                }
+                .instrument(turn.clone())
+                .await;
                 tool_results = batch.messages;
                 has_more_tool_calls = !batch.terminate;
 
@@ -381,12 +421,14 @@ async fn stream_assistant_response(
     )
     .await;
 
+    let mut generation = GenerationObserver::start(&config.model, &llm_context, &options);
     let response = stream_fn(config.model.clone(), llm_context, options).await;
     let mut stream = response;
     let mut partial_message: Option<AssistantMessage> = None;
     let mut added_partial = false;
 
     while let Some(event) = stream.next().await {
+        generation.on_event(&event);
         match &event {
             AssistantMessageEvent::Start { partial } => {
                 partial_message = Some(partial.clone());
@@ -426,37 +468,12 @@ async fn stream_assistant_response(
                     .await;
                 }
             }
-            AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => {
-                let final_message = stream.result().await;
-                if added_partial {
-                    if let Some(last) = context.messages.last_mut() {
-                        *last = AgentMessage::assistant(final_message.clone());
-                    }
-                } else {
-                    context
-                        .messages
-                        .push(AgentMessage::assistant(final_message.clone()));
-                    emit_ev(
-                        emit,
-                        AgentEvent::MessageStart {
-                            message: AgentMessage::assistant(final_message.clone()),
-                        },
-                    )
-                    .await;
-                }
-                emit_ev(
-                    emit,
-                    AgentEvent::MessageEnd {
-                        message: AgentMessage::assistant(final_message.clone()),
-                    },
-                )
-                .await;
-                return final_message;
-            }
+            AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => break,
         }
     }
 
     let final_message = stream.result().await;
+    generation.finish(&final_message);
     if added_partial {
         if let Some(last) = context.messages.last_mut() {
             *last = AgentMessage::assistant(final_message.clone());
@@ -786,7 +803,26 @@ enum PrepOutcome {
     },
 }
 
+/// [`prepare_tool_call_inner`] inside a `tool.preflight` observation.
 async fn prepare_tool_call(
+    current_context: &AgentContext,
+    assistant_message: &AssistantMessage,
+    tool_call: &ToolCall,
+    config: &AgentLoopConfig,
+    cancel: Option<&CancellationToken>,
+) -> PrepOutcome {
+    let span = preflight_span(tool_call);
+    let outcome =
+        prepare_tool_call_inner(current_context, assistant_message, tool_call, config, cancel)
+            .instrument(span.clone())
+            .await;
+    if let PrepOutcome::Immediate { result, is_error } = &outcome {
+        record_tool_result(&span, result, *is_error);
+    }
+    outcome
+}
+
+async fn prepare_tool_call_inner(
     current_context: &AgentContext,
     assistant_message: &AssistantMessage,
     tool_call: &ToolCall,
@@ -905,17 +941,19 @@ async fn execute_prepared_tool_call(
         });
     });
 
+    let span = tool_span(tool_call, &args);
     let result = (tool.execute)(
         tool_call.id.clone(),
         args,
         cancel.cloned(),
         Some(on_update),
     )
+    .instrument(span.clone())
     .await;
 
     accepting.store(false, std::sync::atomic::Ordering::SeqCst);
 
-    match result {
+    let outcome = match result {
         Ok(result) => ExecutedOutcome {
             result,
             is_error: false,
@@ -924,7 +962,9 @@ async fn execute_prepared_tool_call(
             result: create_error_tool_result(err),
             is_error: true,
         },
-    }
+    };
+    record_tool_result(&span, &outcome.result, outcome.is_error);
+    outcome
 }
 
 async fn finalize_executed_tool_call(

@@ -69,6 +69,19 @@ pub enum ChatItem {
         output: String,
     },
     System { text: String },
+    /// A failure the user should notice (model/API errors, rejected setup input).
+    Error { text: String },
+}
+
+/// Error line for an assistant message that ended in an error. Aborts (the user's own
+/// esc) stay quiet.
+pub fn assistant_error_item(message: &loop_ai::AssistantMessage) -> Option<ChatItem> {
+    if message.stop_reason != loop_ai::StopReason::Error {
+        return None;
+    }
+    message.failure().map(|error| ChatItem::Error {
+        text: format!("error: {error}"),
+    })
 }
 
 /// One row in a navigable picker (commands / models).
@@ -94,7 +107,9 @@ pub enum PickerView {
         hint: String,
     },
     Setup {
-        provider: String,
+        prompt: crate::setup_prompt::SetupPrompt,
+        /// First-run provider setup: esc quits instead of cancelling.
+        first_run: bool,
     },
     /// Accept / reject a pending tool (optional reject reason).
     FileReview {
@@ -124,6 +139,8 @@ pub struct FooterOpts<'a> {
     pub picker: &'a PickerView,
     pub setup_mode: bool,
     pub mask_input: bool,
+    /// Placeholder for the empty input line in setup mode.
+    pub setup_placeholder: &'a str,
     /// Left status (e.g. `~/loop (main)`).
     pub path_line: &'a str,
     /// Right status (e.g. `soket/qwen3-30b · medium`).
@@ -140,7 +157,10 @@ pub fn item_is_committed(
     streaming_thinking: Option<usize>,
 ) -> bool {
     match item {
-        ChatItem::User { .. } | ChatItem::System { .. } | ChatItem::Shell { .. } => true,
+        ChatItem::User { .. }
+        | ChatItem::System { .. }
+        | ChatItem::Error { .. }
+        | ChatItem::Shell { .. } => true,
         ChatItem::Queued { .. } => false,
         ChatItem::Assistant { .. } => streaming_assistant != Some(index),
         ChatItem::Thinking { done, .. } => *done && streaming_thinking != Some(index),
@@ -174,8 +194,8 @@ const BANNER_GRADIENT: [(u8, u8, u8); 6] = [
 pub fn welcome_lines(
     theme: &Theme,
     version: &str,
-    provider: &str,
-    model: &str,
+    model: Option<&loop_ai::Model>,
+    model_note: Option<&str>,
     endpoint: &str,
     session_id: &str,
     skills: usize,
@@ -213,16 +233,28 @@ pub fn welcome_lines(
 
     // Info card
     let border = theme.style("border");
-    let rows: Vec<(&str, String)> = vec![
-        ("Provider", provider.to_string()),
-        ("Model", model.to_string()),
-        ("Endpoint", endpoint.to_string()),
-        ("Session", session_id.to_string()),
-    ];
+    let rows: Vec<(&str, String)> = match model {
+        Some(model) => vec![
+            ("Provider", model.provider.clone()),
+            ("Model", model.id.clone()),
+            ("Endpoint", endpoint.to_string()),
+            ("Session", session_id.to_string()),
+        ],
+        None => vec![
+            ("Model", "none — run /model".to_string()),
+            ("Session", session_id.to_string()),
+        ],
+    };
     let (dot_style, status_text) = if needs_setup {
         (
             theme.style("warning"),
-            "setup — paste your API key to begin".to_string(),
+            "setup — connect a model provider to begin (/login)".to_string(),
+        )
+    } else if model.is_none() {
+        let why = model_note.map_or_else(String::new, |note| format!("{note} — "));
+        (
+            theme.style("warning"),
+            format!("{why}choose a model with /model to begin"),
         )
     } else {
         (
@@ -625,6 +657,12 @@ pub fn format_item_lines(
             }
             lines.push(Line::from(""));
         }
+        ChatItem::Error { text } => {
+            for l in text.lines() {
+                lines.extend(wrap_plain(l, theme.error(), w));
+            }
+            lines.push(Line::from(""));
+        }
     }
     lines
 }
@@ -891,7 +929,7 @@ fn draw_input(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
     let placeholder = if !display.is_empty() {
         ""
     } else if opts.setup_mode {
-        " paste your API key"
+        opts.setup_placeholder
     } else {
         " Type a message · / for commands · @ for files"
     };
@@ -916,34 +954,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
     }
     let lines = match picker {
         PickerView::None => Vec::new(),
-        PickerView::Setup { provider } => {
-            let env_hint = if provider == "soket" {
-                "SOKET_API_KEY / TENSORSTUDIO_API_KEY / LOOP_API_KEY".to_string()
-            } else {
-                format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"))
-            };
-            vec![
-                Line::from(vec![
-                    Span::styled("  ◆ ".to_string(), theme.accent()),
-                    Span::styled(
-                        format!("Connect to {provider}"),
-                        theme.style("text").add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(Span::styled(
-                    "    Paste your API key and press enter — input stays hidden".to_string(),
-                    theme.muted(),
-                )),
-                Line::from(Span::styled(
-                    format!("    Tip: you can also set {env_hint} and restart"),
-                    theme.dim(),
-                )),
-                Line::from(Span::styled(
-                    "    enter save · esc quit".to_string(),
-                    theme.dim(),
-                )),
-            ]
-        }
+        PickerView::Setup { prompt, first_run } => setup_lines(prompt, *first_run, theme),
         PickerView::Commands { rows, selected } => picker_lines(rows, *selected, theme, false),
         PickerView::Models { rows, selected, hint } => {
             let mut out = vec![Line::from(Span::styled(hint.clone(), theme.style("warning")))];
@@ -993,6 +1004,68 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
         }
     };
     frame.render_widget(Paragraph::new(lines).style(theme.page()), area);
+}
+
+/// Setup box: title, instructions, optional choice rows, env hint and key help.
+fn setup_lines(
+    prompt: &crate::setup_prompt::SetupPrompt,
+    first_run: bool,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  ◆ ".to_string(), theme.accent()),
+            Span::styled(
+                prompt.title(),
+                theme.style("text").add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!("    {}", prompt.instructions()),
+            theme.muted(),
+        )),
+    ];
+    if let Some((rows, selected)) = prompt.options() {
+        for (i, (label, description)) in rows.into_iter().enumerate() {
+            let (marker, label_style) = if i == selected {
+                ("  ▸ ", theme.accent().add_modifier(Modifier::BOLD))
+            } else {
+                ("    ", theme.style("text"))
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker.to_string(), theme.accent()),
+                Span::styled(format!("{label:<16}"), label_style),
+                Span::styled(description.to_string(), theme.dim()),
+            ]));
+        }
+    }
+    if let Some(env_hint) = prompt.env_hint() {
+        lines.push(Line::from(Span::styled(
+            format!("    Tip: you can also set {env_hint} and restart"),
+            theme.dim(),
+        )));
+    }
+    let esc = if prompt.esc_quits(first_run) {
+        "quit"
+    } else {
+        "cancel"
+    };
+    let keys = if prompt.options().is_some() {
+        format!("    ↑↓ choose · enter continue · esc {esc}")
+    } else if prompt.masked() {
+        // Masked prompts are the last step (API key, secret, auth header).
+        format!("    enter save · esc {esc}")
+    } else {
+        format!("    enter next · esc {esc}")
+    };
+    lines.push(Line::from(Span::styled(keys, theme.dim())));
+    lines
+}
+
+/// Height of [`setup_lines`] without rendering it.
+fn setup_line_count(prompt: &crate::setup_prompt::SetupPrompt, _first_run: bool) -> u16 {
+    let rows = prompt.options().map_or(0, |(rows, _)| rows.len());
+    (3 + rows + usize::from(prompt.env_hint().is_some())) as u16
 }
 
 fn picker_lines(
@@ -1161,7 +1234,9 @@ pub fn format_token_usage_line(
 fn picker_height(picker: &PickerView) -> u16 {
     match picker {
         PickerView::None => 0,
-        PickerView::Setup { .. } => 4,
+        PickerView::Setup { prompt, first_run } => {
+            setup_line_count(prompt, *first_run)
+        }
         PickerView::FileReview { .. } => 6,
         PickerView::Commands { rows, .. } => {
             let n = rows.len().min(PICKER_PAGE) as u16;
@@ -1549,13 +1624,7 @@ pub fn chat_items_from_agent_messages(
                         }
                     }
                 }
-                if let Some(err) = &a.error_message {
-                    if !err.is_empty() {
-                        chat.push(ChatItem::System {
-                            text: format!("error: {err}"),
-                        });
-                    }
-                }
+                chat.extend(assistant_error_item(a));
             }
             AgentMessage::Llm(Message::ToolResult(tr)) => {
                 let result_text = tool_result_text(tr);
@@ -1850,6 +1919,146 @@ mod tests {
             lines.iter().any(|l| l.to_string().contains("thought 249")),
             "last thinking line should remain visible"
         );
+    }
+
+    fn banner_text(model: Option<&loop_ai::Model>, note: Option<&str>) -> String {
+        welcome_lines(&Theme::dark(), "v", model, note, "http://e", "sess", 0, 0, false, 120)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn banner_shows_no_model_and_why() {
+        let text = banner_text(None, None);
+        assert!(text.contains("none — run /model"), "{text}");
+        assert!(text.contains("choose a model with /model to begin"));
+        assert!(!text.contains("Provider"));
+
+        let text = banner_text(None, Some("saved model soket/qwen3-30b is not available"));
+        assert!(text.contains("saved model soket/qwen3-30b is not available — choose a model"));
+    }
+
+    #[test]
+    fn banner_shows_the_selected_model() {
+        let model = loop_ai::providers::soket_seed_models().remove(0);
+        let text = banner_text(Some(&model), None);
+        assert!(text.contains("soket") && text.contains("qwen3-30b"));
+        assert!(text.contains("ready — type /help to begin"));
+    }
+
+    #[test]
+    fn resumed_sessions_show_past_errors_but_not_aborts() {
+        use loop_agent::types::AgentMessage;
+        use loop_ai::StopReason;
+
+        let model = loop_ai::providers::soket_seed_models().remove(0);
+        let mut failed = loop_ai::AssistantMessage::pending(&model);
+        failed.stop_reason = StopReason::Error;
+        failed.error_message = Some("HTTP 401 Unauthorized: Invalid API key".into());
+        let mut aborted = failed.clone();
+        aborted.stop_reason = StopReason::Aborted;
+        aborted.error_message = Some("Operation aborted".into());
+
+        let chat = chat_items_from_agent_messages(&[
+            AgentMessage::assistant(failed),
+            AgentMessage::assistant(aborted),
+        ]);
+        let errors: Vec<_> = chat
+            .iter()
+            .filter_map(|c| match c {
+                ChatItem::Error { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors, ["error: HTTP 401 Unauthorized: Invalid API key"]);
+    }
+
+    #[test]
+    fn error_items_render_in_the_error_color() {
+        let theme = Theme::dark();
+        let lines = format_item_lines(
+            &ChatItem::Error {
+                text: "error: HTTP 502 Bad Gateway".into(),
+            },
+            &theme,
+            false,
+            false,
+            80,
+        );
+        let span = &lines[0].spans[0];
+        assert!(span.content.contains("HTTP 502"));
+        assert_eq!(span.style.fg, theme.error().fg);
+        assert_ne!(theme.error().fg, theme.dim().fg);
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn setup_box_height_matches_rendered_lines() {
+        use crate::setup_prompt::SetupPrompt;
+        use crate::tracing_setup::TracingSetup;
+        use loop_app_core::config::TracingSettings;
+
+        let theme = Theme::dark();
+        let saved = TracingSettings::default();
+        let (picker, _) = TracingSetup::start(None, &saved);
+        let host = TracingSetup::LangfuseHost;
+        let otlp = TracingSetup::OtlpEndpoint;
+        for prompt in [
+            SetupPrompt::Provider(crate::provider_setup::ProviderSetup::start(None).unwrap()),
+            SetupPrompt::Provider(crate::provider_setup::ProviderSetup::start(Some("soket")).unwrap()),
+            SetupPrompt::Tracing(picker),
+            SetupPrompt::Tracing(host),
+            SetupPrompt::Tracing(otlp),
+        ] {
+            let rendered = setup_lines(&prompt, false, &theme).len() as u16;
+            assert_eq!(setup_line_count(&prompt, false), rendered, "{prompt:?}");
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn tracing_picker_marks_selected_backend() {
+        use crate::setup_prompt::SetupPrompt;
+        use crate::tracing_setup::TracingSetup;
+
+        let theme = Theme::dark();
+        let lines = setup_lines(
+            &SetupPrompt::Tracing(TracingSetup::Choose { selected: 1 }),
+            false,
+            &theme,
+        );
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(text.iter().any(|l| l.contains("Langfuse") && !l.contains('▸')));
+        assert!(text.iter().any(|l| l.contains("▸") && l.contains("OTLP endpoint")));
+        assert!(text.last().unwrap().contains("↑↓ choose"));
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn setup_hint_says_next_until_the_final_masked_step() {
+        use crate::setup_prompt::SetupPrompt;
+        use crate::tracing_setup::TracingSetup;
+
+        let theme = Theme::dark();
+        let last_line = |prompt: SetupPrompt| -> String {
+            let lines = setup_lines(&prompt, false, &theme);
+            lines.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        assert!(last_line(SetupPrompt::Tracing(TracingSetup::LangfuseHost)).contains("enter next"));
+        let secret = TracingSetup::LangfuseSecret {
+            host: "h".into(),
+            public_key: "p".into(),
+        };
+        assert!(last_line(SetupPrompt::Tracing(secret)).contains("enter save"));
+        let key = crate::provider_setup::ProviderSetup::start(Some("soket")).unwrap();
+        assert!(last_line(SetupPrompt::Provider(key)).contains("enter save"));
+        let name = crate::provider_setup::ProviderSetup::start(Some("custom")).unwrap();
+        assert!(last_line(SetupPrompt::Provider(name)).contains("enter next"));
     }
 
     #[test]

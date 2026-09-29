@@ -51,7 +51,7 @@ pub mod types;
 pub mod utils;
 
 pub use api::{
-    detect_compat, http_client, list_openai_models, map_remote_model, resolve_compat,
+    detect_compat, http_client, list_openai_models, map_remote_model, resolve_compat, verify_api_key,
     streaming_http_client, transform_messages, ListModelsError, MapRemoteModelOptions,
     OpenAICompletionsAdapter,
 };

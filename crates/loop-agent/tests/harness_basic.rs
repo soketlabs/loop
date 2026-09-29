@@ -24,7 +24,7 @@ async fn harness_prompt_persists() {
 
     let harness = AgentHarness::new(AgentHarnessOptions {
         models,
-        model,
+        model: Some(model),
         session,
         host_env: host,
         tools: vec![],
@@ -56,7 +56,7 @@ async fn harness_start_new_session_resets_id() {
 
     let harness = AgentHarness::new(AgentHarnessOptions {
         models,
-        model,
+        model: Some(model),
         session,
         host_env: host,
         tools: vec![],
@@ -96,7 +96,7 @@ async fn harness_resume_restores_session_context() {
 
     let harness = AgentHarness::new(AgentHarnessOptions {
         models: Arc::clone(&models),
-        model: model.clone(),
+        model: Some(model.clone()),
         session,
         host_env: Arc::new(HostExecutionEnv::new(std::env::temp_dir())),
         tools: vec![],
@@ -118,7 +118,7 @@ async fn harness_resume_restores_session_context() {
     let resumed = repo.open(&session_id).await.unwrap();
     let harness2 = AgentHarness::new(AgentHarnessOptions {
         models,
-        model,
+        model: Some(model),
         session: resumed,
         host_env: Arc::new(HostExecutionEnv::new(std::env::temp_dir())),
         tools: vec![],
@@ -160,7 +160,7 @@ async fn harness_fork_through_user_message() {
 
     let harness = AgentHarness::new(AgentHarnessOptions {
         models,
-        model,
+        model: Some(model),
         session,
         host_env: host,
         tools: vec![],
@@ -203,4 +203,65 @@ async fn harness_fork_through_user_message() {
 
     let ctx2 = harness.session_context().await.unwrap();
     assert!(ctx2.messages.len() >= 4);
+}
+
+#[tokio::test]
+async fn prompt_without_model_fails_cleanly_until_one_is_selected() {
+    let script = FauxScript::new();
+    script.push(FauxResponse::Text("after-select".into()));
+    let models = Arc::new(Models::new());
+    models.set_provider(faux_provider(script));
+    let model = models.get_model("faux", "faux-model").unwrap();
+
+    let store = create_in_memory_session_store();
+    let repo = create_session_repository(store, None);
+    let session = repo.create(None, Some("h".into())).await.unwrap();
+    let harness = AgentHarness::new(AgentHarnessOptions {
+        models,
+        model: None,
+        session,
+        host_env: Arc::new(HostExecutionEnv::new(std::env::temp_dir())),
+        tools: vec![],
+        system_prompt: "sys".into(),
+        sandbox: SandboxMode::Disabled,
+        resources: Default::default(),
+    });
+
+    assert!(harness.model().await.is_none());
+    let err = harness.prompt("hello").await.unwrap_err();
+    assert!(matches!(err, loop_agent::harness::AgentHarnessError::NoModelSelected));
+    assert!(err.to_string().contains("/model"));
+    assert_eq!(harness.phase(), loop_agent::harness::AgentHarnessPhase::Idle);
+    assert!(
+        harness.session_context().await.unwrap().messages.is_empty(),
+        "a rejected prompt must not be recorded"
+    );
+
+    harness.set_model(model).await;
+    let reply = harness.prompt("hello").await.unwrap();
+    assert_eq!(reply.role(), "assistant");
+    harness.wait_for_idle().await;
+
+    harness.clear_model().await;
+    assert!(harness.model().await.is_none());
+}
+
+#[tokio::test]
+async fn tool_env_is_available_without_a_model() {
+    let models = Arc::new(Models::new());
+    let store = create_in_memory_session_store();
+    let repo = create_session_repository(store, None);
+    let session = repo.create(None, Some("h".into())).await.unwrap();
+    let harness = AgentHarness::new(AgentHarnessOptions {
+        models,
+        model: None,
+        session,
+        host_env: Arc::new(HostExecutionEnv::new(std::env::temp_dir())),
+        tools: vec![],
+        system_prompt: "sys".into(),
+        sandbox: SandboxMode::Disabled,
+        resources: Default::default(),
+    });
+    // Startup and /sandbox rebuild tools before any model is chosen.
+    assert!(harness.tool_env().await.is_ok());
 }
