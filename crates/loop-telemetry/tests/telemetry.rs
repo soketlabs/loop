@@ -5,9 +5,22 @@ use loop_telemetry::{
     CredentialSource, ObservationExt, TelemetryDestination, TelemetryHandle, TraceAttrs,
 };
 use loop_test_support::{FakeHttpServer, FakeResponse, RecordedRequest};
-use opentelemetry_sdk::trace::{InMemorySpanExporter, SpanData};
+use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
+use opentelemetry_sdk::trace::{InMemorySpanExporter, SpanData, SpanExporter};
 use tracing::Dispatch;
 use tracing_subscriber::layer::SubscriberExt;
+
+#[derive(Debug)]
+struct FailingExporter;
+
+impl SpanExporter for FailingExporter {
+    fn export(
+        &self,
+        _batch: Vec<SpanData>,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+        async { Err(OTelSdkError::InternalFailure("expected test failure".into())) }
+    }
+}
 
 struct Fixture {
     handle: TelemetryHandle,
@@ -339,20 +352,12 @@ fn otlp_exporter_posts_to_collector_with_optional_auth() {
 
 #[test]
 fn failed_export_is_reported_in_status() {
-    // Bind then drop a listener so the port is closed and connections are refused.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let handle = TelemetryHandle::new("test-release", true);
-    let destination = TelemetryDestination::otlp(
-        &format!("http://127.0.0.1:{port}"),
-        None,
+    handle.install_exporter(
+        FailingExporter,
+        "test exporter".into(),
         CredentialSource::Config,
-    )
-    .unwrap();
-    handle.install(&destination).unwrap();
+    );
     assert!(handle.status().last_error.is_none());
     let dispatch = Dispatch::new(tracing_subscriber::registry().with(handle.layer()));
     tracing::dispatcher::with_default(&dispatch, || {
