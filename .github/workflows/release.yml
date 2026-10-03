@@ -39,7 +39,11 @@ on:
         required: false
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.tag_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,6 +52,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -71,15 +76,18 @@ jobs:
             archive: zip
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
 
@@ -206,7 +214,7 @@ jobs:
           "CHECKSUM=$staging.zip.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: loop-${{ matrix.target }}
           path: |
@@ -217,6 +225,7 @@ jobs:
   build-desktop:
     name: Build Desktop (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -240,11 +249,14 @@ jobs:
             archive: zip
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust (nightly for GPUI)
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
+          toolchain: nightly-2026-09-29
           targets: ${{ matrix.target }}
 
       - name: Install Linux dependencies
@@ -256,7 +268,7 @@ jobs:
             libwayland-dev libvulkan-dev
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: desktop-${{ matrix.target }}
 
@@ -354,7 +366,7 @@ jobs:
           "CHECKSUM=$staging.zip.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: loop-desktop-${{ matrix.target }}
           path: |
@@ -364,23 +376,30 @@ jobs:
 
   release:
     name: Publish GitHub Release
+    permissions:
+      contents: write
+    timeout-minutes: 10
     needs: [build, build-desktop]
     runs-on: ubuntu-latest
     if: >
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' && inputs.create_release)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Resolve tag
         id: tag
+        env:
+          REQUESTED_TAG: ${{ inputs.tag_name }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             tag="${GITHUB_REF#refs/tags/}"
           else
-            tag="${{ inputs.tag_name }}"
+            tag="$REQUESTED_TAG"
             if [[ -z "$tag" ]]; then
               echo "tag_name is required when create_release is true" >&2
               exit 1
@@ -395,10 +414,12 @@ jobs:
 
       - name: Check workspace version matches tag
         shell: bash
+        env:
+          TAG_VERSION: ${{ steps.tag.outputs.version }}
         run: |
           set -euo pipefail
           cargo_version="$(grep -E '^version\s*=' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
-          tag_version="${{ steps.tag.outputs.version }}"
+          tag_version="$TAG_VERSION"
           if [[ "$cargo_version" != "$tag_version" ]]; then
             echo "Cargo.toml version ($cargo_version) does not match tag version ($tag_version)." >&2
             echo "Bump [workspace.package] version in Cargo.toml before tagging." >&2
@@ -406,7 +427,7 @@ jobs:
           fi
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -415,7 +436,7 @@ jobs:
         run: ls -la dist/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: Loop ${{ steps.tag.outputs.tag }}
