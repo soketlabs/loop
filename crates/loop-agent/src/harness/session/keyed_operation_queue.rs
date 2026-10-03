@@ -46,10 +46,7 @@ impl KeyedOperationQueue {
         let (barrier_wait, previous) = {
             let mut state = self.state.lock().await;
             let barrier_wait = std::mem::replace(&mut state.barrier, resolved_future());
-            let previous = state
-                .tails
-                .remove(&key)
-                .unwrap_or_else(resolved_future);
+            let previous = state.tails.remove(&key).unwrap_or_else(resolved_future);
             (barrier_wait, previous)
         };
 

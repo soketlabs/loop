@@ -349,7 +349,10 @@ impl Session {
     }
 
     /// Append a message.
-    pub async fn append_message(&self, message: AgentMessage) -> Result<SessionTreeEntry, SessionError> {
+    pub async fn append_message(
+        &self,
+        message: AgentMessage,
+    ) -> Result<SessionTreeEntry, SessionError> {
         self.store
             .append_entry(
                 &self.metadata().id,
@@ -359,12 +362,12 @@ impl Session {
     }
 
     /// Move leaf.
-    pub async fn move_to(&self, target_id: Option<String>) -> Result<SessionTreeEntry, SessionError> {
+    pub async fn move_to(
+        &self,
+        target_id: Option<String>,
+    ) -> Result<SessionTreeEntry, SessionError> {
         self.store
-            .append_entry(
-                &self.metadata().id,
-                PendingSessionWrite::Leaf { target_id },
-            )
+            .append_entry(&self.metadata().id, PendingSessionWrite::Leaf { target_id })
             .await
     }
 

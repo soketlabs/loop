@@ -8,9 +8,7 @@ use loop_orchestration::planner::task_graph::{TaskKind, TaskNode};
 use loop_orchestration::scheduler::worker::{Worker, WorkerContext, WorkerError};
 use loop_orchestration::workflow::types::{Signal, TaskResult};
 
-use super::tools::{
-    create_memory_list_tool, create_memory_read_tool, create_memory_write_tool,
-};
+use super::tools::{create_memory_list_tool, create_memory_read_tool, create_memory_write_tool};
 use crate::agent_loop::run_agent_loop;
 use crate::harness::types::ExecutionEnv;
 use crate::messages::convert_to_llm;
@@ -194,10 +192,8 @@ impl Worker for AgentWorker {
 
                 let mut output = extract_output_from_messages(&messages);
                 if output_is_empty(&output) && !artifacts.is_empty() {
-                    let paths: Vec<&str> = artifacts
-                        .iter()
-                        .filter_map(|a| a.path.as_deref())
-                        .collect();
+                    let paths: Vec<&str> =
+                        artifacts.iter().filter_map(|a| a.path.as_deref()).collect();
                     output = serde_json::Value::String(format!("Wrote: {}", paths.join(", ")));
                 }
 
@@ -481,9 +477,7 @@ pub fn create_spawn_task_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loop_ai::{
-        AssistantMessage, StopReason, TextContent, ThinkingContent, Usage,
-    };
+    use loop_ai::{AssistantMessage, StopReason, TextContent, ThinkingContent, Usage};
 
     fn asst(text: Option<&str>, thinking: Option<&str>) -> AgentMessage {
         let mut content = Vec::new();
@@ -517,10 +511,7 @@ mod tests {
 
     #[test]
     fn extract_joins_all_assistant_text() {
-        let messages = vec![
-            asst(Some("part one"), None),
-            asst(Some("part two"), None),
-        ];
+        let messages = vec![asst(Some("part one"), None), asst(Some("part two"), None)];
         let out = extract_output_from_messages(&messages);
         assert_eq!(out.as_str(), Some("part one\n\npart two"));
     }

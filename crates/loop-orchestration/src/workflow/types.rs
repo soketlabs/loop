@@ -337,7 +337,9 @@ impl WorkflowState {
                 self.task_statuses
                     .insert(task_id.clone(), TaskStatus::Running);
             }
-            WorkflowEvent::TaskCompleted { task_id, result, .. } => {
+            WorkflowEvent::TaskCompleted {
+                task_id, result, ..
+            } => {
                 self.task_statuses
                     .insert(task_id.clone(), TaskStatus::Completed(result.clone()));
             }
@@ -345,7 +347,9 @@ impl WorkflowState {
                 self.task_statuses
                     .insert(task_id.clone(), TaskStatus::Failed(error.clone()));
             }
-            WorkflowEvent::TaskCancelled { task_id, reason, .. } => {
+            WorkflowEvent::TaskCancelled {
+                task_id, reason, ..
+            } => {
                 self.task_statuses
                     .insert(task_id.clone(), TaskStatus::Cancelled(reason.clone()));
             }
@@ -376,10 +380,7 @@ impl WorkflowState {
             .filter(|id| {
                 let deps = self.graph.dependencies_of(id);
                 deps.iter().all(|dep| {
-                    matches!(
-                        self.task_statuses.get(dep),
-                        Some(TaskStatus::Completed(_))
-                    )
+                    matches!(self.task_statuses.get(dep), Some(TaskStatus::Completed(_)))
                 })
             })
             .cloned()
@@ -444,17 +445,29 @@ mod tests {
         let mut g = TaskGraph::new();
         g.add_task(TaskNode::new(
             "a",
-            TaskKind::AgentTurn { prompt: "do a".into(), tools: None, model: None },
+            TaskKind::AgentTurn {
+                prompt: "do a".into(),
+                tools: None,
+                model: None,
+            },
             "task a",
         ));
         g.add_task(TaskNode::new(
             "b",
-            TaskKind::AgentTurn { prompt: "do b".into(), tools: None, model: None },
+            TaskKind::AgentTurn {
+                prompt: "do b".into(),
+                tools: None,
+                model: None,
+            },
             "task b",
         ));
         g.add_task(TaskNode::new(
             "c",
-            TaskKind::AgentTurn { prompt: "do c".into(), tools: None, model: None },
+            TaskKind::AgentTurn {
+                prompt: "do c".into(),
+                tools: None,
+                model: None,
+            },
             "task c",
         ));
         g.add_dependency("b", "a");
@@ -467,7 +480,10 @@ mod tests {
         let g = make_graph();
         let state = WorkflowState::new("wf1".into(), g);
         assert_eq!(state.status, WorkflowStatus::Running);
-        assert!(state.task_statuses.values().all(|s| matches!(s, TaskStatus::Pending)));
+        assert!(state
+            .task_statuses
+            .values()
+            .all(|s| matches!(s, TaskStatus::Pending)));
     }
 
     #[test]
@@ -483,14 +499,24 @@ mod tests {
         let g = make_graph();
         let mut state = WorkflowState::new("wf1".into(), g);
 
-        state.apply(1, &WorkflowEvent::TaskStarted {
-            task_id: "a".into(), worker_id: "w1".into(), timestamp: 0,
-        });
+        state.apply(
+            1,
+            &WorkflowEvent::TaskStarted {
+                task_id: "a".into(),
+                worker_id: "w1".into(),
+                timestamp: 0,
+            },
+        );
         assert!(state.ready_tasks().is_empty());
 
-        state.apply(2, &WorkflowEvent::TaskCompleted {
-            task_id: "a".into(), result: TaskResult::empty(), timestamp: 1,
-        });
+        state.apply(
+            2,
+            &WorkflowEvent::TaskCompleted {
+                task_id: "a".into(),
+                result: TaskResult::empty(),
+                timestamp: 1,
+            },
+        );
         let ready = state.ready_tasks();
         assert_eq!(ready, vec!["b"]);
     }
@@ -501,17 +527,32 @@ mod tests {
         let mut state = WorkflowState::new("wf1".into(), g);
         assert!(!state.is_complete());
 
-        state.apply(1, &WorkflowEvent::TaskCompleted {
-            task_id: "a".into(), result: TaskResult::empty(), timestamp: 0,
-        });
-        state.apply(2, &WorkflowEvent::TaskCompleted {
-            task_id: "b".into(), result: TaskResult::empty(), timestamp: 1,
-        });
+        state.apply(
+            1,
+            &WorkflowEvent::TaskCompleted {
+                task_id: "a".into(),
+                result: TaskResult::empty(),
+                timestamp: 0,
+            },
+        );
+        state.apply(
+            2,
+            &WorkflowEvent::TaskCompleted {
+                task_id: "b".into(),
+                result: TaskResult::empty(),
+                timestamp: 1,
+            },
+        );
         assert!(!state.is_complete());
 
-        state.apply(3, &WorkflowEvent::TaskCompleted {
-            task_id: "c".into(), result: TaskResult::empty(), timestamp: 2,
-        });
+        state.apply(
+            3,
+            &WorkflowEvent::TaskCompleted {
+                task_id: "c".into(),
+                result: TaskResult::empty(),
+                timestamp: 2,
+            },
+        );
         assert!(state.is_complete());
     }
 
@@ -521,9 +562,15 @@ mod tests {
         let mut state = WorkflowState::new("wf1".into(), g);
         assert!(!state.has_failures());
 
-        state.apply(1, &WorkflowEvent::TaskFailed {
-            task_id: "a".into(), error: "boom".into(), retry_count: 0, timestamp: 0,
-        });
+        state.apply(
+            1,
+            &WorkflowEvent::TaskFailed {
+                task_id: "a".into(),
+                error: "boom".into(),
+                retry_count: 0,
+                timestamp: 0,
+            },
+        );
         assert!(state.has_failures());
     }
 
@@ -532,9 +579,13 @@ mod tests {
         let g = make_graph();
         let mut state = WorkflowState::new("wf1".into(), g);
 
-        state.apply(1, &WorkflowEvent::WorkflowPaused {
-            reason: "user requested".into(), timestamp: 0,
-        });
+        state.apply(
+            1,
+            &WorkflowEvent::WorkflowPaused {
+                reason: "user requested".into(),
+                timestamp: 0,
+            },
+        );
         assert_eq!(state.status, WorkflowStatus::Paused);
 
         state.apply(2, &WorkflowEvent::WorkflowResumed { timestamp: 1 });
@@ -546,16 +597,19 @@ mod tests {
         let g = make_graph();
         let mut state = WorkflowState::new("wf1".into(), g);
 
-        state.apply(1, &WorkflowEvent::WorkflowCompleted {
-            result: WorkflowResult {
-                success: true,
-                output: serde_json::Value::Null,
-                task_results: Vec::new(),
-                failed_tasks: Vec::new(),
-                total_task_count: 0,
+        state.apply(
+            1,
+            &WorkflowEvent::WorkflowCompleted {
+                result: WorkflowResult {
+                    success: true,
+                    output: serde_json::Value::Null,
+                    task_results: Vec::new(),
+                    failed_tasks: Vec::new(),
+                    total_task_count: 0,
+                },
+                timestamp: 0,
             },
-            timestamp: 0,
-        });
+        );
         assert_eq!(state.status, WorkflowStatus::Completed);
     }
 
@@ -564,14 +618,23 @@ mod tests {
         let mut g = TaskGraph::new();
         g.add_task(TaskNode::new(
             "a",
-            TaskKind::AgentTurn { prompt: "x".into(), tools: None, model: None },
+            TaskKind::AgentTurn {
+                prompt: "x".into(),
+                tools: None,
+                model: None,
+            },
             "a",
         ));
         let mut state = WorkflowState::new("wf1".into(), g);
 
-        state.apply(1, &WorkflowEvent::TaskCancelled {
-            task_id: "a".into(), reason: "timeout".into(), timestamp: 0,
-        });
+        state.apply(
+            1,
+            &WorkflowEvent::TaskCancelled {
+                task_id: "a".into(),
+                reason: "timeout".into(),
+                timestamp: 0,
+            },
+        );
         assert!(state.is_complete());
     }
 

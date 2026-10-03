@@ -8,7 +8,9 @@ use parking_lot::Mutex;
 
 use crate::types::AgentMessage;
 
-type Handler = Arc<dyn Fn(HarnessHookEvent) -> Pin<Box<dyn Future<Output = HookOutcome> + Send>> + Send + Sync>;
+type Handler = Arc<
+    dyn Fn(HarnessHookEvent) -> Pin<Box<dyn Future<Output = HookOutcome> + Send>> + Send + Sync,
+>;
 
 /// Harness hook events (pi agent-harness parity).
 #[derive(Debug, Clone)]
@@ -96,9 +98,9 @@ impl HookRegistry {
         F: Fn(HarnessHookEvent) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = HookOutcome> + Send + 'static,
     {
-        self.handlers.lock().push(Arc::new(move |event| {
-            Box::pin(handler(event))
-        }));
+        self.handlers
+            .lock()
+            .push(Arc::new(move |event| Box::pin(handler(event))));
     }
 
     /// Emit an event to all handlers; cancel if any handler cancels; first summary wins.

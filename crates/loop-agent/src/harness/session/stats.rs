@@ -469,7 +469,10 @@ fn detect_cache_miss(
         return None;
     }
 
-    let missed_tokens = prev.prompt_tokens.min(prompt_tokens).saturating_sub(usage.cache_read);
+    let missed_tokens = prev
+        .prompt_tokens
+        .min(prompt_tokens)
+        .saturating_sub(usage.cache_read);
     if missed_tokens <= NOISE_FLOOR_TOKENS {
         return None;
     }
@@ -532,7 +535,10 @@ pub fn format_session_stats(stats: &SessionStats) -> String {
     if let Some(parent) = &stats.parent_session_id {
         out.push_str(&format!("  Parent: {parent}\n"));
     }
-    out.push_str(&format!("  Created: {}\n", format_unix_ms(stats.created_at)));
+    out.push_str(&format!(
+        "  Created: {}\n",
+        format_unix_ms(stats.created_at)
+    ));
     out.push_str(&format!("  Active model: {}\n", stats.active_model));
 
     out.push_str("\nMessages\n");
@@ -584,11 +590,7 @@ pub fn format_session_stats(stats: &SessionStats) -> String {
         } else {
             String::new()
         };
-        out.push_str(&format!(
-            "    Uncached: {}{}\n",
-            fmt_u64(uncached),
-            written
-        ));
+        out.push_str(&format!("    Uncached: {}{}\n", fmt_u64(uncached), written));
     } else {
         out.push_str(&format!("    Uncached input: {}\n", fmt_u64(t.input)));
     }
@@ -636,7 +638,10 @@ pub fn format_session_stats(stats: &SessionStats) -> String {
     if show_cost {
         out.push_str("\nCost\n");
         out.push_str(&format!("  Total: ${:.4}\n", t.cost.total));
-        if t.cost.input > 0.0 || t.cost.output > 0.0 || t.cost.cache_read > 0.0 || t.cost.cache_write > 0.0
+        if t.cost.input > 0.0
+            || t.cost.output > 0.0
+            || t.cost.cache_read > 0.0
+            || t.cost.cache_write > 0.0
         {
             out.push_str(&format!("    Input: ${:.4}\n", t.cost.input));
             out.push_str(&format!("    Output: ${:.4}\n", t.cost.output));

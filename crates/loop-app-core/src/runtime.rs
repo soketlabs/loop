@@ -12,15 +12,11 @@ use loop_agent::harness::{
     Sandbox, SandboxMode,
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
-use loop_ai::providers::{
-    custom_provider, CustomModelSpec, CustomProviderConfig,
-};
-use loop_ai::{
-    CreateModelsOptions, FileModelsStore, Models, ModelsRefreshOptions,
-};
+use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
+use loop_ai::{CreateModelsOptions, FileModelsStore, Models, ModelsRefreshOptions};
 
 use crate::config::auth::FileCredentialStore;
-use loop_ai::CredentialStore;
+use crate::config::paths::trust_path;
 use crate::config::paths::{
     auth_path, ensure_agent_dirs, get_agent_dir, models_json_path, models_store_path,
     sessions_db_path, settings_path,
@@ -28,13 +24,13 @@ use crate::config::paths::{
 use crate::config::settings::{load_settings, McpServerConfig, Settings};
 use crate::config::trust::TrustStore;
 use crate::model_selection::StartupModel;
-use crate::config::paths::{trust_path};
 use crate::resources::{load_resources, LoadedResources};
 use crate::system_prompt::{
     build_system_prompt, default_tool_snippets, load_context_files, resolve_system_prompt_files,
     BuildSystemPromptOptions,
 };
 use crate::theme::{theme_search_dirs, Theme};
+use loop_ai::CredentialStore;
 
 /// Fully constructed interactive runtime.
 pub struct Runtime {
@@ -119,9 +115,11 @@ impl Runtime {
             })
             .await;
         let model_count = self.models.get_models(Some(&id)).len();
-        let failure = refresh.errors.get(&id).cloned().or_else(|| {
-            (model_count == 0).then(|| "no models were listed".to_string())
-        });
+        let failure = refresh
+            .errors
+            .get(&id)
+            .cloned()
+            .or_else(|| (model_count == 0).then(|| "no models were listed".to_string()));
         if let Some(err) = failure {
             restore_api_key(self.credentials.as_ref(), &id, previous_key);
             if entry.is_some() {
@@ -167,8 +165,14 @@ impl Runtime {
             }
             None => preset.map_or_else(|| id.clone(), |p| p.name.to_string()),
         };
-        if self.selected_model.as_ref().is_some_and(|m| m.provider == id) {
-            self.model_note = self.selected_model_spec().map(|spec| format!("{spec} was disconnected"));
+        if self
+            .selected_model
+            .as_ref()
+            .is_some_and(|m| m.provider == id)
+        {
+            self.model_note = self
+                .selected_model_spec()
+                .map(|spec| format!("{spec} was disconnected"));
             self.selected_model = None;
             self.harness.clear_model().await;
             self.settings.clear_selected_model();
@@ -178,7 +182,11 @@ impl Runtime {
     }
 
     /// Select `provider/id` for this and future runs (harness + saved settings).
-    pub async fn select_model(&mut self, provider: &str, id: &str) -> anyhow::Result<loop_ai::Model> {
+    pub async fn select_model(
+        &mut self,
+        provider: &str,
+        id: &str,
+    ) -> anyhow::Result<loop_ai::Model> {
         let model = self
             .models
             .get_model(provider, id)
@@ -427,10 +435,7 @@ pub fn resolve_trust(
             if !interactive {
                 return Ok(false);
             }
-            eprintln!(
-                "Trust project config from {}? [y/N]",
-                cwd.display()
-            );
+            eprintln!("Trust project config from {}? [y/N]", cwd.display());
             let mut answer = String::new();
             std::io::Write::write_all(&mut std::io::stderr(), b"> ").ok();
             std::io::stdin().read_line(&mut answer)?;
@@ -659,7 +664,10 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
 
     let theme_dirs = theme_search_dirs(
         &agent_dir,
-        project_trusted.then_some(crate::config::paths::get_project_dir(&opts.cwd)).as_ref().map(|p| p.as_path()),
+        project_trusted
+            .then_some(crate::config::paths::get_project_dir(&opts.cwd))
+            .as_ref()
+            .map(|p| p.as_path()),
     );
     let theme = Theme::load(&settings.theme, &theme_dirs).unwrap_or_else(|_| Theme::dark());
 
@@ -675,7 +683,8 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         }
         let mcp_tools = loop_agent::harness::mcp::bridge::mcp_tools_to_agent_tools_async(
             mcp_client.connections(),
-        ).await;
+        )
+        .await;
         if !mcp_tools.is_empty() {
             let mut all_tools = harness.get_tools().await;
             all_tools.extend(mcp_tools);
@@ -720,13 +729,21 @@ pub fn mcp_server_entries(
         let transport = if let Some(url) = &cfg.url {
             loop_mcp::McpTransport::Http {
                 url: url.clone(),
-                headers: cfg.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                headers: cfg
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
             }
         } else if let Some(command) = &cfg.command {
             loop_mcp::McpTransport::Stdio {
                 command: command.clone(),
                 args: cfg.args.clone(),
-                env: cfg.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                env: cfg
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
             }
         } else {
             tracing::warn!("mcp: skipping '{name}': neither 'command' nor 'url' configured");

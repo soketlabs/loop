@@ -403,10 +403,7 @@ mod tests {
             .filter(|l| l.contains('│') && (l.contains("foo") || l.contains("longer-cell")))
             .collect();
         assert_eq!(table_rows.len(), 2, "{text}");
-        let pos: Vec<usize> = table_rows
-            .iter()
-            .map(|r| r.find('│').unwrap())
-            .collect();
+        let pos: Vec<usize> = table_rows.iter().map(|r| r.find('│').unwrap()).collect();
         assert_eq!(pos[0], pos[1], "columns should align:\n{text}");
     }
 
@@ -462,7 +459,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod stream_sim {
     use super::*;
@@ -471,7 +467,8 @@ mod stream_sim {
     /// re-rendered each "frame". Table should be rough mid-stream, aligned at end.
     #[test]
     fn streaming_table_progression() {
-        let full = "intro\n\n| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |\n\ndone\n";
+        let full =
+            "intro\n\n| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |\n\ndone\n";
         let theme = Theme::dark();
 
         // Mid-stream: only the header + delimiter have arrived.
@@ -479,7 +476,12 @@ mod stream_sim {
         let lines_mid = render_lines(mid, &theme);
         let text_mid = lines_mid
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         eprintln!("=== MID-STREAM ===\n{text_mid}\n");
@@ -488,7 +490,12 @@ mod stream_sim {
         let lines_full = render_lines(full, &theme);
         let text_full = lines_full
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         eprintln!("=== FULL ===\n{text_full}\n");

@@ -12,6 +12,7 @@ pub mod tool_approval;
 
 pub use config::*;
 pub use runtime::{
-    bootstrap, build_models, build_tools, mcp_server_entries, BootstrapOpts, ConnectedProvider, Runtime,
+    bootstrap, build_models, build_tools, mcp_server_entries, BootstrapOpts, ConnectedProvider,
+    Runtime,
 };
 pub use tool_approval::ToolApprovalBridge;

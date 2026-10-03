@@ -79,12 +79,18 @@ pub fn detect_compat(base_url: &str) -> OpenAICompletionsCompat {
 }
 
 /// Merge URL-detected defaults with explicit model overrides.
-pub fn resolve_compat(model_base_url: &str, override_compat: Option<&OpenAICompletionsCompat>) -> ResolvedOpenAICompletionsCompat {
+pub fn resolve_compat(
+    model_base_url: &str,
+    override_compat: Option<&OpenAICompletionsCompat>,
+) -> ResolvedOpenAICompletionsCompat {
     let detected = detect_compat(model_base_url);
     let o = override_compat.cloned().unwrap_or_default();
 
     ResolvedOpenAICompletionsCompat {
-        supports_store: o.supports_store.or(detected.supports_store).unwrap_or(false),
+        supports_store: o
+            .supports_store
+            .or(detected.supports_store)
+            .unwrap_or(false),
         supports_developer_role: o
             .supports_developer_role
             .or(detected.supports_developer_role)

@@ -50,10 +50,14 @@ impl ExternalEditor {
 
 /// Editors found on this machine.
 pub fn detect_editors() -> Vec<ExternalEditor> {
-    [ExternalEditor::Cursor, ExternalEditor::VsCode, ExternalEditor::Zed]
-        .into_iter()
-        .filter(|e| e.command().is_some())
-        .collect()
+    [
+        ExternalEditor::Cursor,
+        ExternalEditor::VsCode,
+        ExternalEditor::Zed,
+    ]
+    .into_iter()
+    .filter(|e| e.command().is_some())
+    .collect()
 }
 
 /// Open `path` at `line` (1-based) in the chosen editor.

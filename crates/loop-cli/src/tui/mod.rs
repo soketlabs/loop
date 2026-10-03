@@ -7,8 +7,10 @@ pub mod history;
 pub mod markdown;
 
 pub use editor::InputBuffer;
+pub use file_mentions::{
+    filter_files, find_at_mention, insert_text, list_files, AtMention, FileEntry,
+};
 pub use history::CommandHistory;
-pub use file_mentions::{filter_files, find_at_mention, insert_text, list_files, AtMention, FileEntry};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -43,11 +45,20 @@ pub enum CardStatus {
 /// A chat transcript item.
 #[derive(Debug, Clone)]
 pub enum ChatItem {
-    User { text: String },
+    User {
+        text: String,
+    },
     /// User message waiting for the agent to become idle (not yet sent).
-    Queued { text: String },
-    Assistant { text: String },
-    Thinking { text: String, done: bool },
+    Queued {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    Thinking {
+        text: String,
+        done: bool,
+    },
     Tool {
         id: String,
         name: String,
@@ -68,9 +79,13 @@ pub enum ChatItem {
         status: CardStatus,
         output: String,
     },
-    System { text: String },
+    System {
+        text: String,
+    },
     /// A failure the user should notice (model/API errors, rejected setup input).
-    Error { text: String },
+    Error {
+        text: String,
+    },
 }
 
 /// Error line for an assistant message that ended in an error. Aborts (the user's own
@@ -226,7 +241,10 @@ pub fn welcome_lines(
     out.push(Line::from(""));
     out.push(Line::from(vec![
         Span::styled("✦ ".to_string(), theme.accent()),
-        Span::styled("Interactive Coding Agent Harness".to_string(), theme.style("text")),
+        Span::styled(
+            "Interactive Coding Agent Harness".to_string(),
+            theme.style("text"),
+        ),
         Span::styled(" ✦".to_string(), theme.accent()),
     ]));
     out.push(Line::from(""));
@@ -274,10 +292,7 @@ pub fn welcome_lines(
     inner = inner.clamp(24, max_inner);
 
     let hline = |l: char, r: char| -> Line<'static> {
-        Line::from(Span::styled(
-            format!("{l}{}{r}", "─".repeat(inner)),
-            border,
-        ))
+        Line::from(Span::styled(format!("{l}{}{r}", "─".repeat(inner)), border))
     };
     let pad_row = |spans: Vec<Span<'static>>| -> Line<'static> {
         let used: usize = spans
@@ -304,7 +319,10 @@ pub fn welcome_lines(
     out.push(hline('├', '┤'));
     out.push(pad_row(vec![
         Span::styled("  ● ".to_string(), dot_style),
-        Span::styled(truncate_width(&status_text, inner.saturating_sub(6)), theme.style("text")),
+        Span::styled(
+            truncate_width(&status_text, inner.saturating_sub(6)),
+            theme.style("text"),
+        ),
     ]));
     out.push(hline('╰', '╯'));
 
@@ -323,12 +341,7 @@ pub fn welcome_lines(
 
 /// Full-width user message band with a `❯` prompt marker.
 /// When `queued`, render muted with a trailing queue hint.
-fn format_user_band(
-    text: &str,
-    theme: &Theme,
-    w: usize,
-    queued: bool,
-) -> Vec<Line<'static>> {
+fn format_user_band(text: &str, theme: &Theme, w: usize, queued: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let text_style = if queued {
         theme.muted()
@@ -368,10 +381,7 @@ fn format_user_band(
         lines.push(bg_spans_line(
             theme,
             "userMessageBg",
-            vec![
-                Span::raw(" "),
-                Span::styled("❯".to_string(), marker_style),
-            ],
+            vec![Span::raw(" "), Span::styled("❯".to_string(), marker_style)],
             w,
         ));
     }
@@ -423,9 +433,7 @@ pub fn format_item_lines(
         }
         ChatItem::Thinking { text, done } => {
             let label = if *done { "Thinking" } else { "Thinking…" };
-            let think = theme
-                .style("thinkingText")
-                .add_modifier(Modifier::ITALIC);
+            let think = theme.style("thinkingText").add_modifier(Modifier::ITALIC);
             if hide_thinking {
                 lines.push(Line::from(vec![
                     Span::styled("✦ ".to_string(), theme.accent()),
@@ -452,7 +460,10 @@ pub fn format_item_lines(
                     line_summary(text.lines().next().unwrap_or(""), 72)
                 } else {
                     line_summary(
-                        text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(""),
+                        text.lines()
+                            .rev()
+                            .find(|l| !l.trim().is_empty())
+                            .unwrap_or(""),
                         72,
                     )
                 };
@@ -492,10 +503,7 @@ pub fn format_item_lines(
             let detail_lines = detail.lines().count();
             let mut head = vec![
                 Span::styled(" ● ".to_string(), theme.style(dot_key)),
-                Span::styled(
-                    title,
-                    theme.style("toolTitle").add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(title, theme.style("toolTitle").add_modifier(Modifier::BOLD)),
             ];
             match status {
                 CardStatus::Pending => {
@@ -536,20 +544,15 @@ pub fn format_item_lines(
                 let take_n = max_body.unwrap_or(usize::MAX);
                 let mut shown = 0usize;
                 for spans in highlighted.into_iter().take(take_n) {
-                    let mut row = vec![Span::styled(
-                        "  │ ".to_string(),
-                        theme.style("borderMuted"),
-                    )];
+                    let mut row =
+                        vec![Span::styled("  │ ".to_string(), theme.style("borderMuted"))];
                     row.extend(highlight::truncate_spans(spans, body_w));
                     lines.push(Line::from(row));
                     shown += 1;
                 }
                 if total > shown {
                     lines.push(Line::from(Span::styled(
-                        format!(
-                            "  … {} more lines · ctrl+o",
-                            total.saturating_sub(shown)
-                        ),
+                        format!("  … {} more lines · ctrl+o", total.saturating_sub(shown)),
                         theme.dim(),
                     )));
                 }
@@ -575,10 +578,7 @@ pub fn format_item_lines(
             let detail_lines = output.lines().count();
             let mut head = vec![
                 Span::styled(" ● ".to_string(), theme.style(dot_key)),
-                Span::styled(
-                    title,
-                    theme.style("toolTitle").add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(title, theme.style("toolTitle").add_modifier(Modifier::BOLD)),
             ];
             match status {
                 CardStatus::Pending => {
@@ -586,7 +586,14 @@ pub fn format_item_lines(
                 }
                 _ if output.is_empty() => {
                     head.push(Span::styled(
-                        format!(" · {}", if matches!(status, CardStatus::Success) { "done" } else { "failed" }),
+                        format!(
+                            " · {}",
+                            if matches!(status, CardStatus::Success) {
+                                "done"
+                            } else {
+                                "failed"
+                            }
+                        ),
                         theme.dim(),
                     ));
                 }
@@ -623,10 +630,8 @@ pub fn format_item_lines(
                 let take_n = max_body.unwrap_or(usize::MAX);
                 let mut shown = 0usize;
                 for line in output.lines().take(take_n) {
-                    let mut row = vec![Span::styled(
-                        "  │ ".to_string(),
-                        theme.style("borderMuted"),
-                    )];
+                    let mut row =
+                        vec![Span::styled("  │ ".to_string(), theme.style("borderMuted"))];
                     let truncated: String = line.chars().take(body_w).collect();
                     row.push(Span::styled(truncated, fallback));
                     lines.push(Line::from(row));
@@ -687,10 +692,7 @@ fn format_shell_box(
     let content_w = inner.saturating_sub(2).max(1); // side padding inside the box
 
     let hline = |l: char, r: char| -> Line<'static> {
-        Line::from(Span::styled(
-            format!("{l}{}{r}", "─".repeat(inner)),
-            border,
-        ))
+        Line::from(Span::styled(format!("{l}{}{r}", "─".repeat(inner)), border))
     };
     let pad_row = |spans: Vec<Span<'static>>| -> Line<'static> {
         let used: usize = spans
@@ -705,12 +707,13 @@ fn format_shell_box(
         all.push(Span::styled("│".to_string(), border));
         Line::from(all)
     };
-    let content_row = |prefix: Vec<Span<'static>>, body: String, body_style: Style| -> Line<'static> {
-        let mut spans = vec![Span::raw(" ")];
-        spans.extend(prefix);
-        spans.push(Span::styled(body, body_style));
-        pad_row(spans)
-    };
+    let content_row =
+        |prefix: Vec<Span<'static>>, body: String, body_style: Style| -> Line<'static> {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(prefix);
+            spans.push(Span::styled(body, body_style));
+            pad_row(spans)
+        };
 
     let mut out = Vec::new();
     out.push(hline('╭', '╮'));
@@ -726,11 +729,7 @@ fn format_shell_box(
             ));
             cmd_first = false;
         } else {
-            out.push(content_row(
-                vec![Span::raw("  ".to_string())],
-                part,
-                text,
-            ));
+            out.push(content_row(vec![Span::raw("  ".to_string())], part, text));
         }
     }
     if cmd_first {
@@ -784,7 +783,12 @@ struct FooterLayout {
     status_h: u16,
 }
 
-fn footer_layout(area_height: u16, area_width: u16, input: &str, picker: &PickerView) -> FooterLayout {
+fn footer_layout(
+    area_height: u16,
+    area_width: u16,
+    input: &str,
+    picker: &PickerView,
+) -> FooterLayout {
     let picker_h = picker_height(picker);
     let status_h = 2u16;
     let max_input_body = area_height
@@ -942,10 +946,7 @@ fn draw_input(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
         area.width as usize,
         chunks[1].height as usize,
     );
-    frame.render_widget(
-        Paragraph::new(lines).style(opts.theme.page()),
-        chunks[1],
-    );
+    frame.render_widget(Paragraph::new(lines).style(opts.theme.page()), chunks[1]);
 }
 
 fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView) {
@@ -956,8 +957,15 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
         PickerView::None => Vec::new(),
         PickerView::Setup { prompt, first_run } => setup_lines(prompt, *first_run, theme),
         PickerView::Commands { rows, selected } => picker_lines(rows, *selected, theme, false),
-        PickerView::Models { rows, selected, hint } => {
-            let mut out = vec![Line::from(Span::styled(hint.clone(), theme.style("warning")))];
+        PickerView::Models {
+            rows,
+            selected,
+            hint,
+        } => {
+            let mut out = vec![Line::from(Span::styled(
+                hint.clone(),
+                theme.style("warning"),
+            ))];
             out.extend(picker_lines(rows, *selected, theme, true));
             out
         }
@@ -990,7 +998,10 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
             vec![
                 Line::from(vec![
                     Span::styled("  review ".to_string(), theme.accent_bold()),
-                    Span::styled(path.clone(), theme.style("text").add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        path.clone(),
+                        theme.style("text").add_modifier(Modifier::BOLD),
+                    ),
                 ]),
                 opt(0, "Accept", "success"),
                 opt(1, accept_all_label, "success"),
@@ -1076,7 +1087,10 @@ fn picker_lines(
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     if rows.is_empty() {
-        out.push(Line::from(Span::styled("  no matches".to_string(), theme.dim())));
+        out.push(Line::from(Span::styled(
+            "  no matches".to_string(),
+            theme.dim(),
+        )));
         return out;
     }
     let page = PICKER_PAGE;
@@ -1114,7 +1128,10 @@ fn picker_lines(
             Span::styled(format!(" {}", row.description), with_bg(theme.muted())),
         ];
         if let Some(m) = &row.mark {
-            spans.push(Span::styled(format!(" {m}"), with_bg(theme.style("success"))));
+            spans.push(Span::styled(
+                format!(" {m}"),
+                with_bg(theme.style("success")),
+            ));
         }
         out.push(Line::from(spans));
     }
@@ -1134,12 +1151,10 @@ fn draw_status(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
 
     let top = Line::from(vec![
         Span::styled(opts.path_line.to_string(), opts.theme.muted()),
-        Span::raw(" ".repeat(
-            area.width.saturating_sub(
-                (UnicodeWidthStr::width(opts.path_line) + UnicodeWidthStr::width(opts.model_line))
-                    as u16,
-            ) as usize,
-        )),
+        Span::raw(" ".repeat(area.width.saturating_sub(
+            (UnicodeWidthStr::width(opts.path_line) + UnicodeWidthStr::width(opts.model_line))
+                as u16,
+        ) as usize)),
         Span::styled(opts.model_line.to_string(), opts.theme.muted()),
     ]);
 
@@ -1234,9 +1249,7 @@ pub fn format_token_usage_line(
 fn picker_height(picker: &PickerView) -> u16 {
     match picker {
         PickerView::None => 0,
-        PickerView::Setup { prompt, first_run } => {
-            setup_line_count(prompt, *first_run)
-        }
+        PickerView::Setup { prompt, first_run } => setup_line_count(prompt, *first_run),
         PickerView::FileReview { .. } => 6,
         PickerView::Commands { rows, .. } => {
             let n = rows.len().min(PICKER_PAGE) as u16;
@@ -1286,9 +1299,7 @@ fn render_input_lines(
     visible_rows: usize,
 ) -> Vec<Line<'static>> {
     // Block caret in the theme cursor color, sitting on the page background.
-    let caret_style = Style::default()
-        .fg(theme.get("cursor"))
-        .bg(theme.get("bg"));
+    let caret_style = Style::default().fg(theme.get("cursor")).bg(theme.get("bg"));
     let content_width = input_content_width(width);
     let logical_lines: Vec<&str> = if input.is_empty() {
         vec![""]
@@ -1341,10 +1352,7 @@ fn render_input_lines(
 
             let caret_here = caret_wrap == Some(wrap_i);
             if caret_here {
-                let chunk_start: usize = wrapped[..wrap_i]
-                    .iter()
-                    .map(|s| s.chars().count())
-                    .sum();
+                let chunk_start: usize = wrapped[..wrap_i].iter().map(|s| s.chars().count()).sum();
                 let col = cursor_col.unwrap_or(0).saturating_sub(chunk_start);
                 let chars: Vec<char> = chunk.chars().collect();
                 let col = col.min(chars.len());
@@ -1416,7 +1424,6 @@ fn bg_spans_line(
     Line::from(out)
 }
 
-
 fn wrap_plain(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
     soft_wrap(text, width.max(1))
         .into_iter()
@@ -1442,11 +1449,7 @@ fn highlight_tool_detail(
         lines.push(vec![Span::styled("---".to_string(), theme.dim())]);
         let body_lang = if path.is_some() { None } else { Some("json") };
         lines.extend(highlight::highlight_lines(
-            body,
-            body_lang,
-            path,
-            theme,
-            fallback,
+            body, body_lang, path, theme, fallback,
         ));
         return lines;
     }
@@ -1580,8 +1583,8 @@ fn tool_result_text(tr: &loop_ai::ToolResultMessage) -> String {
 pub fn chat_items_from_agent_messages(
     messages: &[loop_agent::types::AgentMessage],
 ) -> Vec<ChatItem> {
-    use loop_ai::{AssistantContent, Message};
     use loop_agent::types::{AgentMessage, CustomAgentMessage};
+    use loop_ai::{AssistantContent, Message};
 
     let mut chat = Vec::new();
     for msg in messages {
@@ -1783,7 +1786,9 @@ mod tests {
 
         let items = chat_items_from_agent_messages(&messages);
         assert!(matches!(&items[0], ChatItem::User { text } if text == "list files"));
-        assert!(matches!(&items[1], ChatItem::Thinking { text, done: true } if text == "I should use bash"));
+        assert!(
+            matches!(&items[1], ChatItem::Thinking { text, done: true } if text == "I should use bash")
+        );
         assert!(matches!(&items[2], ChatItem::Assistant { text } if text == "Running ls"));
         assert!(matches!(
             &items[3],
@@ -1852,15 +1857,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let cursor = text.chars().count();
-        let lines = render_input_lines(
-            &text,
-            cursor,
-            theme.style("text"),
-            &theme,
-            "",
-            80,
-            4,
-        );
+        let lines = render_input_lines(&text, cursor, theme.style("text"), &theme, "", 80, 4);
         assert_eq!(lines.len(), 4);
         assert!(lines.last().unwrap().to_string().contains("line 11"));
     }
@@ -1870,15 +1867,7 @@ mod tests {
         let theme = Theme::dark();
         let text = "word ".repeat(30);
         let cursor = text.chars().count();
-        let lines = render_input_lines(
-            &text,
-            cursor,
-            theme.style("text"),
-            &theme,
-            "",
-            20,
-            4,
-        );
+        let lines = render_input_lines(&text, cursor, theme.style("text"), &theme, "", 20, 4);
         assert!(!lines.is_empty());
     }
 
@@ -1905,10 +1894,7 @@ mod tests {
             .map(|i| format!("thought {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let item = ChatItem::Thinking {
-            text,
-            done: true,
-        };
+        let item = ChatItem::Thinking { text, done: true };
         let lines = format_item_lines(&item, &theme, true, false, 80);
         assert!(
             lines.len() > 250,
@@ -1922,11 +1908,27 @@ mod tests {
     }
 
     fn banner_text(model: Option<&loop_ai::Model>, note: Option<&str>) -> String {
-        welcome_lines(&Theme::dark(), "v", model, note, "http://e", "sess", 0, 0, false, 120)
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
+        welcome_lines(
+            &Theme::dark(),
+            "v",
+            model,
+            note,
+            "http://e",
+            "sess",
+            0,
+            0,
+            false,
+            120,
+        )
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
     }
 
     #[test]
@@ -2007,7 +2009,9 @@ mod tests {
         let otlp = TracingSetup::OtlpEndpoint;
         for prompt in [
             SetupPrompt::Provider(crate::provider_setup::ProviderSetup::start(None).unwrap()),
-            SetupPrompt::Provider(crate::provider_setup::ProviderSetup::start(Some("soket")).unwrap()),
+            SetupPrompt::Provider(
+                crate::provider_setup::ProviderSetup::start(Some("soket")).unwrap(),
+            ),
             SetupPrompt::Tracing(picker),
             SetupPrompt::Tracing(host),
             SetupPrompt::Tracing(otlp),
@@ -2033,8 +2037,12 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
-        assert!(text.iter().any(|l| l.contains("Langfuse") && !l.contains('▸')));
-        assert!(text.iter().any(|l| l.contains("▸") && l.contains("OTLP endpoint")));
+        assert!(text
+            .iter()
+            .any(|l| l.contains("Langfuse") && !l.contains('▸')));
+        assert!(text
+            .iter()
+            .any(|l| l.contains("▸") && l.contains("OTLP endpoint")));
         assert!(text.last().unwrap().contains("↑↓ choose"));
     }
 
@@ -2047,7 +2055,13 @@ mod tests {
         let theme = Theme::dark();
         let last_line = |prompt: SetupPrompt| -> String {
             let lines = setup_lines(&prompt, false, &theme);
-            lines.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect()
+            lines
+                .last()
+                .unwrap()
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
         };
         assert!(last_line(SetupPrompt::Tracing(TracingSetup::LangfuseHost)).contains("enter next"));
         let secret = TracingSetup::LangfuseSecret {

@@ -253,7 +253,10 @@ impl Default for Settings {
 impl Settings {
     /// The saved `(provider, model id)`, when both are set.
     pub fn selected_model(&self) -> Option<(&str, &str)> {
-        Some((self.default_provider.as_deref()?, self.default_model.as_deref()?))
+        Some((
+            self.default_provider.as_deref()?,
+            self.default_model.as_deref()?,
+        ))
     }
 
     /// `provider/model id` of the saved selection.
@@ -354,7 +357,11 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
 }
 
 /// Load global settings then overlay trusted project settings.
-pub fn load_settings(agent_dir: &Path, cwd: &Path, project_trusted: bool) -> anyhow::Result<Settings> {
+pub fn load_settings(
+    agent_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+) -> anyhow::Result<Settings> {
     let mut settings = Settings::load_file(&settings_path(agent_dir))?;
     if project_trusted {
         let project_settings = get_project_dir(cwd).join("settings.json");

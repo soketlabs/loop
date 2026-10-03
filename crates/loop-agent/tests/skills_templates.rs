@@ -2,9 +2,7 @@
 
 use std::fs;
 
-use loop_agent::harness::prompt_templates::{
-    parse_command_args, substitute_args,
-};
+use loop_agent::harness::prompt_templates::{parse_command_args, substitute_args};
 use loop_agent::harness::skills::load_skills;
 use loop_agent::harness::system_prompt::format_skills_for_system_prompt;
 

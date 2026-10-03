@@ -13,7 +13,7 @@ use loop_agent::{
 use loop_ai::{TextContent, ToolResultContent};
 use parking_lot::Mutex as SyncMutex;
 use serde_json::json;
-use tokio::sync::{mpsc, Mutex, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// Label prefix persisted on the session tree for auto-approve.
@@ -200,8 +200,9 @@ pub struct ToolApprovalBridge {
 }
 
 /// Callback used to append a session label (and optionally notify).
-pub type PersistAutoApprove =
-    Arc<dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+pub type PersistAutoApprove = Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
 
 impl ToolApprovalBridge {
     /// Create a bridge; `prompt_rx` is drained by the TUI.
@@ -248,8 +249,7 @@ impl ToolApprovalBridge {
 
     /// Whether ask policy is active.
     pub fn policy_active(&self) -> bool {
-        self.policy_active
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.policy_active.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Replace per-tool permissions from settings.
@@ -398,13 +398,7 @@ impl ToolApprovalBridge {
         }
 
         let decision = self
-            .ask_user(
-                ApprovalKind::Bash,
-                name,
-                summary,
-                detail,
-                cancel.as_ref(),
-            )
+            .ask_user(ApprovalKind::Bash, name, summary, detail, cancel.as_ref())
             .await;
 
         match decision {
@@ -440,7 +434,9 @@ impl ToolApprovalBridge {
         }
         if self.is_denied(name) {
             // Should have been blocked before; if we got here, revert.
-            return self.reject_file_result(&ctx, "Tool denied by settings.toolPermissions").await;
+            return self
+                .reject_file_result(&ctx, "Tool denied by settings.toolPermissions")
+                .await;
         }
         if !self.should_ask(name) {
             // Still clean up review snapshots when not asking.
@@ -531,15 +527,15 @@ impl ToolApprovalBridge {
                 None
             }
             ApprovalDecision::Reject { reason } => {
-                if let Err(e) = self.revert_change(&path, previous_path.as_deref(), created).await {
+                if let Err(e) = self
+                    .revert_change(&path, previous_path.as_deref(), created)
+                    .await
+                {
                     tracing::warn!("revert after reject failed: {e}");
                 }
                 cleanup_snapshot(previous_path.as_deref());
                 let msg = match reason.filter(|r| !r.trim().is_empty()) {
-                    Some(r) => format!(
-                        "User rejected the edit to {}. Reason: {r}",
-                        path.display()
-                    ),
+                    Some(r) => format!("User rejected the edit to {}. Reason: {r}", path.display()),
                     None => format!("User rejected the edit to {}.", path.display()),
                 };
                 Some(reject_file_patch(&msg, &path, None))
@@ -674,7 +670,9 @@ pub fn auto_approve_from_entries<'a>(
 }
 
 /// Build permission map from settings JSON strings.
-pub fn permissions_from_settings(map: &BTreeMap<String, String>) -> BTreeMap<String, ToolPermission> {
+pub fn permissions_from_settings(
+    map: &BTreeMap<String, String>,
+) -> BTreeMap<String, ToolPermission> {
     let mut out = BTreeMap::new();
     for (k, v) in default_tool_permissions() {
         out.insert(k, ToolPermission::parse(&v));

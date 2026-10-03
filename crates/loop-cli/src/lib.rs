@@ -17,8 +17,9 @@ pub mod tui;
 pub mod wizard;
 
 pub use loop_app_core::{
-    self as config, bootstrap, build_models, build_tools, extensions, hooks_load, mcp_server_entries,
-    resources, runtime, system_prompt, theme, tool_approval, BootstrapOpts, Runtime, ToolApprovalBridge,
+    self as config, bootstrap, build_models, build_tools, extensions, hooks_load,
+    mcp_server_entries, resources, runtime, system_prompt, theme, tool_approval, BootstrapOpts,
+    Runtime, ToolApprovalBridge,
 };
 
 /// CLI runtime with terminal keybindings.

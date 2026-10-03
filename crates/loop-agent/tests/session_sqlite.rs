@@ -82,10 +82,7 @@ async fn sqlite_fts_search_with_cwd_filter() {
     let store = create_sqlite_session_store(&path).unwrap();
     let search = create_sqlite_session_search(&path, Arc::clone(&store));
     let repo = create_session_repository(store, Some(search));
-    let session = repo
-        .create(Some("/proj-a".into()), None)
-        .await
-        .unwrap();
+    let session = repo.create(Some("/proj-a".into()), None).await.unwrap();
     session
         .append_message(AgentMessage::user_text("unique fts needle alpha"))
         .await
@@ -127,7 +124,12 @@ async fn sqlite_fork_still_works() {
         .await
         .unwrap();
     let forked = store
-        .fork(&session.metadata().id, SessionForkSelection::All, None, Some("fork".into()))
+        .fork(
+            &session.metadata().id,
+            SessionForkSelection::All,
+            None,
+            Some("fork".into()),
+        )
         .await
         .unwrap();
     let entries = forked.read_entries(None).await.unwrap();

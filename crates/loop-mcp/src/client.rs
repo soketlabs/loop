@@ -73,9 +73,8 @@ impl McpClientManager {
                     }
                 });
 
-                let transport = TokioChildProcess::new(cmd).map_err(|e| {
-                    format!("failed to spawn MCP server '{}': {e}", entry.name)
-                })?;
+                let transport = TokioChildProcess::new(cmd)
+                    .map_err(|e| format!("failed to spawn MCP server '{}': {e}", entry.name))?;
 
                 ().serve(transport).await.map_err(|e| {
                     format!(
@@ -96,9 +95,10 @@ impl McpClientManager {
             }
         };
 
-        let tools_result = client.list_tools(None).await.map_err(|e| {
-            format!("failed to list tools from '{}': {e}", entry.name)
-        })?;
+        let tools_result = client
+            .list_tools(None)
+            .await
+            .map_err(|e| format!("failed to list tools from '{}': {e}", entry.name))?;
 
         let tools = tools_result.tools;
         let count = tools.len();
@@ -109,7 +109,10 @@ impl McpClientManager {
             tools,
         };
 
-        self.connections.write().await.insert(entry.name.clone(), conn);
+        self.connections
+            .write()
+            .await
+            .insert(entry.name.clone(), conn);
         Ok(count)
     }
 

@@ -23,40 +23,36 @@ use loop_agent::harness::{
 };
 use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel};
 use loop_ai::providers::SOKET_BASE_URL;
-use loop_ai::{
-    calculate_context_tokens, Message, ModelsRefreshOptions,
-    ToolResultContent, Usage,
-};
+use loop_ai::{calculate_context_tokens, Message, ModelsRefreshOptions, ToolResultContent, Usage};
 
-use crate::commands::{self, AutocompleteEntry, CommandEffect};
 #[cfg(feature = "telemetry")]
 use crate::commands::TracingCommand;
+use crate::commands::{self, AutocompleteEntry, CommandEffect};
 #[cfg(feature = "telemetry")]
 use crate::config::describe_tracing_status;
-use crate::provider_setup::ProviderSetup;
-use crate::setup_prompt::SetupPrompt;
-#[cfg(feature = "telemetry")]
-use crate::tracing_setup::TracingSetup;
 use crate::keybindings::{
     hotkey_help, multiline_paste_text, normalize_pasted_text, paste_burst_pending,
     pasted_single_line, Action,
 };
-use crate::{build_tools, mcp_server_entries, CliRuntime};
+use crate::provider_setup::ProviderSetup;
+use crate::setup_prompt::SetupPrompt;
 use crate::theme::Theme;
 use crate::tool_approval::{
     auto_approve_from_entries, permissions_from_settings, ApprovalDecision, ApprovalKind,
     ApprovalPolicy, ApprovalPrompt, ToolApprovalBridge, GROUP_BASH, GROUP_FILE,
 };
-use crate::tui::{
-    chat_items_from_agent_messages, consume_frozen_lines, filter_files, find_at_mention,
-    find_tool_index, footer_live_height, format_item_lines, format_live_lines,
-    format_token_usage_line, insert_text, item_is_committed, list_files, live_overflow_count,
-    assistant_error_item, render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus,
-    ChatItem,
-    CommandHistory, FileEntry, FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow, PickerView,
-};
+#[cfg(feature = "telemetry")]
+use crate::tracing_setup::TracingSetup;
 #[cfg(feature = "orchestration")]
 use crate::tui::find_workflow_task_index;
+use crate::tui::{
+    assistant_error_item, chat_items_from_agent_messages, consume_frozen_lines, filter_files,
+    find_at_mention, find_tool_index, footer_live_height, format_item_lines, format_live_lines,
+    format_token_usage_line, insert_text, item_is_committed, list_files, live_overflow_count,
+    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, CommandHistory,
+    FileEntry, FooterOpts, InputBuffer, PickerRow, PickerView, FOOTER_HEIGHT,
+};
+use crate::{build_tools, mcp_server_entries, CliRuntime};
 
 enum UiEvent {
     Agent(AgentEvent),
@@ -71,16 +67,28 @@ enum UiEvent {
     WorkflowDone(Result<WorkflowDoneOk, String>),
     /// Planned task graph ready to display.
     #[cfg(feature = "orchestration")]
-    WorkflowGraph { outline: String, mermaid: String },
+    WorkflowGraph {
+        outline: String,
+        mermaid: String,
+    },
     /// Workflow task started executing.
     #[cfg(feature = "orchestration")]
-    WorkflowTaskStarted { task_id: String, description: String },
+    WorkflowTaskStarted {
+        task_id: String,
+        description: String,
+    },
     /// Workflow task completed.
     #[cfg(feature = "orchestration")]
-    WorkflowTaskCompleted { task_id: String, output: String },
+    WorkflowTaskCompleted {
+        task_id: String,
+        output: String,
+    },
     /// Workflow task failed.
     #[cfg(feature = "orchestration")]
-    WorkflowTaskFailed { task_id: String, error: String },
+    WorkflowTaskFailed {
+        task_id: String,
+        error: String,
+    },
 }
 
 /// Successful workflow completion info.
@@ -99,10 +107,7 @@ enum SandboxDoneOk {
     /// Sandbox disabled.
     Off,
     /// Local sandbox enabled.
-    Local {
-        isolation: String,
-        runtime: String,
-    },
+    Local { isolation: String, runtime: String },
 }
 
 /// Pending accept/reject prompt for a tool call.
@@ -294,7 +299,9 @@ async fn run_loop(
                         format!("tool_start: {tool_name}")
                     }
                     AgentEvent::ToolExecutionEnd {
-                        tool_name, is_error, ..
+                        tool_name,
+                        is_error,
+                        ..
                     } => format!("tool_end: {tool_name} error={is_error}"),
                     other => other.type_name().to_string(),
                 };
@@ -362,10 +369,7 @@ async fn run_loop(
         if chat.is_empty() {
             "resumed · empty session · /help for commands".into()
         } else {
-            format!(
-                "resumed · {} messages · /help for commands",
-                chat.len()
-            )
+            format!("resumed · {} messages · /help for commands", chat.len())
         }
     } else {
         let review_hint = if policy_active {
@@ -538,8 +542,7 @@ async fn run_loop(
                     })
                     .collect(),
                 selected: p.selected,
-                hint: "Fork: edit this user message and continue (prior history kept)."
-                    .into(),
+                hint: "Fork: edit this user message and continue (prior history kept).".into(),
             }
         } else if let Some(prompt) = &pending_setup {
             PickerView::Setup {
@@ -631,12 +634,8 @@ async fn run_loop(
         }
         let usage_line = token_bar.usage_line();
         let term_width = terminal.size()?.width;
-        let live_h = footer_live_height(
-            FOOTER_HEIGHT,
-            term_width,
-            input.as_str(),
-            &picker,
-        ) as usize;
+        let live_h =
+            footer_live_height(FOOTER_HEIGHT, term_width, input.as_str(), &picker) as usize;
         let live_lines = format_live_lines(
             &live,
             &runtime.theme,
@@ -673,9 +672,7 @@ async fn run_loop(
                     picker: &picker,
                     setup_mode,
                     mask_input: pending_setup.as_ref().is_some_and(SetupPrompt::masked),
-                    setup_placeholder: pending_setup
-                        .as_ref()
-                        .map_or("", SetupPrompt::placeholder),
+                    setup_placeholder: pending_setup.as_ref().map_or("", SetupPrompt::placeholder),
                     path_line: &path_line,
                     model_line: &model_line,
                     usage_line: &usage_line,
@@ -956,9 +953,7 @@ fn reset_and_redraw(
     hide_thinking: bool,
 ) -> anyhow::Result<()> {
     use crossterm::cursor::MoveTo;
-    use crossterm::terminal::{
-        BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate,
-    };
+    use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 
     let mut out = io::stdout();
     // Equivalent of pi's `\x1b[2J\x1b[H\x1b[3J`: without purging scrollback the
@@ -1093,8 +1088,6 @@ fn error_item(text: impl Into<String>) -> ChatItem {
     ChatItem::Error { text: text.into() }
 }
 
-
-
 /// Index of the first queued bubble, or `chat.len()` if none.
 /// Agent stream items must be inserted here so they stay above the queue.
 fn first_queued_index(chat: &[ChatItem]) -> usize {
@@ -1125,10 +1118,7 @@ fn settle_queue_at_end(
     streaming_assistant: &mut Option<usize>,
     streaming_thinking: &mut Option<usize>,
 ) {
-    if !chat
-        .iter()
-        .any(|c| matches!(c, ChatItem::Queued { .. }))
-    {
+    if !chat.iter().any(|c| matches!(c, ChatItem::Queued { .. })) {
         return;
     }
     // Already a clean trailing run of Queued items?
@@ -1280,9 +1270,7 @@ fn drain_ui_events(
                         };
                         chat.push(sys(msg));
                         if !info.output.is_empty() {
-                            chat.push(ChatItem::Assistant {
-                                text: info.output,
-                            });
+                            chat.push(ChatItem::Assistant { text: info.output });
                         } else if info.success {
                             chat.push(sys("workflow produced no output"));
                         }
@@ -1304,7 +1292,10 @@ fn drain_ui_events(
                 )));
             }
             #[cfg(feature = "orchestration")]
-            UiEvent::WorkflowTaskStarted { task_id, description } => {
+            UiEvent::WorkflowTaskStarted {
+                task_id,
+                description,
+            } => {
                 chat.push(ChatItem::WorkflowTask {
                     task_id,
                     description,
@@ -1348,11 +1339,7 @@ fn drain_ui_events(
                 reason: Some("superseded by another review".into()),
             });
         }
-        *status = format!(
-            "review · {} · {}",
-            prompt.kind.label(),
-            prompt.summary
-        );
+        *status = format!("review · {} · {}", prompt.kind.label(), prompt.summary);
         *active_approval = Some(ActiveApproval::from_prompt(prompt));
     }
     try_drain_message_queue(
@@ -1395,9 +1382,10 @@ fn dequeue_last_message(
     message_queue: &mut VecDeque<QueuedMessage>,
 ) -> Option<String> {
     let item = message_queue.pop_back()?;
-    if let Some(idx) = chat.iter().rposition(|c| {
-        matches!(c, ChatItem::Queued { text: t } if *t == item.display)
-    }) {
+    if let Some(idx) = chat
+        .iter()
+        .rposition(|c| matches!(c, ChatItem::Queued { text: t } if *t == item.display))
+    {
         chat.remove(idx);
     }
     Some(item.display)
@@ -1419,12 +1407,11 @@ fn start_user_turn(
     settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
 
     // Promote a matching queued bubble if this came from the outbound queue.
-    if let Some(idx) = chat.iter().position(|item| {
-        matches!(item, ChatItem::Queued { text: t } if *t == display)
-    }) {
-        chat[idx] = ChatItem::User {
-            text: display,
-        };
+    if let Some(idx) = chat
+        .iter()
+        .position(|item| matches!(item, ChatItem::Queued { text: t } if *t == display))
+    {
+        chat[idx] = ChatItem::User { text: display };
     } else {
         chat.push(ChatItem::User { text: display });
     }
@@ -1463,10 +1450,7 @@ fn try_drain_message_queue(
 ) {
     // Wait until the harness is fully idle. AgentEnd clears `working` slightly
     // before phase flips, and Esc must be able to flush the queue in between.
-    if *working
-        || runtime.harness.phase() != AgentHarnessPhase::Idle
-        || message_queue.is_empty()
-    {
+    if *working || runtime.harness.phase() != AgentHarnessPhase::Idle || message_queue.is_empty() {
         return;
     }
     let Some(item) = message_queue.pop_front() else {
@@ -1737,7 +1721,9 @@ async fn handle_key(
                 if review.reason_focused {
                     review.reason_focused = false;
                 } else if let Some(r) = active_approval.take() {
-                    let _ = r.response_tx.send(ApprovalDecision::Reject { reason: None });
+                    let _ = r
+                        .response_tx
+                        .send(ApprovalDecision::Reject { reason: None });
                     chat.push(sys(format!("rejected {} · {}", r.kind.label(), r.summary)));
                     *status = "rejected · continuing".into();
                 }
@@ -1771,11 +1757,7 @@ async fn handle_key(
                     };
                     match &decision {
                         ApprovalDecision::Accept => {
-                            chat.push(sys(format!(
-                                "accepted {} · {}",
-                                r.kind.label(),
-                                r.summary
-                            )));
+                            chat.push(sys(format!("accepted {} · {}", r.kind.label(), r.summary)));
                             *status = "accepted · continuing".into();
                         }
                         ApprovalDecision::AcceptSession => {
@@ -1963,8 +1945,7 @@ async fn handle_key(
                 return Ok(());
             }
             KeyCode::Tab => {
-                if let (Some(mention), Some(sel)) =
-                    (at_mention, file_ac_entries.get(*ac_selected))
+                if let (Some(mention), Some(sel)) = (at_mention, file_ac_entries.get(*ac_selected))
                 {
                     let text = format!("{} ", insert_text(&sel.absolute));
                     input.replace_char_range(mention.start, mention.end, &text);
@@ -1975,8 +1956,7 @@ async fn handle_key(
                 if !key.modifiers.contains(KeyModifiers::SHIFT)
                     && !key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                if let (Some(mention), Some(sel)) =
-                    (at_mention, file_ac_entries.get(*ac_selected))
+                if let (Some(mention), Some(sel)) = (at_mention, file_ac_entries.get(*ac_selected))
                 {
                     let text = insert_text(&sel.absolute);
                     input.replace_char_range(mention.start, mention.end, &text);
@@ -2028,12 +2008,28 @@ async fn handle_key(
             *pending_setup = None;
             match prompt {
                 SetupPrompt::Provider(step) => {
-                    advance_provider_setup(step, &value, runtime, pending_setup, input, chat, status)
-                        .await;
+                    advance_provider_setup(
+                        step,
+                        &value,
+                        runtime,
+                        pending_setup,
+                        input,
+                        chat,
+                        status,
+                    )
+                    .await;
                 }
                 #[cfg(feature = "telemetry")]
                 SetupPrompt::Tracing(step) => {
-                    advance_tracing_setup(step, &value, runtime, pending_setup, input, chat, status);
+                    advance_tracing_setup(
+                        step,
+                        &value,
+                        runtime,
+                        pending_setup,
+                        input,
+                        chat,
+                        status,
+                    );
                 }
             }
             return Ok(());
@@ -2114,19 +2110,11 @@ async fn handle_key(
                 } else if last_escape.elapsed() < Duration::from_millis(500) {
                     match runtime.settings.double_escape_action.as_str() {
                         "tree" => {
-                            chat.push(sys(
-                                "session tree: use /tree (branch nav in session store)",
-                            ));
+                            chat.push(sys("session tree: use /tree (branch nav in session store)"));
                         }
                         "fork" => {
-                            open_fork_picker(
-                                runtime,
-                                fork_picker,
-                                model_picker,
-                                chat,
-                                status,
-                            )
-                            .await;
+                            open_fork_picker(runtime, fork_picker, model_picker, chat, status)
+                                .await;
                         }
                         _ => {}
                     }
@@ -2356,10 +2344,7 @@ async fn handle_key(
                     *status = if message_queue.is_empty() {
                         format!("dequeued: {preview}")
                     } else {
-                        format!(
-                            "dequeued: {preview} · {} still queued",
-                            message_queue.len()
-                        )
+                        format!("dequeued: {preview} · {} still queued", message_queue.len())
                     };
                 } else {
                     *status = "queue empty".into();
@@ -2457,8 +2442,7 @@ impl ForkPickerState {
             .iter()
             .enumerate()
             .filter(|(_, p)| {
-                p.preview.to_lowercase().contains(&q)
-                    || format!("#{}", p.index).contains(&q)
+                p.preview.to_lowercase().contains(&q) || format!("#{}", p.index).contains(&q)
             })
             .map(|(i, _)| i)
             .collect();
@@ -2979,7 +2963,10 @@ async fn apply_logout(provider: Option<String>, runtime: &mut CliRuntime) -> Str
         return if connected.is_empty() {
             "Usage: /logout <provider> · no providers are connected".into()
         } else {
-            format!("Usage: /logout <provider> · connected: {}", connected.join(", "))
+            format!(
+                "Usage: /logout <provider> · connected: {}",
+                connected.join(", ")
+            )
         };
     };
     match runtime.disconnect_provider(&provider).await {
@@ -3141,9 +3128,7 @@ async fn apply_effect(
                     *working = true;
                     *status = format!("enabling sandbox (--{iso_s} --{rt_s})…");
                     chat.push(sys(" "));
-                    chat.push(sys(format!(
-                        "enabling sandbox (--{iso_s} --{rt_s})…"
-                    )));
+                    chat.push(sys(format!("enabling sandbox (--{iso_s} --{rt_s})…")));
                     tokio::spawn(async move {
                         let result = async {
                             let sb = KrunSandbox::new(KrunSandbox::config_for(
@@ -3153,10 +3138,7 @@ async fn apply_effect(
                             ));
                             sb.start().await.map_err(|e| e.to_string())?;
                             let env = sb.env();
-                            if let Err(e) = harness
-                                .set_tools(build_tools(Arc::clone(&env)))
-                                .await
-                            {
+                            if let Err(e) = harness.set_tools(build_tools(Arc::clone(&env))).await {
                                 let _ = sb.destroy().await;
                                 return Err(format!("sandbox: {e}"));
                             }
@@ -3190,7 +3172,12 @@ async fn apply_effect(
         }
         #[cfg(feature = "telemetry")]
         CommandEffect::Tracing(command) => {
-            chat.push(sys(apply_tracing_command(command, runtime, pending_setup, input)));
+            chat.push(sys(apply_tracing_command(
+                command,
+                runtime,
+                pending_setup,
+                input,
+            )));
         }
         CommandEffect::Login(provider) => match ProviderSetup::start(provider.as_deref()) {
             Ok(step) => {
@@ -3211,10 +3198,7 @@ async fn apply_effect(
             *working = false;
             match runtime
                 .harness
-                .start_new_session(
-                    Some(runtime.cwd.to_string_lossy().into_owned()),
-                    None,
-                )
+                .start_new_session(Some(runtime.cwd.to_string_lossy().into_owned()), None)
                 .await
             {
                 Ok(id) => {
@@ -3222,8 +3206,7 @@ async fn apply_effect(
                     runtime.resumed = false;
                     runtime.active_skills.clear();
                     chat.clear();
-                    let policy =
-                        ApprovalPolicy::parse(&runtime.settings.file_edit_review);
+                    let policy = ApprovalPolicy::parse(&runtime.settings.file_edit_review);
                     let enabled = policy.asks_for_session(true);
                     if let Some(bridge) = &runtime.tool_approval {
                         bridge.clear_session_grants();
@@ -3245,38 +3228,37 @@ async fn apply_effect(
                 }
             }
         }
-        CommandEffect::SetFileReview(arg) => {
-            match arg {
-                None => {
-                    let active = runtime
-                        .tool_approval
-                        .as_ref()
-                        .map(|b| b.policy_active())
-                        .unwrap_or(false);
-                    let grants = runtime
-                        .tool_approval
-                        .as_ref()
-                        .map(|b| {
-                            let g = b.auto_approve_groups();
-                            let mut parts = Vec::new();
-                            if g.contains(GROUP_FILE) {
-                                parts.push("file");
-                            }
-                            if g.contains(GROUP_BASH) {
-                                parts.push("bash");
-                            }
-                            if parts.is_empty() {
-                                "(none)".into()
-                            } else {
-                                parts.join(", ")
-                            }
-                        })
-                        .unwrap_or_else(|| "(none)".into());
-                    let mut perms = String::new();
-                    for (k, v) in &runtime.settings.tool_permissions {
-                        perms.push_str(&format!("\n    {k}: {v}"));
-                    }
-                    chat.push(sys(format!(
+        CommandEffect::SetFileReview(arg) => match arg {
+            None => {
+                let active = runtime
+                    .tool_approval
+                    .as_ref()
+                    .map(|b| b.policy_active())
+                    .unwrap_or(false);
+                let grants = runtime
+                    .tool_approval
+                    .as_ref()
+                    .map(|b| {
+                        let g = b.auto_approve_groups();
+                        let mut parts = Vec::new();
+                        if g.contains(GROUP_FILE) {
+                            parts.push("file");
+                        }
+                        if g.contains(GROUP_BASH) {
+                            parts.push("bash");
+                        }
+                        if parts.is_empty() {
+                            "(none)".into()
+                        } else {
+                            parts.join(", ")
+                        }
+                    })
+                    .unwrap_or_else(|| "(none)".into());
+                let mut perms = String::new();
+                for (k, v) in &runtime.settings.tool_permissions {
+                    perms.push_str(&format!("\n    {k}: {v}"));
+                }
+                chat.push(sys(format!(
                         "tool approval policy: {} (session asking: {active})\n  session auto-approve: {grants}\n  /review newSession|always|never\n  settings.toolPermissions:{perms}\n  settings.diffEditor: {}",
                         runtime.settings.file_edit_review,
                         runtime
@@ -3285,62 +3267,59 @@ async fn apply_effect(
                             .as_deref()
                             .unwrap_or("(auto: cursor|code)"),
                     )));
-                }
-                Some(raw) => {
-                    let policy = ApprovalPolicy::parse(&raw);
-                    runtime.settings.file_edit_review = policy.as_str().into();
-                    let enabled = policy.asks_for_session(!runtime.resumed);
-                    if let Some(bridge) = &runtime.tool_approval {
-                        bridge.set_policy_active(enabled);
-                        bridge.set_permissions(permissions_from_settings(
-                            &runtime.settings.tool_permissions,
-                        ));
-                    }
-                    let _ = runtime.save_settings();
-                    chat.push(sys(format!(
-                        "tool approval → {} (this session: {})",
-                        policy.as_str(),
-                        if enabled { "on" } else { "off" }
-                    )));
-                }
             }
-        }
-        CommandEffect::SetResponseHeaderTimeout(arg) => {
-            match arg {
-                None => {
-                    let ms = runtime.harness.response_header_timeout_ms().await;
+            Some(raw) => {
+                let policy = ApprovalPolicy::parse(&raw);
+                runtime.settings.file_edit_review = policy.as_str().into();
+                let enabled = policy.asks_for_session(!runtime.resumed);
+                if let Some(bridge) = &runtime.tool_approval {
+                    bridge.set_policy_active(enabled);
+                    bridge.set_permissions(permissions_from_settings(
+                        &runtime.settings.tool_permissions,
+                    ));
+                }
+                let _ = runtime.save_settings();
+                chat.push(sys(format!(
+                    "tool approval → {} (this session: {})",
+                    policy.as_str(),
+                    if enabled { "on" } else { "off" }
+                )));
+            }
+        },
+        CommandEffect::SetResponseHeaderTimeout(arg) => match arg {
+            None => {
+                let ms = runtime.harness.response_header_timeout_ms().await;
+                let label = if ms == 0 {
+                    "off (unlimited)".into()
+                } else if ms % 1000 == 0 {
+                    format!("{}s", ms / 1000)
+                } else {
+                    format!("{ms}ms")
+                };
+                chat.push(sys(format!(
+                        "response header timeout (TTFB): {label}\n  /ttfb off|on|60s|120000\n  settings.responseHeaderTimeoutMs: {} (0 = unlimited)",
+                        runtime.settings.response_header_timeout_ms
+                    )));
+            }
+            Some(raw) => match parse_response_header_timeout(&raw) {
+                Ok(ms) => {
+                    runtime.settings.response_header_timeout_ms = ms;
+                    runtime.harness.set_response_header_timeout_ms(ms).await;
+                    let _ = runtime.save_settings();
                     let label = if ms == 0 {
-                        "off (unlimited)".into()
+                        "off (unlimited — for long-running workflows)".into()
                     } else if ms % 1000 == 0 {
                         format!("{}s", ms / 1000)
                     } else {
                         format!("{ms}ms")
                     };
-                    chat.push(sys(format!(
-                        "response header timeout (TTFB): {label}\n  /ttfb off|on|60s|120000\n  settings.responseHeaderTimeoutMs: {} (0 = unlimited)",
-                        runtime.settings.response_header_timeout_ms
-                    )));
+                    chat.push(sys(format!("response header timeout → {label}")));
                 }
-                Some(raw) => match parse_response_header_timeout(&raw) {
-                    Ok(ms) => {
-                        runtime.settings.response_header_timeout_ms = ms;
-                        runtime.harness.set_response_header_timeout_ms(ms).await;
-                        let _ = runtime.save_settings();
-                        let label = if ms == 0 {
-                            "off (unlimited — for long-running workflows)".into()
-                        } else if ms % 1000 == 0 {
-                            format!("{}s", ms / 1000)
-                        } else {
-                            format!("{ms}ms")
-                        };
-                        chat.push(sys(format!("response header timeout → {label}")));
-                    }
-                    Err(e) => {
-                        chat.push(sys(e));
-                    }
-                },
-            }
-        }
+                Err(e) => {
+                    chat.push(sys(e));
+                }
+            },
+        },
         CommandEffect::Compact(instructions) => {
             let harness = Arc::clone(&runtime.harness);
             let tx = tx.clone();
@@ -3375,8 +3354,7 @@ async fn apply_effect(
         CommandEffect::SessionInfo => {
             match runtime.harness.session_stats().await {
                 Ok(stats) => {
-                    let mut report =
-                        loop_agent::harness::format_session_stats(&stats);
+                    let mut report = loop_agent::harness::format_session_stats(&stats);
                     report.push_str(&format!(
                         "\nEnvironment\n  Sessions DB: {}\n  Theme: {}\n  Trusted: {}\n  Model: {}\n",
                         runtime.sessions_db.display(),
@@ -3389,7 +3367,9 @@ async fn apply_effect(
                 Err(e) => {
                     chat.push(sys(format!(
                         "model: {}\nsessions db: {}\ntheme: {}\ntrusted: {}\n(stats error: {e})",
-                        runtime.selected_model_spec().unwrap_or_else(|| "none".into()),
+                        runtime
+                            .selected_model_spec()
+                            .unwrap_or_else(|| "none".into()),
                         runtime.sessions_db.display(),
                         runtime.theme.name,
                         runtime.project_trusted
@@ -3470,7 +3450,12 @@ async fn apply_effect(
                     } else {
                         s.description.clone()
                     };
-                    text.push_str(&format!("\n  /skill:{} — {}\n      {}", s.name, desc, s.path.display()));
+                    text.push_str(&format!(
+                        "\n  /skill:{} — {}\n      {}",
+                        s.name,
+                        desc,
+                        s.path.display()
+                    ));
                 }
                 text.push_str("\n\nActivate with /skill:<name> [optional args for the input]. Skills stay active until /new; the model sees them under <available_skills> and can read SKILL.md when relevant.");
                 chat.push(sys(text));
@@ -3481,10 +3466,7 @@ async fn apply_effect(
                 "resume: restart with `loop --resume <session-id>` (picker UI forthcoming)",
             ));
             if !runtime.session_id.is_empty() {
-                chat.push(sys(format!(
-                    "current session id: {}",
-                    runtime.session_id
-                )));
+                chat.push(sys(format!("current session id: {}", runtime.session_id)));
             }
         }
         CommandEffect::Tree => {
@@ -3563,14 +3545,21 @@ async fn apply_effect(
                         let mut text = String::from("MCP reload:\n");
                         for (name, result) in &results {
                             match result {
-                                Ok(count) => text.push_str(&format!("  ✓ {name} — {count} tools\n")),
+                                Ok(count) => {
+                                    text.push_str(&format!("  ✓ {name} — {count} tools\n"))
+                                }
                                 Err(e) => text.push_str(&format!("  ✗ {name} — {e}\n")),
                             }
                         }
-                        let mcp_tools = loop_agent::harness::mcp::bridge::mcp_tools_to_agent_tools_async(
-                            runtime.mcp_client.connections(),
-                        ).await;
-                        let mut all_tools: Vec<_> = runtime.harness.get_tools().await
+                        let mcp_tools =
+                            loop_agent::harness::mcp::bridge::mcp_tools_to_agent_tools_async(
+                                runtime.mcp_client.connections(),
+                            )
+                            .await;
+                        let mut all_tools: Vec<_> = runtime
+                            .harness
+                            .get_tools()
+                            .await
                             .into_iter()
                             .filter(|t| !t.name.starts_with("mcp__"))
                             .collect();
@@ -3582,7 +3571,9 @@ async fn apply_effect(
                     }
                 }
                 other => {
-                    chat.push(sys(format!("Unknown /mcp sub-command: {other}\n\nUsage: /mcp [list|reload]")));
+                    chat.push(sys(format!(
+                        "Unknown /mcp sub-command: {other}\n\nUsage: /mcp [list|reload]"
+                    )));
                 }
             }
         }
@@ -3599,9 +3590,7 @@ async fn apply_effect(
                 let args = args.trim();
                 if !args.is_empty() {
                     let current = input.as_str();
-                    if !current.is_empty()
-                        && !current.ends_with(|c: char| c.is_whitespace())
-                    {
+                    if !current.is_empty() && !current.ends_with(|c: char| c.is_whitespace()) {
                         input.insert_str(" ");
                     }
                     input.insert_str(args);
@@ -3640,16 +3629,7 @@ async fn apply_effect(
             if agent_is_busy(runtime, *working) {
                 chat.push(sys("cannot start workflow while agent is busy"));
             } else {
-                start_workflow(
-                    runtime,
-                    chat,
-                    status,
-                    working,
-                    tx,
-                    &goal,
-                    concurrency,
-                )
-                .await;
+                start_workflow(runtime, chat, status, working, tx, &goal, concurrency).await;
             }
         }
     }
@@ -3692,9 +3672,13 @@ async fn start_workflow(
                 WorkflowProgressEvent::GraphPlanned { outline, mermaid } => {
                     UiEvent::WorkflowGraph { outline, mermaid }
                 }
-                WorkflowProgressEvent::TaskStarted { task_id, description } => {
-                    UiEvent::WorkflowTaskStarted { task_id, description }
-                }
+                WorkflowProgressEvent::TaskStarted {
+                    task_id,
+                    description,
+                } => UiEvent::WorkflowTaskStarted {
+                    task_id,
+                    description,
+                },
                 WorkflowProgressEvent::TaskCompleted { task_id, output } => {
                     UiEvent::WorkflowTaskCompleted { task_id, output }
                 }
@@ -3715,16 +3699,14 @@ async fn start_workflow(
             .await;
 
         let event = match result {
-            Ok(wf_result) => {
-                UiEvent::WorkflowDone(Ok(WorkflowDoneOk {
-                    success: wf_result.success,
-                    completed_count: wf_result.task_results.len(),
-                    failed_count: wf_result.failed_tasks.len(),
-                    total_count: wf_result.total_task_count,
-                    output: wf_result.output_text(),
-                    artifacts: wf_result.artifact_paths(),
-                }))
-            }
+            Ok(wf_result) => UiEvent::WorkflowDone(Ok(WorkflowDoneOk {
+                success: wf_result.success,
+                completed_count: wf_result.task_results.len(),
+                failed_count: wf_result.failed_tasks.len(),
+                total_count: wf_result.total_task_count,
+                output: wf_result.output_text(),
+                artifacts: wf_result.artifact_paths(),
+            })),
             Err(e) => UiEvent::WorkflowDone(Err(e.to_string())),
         };
 

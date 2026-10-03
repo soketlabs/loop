@@ -268,9 +268,7 @@ pub fn parse_local_sandbox_flags(
         if raw.is_empty() {
             continue;
         }
-        let key = raw
-            .trim_start_matches('-')
-            .to_ascii_lowercase();
+        let key = raw.trim_start_matches('-').to_ascii_lowercase();
         match key.as_str() {
             "full" => {
                 if isolation.is_some() {
@@ -286,9 +284,7 @@ pub fn parse_local_sandbox_flags(
             }
             "crun" | "runc" | "runsc" | "gvisor" | "krun" => {
                 if runtime.is_some() {
-                    return Err(
-                        "specify only one runtime (--crun|--runc|--runsc|--krun)".into(),
-                    );
+                    return Err("specify only one runtime (--crun|--runc|--runsc|--krun)".into());
                 }
                 runtime = LocalSandboxRuntime::parse(&key);
             }
@@ -437,7 +433,11 @@ pub fn parse_tracing(args: &str) -> Result<TracingCommand, String> {
 }
 
 /// Dispatch a built-in or dynamic command to an effect.
-pub fn dispatch(cmd: &ParsedCommand, skill_names: &[String], template_names: &[String]) -> CommandEffect {
+pub fn dispatch(
+    cmd: &ParsedCommand,
+    skill_names: &[String],
+    template_names: &[String],
+) -> CommandEffect {
     match cmd.name.as_str() {
         "quit" | "exit" | "q" => CommandEffect::Quit,
         "theme" => {
@@ -575,7 +575,11 @@ fn parse_workflow_args(args: &str) -> (String, Option<usize>) {
     let parts: Vec<&str> = args.splitn(3, char::is_whitespace).collect();
     if parts.len() >= 2 && (parts[0] == "--concurrency" || parts[0] == "-c") {
         if let Ok(n) = parts[1].parse::<usize>() {
-            let goal = if parts.len() > 2 { parts[2].to_string() } else { String::new() };
+            let goal = if parts.len() > 2 {
+                parts[2].to_string()
+            } else {
+                String::new()
+            };
             return (goal, Some(n));
         }
     }

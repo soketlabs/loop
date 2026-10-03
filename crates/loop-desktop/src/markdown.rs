@@ -1,7 +1,7 @@
 //! Markdown rendering for assistant messages.
 
 use gpui::{
-    App, HighlightStyle, IntoElement, ParentElement as _, SharedString, Styled, div, px, rems,
+    div, px, rems, App, HighlightStyle, IntoElement, ParentElement as _, SharedString, Styled,
 };
 use gpui_component::clipboard::Clipboard;
 use gpui_component::h_flex;
@@ -37,11 +37,10 @@ pub fn render_markdown(
         .code_block_actions(move |code_block, _, _| {
             let code = code_block.code();
             let block_id = format!("{copy_id}-{}", code.len());
-            h_flex().w_full().justify_end().child(
-                Clipboard::new(block_id)
-                    .value(code)
-                    .tooltip("Copy code"),
-            )
+            h_flex()
+                .w_full()
+                .justify_end()
+                .child(Clipboard::new(block_id).value(code).tooltip("Copy code"))
         })
 }
 

@@ -43,9 +43,7 @@ impl WorkerPool {
     }
 
     /// Acquire a concurrency permit (blocks if at limit).
-    pub async fn acquire_permit(
-        &self,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, WorkerError> {
+    pub async fn acquire_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, WorkerError> {
         Arc::clone(&self.concurrency_limit)
             .acquire_owned()
             .await

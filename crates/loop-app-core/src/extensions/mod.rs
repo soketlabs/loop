@@ -30,17 +30,14 @@ pub fn load_extensions(paths: &[std::path::PathBuf]) -> ExtensionState {
 
     {
         let state_cmd = Arc::clone(&state);
-        engine.register_fn(
-            "register_command",
-            move |name: &str, description: &str| {
-                if let Ok(mut s) = state_cmd.lock() {
-                    s.commands.push(ExtensionCommand {
-                        name: name.to_string(),
-                        description: description.to_string(),
-                    });
-                }
-            },
-        );
+        engine.register_fn("register_command", move |name: &str, description: &str| {
+            if let Ok(mut s) = state_cmd.lock() {
+                s.commands.push(ExtensionCommand {
+                    name: name.to_string(),
+                    description: description.to_string(),
+                });
+            }
+        });
     }
     {
         let state_n = Arc::clone(&state);

@@ -7,9 +7,9 @@ use rmcp::model::{CallToolRequestParams, ContentBlock, Tool as McpTool};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use loop_mcp::client::McpConnection;
 use crate::types::{AgentTool, AgentToolResult};
 use loop_ai::{TextContent, ToolResultContent};
+use loop_mcp::client::McpConnection;
 
 /// Convert all tools from all connected MCP servers into `AgentTool` instances.
 ///
@@ -51,11 +51,7 @@ fn make_agent_tool(
     connections: &Arc<RwLock<HashMap<String, McpConnection>>>,
 ) -> AgentTool {
     let prefixed_name = format!("mcp__{}__{}", server_name, mcp_tool.name);
-    let description = mcp_tool
-        .description
-        .clone()
-        .unwrap_or_default()
-        .to_string();
+    let description = mcp_tool.description.clone().unwrap_or_default().to_string();
     let label = format!("{} ({})", mcp_tool.name, server_name);
 
     let parameters = Value::Object(mcp_tool.input_schema.as_ref().clone());
@@ -75,9 +71,9 @@ fn make_agent_tool(
             let server = srv_name.clone();
             async move {
                 let guard = conns.read().await;
-                let conn = guard.get(&server).ok_or_else(|| {
-                    format!("MCP server '{server}' is not connected")
-                })?;
+                let conn = guard
+                    .get(&server)
+                    .ok_or_else(|| format!("MCP server '{server}' is not connected"))?;
 
                 let mut params = CallToolRequestParams::new(tool_name.clone());
                 if let Some(map) = args.as_object() {

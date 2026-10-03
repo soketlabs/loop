@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn estimates_simple_context() {
         let ctx = Context {
-            system_prompt: Some("abcd".into()), // 1 token
+            system_prompt: Some("abcd".into()),             // 1 token
             messages: vec![Message::user_text("abcdefgh")], // 2 tokens
             tools: None,
         };

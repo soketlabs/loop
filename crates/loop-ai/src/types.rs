@@ -906,10 +906,16 @@ mod tests {
         message.error_message = Some("HTTP 502 Bad Gateway".into());
         assert_eq!(message.failure().as_deref(), Some("HTTP 502 Bad Gateway"));
         message.error_message = Some("  ".into());
-        assert_eq!(message.failure().as_deref(), Some("assistant stopped with Error"));
+        assert_eq!(
+            message.failure().as_deref(),
+            Some("assistant stopped with Error")
+        );
         message.stop_reason = StopReason::Aborted;
         message.error_message = None;
-        assert_eq!(message.failure().as_deref(), Some("assistant stopped with Aborted"));
+        assert_eq!(
+            message.failure().as_deref(),
+            Some("assistant stopped with Aborted")
+        );
     }
 
     use super::*;

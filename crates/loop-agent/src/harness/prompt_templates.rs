@@ -78,10 +78,7 @@ fn load_template_file(path: &Path) -> Result<PromptTemplate, FileError> {
 fn split_frontmatter(text: &str) -> (String, String) {
     if let Some(rest) = text.strip_prefix("---") {
         if let Some(end) = rest.find("\n---") {
-            return (
-                rest[..end].trim().to_string(),
-                rest[end + 4..].to_string(),
-            );
+            return (rest[..end].trim().to_string(), rest[end + 4..].to_string());
         }
     }
     (String::new(), text.to_string())
@@ -127,12 +124,13 @@ pub fn substitute_args(template: &str, args: &[String]) -> String {
             let start_idx = start.saturating_sub(1);
             if let Some(len_s) = caps.get(2) {
                 let len: usize = len_s.as_str().parse().unwrap_or(0);
-                args
-                    .get(start_idx..start_idx.saturating_add(len).min(args.len()))
+                args.get(start_idx..start_idx.saturating_add(len).min(args.len()))
                     .map(|s| s.join(" "))
                     .unwrap_or_default()
             } else {
-                args.get(start_idx..).map(|s| s.join(" ")).unwrap_or_default()
+                args.get(start_idx..)
+                    .map(|s| s.join(" "))
+                    .unwrap_or_default()
             }
         })
         .into_owned();

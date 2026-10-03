@@ -13,9 +13,7 @@ use crate::harness::types::Skill;
 pub fn format_skills_for_system_prompt(skills: &[Skill], force_include: &[String]) -> String {
     let visible: Vec<&Skill> = skills
         .iter()
-        .filter(|s| {
-            !s.disable_model_invocation || force_include.iter().any(|n| n == &s.name)
-        })
+        .filter(|s| !s.disable_model_invocation || force_include.iter().any(|n| n == &s.name))
         .collect();
     if visible.is_empty() {
         return String::new();

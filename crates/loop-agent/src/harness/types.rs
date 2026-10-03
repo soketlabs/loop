@@ -142,7 +142,10 @@ impl std::fmt::Debug for ShellExecOptions {
             .field("inherit_env", &self.inherit_env)
             .field("timeout_ms", &self.timeout_ms)
             .field("cancel", &self.cancel.as_ref().map(|_| "CancellationToken"))
-            .field("on_output", &self.on_output.as_ref().map(|_| "ShellOutputCallback"))
+            .field(
+                "on_output",
+                &self.on_output.as_ref().map(|_| "ShellOutputCallback"),
+            )
             .finish()
     }
 }

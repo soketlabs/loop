@@ -45,7 +45,9 @@ async fn live_openai_compatible_stream() {
         headers: None,
     }));
 
-    let model = models.get_model("live", &model_id).expect("model registered");
+    let model = models
+        .get_model("live", &model_id)
+        .expect("model registered");
     let context = Context {
         messages: vec![Message::user_text("Reply with the single word: pong")],
         ..Default::default()
@@ -124,10 +126,7 @@ async fn live_openai_compatible_stream() {
         }
         eprintln!(
             "stop={:?} usage_in={} usage_out={} total={}",
-            result.stop_reason,
-            result.usage.input,
-            result.usage.output,
-            result.usage.total_tokens
+            result.stop_reason, result.usage.input, result.usage.output, result.usage.total_tokens
         );
     }
 }

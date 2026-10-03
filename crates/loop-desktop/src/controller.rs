@@ -5,13 +5,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_channel::{Receiver, Sender};
+use loop_agent::harness::types::ShellExecOptions;
 use loop_agent::harness::{
     create_session_repository, create_sqlite_session_store, AgentHarnessPhase,
 };
-use loop_agent::harness::types::ShellExecOptions;
 use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel, AgentToolResult};
 use loop_ai::AssistantMessageEvent;
-use loop_app_core::tool_approval::{permissions_from_settings, ApprovalDecision, ToolApprovalBridge};
+use loop_app_core::tool_approval::{
+    permissions_from_settings, ApprovalDecision, ToolApprovalBridge,
+};
 use loop_app_core::{bootstrap, settings_path, BootstrapOpts, Runtime, Settings};
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -39,7 +41,10 @@ pub enum DesktopCommand {
     DequeueLast,
     /// Drop every queued follow-up.
     ClearQueue,
-    SetModel { provider: String, model_id: String },
+    SetModel {
+        provider: String,
+        model_id: String,
+    },
     CycleModel,
     SetThinking(AgentThinkingLevel),
     CycleThinking,
@@ -160,10 +165,9 @@ impl DesktopController {
         }));
 
         let tool_env = runtime.harness.tool_env().await?;
-        let policy_active = loop_app_core::tool_approval::ApprovalPolicy::parse(
-            &runtime.settings.file_edit_review,
-        )
-        .asks_for_session(!runtime.resumed);
+        let policy_active =
+            loop_app_core::tool_approval::ApprovalPolicy::parse(&runtime.settings.file_edit_review)
+                .asks_for_session(!runtime.resumed);
         let (bridge, approval_rx) = ToolApprovalBridge::new(
             tool_env,
             runtime.settings.diff_editor.clone(),
@@ -284,7 +288,10 @@ impl DesktopController {
         });
     }
 
-    fn spawn_approval_handler(&self, mut approval_rx: mpsc::UnboundedReceiver<loop_app_core::tool_approval::ApprovalPrompt>) {
+    fn spawn_approval_handler(
+        &self,
+        mut approval_rx: mpsc::UnboundedReceiver<loop_app_core::tool_approval::ApprovalPrompt>,
+    ) {
         let snap = Arc::clone(&self.snapshot);
         let pending = Arc::clone(&self.pending_approval);
         let ui_tick = self.ui_tick_tx.clone();
@@ -408,11 +415,7 @@ impl DesktopController {
                 self.runtime.harness.set_thinking_level(level).await;
                 let mut snap = self.snapshot.lock();
                 snap.thinking_label = thinking_label_str(level);
-                if let Some(ix) = self
-                    .thinking_levels
-                    .iter()
-                    .position(|l| *l == level)
-                {
+                if let Some(ix) = self.thinking_levels.iter().position(|l| *l == level) {
                     *self.thinking_index.lock() = ix;
                 }
             }
@@ -484,7 +487,9 @@ impl DesktopController {
                         .cloned()
                 };
                 if let Some(change) = change {
-                    if let Some(editor) = crate::editor_launcher::detect_editors().into_iter().next() {
+                    if let Some(editor) =
+                        crate::editor_launcher::detect_editors().into_iter().next()
+                    {
                         crate::editor_launcher::open_in_editor(editor, &change.path, 1)?;
                     }
                 }
@@ -527,10 +532,7 @@ impl DesktopController {
                 let id = self
                     .runtime
                     .harness
-                    .start_new_session(
-                        Some(self.runtime.cwd.to_string_lossy().into_owned()),
-                        None,
-                    )
+                    .start_new_session(Some(self.runtime.cwd.to_string_lossy().into_owned()), None)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 {
@@ -609,11 +611,7 @@ impl DesktopController {
             let checkpoint = TurnCheckpoint {
                 text: text.clone(),
                 chat_len: snap.chat_rows.len(),
-                pending_change_ids: snap
-                    .pending_changes
-                    .iter()
-                    .map(|c| c.id.clone())
-                    .collect(),
+                pending_change_ids: snap.pending_changes.iter().map(|c| c.id.clone()).collect(),
             };
             *self.turn_checkpoint.lock() = Some(checkpoint);
             *self.discard_turn.lock() = false;
@@ -634,12 +632,9 @@ impl DesktopController {
         }
         self.notify_ui();
         if needs_title {
-            let _ = crate::session_title::persist_session_name(
-                &self.runtime,
-                &session_id,
-                &fallback,
-            )
-            .await;
+            let _ =
+                crate::session_title::persist_session_name(&self.runtime, &session_id, &fallback)
+                    .await;
         }
         let result = self.runtime.harness.prompt(text.clone()).await;
         let discarded = self.take_discard_and_rollback();
@@ -707,7 +702,8 @@ impl DesktopController {
                 text: raw.to_string(),
             });
             if command.is_empty() {
-                snap.chat_rows.push(ChatRow::System("usage: !command".into()));
+                snap.chat_rows
+                    .push(ChatRow::System("usage: !command".into()));
             } else {
                 snap.streaming = true;
             }
@@ -846,8 +842,7 @@ impl DesktopController {
             .filter(|c| !kept.contains(&c.id))
             .cloned()
             .collect();
-        snap.pending_changes
-            .retain(|c| kept.contains(&c.id));
+        snap.pending_changes.retain(|c| kept.contains(&c.id));
         if let Some(sel) = snap.selected_change_id.as_deref() {
             if !snap.pending_changes.iter().any(|c| c.id == sel) {
                 snap.selected_change_id = None;
@@ -943,8 +938,8 @@ async fn load_session_rows(
     runtime: &Runtime,
     snapshot: &Arc<Mutex<DesktopSnapshot>>,
 ) -> anyhow::Result<Vec<SessionRow>> {
-    let store = create_sqlite_session_store(&runtime.sessions_db)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let store =
+        create_sqlite_session_store(&runtime.sessions_db).map_err(|e| anyhow::anyhow!(e))?;
     let repo = create_session_repository(store, None);
     let list = repo.list(None).await.map_err(|e| anyhow::anyhow!(e))?;
     let active = snapshot.lock().active_session_id.clone();
@@ -1106,10 +1101,8 @@ fn apply_agent_event(
             {
                 if let ChatRow::Tool { detail, status, .. } = row {
                     // Ignore late updates that race past ToolExecutionEnd.
-                    if matches!(
-                        *status,
-                        ToolCardStatus::Running | ToolCardStatus::Pending
-                    ) && out.len() >= detail.len()
+                    if matches!(*status, ToolCardStatus::Running | ToolCardStatus::Pending)
+                        && out.len() >= detail.len()
                     {
                         *detail = out;
                         *status = ToolCardStatus::Running;
@@ -1149,9 +1142,7 @@ fn apply_agent_event(
             }
             if (tool_name == "write" || tool_name == "edit") && !*is_error {
                 let snapshot = file_snapshots.lock().remove(tool_call_id);
-                if let Some(change) =
-                    pending_change_from_write(result, snapshot, &s.cwd)
-                {
+                if let Some(change) = pending_change_from_write(result, snapshot, &s.cwd) {
                     s.chat_rows.push(ChatRow::FileChange {
                         id: change.id.clone(),
                         path: change.path.display().to_string(),
@@ -1170,11 +1161,15 @@ fn apply_agent_event(
 }
 
 fn close_streaming_assistant(rows: &mut Vec<ChatRow>) {
-    if let Some(ChatRow::Assistant { streaming, .. }) = rows
-        .iter_mut()
-        .rev()
-        .find(|r| matches!(r, ChatRow::Assistant { streaming: true, .. }))
-    {
+    if let Some(ChatRow::Assistant { streaming, .. }) = rows.iter_mut().rev().find(|r| {
+        matches!(
+            r,
+            ChatRow::Assistant {
+                streaming: true,
+                ..
+            }
+        )
+    }) {
         *streaming = false;
     }
 }
@@ -1206,9 +1201,7 @@ fn open_thinking(rows: &mut Vec<ChatRow>) {
 
 fn append_thinking_delta(rows: &mut Vec<ChatRow>, delta: &str) {
     if let Some(ChatRow::Thinking {
-        text,
-        done: false,
-        ..
+        text, done: false, ..
     }) = rows
         .iter_mut()
         .rev()
@@ -1225,11 +1218,15 @@ fn append_thinking_delta(rows: &mut Vec<ChatRow>, delta: &str) {
 }
 
 fn ensure_streaming_assistant(rows: &mut Vec<ChatRow>) {
-    if rows
-        .iter()
-        .rev()
-        .any(|r| matches!(r, ChatRow::Assistant { streaming: true, .. }))
-    {
+    if rows.iter().rev().any(|r| {
+        matches!(
+            r,
+            ChatRow::Assistant {
+                streaming: true,
+                ..
+            }
+        )
+    }) {
         return;
     }
     rows.push(ChatRow::Assistant {
@@ -1244,11 +1241,15 @@ fn append_assistant_delta(rows: &mut Vec<ChatRow>, delta: &str) {
         text,
         streaming: true,
         ..
-    }) = rows
-        .iter_mut()
-        .rev()
-        .find(|r| matches!(r, ChatRow::Assistant { streaming: true, .. }))
-    {
+    }) = rows.iter_mut().rev().find(|r| {
+        matches!(
+            r,
+            ChatRow::Assistant {
+                streaming: true,
+                ..
+            }
+        )
+    }) {
         text.push_str(delta);
         return;
     }
@@ -1568,10 +1569,7 @@ mod tests {
         let mut rows = Vec::new();
         append_assistant_delta(&mut rows, "Intro.");
         close_streaming_assistant(&mut rows);
-        upsert_streaming_tool_calls(
-            &mut rows,
-            &assistant_with_write("Intro.", "a.py", "x"),
-        );
+        upsert_streaming_tool_calls(&mut rows, &assistant_with_write("Intro.", "a.py", "x"));
         close_streaming_assistant(&mut rows);
 
         // Later model text (after tools) must be a new bubble.

@@ -48,8 +48,12 @@ pub fn create_memory_read_tool(
                 };
 
                 match value {
-                    Some(v) => Ok(AgentToolResult::text(serde_json::to_string_pretty(&v).unwrap_or_default())),
-                    None => Ok(AgentToolResult::text(format!("Key '{key}' not found in {scope} memory"))),
+                    Some(v) => Ok(AgentToolResult::text(
+                        serde_json::to_string_pretty(&v).unwrap_or_default(),
+                    )),
+                    None => Ok(AgentToolResult::text(format!(
+                        "Key '{key}' not found in {scope} memory"
+                    ))),
                 }
             }
         },
@@ -94,10 +98,7 @@ pub fn create_memory_write_tool(
                     .get("key")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "missing key argument".to_string())?;
-                let value = args
-                    .get("value")
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                let value = args.get("value").cloned().unwrap_or(Value::Null);
 
                 match scope {
                     "shared" => shared.set(key, value, &writer).await,
@@ -105,7 +106,9 @@ pub fn create_memory_write_tool(
                     _ => return Err(format!("invalid scope: {scope}")),
                 }
 
-                Ok(AgentToolResult::text(format!("Written to {scope} memory: {key}")))
+                Ok(AgentToolResult::text(format!(
+                    "Written to {scope} memory: {key}"
+                )))
             }
         },
     )
@@ -155,7 +158,9 @@ pub fn create_memory_list_tool(
                     _ => return Err(format!("invalid scope: {scope}")),
                 };
 
-                Ok(AgentToolResult::text(serde_json::to_string_pretty(&keys).unwrap_or_default()))
+                Ok(AgentToolResult::text(
+                    serde_json::to_string_pretty(&keys).unwrap_or_default(),
+                ))
             }
         },
     )

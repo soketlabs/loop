@@ -20,11 +20,11 @@ use crate::harness::prompt_templates::format_prompt_template_invocation;
 use crate::harness::sandbox::{Sandbox, SandboxInfo, SandboxMode, SandboxStatus};
 use crate::harness::session::types::{PendingSessionWrite, Session, SessionTreeEntry};
 use crate::harness::skills::format_skill_invocation;
+use crate::harness::system_prompt::format_skills_for_system_prompt;
 use crate::harness::types::{
     AgentHarnessError, AgentHarnessPhase, AgentHarnessResources, CompactResult, ExecutionEnv,
     NavigateTreeResult,
 };
-use crate::harness::system_prompt::format_skills_for_system_prompt;
 use crate::messages::{convert_to_llm, user_message_with_images};
 use crate::stream_fn::{stream_fn_from_models, StreamFn};
 use crate::types::{
@@ -235,10 +235,7 @@ impl AgentHarness {
         self.wait_for_idle().await;
 
         let store = self.session.lock().await.store();
-        let reader = store
-            .load(id)
-            .await
-            .map_err(AgentHarnessError::Session)?;
+        let reader = store.load(id).await.map_err(AgentHarnessError::Session)?;
         let new_session = Session::new(store, reader);
         let sid = new_session.metadata().id.clone();
 
@@ -614,10 +611,7 @@ impl AgentHarness {
         });
     }
 
-    async fn acquire_idle_phase(
-        &self,
-        target: AgentHarnessPhase,
-    ) -> Result<(), AgentHarnessError> {
+    async fn acquire_idle_phase(&self, target: AgentHarnessPhase) -> Result<(), AgentHarnessError> {
         self.assert_not_shut_down()?;
         let mut phase = self.phase.lock();
         if *phase != AgentHarnessPhase::Idle {
@@ -652,10 +646,7 @@ impl AgentHarness {
             let session = self.session.lock().await;
             session
                 .store()
-                .append_entry(
-                    &session.metadata().id,
-                    PendingSessionWrite::Label { label },
-                )
+                .append_entry(&session.metadata().id, PendingSessionWrite::Label { label })
                 .await
                 .map_err(AgentHarnessError::Session)?;
         } else {
@@ -667,9 +658,7 @@ impl AgentHarness {
     }
 
     /// Read all session entries (full tree).
-    pub async fn read_session_entries(
-        &self,
-    ) -> Result<Vec<SessionTreeEntry>, AgentHarnessError> {
+    pub async fn read_session_entries(&self) -> Result<Vec<SessionTreeEntry>, AgentHarnessError> {
         let session = self.session.lock().await;
         session
             .read_entries()
@@ -678,10 +667,7 @@ impl AgentHarness {
     }
 
     /// Append a message to the session (immediate when idle, deferred during a turn).
-    pub async fn append_message(
-        &self,
-        message: AgentMessage,
-    ) -> Result<(), AgentHarnessError> {
+    pub async fn append_message(&self, message: AgentMessage) -> Result<(), AgentHarnessError> {
         if *self.phase.lock() == AgentHarnessPhase::Idle {
             let session = self.session.lock().await;
             session
@@ -825,9 +811,8 @@ impl AgentHarness {
         let llm = convert_to_llm(&ctx.messages);
         let tokens_before = estimate_tokens(&llm);
 
-        let prep = prepare_compaction(&ctx.messages, &llm, settings).map_err(|e| {
-            AgentHarnessError::Compaction(e.to_string())
-        })?;
+        let prep = prepare_compaction(&ctx.messages, &llm, settings)
+            .map_err(|e| AgentHarnessError::Compaction(e.to_string()))?;
 
         let hook = self
             .hooks
@@ -935,9 +920,7 @@ impl AgentHarness {
                     .store()
                     .append_entry(
                         &session.metadata().id,
-                        PendingSessionWrite::BranchSummary {
-                            summary: s.clone(),
-                        },
+                        PendingSessionWrite::BranchSummary { summary: s.clone() },
                     )
                     .await
                     .map_err(AgentHarnessError::Session)?;
@@ -1304,7 +1287,11 @@ impl AgentHarness {
         &self,
         graph: loop_orchestration::planner::TaskGraph,
         config: Option<loop_orchestration::scheduler::SchedulerConfig>,
-        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::harness::orchestration::WorkflowProgressEvent>>,
+        progress_tx: Option<
+            tokio::sync::mpsc::UnboundedSender<
+                crate::harness::orchestration::WorkflowProgressEvent,
+            >,
+        >,
     ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
         self.acquire_idle_phase(AgentHarnessPhase::Workflow).await?;
 
@@ -1319,14 +1306,23 @@ impl AgentHarness {
         &self,
         graph: loop_orchestration::planner::TaskGraph,
         config: Option<loop_orchestration::scheduler::SchedulerConfig>,
-        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::harness::orchestration::WorkflowProgressEvent>>,
+        progress_tx: Option<
+            tokio::sync::mpsc::UnboundedSender<
+                crate::harness::orchestration::WorkflowProgressEvent,
+            >,
+        >,
     ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
-        use std::collections::HashMap;
+        use crate::harness::orchestration::{
+            agent_worker::{AgentWorker, ShellWorker},
+            WorkflowProgressEvent,
+        };
         use loop_orchestration::memory::bus::create_memory_bus;
         use loop_orchestration::memory::SharedMemory;
         use loop_orchestration::scheduler::{Scheduler, WorkerPool};
-        use loop_orchestration::workflow::{MemoryEventLog, SignalRouter, WorkflowEngine, WorkflowEvent};
-        use crate::harness::orchestration::{WorkflowProgressEvent, agent_worker::{AgentWorker, ShellWorker}};
+        use loop_orchestration::workflow::{
+            MemoryEventLog, SignalRouter, WorkflowEngine, WorkflowEvent,
+        };
+        use std::collections::HashMap;
 
         let workflow_id = format!("wf_{}", uuid::Uuid::now_v7());
         let scheduler_config = config.unwrap_or_default();
@@ -1408,16 +1404,15 @@ impl AgentHarness {
                             })
                         }
                         WorkflowEvent::TaskStarted { task_id, .. } => {
-                            let desc = task_descs
-                                .get(task_id)
-                                .cloned()
-                                .unwrap_or_default();
+                            let desc = task_descs.get(task_id).cloned().unwrap_or_default();
                             Some(WorkflowProgressEvent::TaskStarted {
                                 task_id: task_id.clone(),
                                 description: desc,
                             })
                         }
-                        WorkflowEvent::TaskCompleted { task_id, result, .. } => {
+                        WorkflowEvent::TaskCompleted {
+                            task_id, result, ..
+                        } => {
                             let mut output = result.output_text();
                             let paths = result.artifact_paths();
                             if !paths.is_empty() {
@@ -1454,12 +1449,7 @@ impl AgentHarness {
             .await
             .map_err(|e| AgentHarnessError::Other(e.to_string()))?;
 
-        let scheduler = Scheduler::new(
-            Arc::clone(&engine),
-            pool,
-            shared_memory,
-            scheduler_config,
-        );
+        let scheduler = Scheduler::new(Arc::clone(&engine), pool, shared_memory, scheduler_config);
 
         let result = scheduler
             .run(&workflow_id)
@@ -1490,7 +1480,11 @@ impl AgentHarness {
         goal: &str,
         context: Option<loop_orchestration::planner::PlannerContext>,
         config: Option<loop_orchestration::scheduler::SchedulerConfig>,
-        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::harness::orchestration::WorkflowProgressEvent>>,
+        progress_tx: Option<
+            tokio::sync::mpsc::UnboundedSender<
+                crate::harness::orchestration::WorkflowProgressEvent,
+            >,
+        >,
     ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
         use loop_orchestration::planner::{LlmPlanner, Planner};
 

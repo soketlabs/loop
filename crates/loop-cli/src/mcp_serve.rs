@@ -7,8 +7,7 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-    session::local::LocalSessionManager,
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -19,11 +18,7 @@ use loop_app_core::Runtime;
 
 /// Bearer token auth middleware. If `expected_token` is `Some`, every request
 /// must carry a matching `Authorization: Bearer <token>` header.
-async fn bearer_auth(
-    expected: Arc<Option<String>>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn bearer_auth(expected: Arc<Option<String>>, req: Request, next: Next) -> Response {
     if let Some(token) = expected.as_ref() {
         let auth_header = req
             .headers()
@@ -33,7 +28,10 @@ async fn bearer_auth(
         match auth_header {
             Some(value) if value == format!("Bearer {token}") => {}
             _ => {
-                return (StatusCode::UNAUTHORIZED, "Unauthorized: invalid or missing Bearer token")
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "Unauthorized: invalid or missing Bearer token",
+                )
                     .into_response();
             }
         }

@@ -5,50 +5,118 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit to validate before a release
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
+    name: Core tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-          - os: macos-latest
-          - os: windows-latest
+        os: [ubuntu-24.04, macos-14, windows-2022]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
-          toolchain: 1.98.1
+          toolchain: '1.98.1'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Build default CLI
+        run: cargo build -p loop-cli --locked
+      - name: Test core workspace (default features)
+        run: cargo test --workspace --exclude loop-desktop --locked
+      - name: Test telemetry and orchestration together
+        run: cargo test --workspace --exclude loop-desktop --features loop-cli/telemetry,loop-cli/orchestration --locked
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+  desktop:
+    name: Desktop compile (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    env:
+      RUST_FONTCONFIG_DLOPEN: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: nightly-2026-09-29
+      - name: Install desktop system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libxcb1-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libwayland-dev libvulkan-dev
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: desktop-check
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Compile desktop and its test targets
+        run: cargo check -p loop-desktop --all-targets --locked
 
-      - name: Build
-        run: cargo build -p loop-cli -p loop-app-core --locked
+  quality:
+    name: Formatting and Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: '1.98.1'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: clippy
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check core code and tests
+        run: cargo clippy --workspace --exclude loop-desktop --all-targets --features loop-cli/telemetry,loop-cli/orchestration --locked -- -D clippy::correctness
 
-      - name: Test
-        run: cargo test -p loop-ai -p loop-agent -p loop-mcp -p loop-orchestration -p loop-app-core -p loop-cli --locked
-
-      - name: Build (telemetry)
-        run: cargo build -p loop-cli --features telemetry --locked
-
-      - name: Test (telemetry)
-        run: cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli --features loop-agent/telemetry,loop-app-core/telemetry,loop-cli/telemetry --locked
+  gate:
+    name: CI gate
+    if: always()
+    needs: [test, desktop, quality]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every CI job to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          jobs = json.loads(os.environ['RESULTS'])
+          failed = [name for name, job in jobs.items() if job['result'] != 'success']
+          if failed:
+              raise SystemExit('CI checks did not pass: ' + ', '.join(failed))
+          PY

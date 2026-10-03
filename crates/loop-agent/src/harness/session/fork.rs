@@ -121,9 +121,8 @@ pub(crate) fn entries_for_fork_selection(
             Ok(out)
         }
         SessionForkSelection::ThroughEntry => {
-            let target = through_entry_id.ok_or_else(|| {
-                SessionError::Invalid("through_entry_id required".into())
-            })?;
+            let target = through_entry_id
+                .ok_or_else(|| SessionError::Invalid("through_entry_id required".into()))?;
             let mut out = Vec::new();
             let mut found = false;
             for e in branch {
@@ -142,9 +141,8 @@ pub(crate) fn entries_for_fork_selection(
             Ok(out)
         }
         SessionForkSelection::BeforeEntry => {
-            let target = through_entry_id.ok_or_else(|| {
-                SessionError::Invalid("through_entry_id required".into())
-            })?;
+            let target = through_entry_id
+                .ok_or_else(|| SessionError::Invalid("through_entry_id required".into()))?;
             let mut out = Vec::new();
             let mut found = false;
             for e in branch {
@@ -168,8 +166,10 @@ fn path_to_leaf(entries: &[SessionTreeEntry], leaf_id: Option<&str>) -> Vec<Sess
     let Some(leaf) = leaf_id else {
         return entries.to_vec();
     };
-    let by_id: std::collections::HashMap<_, _> =
-        entries.iter().map(|e| (e.id().to_string(), e.clone())).collect();
+    let by_id: std::collections::HashMap<_, _> = entries
+        .iter()
+        .map(|e| (e.id().to_string(), e.clone()))
+        .collect();
     let mut path = Vec::new();
     let mut cur = Some(leaf.to_string());
     while let Some(id) = cur {
