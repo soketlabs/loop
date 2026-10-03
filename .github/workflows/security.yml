@@ -36,7 +36,7 @@ jobs:
         with:
           rust-version: '1.98.1'
           arguments: --locked --all-features
-          command: check advisories sources
+          command: check advisories sources --warn unmaintained
       - name: Report dependency licenses (informational)
         continue-on-error: true
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2

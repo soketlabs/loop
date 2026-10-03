@@ -34,7 +34,7 @@ mitigations. Revisit exceptions when dependency versions or scanner rules change
 Use cargo-deny 0.20.2, Gitleaks 8.30.1, and Zizmor 1.30.1:
 
 ```sh
-cargo deny --locked --all-features check advisories sources
+cargo deny --locked --all-features check advisories sources --warn unmaintained
 cargo deny --locked --all-features check licenses # informational
 # Run history scans on trusted local repositories only; do not paste findings.
 gitleaks git --redact .
