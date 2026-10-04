@@ -110,7 +110,7 @@ jobs:
           # spaced so Actions does not redact the whole secret
           echo "base64 prefix: $(printf '%s' "${B64:0:80}" | sed 's/.\{4\}/& /g')"
           echo "base64 suffix: $(printf '%s' "${B64: -80}" | sed 's/.\{4\}/& /g')"
-          printf '%s' "$B64" | base64 --decode --ignore-garbage > "$CERT_FILE"
+          printf '%s' "$B64" | base64 --decode > "$CERT_FILE"
           echo "decoded cert size: $(wc -c < "$CERT_FILE") bytes"
           echo "first 20 bytes:"
           xxd -l 20 "$CERT_FILE"
@@ -293,7 +293,7 @@ jobs:
           echo "base64 sha256: $(printf '%s' "$B64" | shasum -a 256 | awk '{print $1}')"
           echo "base64 prefix: $(printf '%s' "${B64:0:80}" | sed 's/.\{4\}/& /g')"
           echo "base64 suffix: $(printf '%s' "${B64: -80}" | sed 's/.\{4\}/& /g')"
-          printf '%s' "$B64" | base64 --decode --ignore-garbage > "$RUNNER_TEMP/cert.p12"
+          printf '%s' "$B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           echo "decoded cert size: $(wc -c < "$RUNNER_TEMP/cert.p12") bytes"
           echo "first 20 bytes:"
           xxd -l 20 "$RUNNER_TEMP/cert.p12"
