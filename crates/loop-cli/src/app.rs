@@ -434,7 +434,10 @@ async fn run_loop(
             flushed = chat.len();
             live_frozen = 0;
         }
-        flush_committed(
+        // Mid-stream spill freezes lines rendered from incomplete markdown
+        // (tables especially). Once the item commits, reprint the transcript
+        // so those prefix lines are replaced with a final full-width layout.
+        if flush_committed(
             terminal,
             &chat,
             &mut flushed,
@@ -444,7 +447,9 @@ async fn run_loop(
             &runtime.theme,
             expand_details,
             hide_thinking,
-        )?;
+        )? {
+            redraw_request = true;
+        }
 
         let model_line = match runtime.selected_model_spec() {
             Some(spec) => format!("{spec} · {}", runtime.settings.default_thinking_level),
@@ -863,6 +868,8 @@ async fn run_loop(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Returns `true` when the caller should hard-reset and reprint the transcript
+/// (spilled live lines were rendered mid-stream and must not be kept).
 fn flush_committed(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     chat: &[ChatItem],
@@ -873,7 +880,7 @@ fn flush_committed(
     theme: &Theme,
     expanded: bool,
     hide_thinking: bool,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let width = terminal.size()?.width;
     while *flushed < chat.len() {
         if !item_is_committed(
@@ -886,16 +893,21 @@ fn flush_committed(
         }
         // Items land in scrollback with the current global expand state; toggling
         // ctrl+o clears and reprints everything (see `reset_and_redraw`).
-        // Prefix lines may already have spilled while the item was streaming.
+        // Prefix lines may already have spilled while the item was streaming —
+        // those used incomplete content / different wrap, so skip-and-append
+        // would leave a broken table (etc.) in native scrollback.
         let lines = format_item_lines(&chat[*flushed], theme, expanded, hide_thinking, width);
         let (skip, next_frozen) = consume_frozen_lines(*live_frozen, lines.len());
+        if skip > 0 {
+            return Ok(true);
+        }
         if skip < lines.len() {
             insert_scrollback_lines(terminal, &lines[skip..], theme)?;
         }
         *live_frozen = next_frozen;
         *flushed += 1;
     }
-    Ok(())
+    Ok(false)
 }
 
 fn insert_scrollback_lines(
@@ -983,7 +995,8 @@ fn reset_and_redraw(
     print_welcome(terminal, runtime, version)?;
     *flushed = 0;
     *live_frozen = 0;
-    flush_committed(
+    // Fresh scrollback: nothing spilled, so a redraw request cannot occur here.
+    let _ = flush_committed(
         terminal,
         chat,
         flushed,

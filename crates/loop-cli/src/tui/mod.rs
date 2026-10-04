@@ -417,7 +417,7 @@ pub fn format_item_lines(
             if text.is_empty() {
                 return lines;
             }
-            let rendered = markdown::render_lines(text, theme);
+            let rendered = markdown::render_lines(text, theme, w);
             lines.extend(markdown::wrap_rendered_lines(rendered, w));
             lines.push(Line::from(""));
         }
