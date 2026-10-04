@@ -12,6 +12,23 @@ Production-grade AI harness in Rust by **Soket AI**: unified LLM API, stateful a
 
 ## Quick start
 
+Install the CLI from GitHub Releases:
+
+```bash
+curl -fsSL https://loop.soket.ai/install | bash
+```
+
+That downloads the latest `loop` binary for your OS into `~/.loop/bin` and adds it to `PATH`. Pin a version or skip PATH edits:
+
+```bash
+curl -fsSL https://loop.soket.ai/install | bash -s -- --version 0.3.2
+curl -fsSL https://loop.soket.ai/install | bash -s -- --no-modify-path
+```
+
+From a clone of this repo you can also run `./install.sh`. Assets come from [soketlabs/loop releases](https://github.com/soketlabs/loop/releases).
+
+Build from source:
+
 ```bash
 cargo run -p loop-cli
 ```
