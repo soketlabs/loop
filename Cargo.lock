@@ -2952,7 +2952,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.5.2"
-source = "git+https://github.com/longbridge/gpui-component#77a6e32a6e19074a8d257783c273271c9ed15f6a"
+source = "git+https://github.com/longbridge/gpui-kit?rev=77a6e32a6e19074a8d257783c273271c9ed15f6a#77a6e32a6e19074a8d257783c273271c9ed15f6a"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2988,7 +2988,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/longbridge/gpui-component#77a6e32a6e19074a8d257783c273271c9ed15f6a"
+source = "git+https://github.com/longbridge/gpui-kit?rev=77a6e32a6e19074a8d257783c273271c9ed15f6a#77a6e32a6e19074a8d257783c273271c9ed15f6a"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3044,7 +3044,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/longbridge/gpui-component#77a6e32a6e19074a8d257783c273271c9ed15f6a"
+source = "git+https://github.com/longbridge/gpui-kit?rev=77a6e32a6e19074a8d257783c273271c9ed15f6a#77a6e32a6e19074a8d257783c273271c9ed15f6a"
 dependencies = [
  "anyhow",
  "gpui",
@@ -3058,7 +3058,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/longbridge/gpui-component#77a6e32a6e19074a8d257783c273271c9ed15f6a"
+source = "git+https://github.com/longbridge/gpui-kit?rev=77a6e32a6e19074a8d257783c273271c9ed15f6a#77a6e32a6e19074a8d257783c273271c9ed15f6a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4364,7 +4364,7 @@ dependencies = [
 
 [[package]]
 name = "loop-agent"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4402,7 +4402,7 @@ dependencies = [
 
 [[package]]
 name = "loop-ai"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4425,7 +4425,7 @@ dependencies = [
 
 [[package]]
 name = "loop-app-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "dirs",
@@ -4450,7 +4450,7 @@ dependencies = [
 
 [[package]]
 name = "loop-cli"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
@@ -4499,7 +4499,7 @@ dependencies = [
 
 [[package]]
 name = "loop-desktop"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4524,7 +4524,7 @@ dependencies = [
 
 [[package]]
 name = "loop-mcp"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -4540,7 +4540,7 @@ dependencies = [
 
 [[package]]
 name = "loop-orchestration"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4558,7 +4558,7 @@ dependencies = [
 
 [[package]]
 name = "loop-telemetry"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4579,7 +4579,7 @@ dependencies = [
 
 [[package]]
 name = "loop-test-support"
-version = "0.3.2"
+version = "0.3.3"
 
 [[package]]
 name = "loop9"
@@ -7029,7 +7029,7 @@ dependencies = [
 [[package]]
 name = "rmcp"
 version = "3.1.4"
-source = "git+https://github.com/modelcontextprotocol/rust-sdk?branch=main#3a2ebbc92034f6711e4eac9e93f5de0423be8dfe"
+source = "git+https://github.com/modelcontextprotocol/rust-sdk?rev=3a2ebbc92034f6711e4eac9e93f5de0423be8dfe#3a2ebbc92034f6711e4eac9e93f5de0423be8dfe"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7062,7 +7062,7 @@ dependencies = [
 [[package]]
 name = "rmcp-macros"
 version = "3.1.4"
-source = "git+https://github.com/modelcontextprotocol/rust-sdk?branch=main#3a2ebbc92034f6711e4eac9e93f5de0423be8dfe"
+source = "git+https://github.com/modelcontextprotocol/rust-sdk?rev=3a2ebbc92034f6711e4eac9e93f5de0423be8dfe#3a2ebbc92034f6711e4eac9e93f5de0423be8dfe"
 dependencies = [
  "darling",
  "proc-macro2",

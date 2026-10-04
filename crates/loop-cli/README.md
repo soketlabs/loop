@@ -7,6 +7,13 @@ Built on [`loop-ai`](../loop-ai) and [`loop-agent`](../loop-agent), with a ratat
 ## Install / run
 
 ```bash
+curl -fsSL https://loop.soket.ai/install | bash
+loop
+```
+
+Or from source:
+
+```bash
 cargo run -p loop-cli
 # or
 cargo install --path crates/loop-cli
