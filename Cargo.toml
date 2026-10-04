@@ -73,15 +73,18 @@ rhai = { version = "1.21", default-features = false, features = ["std", "sync"] 
 rustyline = "15"
 unicode-width = "0.2"
 tokio-stream = { version = "0.1", features = ["sync"] }
-rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", branch = "main", default-features = false, features = ["client", "server", "macros", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "reqwest"] }
+rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "3a2ebbc92034f6711e4eac9e93f5de0423be8dfe", default-features = false, features = ["client", "server", "macros", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "reqwest"] }
 axum = "0.8"
 tower = "0.5"
 
-# GPUI desktop
+# GPUI desktop. Pin gpui-kit: the repo was renamed from gpui-component, and
+# main dropped gpui-component-assets. Leave zed unpinned so it unifies with
+# gpui-kit's zed git dep; after version bumps run `cargo update -w` (not
+# `cargo generate-lockfile`) so HEAD git deps are not re-resolved.
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["x11", "wayland"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", package = "gpui-component" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", package = "gpui-component-assets" }
+gpui-component = { git = "https://github.com/longbridge/gpui-kit", rev = "77a6e32a6e19074a8d257783c273271c9ed15f6a", package = "gpui-component" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-kit", rev = "77a6e32a6e19074a8d257783c273271c9ed15f6a", package = "gpui-component-assets" }
 async-channel = "2"
 portable-pty = "0.9"
 
