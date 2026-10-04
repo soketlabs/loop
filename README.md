@@ -1,6 +1,12 @@
 # loop
 
-Production-grade AI harness in Rust by **Soket AI**: unified LLM API, stateful agent, and interactive coding CLI.
+Open-source Rust agent harness by [**Soket AI**](https://soket.ai): an agent loop with tool use, sessions, sandboxing, and a unified LLM provider API. Designed to be performant and memory-efficient for long-running agents on the most critical workloads.
+
+<picture>
+  <img src="resources/bitmap.png" alt="Loop logo">
+</picture>
+
+Docs: [https://loop.soket.ai/](https://loop.soket.ai/)
 
 ## Crates
 
@@ -82,20 +88,8 @@ git push origin v0.1.0
 
 That starts the Release workflow, builds all targets, and creates a GitHub Release with archives + `.sha256` checksums.
 
-#### Build artifacts without releasing
+## License
 
-In GitHub: **Actions → Release → Run workflow**, leave **create_release** unchecked. Binaries are uploaded as workflow artifacts only.
+Copyright 2026 Soket AI.
 
-Live OpenAI-compatible tests (ignored by default):
-
-```bash
-LOOP_TEST_BASE_URL="https://api.tensorstudio.ai/v1" \
-LOOP_TEST_MODEL="qwen3-30b" \
-LOOP_TEST_API_KEY_ENV="OPENAI_API_KEY" \
-cargo test -p loop-ai --test live_openai_compat -- --ignored --nocapture
-
-LOOP_TEST_BASE_URL="https://api.tensorstudio.ai/v1" \
-LOOP_TEST_MODEL="qwen3-30b" \
-LOOP_TEST_API_KEY_ENV="OPENAI_API_KEY" \
-cargo test -p loop-agent --test live_agent -- --ignored --nocapture
-```
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
