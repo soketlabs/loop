@@ -397,7 +397,7 @@ print_done() {
         echo -e "    export PATH=$INSTALL_DIR:\$PATH" >&2
         echo "" >&2
     fi
-    echo -e "  ${MUTED}Docs: ${NC}https://github.com/${REPO}" >&2
+    echo -e "  ${MUTED}Docs: https://loop.soket.ai >&2
     echo "" >&2
 }
 
