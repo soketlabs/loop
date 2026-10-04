@@ -52,10 +52,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Ubuntu 22.04 (glibc 2.35) so GNU binaries run on 22.04+ (not only 24.04).
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             archive: tar.gz
           - os: macos-14
@@ -104,6 +105,9 @@ jobs:
 
           CERT_FILE="$(mktemp)"
           echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERT_FILE"
+          echo "decoded cert size: $(wc -c < "$CERT_FILE") bytes"
+          echo "first 20 bytes:"
+          xxd -l 20 "$CERT_FILE"
           security import "$CERT_FILE" \
             -k "$KEYCHAIN" \
             -P "$APPLE_CERTIFICATE_PASSWORD" \
@@ -221,10 +225,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Ubuntu 22.04 (glibc 2.35) so GNU binaries run on 22.04+ (not only 24.04).
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             archive: tar.gz
           - os: macos-14
@@ -278,6 +283,9 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$APPLE_CERTIFICATE_PASSWORD" "$KEYCHAIN"
           echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          echo "decoded cert size: $(wc -c < "$RUNNER_TEMP/cert.p12") bytes"
+          echo "first 20 bytes:"
+          xxd -l 20 "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$APPLE_CERTIFICATE_PASSWORD" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN"
