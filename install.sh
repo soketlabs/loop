@@ -108,15 +108,18 @@ curl_base() {
 }
 
 github_curl() {
-    local extra=()
     if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-        extra=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+        curl_base -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            "$@"
+    else
+        curl_base -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$@"
     fi
-    curl_base -fsSL \
-        -H "Accept: application/vnd.github+json" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        "${extra[@]}" \
-        "$@"
 }
 
 detect_target() {
