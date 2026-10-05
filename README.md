@@ -41,6 +41,19 @@ cargo run -p loop-cli
 
 First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, or any OpenAI-compatible API (`/login` later to add more). Alternatively set `SOKET_API_KEY`, `OPENROUTER_API_KEY` or `OPENAI_API_KEY`. Config lives under `~/.loop/agent/`. See [`crates/loop-cli/README.md`](crates/loop-cli/README.md).
 
+### Supported platforms
+
+| OS | Architecture | Status | Install |
+|----|--------------|--------|---------|
+| macOS (Apple Silicon) | arm64 | Supported | `curl -fsSL https://loop.soket.ai/install \| bash` |
+| macOS (Intel) | x86_64 | Supported | `curl -fsSL https://loop.soket.ai/install \| bash` |
+| Linux (glibc) | x86_64, arm64 | Supported | `curl -fsSL https://loop.soket.ai/install \| bash` |
+| Linux via WSL | x86_64, arm64 | Supported (uses the Linux build) | `curl -fsSL https://loop.soket.ai/install \| bash` inside WSL |
+| Windows (native) | x86_64 | In testing | Not yet officially supported; the `x86_64-pc-windows-msvc` build is published but its installer is still being tested |
+| Linux (musl, e.g. Alpine) | any | Not supported | [Build from source](#build--test) |
+
+The installer detects your OS and CPU, downloads the latest matching release from GitHub, verifies its SHA-256 checksum, installs to `~/.loop/bin`, and adds that directory to your `PATH`. Re-running it is safe: it skips the download if you already have the latest version (use `--force` to reinstall).
+
 ## Build / test
 
 ```bash
