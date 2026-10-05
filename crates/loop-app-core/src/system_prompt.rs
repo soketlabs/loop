@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::config::paths::{append_system_md_path, get_agent_dir, get_project_dir, system_md_path};
 
 /// Context file candidate names (first match wins per directory).
-const CONTEXT_NAMES: &[&str] = &["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+const CONTEXT_NAMES: &[&str] = &["LOOP.md", "LOOP.MD", "AGENTS.md", "AGENTS.MD"];
 
 /// A loaded project context file.
 #[derive(Debug, Clone)]
@@ -157,7 +157,7 @@ pub fn resolve_system_prompt_files(
     (custom, append)
 }
 
-/// Load AGENTS.md / CLAUDE.md from agent dir + ancestors of cwd.
+/// Load LOOP.md / AGENTS.md from agent dir + ancestors of cwd.
 pub fn load_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
     let mut files = Vec::new();
     if let Some(cf) = read_context_in_dir(agent_dir) {

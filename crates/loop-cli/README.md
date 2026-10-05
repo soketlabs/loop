@@ -51,12 +51,6 @@ Default provider/model: **`soket` / `qwen3-30b`** at `https://api.tensorstudio.a
 
 Override root with `LOOP_CODING_AGENT_DIR`.
 
-Claude skills are **opt-in** via settings:
-
-```json
-{ "skills": ["~/.claude/skills"] }
-```
-
 Turn individual skills on or off with `/skills` (an interactive picker: space or enter toggles), or `/skills enable <name>` / `/skills disable <name>`. `/skills list` shows every discovered skill and its state. Disabled skills are hidden from the model and from `/skill:` commands, and are saved under `disabledSkills` in the global `settings.json`:
 
 ```json
@@ -65,7 +59,7 @@ Turn individual skills on or off with `/skills` (an interactive picker: space or
 
 A project `.loop/settings.json` can add more names to `disabledSkills`; they are combined with the global list.
 
-`AGENTS.md` / `CLAUDE.md` are loaded automatically from the agent dir and cwd ancestors.
+`LOOP.md` / `AGENTS.md` are loaded automatically from the agent dir and cwd ancestors. `LOOP.md` wins when both exist in the same directory.
 
 ## Slash commands (highlights)
 

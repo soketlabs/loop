@@ -4045,7 +4045,7 @@ async fn apply_effect(
             let all = runtime.resources.all_skills();
             if all.is_empty() {
                 chat.push(sys(format!(
-                    "No skills loaded.\n\nAdd folders containing a SKILL.md (with YAML frontmatter: name, description) under:\n  {}/skills\n  ~/.agents/skills\n  .agents/skills or .loop/skills in trusted projects\nor list extra paths (e.g. ~/.claude/skills) under \"skills\" in settings.json,\nthen run /reload.",
+                    "No skills loaded.\n\nAdd folders containing a SKILL.md (with YAML frontmatter: name, description) under:\n  {}/skills\n  ~/.agents/skills\n  .agents/skills or .loop/skills in trusted projects\nor list extra paths under \"skills\" in settings.json,\nthen run /reload.",
                     runtime.agent_dir.display()
                 )));
             } else {

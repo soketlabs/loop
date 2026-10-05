@@ -83,7 +83,7 @@ pub fn load_resources(
         }
     }
 
-    // Settings skill paths (supports ~/.claude/skills opt-in)
+    // Extra skill paths from settings.
     for entry in &settings.skills {
         let path = expand_path(entry, agent_dir);
         if path.is_dir() {

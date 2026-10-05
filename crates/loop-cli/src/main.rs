@@ -38,7 +38,7 @@ struct Cli {
     #[arg(long, global = true)]
     append_system_prompt: Option<String>,
 
-    /// Do not load AGENTS.md / CLAUDE.md context files.
+    /// Do not load LOOP.md / AGENTS.md context files.
     #[arg(long, short = 'c', global = true)]
     no_context_files: bool,
 
