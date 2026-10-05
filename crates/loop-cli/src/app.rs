@@ -255,7 +255,7 @@ pub async fn run(mut runtime: CliRuntime) -> anyhow::Result<()> {
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
         )
     );
-    // Start on a clean screen (pi-style): clear and home before anchoring the viewport.
+    // Start on a clean screen: clear and home before anchoring the viewport.
     let _ = execute!(
         stdout,
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
@@ -1036,7 +1036,7 @@ fn reset_and_redraw(
     use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 
     let mut out = io::stdout();
-    // Equivalent of pi's `\x1b[2J\x1b[H\x1b[3J`: without purging scrollback the
+    // Equivalent of `\x1b[2J\x1b[H\x1b[3J`: without purging scrollback the
     // reprinted transcript would duplicate below the old copy.
     execute!(
         out,
@@ -1728,7 +1728,7 @@ fn note_terminal_resize(
     redraw_request: &mut bool,
 ) {
     let _ = terminal.autoresize();
-    // Re-wrapping invalidates the whole transcript (pi does the same).
+    // Re-wrapping invalidates the whole transcript.
     if width != *last_width {
         *last_width = width;
         *redraw_request = true;

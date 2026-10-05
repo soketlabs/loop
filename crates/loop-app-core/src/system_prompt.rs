@@ -44,7 +44,7 @@ pub fn default_tool_snippets() -> Vec<(&'static str, &'static str)> {
 
 /// Build the system prompt.
 ///
-/// Skills are not embedded here: `AgentHarness` appends the pi-style
+/// Skills are not embedded here: `AgentHarness` appends the
 /// `<available_skills>` block each turn (with paths) when `read` is available.
 pub fn build_system_prompt(opts: BuildSystemPromptOptions<'_>) -> String {
     let cwd = opts.cwd.display().to_string().replace('\\', "/");

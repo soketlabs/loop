@@ -6,7 +6,7 @@ use crate::harness::types::CompactionError;
 use crate::types::AgentMessage;
 use loop_ai::{estimate_context_tokens, estimate_message_tokens, Message};
 
-/// Default compaction settings (pi parity).
+/// Default compaction settings.
 pub const DEFAULT_RESERVE_TOKENS: u64 = 16384;
 /// Keep recent tokens.
 pub const DEFAULT_KEEP_RECENT_TOKENS: u64 = 20000;

@@ -1,6 +1,6 @@
 //! Clipboard helpers with OSC 52 fallback for SSH / headless sessions.
 //!
-//! Mirrors pi's strategy: prefer native / platform tools, then emit OSC 52 so
+//! Prefer native / platform tools, then emit OSC 52 so
 //! terminal multiplexers and remote sessions can still receive the text.
 
 use std::io::{self, Write};

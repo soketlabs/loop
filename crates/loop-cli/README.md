@@ -2,7 +2,7 @@
 
 Interactive coding agent CLI for **Loop** by Soket AI.
 
-Built on [`loop-ai`](../loop-ai) and [`loop-agent`](../loop-agent), with a ratatui TUI inspired by pi’s coding-agent UX.
+Built on [`loop-ai`](../loop-ai) and [`loop-agent`](../loop-agent), with a ratatui TUI.
 
 ## Install / run
 
@@ -41,7 +41,7 @@ Default provider/model: **`soket` / `qwen3-30b`** at `https://api.tensorstudio.a
 | `~/.loop/agent/auth.json` | API keys |
 | `~/.loop/agent/models.json` | Extra OpenAI-compat providers (hand-written; `models` optional — listed from `/models`) |
 | `~/.loop/agent/models-store.json` | Dynamic catalog cache |
-| `~/.loop/agent/themes/*.json` | Custom themes (pi-compatible tokens) |
+| `~/.loop/agent/themes/*.json` | Custom themes (JSON color tokens) |
 | `~/.loop/agent/skills/` | Agent Skills (`SKILL.md`) |
 | `~/.loop/agent/prompts/` | Prompt templates → `/name` |
 | `~/.loop/agent/extensions/*.rhai` | Rhai extensions |
@@ -95,7 +95,7 @@ See `/hotkeys`. Override in `keybindings.json`.
 
 ## Themes
 
-Ship `dark` and `light`. Custom JSON themes use the same color tokens as pi. Change with `/theme name` or `settings.theme`.
+Ship `dark` and `light`. Custom JSON themes use the same color tokens. Change with `/theme name` or `settings.theme`.
 
 ## Sandbox
 

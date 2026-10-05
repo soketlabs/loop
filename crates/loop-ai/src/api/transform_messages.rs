@@ -72,7 +72,7 @@ pub fn transform_messages(messages: &[Message], model: &Model) -> Vec<Message> {
                             }
                         }
                         AssistantContent::ToolCall(mut tc) => {
-                            // Strip Google-style thought signatures on cross-model handoff.
+                            // Strip thought signatures on cross-model handoff.
                             if !is_same_model {
                                 tc.thought_signature = None;
                             }

@@ -10,7 +10,7 @@ use crate::types::AgentMessage;
 
 type Handler = Arc<dyn Fn(HarnessHookEvent) -> Pin<Box<dyn Future<Output = HookOutcome> + Send>> + Send + Sync>;
 
-/// Harness hook events (pi agent-harness parity).
+/// Harness hook events.
 #[derive(Debug, Clone)]
 pub enum HarnessHookEvent {
     /// Before an agent turn starts.

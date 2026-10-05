@@ -1,4 +1,4 @@
-//! System prompt helpers for skills (pi / Agent Skills progressive disclosure).
+//! System prompt helpers for skills (progressive disclosure).
 
 use crate::harness::types::Skill;
 
@@ -8,7 +8,7 @@ use crate::harness::types::Skill;
 /// `force_include` (user-activated via `/skill:name`, including those with
 /// `disable-model-invocation`).
 ///
-/// Matches pi's `formatSkillsForPrompt`: XML catalog with absolute paths so the
+/// XML catalog with absolute paths so the
 /// model can `read` a skill's `SKILL.md` when the task matches its description.
 pub fn format_skills_for_system_prompt(skills: &[Skill], force_include: &[String]) -> String {
     let visible: Vec<&Skill> = skills

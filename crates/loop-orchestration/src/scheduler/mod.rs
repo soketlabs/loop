@@ -1,7 +1,6 @@
 //! Scheduler: dispatch loop coordinating workers on a task graph.
 //!
-//! Inspired by Orloj's approach to execution scheduling, worker coordination,
-//! and artifact management.
+//! Execution scheduling, worker coordination, and artifact management.
 
 pub mod artifacts;
 pub mod pool;

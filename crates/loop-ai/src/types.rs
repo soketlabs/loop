@@ -194,7 +194,7 @@ pub struct Usage {
     pub cache_read: u64,
     /// Cache-write tokens.
     pub cache_write: u64,
-    /// Optional 1h cache-write tokens (Anthropic-style).
+    /// Optional 1h cache-write tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_1h: Option<u64>,
     /// Reasoning tokens (subset of output when reported).
@@ -258,7 +258,7 @@ pub struct ToolCall {
     pub name: String,
     /// Parsed arguments object.
     pub arguments: Value,
-    /// Optional thought signature (Google-style).
+    /// Optional thought signature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
 }

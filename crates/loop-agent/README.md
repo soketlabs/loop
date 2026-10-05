@@ -1,8 +1,6 @@
 # loop-agent
 
-Stateful agent with tool execution and event streaming, built on [`loop-ai`](../loop-ai).
-
-Inspired by `@earendil-works/pi-agent-core`, implemented in pure Rust for a unified distributable binary.
+Stateful agent with tool execution and event streaming, built on [`loop-ai`](../loop-ai). Implemented in pure Rust for a unified distributable binary.
 
 ## Components
 

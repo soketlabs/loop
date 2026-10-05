@@ -11,7 +11,7 @@ use crate::harness::session::types::SessionTreeEntry;
 use crate::messages::convert_to_llm;
 use crate::types::AgentMessage;
 
-/// Prompt-cache TTL: idle gaps longer than this often cause misses (Anthropic default).
+/// Prompt-cache TTL: idle gaps longer than this often cause misses.
 pub const CACHE_TTL_MS: i64 = 5 * 60 * 1000;
 
 /// Per-turn misses at or below this are cache breakpoint granularity noise.

@@ -1,7 +1,6 @@
 //! Planner layer: task decomposition and graph generation.
 //!
-//! Inspired by Pi's approach to planning: decompose high-level goals into
-//! a directed acyclic graph of concrete tasks.
+//! Decompose high-level goals into a directed acyclic graph of concrete tasks.
 
 pub mod llm_planner;
 pub mod manual_planner;

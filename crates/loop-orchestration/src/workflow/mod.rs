@@ -1,7 +1,6 @@
 //! Workflow layer: durable event-sourced workflow runtime.
 //!
-//! Inspired by Temporal's concepts: event history, replay, signals, timers,
-//! and resumable execution -- but not AI-specific.
+//! Event history, replay, signals, timers, and resumable execution.
 
 pub mod checkpoint;
 pub mod engine;
