@@ -8,7 +8,10 @@
 //! allowing the host crate (`loop-agent`) to provide its own implementation.
 
 pub mod client;
+mod oauth;
 pub mod server;
 
-pub use client::{McpClientManager, McpConnection, McpServerEntry, McpTransport};
+pub use client::{
+    McpClientManager, McpConnection, McpServerEntry, McpTransport, OAuthLoginOutcome,
+};
 pub use server::{McpServer, McpSessionManager, ToolDef, ToolOutput, ToolProvider};

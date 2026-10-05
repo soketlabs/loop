@@ -35,7 +35,9 @@ pub fn resolve_startup_model(
             .get_model(provider, id)
             .map(|m| StartupModel::Selected(Box::new(m)))
             .ok_or_else(|| unknown(&format!("{provider}/{id}"))),
-        (None, Some(spec)) => resolve_model_spec(models, spec).map(|m| StartupModel::Selected(Box::new(m))),
+        (None, Some(spec)) => {
+            resolve_model_spec(models, spec).map(|m| StartupModel::Selected(Box::new(m)))
+        }
         (Some(_), None) => anyhow::bail!("--provider needs --model"),
         (None, None) => Ok(match saved {
             Some((provider, id)) => match models.get_model(provider, id) {

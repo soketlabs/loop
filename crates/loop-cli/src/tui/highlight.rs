@@ -24,10 +24,16 @@ static SCOPE_STYLES: LazyLock<Vec<(ScopeSelector, ScopeStyle)>> = LazyLock::new(
         (sel("comment"), ScopeStyle::key("syntaxComment")),
         (sel("string"), ScopeStyle::key("syntaxString")),
         (sel("constant.numeric"), ScopeStyle::key("syntaxNumber")),
-        (sel("constant.character.escape"), ScopeStyle::key("syntaxString")),
+        (
+            sel("constant.character.escape"),
+            ScopeStyle::key("syntaxString"),
+        ),
         (sel("constant.language"), ScopeStyle::key("syntaxKeyword")),
         (sel("constant.other.color"), ScopeStyle::key("syntaxNumber")),
-        (sel("entity.name.function"), ScopeStyle::key("syntaxFunction")),
+        (
+            sel("entity.name.function"),
+            ScopeStyle::key("syntaxFunction"),
+        ),
         (sel("entity.name.method"), ScopeStyle::key("syntaxFunction")),
         (sel("support.function"), ScopeStyle::key("syntaxFunction")),
         (sel("entity.name.type"), ScopeStyle::key("syntaxType")),
@@ -38,7 +44,10 @@ static SCOPE_STYLES: LazyLock<Vec<(ScopeSelector, ScopeStyle)>> = LazyLock::new(
         (sel("entity.name.interface"), ScopeStyle::key("syntaxType")),
         (sel("entity.name.namespace"), ScopeStyle::key("syntaxType")),
         (sel("entity.name.tag"), ScopeStyle::key("syntaxKeyword")),
-        (sel("entity.other.attribute-name"), ScopeStyle::key("syntaxVariable")),
+        (
+            sel("entity.other.attribute-name"),
+            ScopeStyle::key("syntaxVariable"),
+        ),
         (sel("storage.type"), ScopeStyle::key("syntaxType")),
         (sel("storage.modifier"), ScopeStyle::key("syntaxKeyword")),
         (sel("storage"), ScopeStyle::key("syntaxKeyword")),
@@ -51,21 +60,39 @@ static SCOPE_STYLES: LazyLock<Vec<(ScopeSelector, ScopeStyle)>> = LazyLock::new(
         (sel("variable.function"), ScopeStyle::key("syntaxFunction")),
         (sel("variable.parameter"), ScopeStyle::key("syntaxVariable")),
         (sel("variable"), ScopeStyle::key("syntaxVariable")),
-        (sel("punctuation.definition.string"), ScopeStyle::key("syntaxString")),
+        (
+            sel("punctuation.definition.string"),
+            ScopeStyle::key("syntaxString"),
+        ),
         (sel("punctuation"), ScopeStyle::key("syntaxPunctuation")),
-        (sel("markup.heading"), ScopeStyle::key_mod("mdHeading", Modifier::BOLD)),
-        (sel("markup.bold"), ScopeStyle::key_mod("text", Modifier::BOLD)),
-        (sel("markup.italic"), ScopeStyle::key_mod("text", Modifier::ITALIC)),
+        (
+            sel("markup.heading"),
+            ScopeStyle::key_mod("mdHeading", Modifier::BOLD),
+        ),
+        (
+            sel("markup.bold"),
+            ScopeStyle::key_mod("text", Modifier::BOLD),
+        ),
+        (
+            sel("markup.italic"),
+            ScopeStyle::key_mod("text", Modifier::ITALIC),
+        ),
         (sel("markup.underline.link"), ScopeStyle::key("mdLink")),
         (sel("markup.raw"), ScopeStyle::key("mdCode")),
         (sel("markup.quote"), ScopeStyle::key("mdQuote")),
         (sel("markup.list"), ScopeStyle::key("mdListBullet")),
         (sel("meta.separator"), ScopeStyle::key("mdHr")),
         (sel("meta.annotation"), ScopeStyle::key("syntaxType")),
-        (sel("entity.name.section"), ScopeStyle::key_mod("mdHeading", Modifier::BOLD)),
+        (
+            sel("entity.name.section"),
+            ScopeStyle::key_mod("mdHeading", Modifier::BOLD),
+        ),
         // TOML / INI section headers
         (sel("entity.name.tag.toml"), ScopeStyle::key("syntaxType")),
-        (sel("support.type.property-name"), ScopeStyle::key("syntaxVariable")),
+        (
+            sel("support.type.property-name"),
+            ScopeStyle::key("syntaxVariable"),
+        ),
         (sel("meta.mapping.key"), ScopeStyle::key("syntaxVariable")),
     ]
 });
@@ -178,10 +205,7 @@ fn resolve_syntax<'a>(
             }
         }
         // Bare filenames / truncated summaries still carry an extension.
-        if let Some(ext) = std::path::Path::new(p)
-            .extension()
-            .and_then(|e| e.to_str())
-        {
+        if let Some(ext) = std::path::Path::new(p).extension().and_then(|e| e.to_str()) {
             if let Some(s) = ss.find_syntax_by_extension(ext) {
                 if s.name != "Plain Text" {
                     return Some(s);

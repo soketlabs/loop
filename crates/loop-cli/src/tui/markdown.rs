@@ -174,9 +174,7 @@ fn split_table_chunks(md: &str) -> Vec<TableChunk> {
             push_prose(&mut prose, &mut out);
             let start = i;
             i += 2; // header + separator
-            while i < lines.len()
-                && is_table_row_line(lines[i].trim_end_matches(['\n', '\r']))
-            {
+            while i < lines.len() && is_table_row_line(lines[i].trim_end_matches(['\n', '\r'])) {
                 i += 1;
             }
             let mut block = String::new();
@@ -362,10 +360,11 @@ fn wrap_styled_cell(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'stat
             .map(|(ch, _)| UnicodeWidthStr::width(ch.to_string().as_str()).max(1))
             .sum()
     };
-    let flush_row = |row: &mut Vec<Span<'static>>, row_w: &mut usize, rows: &mut Vec<Vec<Span<'static>>>| {
-        rows.push(std::mem::take(row));
-        *row_w = 0;
-    };
+    let flush_row =
+        |row: &mut Vec<Span<'static>>, row_w: &mut usize, rows: &mut Vec<Vec<Span<'static>>>| {
+            rows.push(std::mem::take(row));
+            *row_w = 0;
+        };
     let append_word = |row: &mut Vec<Span<'static>>,
                        row_w: &mut usize,
                        word: &[(char, Style)],
@@ -435,7 +434,11 @@ fn wrap_styled_cell(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'stat
     rows
 }
 
-fn pad_styled_cell(mut spans: Vec<Span<'static>>, width: usize, pad_style: Style) -> Vec<Span<'static>> {
+fn pad_styled_cell(
+    mut spans: Vec<Span<'static>>,
+    width: usize,
+    pad_style: Style,
+) -> Vec<Span<'static>> {
     let w = spans_width(&spans);
     if w < width {
         spans.push(Span::styled(" ".repeat(width - w), pad_style));
@@ -497,7 +500,9 @@ fn render_markdown_table(block: &str, theme: &Theme, width: usize) -> Vec<Line<'
 
     // Borders: │cell│cell│ → 1 + ncols verticals, ncols cell widths.
     let border_overhead = ncols + 1;
-    let available = width.saturating_sub(border_overhead).max(ncols * MIN_TABLE_COL_WIDTH);
+    let available = width
+        .saturating_sub(border_overhead)
+        .max(ncols * MIN_TABLE_COL_WIDTH);
     let natural: Vec<usize> = (0..ncols)
         .map(|c| {
             rows.iter()
@@ -795,10 +800,7 @@ mod tests {
             .filter(|l| l.contains('│') && (l.contains("foo") || l.contains("longer-cell")))
             .collect();
         assert_eq!(table_rows.len(), 2, "{text}");
-        let pos: Vec<usize> = table_rows
-            .iter()
-            .map(|r| r.find('│').unwrap())
-            .collect();
+        let pos: Vec<usize> = table_rows.iter().map(|r| r.find('│').unwrap()).collect();
         assert_eq!(pos[0], pos[1], "columns should align:\n{text}");
     }
 
@@ -901,10 +903,7 @@ mod tests {
         assert!(text.contains("first"), "{text}");
         assert!(text.contains("column") || text.contains("wrap"), "{text}");
         let table_rows = text.lines().filter(|l| l.contains('│')).count();
-        assert!(
-            table_rows > 2,
-            "expected multi-line wrapped cells:\n{text}"
-        );
+        assert!(table_rows > 2, "expected multi-line wrapped cells:\n{text}");
 
         // Long paragraph text still wraps.
         let md2 = "word ".repeat(30);
@@ -938,16 +937,16 @@ mod tests {
         let w2 = UnicodeWidthStr::width(cols[1]);
         let w3 = UnicodeWidthStr::width(cols[2]);
         // Last column must not be crushed to the old termimad minimum (~3).
-        assert!(
-            w3 >= 12,
-            "last column too narrow ({w3}): {row}\n{text}"
-        );
+        assert!(w3 >= 12, "last column too narrow ({w3}): {row}\n{text}");
         // And the middle column should not keep nearly all leftover space.
         assert!(
             w2 <= w3 + 8,
             "columns unbalanced mid={w2} last={w3}: {row}\n{text}"
         );
-        assert!(text.contains("Bengaluru") || text.contains("Axonwise"), "{text}");
+        assert!(
+            text.contains("Bengaluru") || text.contains("Axonwise"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -956,10 +955,12 @@ mod tests {
         assert_eq!(widths.iter().sum::<usize>(), 56);
         assert!(widths[0] >= 8 && widths[0] <= 9, "{widths:?}");
         assert!(widths[2] >= 12, "last starved: {widths:?}");
-        assert!((widths[1] as isize - widths[2] as isize).abs() <= 2, "{widths:?}");
+        assert!(
+            (widths[1] as isize - widths[2] as isize).abs() <= 2,
+            "{widths:?}"
+        );
     }
 }
-
 
 #[cfg(test)]
 mod stream_sim {
@@ -969,7 +970,8 @@ mod stream_sim {
     /// re-rendered each "frame". Table should be rough mid-stream, aligned at end.
     #[test]
     fn streaming_table_progression() {
-        let full = "intro\n\n| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |\n\ndone\n";
+        let full =
+            "intro\n\n| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |\n\ndone\n";
         let theme = Theme::dark();
 
         // Mid-stream: only the header + delimiter have arrived.
@@ -977,7 +979,12 @@ mod stream_sim {
         let lines_mid = render_lines(mid, &theme, 80);
         let text_mid = lines_mid
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         eprintln!("=== MID-STREAM ===\n{text_mid}\n");
@@ -986,7 +993,12 @@ mod stream_sim {
         let lines_full = render_lines(full, &theme, 80);
         let text_full = lines_full
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         eprintln!("=== FULL ===\n{text_full}\n");

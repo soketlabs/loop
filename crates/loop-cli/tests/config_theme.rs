@@ -67,8 +67,14 @@ fn settings_defaults_soket() {
     assert_eq!(s.selected_model(), None);
     assert_eq!(s.theme, "dark");
     assert_eq!(s.file_edit_review, "newSession");
-    assert_eq!(s.tool_permissions.get("bash").map(String::as_str), Some("ask"));
-    assert_eq!(s.tool_permissions.get("read").map(String::as_str), Some("allow"));
+    assert_eq!(
+        s.tool_permissions.get("bash").map(String::as_str),
+        Some("ask")
+    );
+    assert_eq!(
+        s.tool_permissions.get("read").map(String::as_str),
+        Some("allow")
+    );
     assert_eq!(s.sandbox.mode, "off");
     assert_eq!(s.sandbox.isolation, "full");
     assert_eq!(s.sandbox.runtime, "runc");

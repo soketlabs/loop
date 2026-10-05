@@ -83,10 +83,7 @@ pub fn list_files(cwd: &Path) -> Vec<FileEntry> {
             continue;
         }
         let absolute = canonicalize_display(path);
-        out.push(FileEntry {
-            relative,
-            absolute,
-        });
+        out.push(FileEntry { relative, absolute });
         if out.len() >= 8_000 {
             break;
         }
