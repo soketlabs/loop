@@ -2091,7 +2091,9 @@ async fn handle_key(
     }
 
     // Slash-command picker navigation (before general keybindings).
-    if !ac_entries.is_empty() {
+    // While a recalled entry is on screen, Up/Down keep walking lines and
+    // history. Otherwise `/login` and `/mcp` open this menu and swallow Up.
+    if !ac_entries.is_empty() && !history.is_browsing() {
         match key.code {
             KeyCode::Up => {
                 *ac_selected = ac_selected.saturating_sub(1);
@@ -2126,7 +2128,8 @@ async fn handle_key(
     }
 
     // `@file` mention picker — Tab/Enter insert absolute path in place of `@…`.
-    if !file_ac_entries.is_empty() {
+    // Same history exception as the slash menu: recalled lines keep Up/Down.
+    if !file_ac_entries.is_empty() && !history.is_browsing() {
         match key.code {
             KeyCode::Up => {
                 *ac_selected = ac_selected.saturating_sub(1);
