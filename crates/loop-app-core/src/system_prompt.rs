@@ -4,8 +4,14 @@ use std::path::{Path, PathBuf};
 
 use crate::config::paths::{append_system_md_path, get_agent_dir, get_project_dir, system_md_path};
 
-/// Context file candidate names (first match wins per directory).
-const CONTEXT_NAMES: &[&str] = &["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+/// Context file candidates per directory. Every group is loaded; within a group the
+/// first existing spelling wins.
+const CONTEXT_NAMES: &[&[&str]] = &[
+    &["AGENTS.md", "AGENTS.MD"],
+    &["CLAUDE.md", "CLAUDE.MD"],
+    &["CLAUDE.local.md"],
+    &[".claude/CLAUDE.md"],
+];
 
 /// A loaded project context file.
 #[derive(Debug, Clone)]
@@ -157,21 +163,22 @@ pub fn resolve_system_prompt_files(
     (custom, append)
 }
 
-/// Load AGENTS.md / CLAUDE.md from agent dir + ancestors of cwd.
+/// Load AGENTS.md / CLAUDE.md from the agent dir, `~/.claude`, and ancestors of cwd.
 pub fn load_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
     let mut files = Vec::new();
-    if let Some(cf) = read_context_in_dir(agent_dir) {
-        files.push(cf);
+    let mut seen_files = std::collections::HashSet::new();
+    read_context_in_dir(agent_dir, &mut seen_files, &mut files);
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".claude").join("CLAUDE.md");
+        push_context_file(path, &mut seen_files, &mut files);
     }
 
     let mut dir = cwd.to_path_buf();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen_dirs = std::collections::HashSet::new();
     loop {
         let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-        if seen.insert(key) {
-            if let Some(cf) = read_context_in_dir(&dir) {
-                files.push(cf);
-            }
+        if seen_dirs.insert(key) {
+            read_context_in_dir(&dir, &mut seen_files, &mut files);
         }
         if !dir.pop() {
             break;
@@ -180,14 +187,63 @@ pub fn load_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
     files
 }
 
-fn read_context_in_dir(dir: &Path) -> Option<ContextFile> {
-    for name in CONTEXT_NAMES {
-        let path = dir.join(name);
-        if path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                return Some(ContextFile { path, content });
+fn read_context_in_dir(
+    dir: &Path,
+    seen: &mut std::collections::HashSet<PathBuf>,
+    out: &mut Vec<ContextFile>,
+) {
+    for group in CONTEXT_NAMES {
+        for name in *group {
+            if push_context_file(dir.join(name), seen, out) {
+                break;
             }
         }
     }
-    None
+}
+
+/// Returns `true` when `path` is a readable file (even if skipped as a duplicate).
+fn push_context_file(
+    path: PathBuf,
+    seen: &mut std::collections::HashSet<PathBuf>,
+    out: &mut Vec<ContextFile>,
+) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    // Symlinks (CLAUDE.md -> AGENTS.md) and case-insensitive filesystems.
+    let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+    if seen.insert(key) && !out.iter().any(|f| f.content == content) {
+        out.push(ContextFile { path, content });
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_agents_and_claude_files_without_duplicates() {
+        let agent = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("sub");
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "root agents").unwrap();
+        std::fs::write(cwd.join("AGENTS.md"), "agents").unwrap();
+        std::fs::write(cwd.join("CLAUDE.md"), "claude").unwrap();
+        std::fs::write(cwd.join("CLAUDE.local.md"), "local").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(cwd.join("CLAUDE.md"), cwd.join(".claude").join("CLAUDE.md"))
+            .unwrap();
+
+        let contents: Vec<_> = load_context_files(&cwd, agent.path())
+            .into_iter()
+            .map(|f| f.content)
+            .filter(|c| ["root agents", "agents", "claude", "local"].contains(&c.as_str()))
+            .collect();
+        assert_eq!(contents, ["agents", "claude", "local", "root agents"]);
+    }
 }

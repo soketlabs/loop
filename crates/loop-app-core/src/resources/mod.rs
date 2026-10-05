@@ -67,23 +67,25 @@ pub fn load_resources(
     let mut skill_dirs = Vec::new();
 
     skill_dirs.push(agent_dir.join("skills"));
-    // Cross-harness user skills
+    // Cross-harness user skills (shared with Claude Code)
     if let Some(home) = dirs::home_dir() {
         skill_dirs.push(home.join(".agents").join("skills"));
+        skill_dirs.push(home.join(".claude").join("skills"));
     }
     if project_trusted {
         skill_dirs.push(get_project_dir(cwd).join("skills"));
-        // Walk ancestors for .agents/skills
+        // Walk ancestors for .agents/skills and .claude/skills
         let mut dir = cwd.to_path_buf();
         loop {
             skill_dirs.push(dir.join(".agents").join("skills"));
+            skill_dirs.push(dir.join(".claude").join("skills"));
             if !dir.pop() {
                 break;
             }
         }
     }
 
-    // Settings skill paths (supports ~/.claude/skills opt-in)
+    // Extra skill paths from settings
     for entry in &settings.skills {
         let path = expand_path(entry, agent_dir);
         if path.is_dir() {
@@ -91,9 +93,13 @@ pub fn load_resources(
         }
     }
 
+    let mut seen_dirs = std::collections::HashSet::new();
     let mut seen_skills = std::collections::HashSet::new();
     for dir in skill_dirs {
         if !dir.is_dir() {
+            continue;
+        }
+        if !seen_dirs.insert(dir.canonicalize().unwrap_or_else(|_| dir.clone())) {
             continue;
         }
         let (skills, _) = load_skills(&dir);
@@ -227,8 +233,13 @@ mod tests {
         .unwrap();
     }
 
+    /// Names of test skills only (the user's real `~/.claude/skills` also load).
     fn names(skills: &[Skill]) -> Vec<&str> {
-        skills.iter().map(|s| s.name.as_str()).collect()
+        skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .filter(|n| ["alpha", "beta"].contains(n))
+            .collect()
     }
 
     #[test]
@@ -257,6 +268,7 @@ mod tests {
             .all_skills()
             .into_iter()
             .map(|(s, on)| (s.name.as_str(), on))
+            .filter(|(n, _)| ["alpha", "beta"].contains(n))
             .collect();
         assert_eq!(all, [("alpha", false), ("beta", true)]);
     }
