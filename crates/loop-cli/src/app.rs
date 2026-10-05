@@ -23,40 +23,36 @@ use loop_agent::harness::{
 };
 use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel};
 use loop_ai::providers::SOKET_BASE_URL;
-use loop_ai::{
-    calculate_context_tokens, Message, ModelsRefreshOptions,
-    ToolResultContent, Usage,
-};
+use loop_ai::{calculate_context_tokens, Message, ModelsRefreshOptions, ToolResultContent, Usage};
 
-use crate::commands::{self, AutocompleteEntry, CommandEffect, SkillsCommand};
 #[cfg(feature = "telemetry")]
 use crate::commands::TracingCommand;
+use crate::commands::{self, AutocompleteEntry, CommandEffect, McpCommand, SkillsCommand};
 #[cfg(feature = "telemetry")]
 use crate::config::describe_tracing_status;
-use crate::provider_setup::ProviderSetup;
-use crate::setup_prompt::SetupPrompt;
-#[cfg(feature = "telemetry")]
-use crate::tracing_setup::TracingSetup;
 use crate::keybindings::{
     hotkey_help, multiline_paste_text, normalize_pasted_text, paste_burst_pending,
     pasted_single_line, Action,
 };
-use crate::{build_tools, mcp_server_entries, CliRuntime};
+use crate::provider_setup::ProviderSetup;
+use crate::setup_prompt::SetupPrompt;
 use crate::theme::Theme;
 use crate::tool_approval::{
     auto_approve_from_entries, permissions_from_settings, ApprovalDecision, ApprovalKind,
     ApprovalPolicy, ApprovalPrompt, ToolApprovalBridge, GROUP_BASH, GROUP_FILE,
 };
-use crate::tui::{
-    chat_items_from_agent_messages, consume_frozen_lines, filter_files, find_at_mention,
-    find_tool_index, footer_live_height, format_item_lines, format_live_lines,
-    format_token_usage_line, insert_text, item_is_committed, list_files, live_overflow_count,
-    assistant_error_item, render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus,
-    ChatItem,
-    CommandHistory, FileEntry, FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow, PickerView,
-};
+#[cfg(feature = "telemetry")]
+use crate::tracing_setup::TracingSetup;
 #[cfg(feature = "orchestration")]
 use crate::tui::find_workflow_task_index;
+use crate::tui::{
+    assistant_error_item, chat_items_from_agent_messages, consume_frozen_lines, filter_files,
+    find_at_mention, find_tool_index, footer_live_height, format_item_lines, format_live_lines,
+    format_token_usage_line, insert_text, item_is_committed, list_files, live_overflow_count,
+    render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, CommandHistory,
+    FileEntry, FooterOpts, InputBuffer, McpServerListing, PickerRow, PickerView, FOOTER_HEIGHT,
+};
+use crate::{build_tools, CliRuntime};
 
 enum UiEvent {
     Agent(AgentEvent),
@@ -71,16 +67,39 @@ enum UiEvent {
     WorkflowDone(Result<WorkflowDoneOk, String>),
     /// Planned task graph ready to display.
     #[cfg(feature = "orchestration")]
-    WorkflowGraph { outline: String, mermaid: String },
+    WorkflowGraph {
+        outline: String,
+        mermaid: String,
+    },
     /// Workflow task started executing.
     #[cfg(feature = "orchestration")]
-    WorkflowTaskStarted { task_id: String, description: String },
+    WorkflowTaskStarted {
+        task_id: String,
+        description: String,
+    },
     /// Workflow task completed.
     #[cfg(feature = "orchestration")]
-    WorkflowTaskCompleted { task_id: String, output: String },
+    WorkflowTaskCompleted {
+        task_id: String,
+        output: String,
+    },
     /// Workflow task failed.
     #[cfg(feature = "orchestration")]
-    WorkflowTaskFailed { task_id: String, error: String },
+    WorkflowTaskFailed {
+        task_id: String,
+        error: String,
+    },
+    /// `/mcp login` has an authorization URL ready to show.
+    McpAuthUrl {
+        name: String,
+        url: String,
+        browser_error: Option<String>,
+    },
+    /// `/mcp login` finished (tokens saved, or an error).
+    McpLoginDone {
+        name: String,
+        result: Result<loop_mcp::OAuthLoginOutcome, String>,
+    },
 }
 
 /// Successful workflow completion info.
@@ -99,10 +118,7 @@ enum SandboxDoneOk {
     /// Sandbox disabled.
     Off,
     /// Local sandbox enabled.
-    Local {
-        isolation: String,
-        runtime: String,
-    },
+    Local { isolation: String, runtime: String },
 }
 
 /// Pending accept/reject prompt for a tool call.
@@ -294,7 +310,9 @@ async fn run_loop(
                         format!("tool_start: {tool_name}")
                     }
                     AgentEvent::ToolExecutionEnd {
-                        tool_name, is_error, ..
+                        tool_name,
+                        is_error,
+                        ..
                     } => format!("tool_end: {tool_name} error={is_error}"),
                     other => other.type_name().to_string(),
                 };
@@ -362,10 +380,7 @@ async fn run_loop(
         if chat.is_empty() {
             "resumed · empty session · /help for commands".into()
         } else {
-            format!(
-                "resumed · {} messages · /help for commands",
-                chat.len()
-            )
+            format!("resumed · {} messages · /help for commands", chat.len())
         }
     } else {
         let review_hint = if policy_active {
@@ -394,6 +409,7 @@ async fn run_loop(
     let mut model_picker: Option<ModelPickerState> = None;
     let mut fork_picker: Option<ForkPickerState> = None;
     let mut skill_picker: Option<SkillPickerState> = None;
+    let mut mcp_picker: Option<McpPickerState> = None;
     let mut active_approval: Option<ActiveApproval> = None;
     let mut ac_selected: usize = 0;
     let mut last_ac_filter = String::new();
@@ -463,6 +479,7 @@ async fn run_loop(
             && model_picker.is_none()
             && fork_picker.is_none()
             && skill_picker.is_none()
+            && mcp_picker.is_none()
             && active_approval.is_none()
         {
             let extra = dynamic_command_entries(runtime);
@@ -475,6 +492,7 @@ async fn run_loop(
             && model_picker.is_none()
             && fork_picker.is_none()
             && skill_picker.is_none()
+            && mcp_picker.is_none()
             && active_approval.is_none()
         {
             find_at_mention(input.as_str(), input.cursor())
@@ -546,8 +564,7 @@ async fn run_loop(
                     })
                     .collect(),
                 selected: p.selected,
-                hint: "Fork: edit this user message and continue (prior history kept)."
-                    .into(),
+                hint: "Fork: edit this user message and continue (prior history kept).".into(),
             }
         } else if let Some(p) = &skill_picker {
             PickerView::Models {
@@ -567,6 +584,28 @@ async fn run_loop(
                 selected: p.selected,
                 hint: "Skills: [x] enabled · [ ] disabled. Changes are saved to settings.json."
                     .into(),
+            }
+        } else if let Some(p) = &mcp_picker {
+            PickerView::Models {
+                rows: p
+                    .filtered
+                    .iter()
+                    .filter_map(|&i| p.servers.get(i))
+                    .map(|(name, desc)| {
+                        let enabled = !runtime
+                            .settings
+                            .disabled_mcp_servers
+                            .iter()
+                            .any(|n| n == name);
+                        PickerRow {
+                            label: format!("[{}] {name}", if enabled { "x" } else { " " }),
+                            description: desc.clone(),
+                            mark: None,
+                        }
+                    })
+                    .collect(),
+                selected: p.selected,
+                hint: "MCP: [x] enabled · [ ] disabled. Changes are saved to settings.json.".into(),
             }
         } else if let Some(prompt) = &pending_setup {
             PickerView::Setup {
@@ -607,7 +646,7 @@ async fn run_loop(
             "↑↓ select · enter confirm · esc cancel".into()
         } else if fork_picker.is_some() {
             "↑↓ select · enter edit · esc cancel".into()
-        } else if skill_picker.is_some() {
+        } else if skill_picker.is_some() || mcp_picker.is_some() {
             "↑↓ select · space/enter toggle · type to filter · esc close".into()
         } else if let Some(prompt) = &pending_setup {
             prompt.status_hint(runtime.needs_provider_setup)
@@ -660,12 +699,8 @@ async fn run_loop(
         }
         let usage_line = token_bar.usage_line();
         let term_width = terminal.size()?.width;
-        let live_h = footer_live_height(
-            FOOTER_HEIGHT,
-            term_width,
-            input.as_str(),
-            &picker,
-        ) as usize;
+        let live_h =
+            footer_live_height(FOOTER_HEIGHT, term_width, input.as_str(), &picker) as usize;
         let live_lines = format_live_lines(
             &live,
             &runtime.theme,
@@ -702,9 +737,7 @@ async fn run_loop(
                     picker: &picker,
                     setup_mode,
                     mask_input: pending_setup.as_ref().is_some_and(SetupPrompt::masked),
-                    setup_placeholder: pending_setup
-                        .as_ref()
-                        .map_or("", SetupPrompt::placeholder),
+                    setup_placeholder: pending_setup.as_ref().map_or("", SetupPrompt::placeholder),
                     path_line: &path_line,
                     model_line: &model_line,
                     usage_line: &usage_line,
@@ -730,7 +763,8 @@ async fn run_loop(
                 &mut token_bar,
                 &mut refresh_token_bar,
                 &tx,
-            );
+            )
+            .await;
             continue;
         }
 
@@ -749,6 +783,7 @@ async fn run_loop(
                         &mut model_picker,
                         &mut fork_picker,
                         &mut skill_picker,
+                        &mut mcp_picker,
                         &mut active_approval,
                     );
                     for ev in &batch {
@@ -779,6 +814,7 @@ async fn run_loop(
                             &mut model_picker,
                             &mut fork_picker,
                             &mut skill_picker,
+                            &mut mcp_picker,
                             &mut active_approval,
                         );
                         token_bar.sync_window(runtime);
@@ -805,6 +841,7 @@ async fn run_loop(
                             &mut model_picker,
                             &mut fork_picker,
                             &mut skill_picker,
+                            &mut mcp_picker,
                             &mut active_approval,
                             &mut working,
                             &mut message_queue,
@@ -884,7 +921,8 @@ async fn run_loop(
             &mut token_bar,
             &mut refresh_token_bar,
             &tx,
-        );
+        )
+        .await;
     }
 
     runtime.harness.request_shutdown();
@@ -995,9 +1033,7 @@ fn reset_and_redraw(
     hide_thinking: bool,
 ) -> anyhow::Result<()> {
     use crossterm::cursor::MoveTo;
-    use crossterm::terminal::{
-        BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate,
-    };
+    use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 
     let mut out = io::stdout();
     // Equivalent of pi's `\x1b[2J\x1b[H\x1b[3J`: without purging scrollback the
@@ -1133,8 +1169,6 @@ fn error_item(text: impl Into<String>) -> ChatItem {
     ChatItem::Error { text: text.into() }
 }
 
-
-
 /// Index of the first queued bubble, or `chat.len()` if none.
 /// Agent stream items must be inserted here so they stay above the queue.
 fn first_queued_index(chat: &[ChatItem]) -> usize {
@@ -1165,10 +1199,7 @@ fn settle_queue_at_end(
     streaming_assistant: &mut Option<usize>,
     streaming_thinking: &mut Option<usize>,
 ) {
-    if !chat
-        .iter()
-        .any(|c| matches!(c, ChatItem::Queued { .. }))
-    {
+    if !chat.iter().any(|c| matches!(c, ChatItem::Queued { .. })) {
         return;
     }
     // Already a clean trailing run of Queued items?
@@ -1216,7 +1247,7 @@ fn truncate_status(s: &str, max: usize) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn drain_ui_events(
+async fn drain_ui_events(
     runtime: &mut CliRuntime,
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
     review_rx: &mut mpsc::UnboundedReceiver<ApprovalPrompt>,
@@ -1320,9 +1351,7 @@ fn drain_ui_events(
                         };
                         chat.push(sys(msg));
                         if !info.output.is_empty() {
-                            chat.push(ChatItem::Assistant {
-                                text: info.output,
-                            });
+                            chat.push(ChatItem::Assistant { text: info.output });
                         } else if info.success {
                             chat.push(sys("workflow produced no output"));
                         }
@@ -1344,7 +1373,10 @@ fn drain_ui_events(
                 )));
             }
             #[cfg(feature = "orchestration")]
-            UiEvent::WorkflowTaskStarted { task_id, description } => {
+            UiEvent::WorkflowTaskStarted {
+                task_id,
+                description,
+            } => {
                 chat.push(ChatItem::WorkflowTask {
                     task_id,
                     description,
@@ -1380,6 +1412,29 @@ fn drain_ui_events(
                     }
                 }
             }
+            UiEvent::McpAuthUrl {
+                name,
+                url,
+                browser_error,
+            } => {
+                let mut text = format!("Authorize mcp `{name}` in your browser:\n{url}");
+                if let Some(err) = browser_error {
+                    text.push_str(&format!(
+                        "\nCould not open a browser ({err}). Open the link above."
+                    ));
+                }
+                chat.push(sys(text));
+                *status = format!("mcp `{name}` · waiting for browser authorization");
+            }
+            UiEvent::McpLoginDone { name, result } => match result {
+                Ok(outcome) => {
+                    finish_mcp_login(runtime, chat, status, &name, outcome).await;
+                }
+                Err(err) => {
+                    chat.push(error_item(format!("mcp `{name}` login failed: {err}")));
+                    *status = "ready".into();
+                }
+            },
         }
     }
     while let Ok(prompt) = review_rx.try_recv() {
@@ -1388,11 +1443,7 @@ fn drain_ui_events(
                 reason: Some("superseded by another review".into()),
             });
         }
-        *status = format!(
-            "review · {} · {}",
-            prompt.kind.label(),
-            prompt.summary
-        );
+        *status = format!("review · {} · {}", prompt.kind.label(), prompt.summary);
         *active_approval = Some(ActiveApproval::from_prompt(prompt));
     }
     try_drain_message_queue(
@@ -1435,9 +1486,10 @@ fn dequeue_last_message(
     message_queue: &mut VecDeque<QueuedMessage>,
 ) -> Option<String> {
     let item = message_queue.pop_back()?;
-    if let Some(idx) = chat.iter().rposition(|c| {
-        matches!(c, ChatItem::Queued { text: t } if *t == item.display)
-    }) {
+    if let Some(idx) = chat
+        .iter()
+        .rposition(|c| matches!(c, ChatItem::Queued { text: t } if *t == item.display))
+    {
         chat.remove(idx);
     }
     Some(item.display)
@@ -1459,12 +1511,11 @@ fn start_user_turn(
     settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
 
     // Promote a matching queued bubble if this came from the outbound queue.
-    if let Some(idx) = chat.iter().position(|item| {
-        matches!(item, ChatItem::Queued { text: t } if *t == display)
-    }) {
-        chat[idx] = ChatItem::User {
-            text: display,
-        };
+    if let Some(idx) = chat
+        .iter()
+        .position(|item| matches!(item, ChatItem::Queued { text: t } if *t == display))
+    {
+        chat[idx] = ChatItem::User { text: display };
     } else {
         chat.push(ChatItem::User { text: display });
     }
@@ -1503,10 +1554,7 @@ fn try_drain_message_queue(
 ) {
     // Wait until the harness is fully idle. AgentEnd clears `working` slightly
     // before phase flips, and Esc must be able to flush the queue in between.
-    if *working
-        || runtime.harness.phase() != AgentHarnessPhase::Idle
-        || message_queue.is_empty()
-    {
+    if *working || runtime.harness.phase() != AgentHarnessPhase::Idle || message_queue.is_empty() {
         return;
     }
     let Some(item) = message_queue.pop_front() else {
@@ -1697,6 +1745,7 @@ fn insert_pasted_text(
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
     skill_picker: &mut Option<SkillPickerState>,
+    mcp_picker: &mut Option<McpPickerState>,
     active_approval: &mut Option<ActiveApproval>,
 ) {
     if let Some(review) = active_approval.as_mut() {
@@ -1725,6 +1774,14 @@ fn insert_pasted_text(
         return;
     }
     if let Some(picker) = skill_picker.as_mut() {
+        let line = pasted_single_line(text);
+        if !line.is_empty() {
+            picker.query.push_str(&line);
+            picker.refilter();
+        }
+        return;
+    }
+    if let Some(picker) = mcp_picker.as_mut() {
         let line = pasted_single_line(text);
         if !line.is_empty() {
             picker.query.push_str(&line);
@@ -1769,6 +1826,7 @@ async fn handle_key(
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
     skill_picker: &mut Option<SkillPickerState>,
+    mcp_picker: &mut Option<McpPickerState>,
     active_approval: &mut Option<ActiveApproval>,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
@@ -1787,7 +1845,9 @@ async fn handle_key(
                 if review.reason_focused {
                     review.reason_focused = false;
                 } else if let Some(r) = active_approval.take() {
-                    let _ = r.response_tx.send(ApprovalDecision::Reject { reason: None });
+                    let _ = r
+                        .response_tx
+                        .send(ApprovalDecision::Reject { reason: None });
                     chat.push(sys(format!("rejected {} · {}", r.kind.label(), r.summary)));
                     *status = "rejected · continuing".into();
                 }
@@ -1821,11 +1881,7 @@ async fn handle_key(
                     };
                     match &decision {
                         ApprovalDecision::Accept => {
-                            chat.push(sys(format!(
-                                "accepted {} · {}",
-                                r.kind.label(),
-                                r.summary
-                            )));
+                            chat.push(sys(format!("accepted {} · {}", r.kind.label(), r.summary)));
                             *status = "accepted · continuing".into();
                         }
                         ApprovalDecision::AcceptSession => {
@@ -1997,6 +2053,43 @@ async fn handle_key(
         return Ok(());
     }
 
+    if let Some(picker) = mcp_picker.as_mut() {
+        match key.code {
+            KeyCode::Esc => {
+                *mcp_picker = None;
+                *status = "ready".into();
+            }
+            KeyCode::Up => {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if picker.selected + 1 < picker.filtered.len() {
+                    picker.selected += 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(name) = picker.selected_name().map(str::to_string) {
+                    let enabled = runtime
+                        .settings
+                        .disabled_mcp_servers
+                        .iter()
+                        .any(|n| n == &name);
+                    set_mcp_enabled(runtime, &name, enabled, chat, status).await;
+                }
+            }
+            KeyCode::Char(c) => {
+                picker.query.push(c);
+                picker.refilter();
+            }
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.refilter();
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // Slash-command picker navigation (before general keybindings).
     if !ac_entries.is_empty() {
         match key.code {
@@ -2046,8 +2139,7 @@ async fn handle_key(
                 return Ok(());
             }
             KeyCode::Tab => {
-                if let (Some(mention), Some(sel)) =
-                    (at_mention, file_ac_entries.get(*ac_selected))
+                if let (Some(mention), Some(sel)) = (at_mention, file_ac_entries.get(*ac_selected))
                 {
                     let text = format!("{} ", insert_text(&sel.absolute));
                     input.replace_char_range(mention.start, mention.end, &text);
@@ -2058,8 +2150,7 @@ async fn handle_key(
                 if !key.modifiers.contains(KeyModifiers::SHIFT)
                     && !key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                if let (Some(mention), Some(sel)) =
-                    (at_mention, file_ac_entries.get(*ac_selected))
+                if let (Some(mention), Some(sel)) = (at_mention, file_ac_entries.get(*ac_selected))
                 {
                     let text = insert_text(&sel.absolute);
                     input.replace_char_range(mention.start, mention.end, &text);
@@ -2111,12 +2202,28 @@ async fn handle_key(
             *pending_setup = None;
             match prompt {
                 SetupPrompt::Provider(step) => {
-                    advance_provider_setup(step, &value, runtime, pending_setup, input, chat, status)
-                        .await;
+                    advance_provider_setup(
+                        step,
+                        &value,
+                        runtime,
+                        pending_setup,
+                        input,
+                        chat,
+                        status,
+                    )
+                    .await;
                 }
                 #[cfg(feature = "telemetry")]
                 SetupPrompt::Tracing(step) => {
-                    advance_tracing_setup(step, &value, runtime, pending_setup, input, chat, status);
+                    advance_tracing_setup(
+                        step,
+                        &value,
+                        runtime,
+                        pending_setup,
+                        input,
+                        chat,
+                        status,
+                    );
                 }
             }
             return Ok(());
@@ -2197,19 +2304,11 @@ async fn handle_key(
                 } else if last_escape.elapsed() < Duration::from_millis(500) {
                     match runtime.settings.double_escape_action.as_str() {
                         "tree" => {
-                            chat.push(sys(
-                                "session tree: use /tree (branch nav in session store)",
-                            ));
+                            chat.push(sys("session tree: use /tree (branch nav in session store)"));
                         }
                         "fork" => {
-                            open_fork_picker(
-                                runtime,
-                                fork_picker,
-                                model_picker,
-                                chat,
-                                status,
-                            )
-                            .await;
+                            open_fork_picker(runtime, fork_picker, model_picker, chat, status)
+                                .await;
                         }
                         _ => {}
                     }
@@ -2259,6 +2358,7 @@ async fn handle_key(
                             model_picker,
                             fork_picker,
                             skill_picker,
+                            mcp_picker,
                             hide_thinking,
                             working,
                             message_queue,
@@ -2440,10 +2540,7 @@ async fn handle_key(
                     *status = if message_queue.is_empty() {
                         format!("dequeued: {preview}")
                     } else {
-                        format!(
-                            "dequeued: {preview} · {} still queued",
-                            message_queue.len()
-                        )
+                        format!("dequeued: {preview} · {} still queued", message_queue.len())
                     };
                 } else {
                     *status = "queue empty".into();
@@ -2541,8 +2638,7 @@ impl ForkPickerState {
             .iter()
             .enumerate()
             .filter(|(_, p)| {
-                p.preview.to_lowercase().contains(&q)
-                    || format!("#{}", p.index).contains(&q)
+                p.preview.to_lowercase().contains(&q) || format!("#{}", p.index).contains(&q)
             })
             .map(|(i, _)| i)
             .collect();
@@ -2604,6 +2700,317 @@ impl SkillPickerState {
             .get(self.selected)
             .and_then(|&i| self.skills.get(i))
             .map(|(name, _)| name.as_str())
+    }
+}
+
+struct McpPickerState {
+    /// `(name, how to reach it)` for every configured server, sorted by name.
+    servers: Vec<(String, String)>,
+    /// Indices into `servers` after filter.
+    filtered: Vec<usize>,
+    selected: usize,
+    query: String,
+}
+
+impl McpPickerState {
+    fn new(settings: &crate::config::Settings) -> Self {
+        let servers = settings
+            .mcp_servers
+            .iter()
+            .map(|(name, cfg)| (name.clone(), mcp_server_hint(cfg)))
+            .collect::<Vec<_>>();
+        let filtered = (0..servers.len()).collect();
+        Self {
+            servers,
+            filtered,
+            selected: 0,
+            query: String::new(),
+        }
+    }
+
+    fn refilter(&mut self) {
+        let q = self.query.to_lowercase();
+        self.filtered = self
+            .servers
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, hint))| {
+                name.to_lowercase().contains(&q) || hint.to_lowercase().contains(&q)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if self.selected >= self.filtered.len() {
+            self.selected = self.filtered.len().saturating_sub(1);
+        }
+    }
+
+    fn selected_name(&self) -> Option<&str> {
+        self.filtered
+            .get(self.selected)
+            .and_then(|&i| self.servers.get(i))
+            .map(|(name, _)| name.as_str())
+    }
+}
+
+fn mcp_server_hint(cfg: &loop_app_core::config::settings::McpServerConfig) -> String {
+    if let Some(url) = &cfg.url {
+        url.clone()
+    } else if let Some(command) = &cfg.command {
+        if cfg.args.is_empty() {
+            command.clone()
+        } else {
+            format!("{command} {}", cfg.args.join(" "))
+        }
+    } else {
+        "not configured".into()
+    }
+}
+
+fn start_mcp_login(
+    runtime: &CliRuntime,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+    name: &str,
+) {
+    let Some(cfg) = runtime.settings.mcp_servers.get(name) else {
+        chat.push(sys(format!("mcp server not found: {name} (see /mcp list)")));
+        return;
+    };
+    let Some(url) = cfg.url.clone() else {
+        chat.push(error_item(format!(
+            "mcp `{name}` is a local command server and does not use OAuth"
+        )));
+        return;
+    };
+    match runtime.mcp_client.oauth_credential_path(name) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            chat.push(error_item(
+                "OAuth credential storage is not configured for this session".to_string(),
+            ));
+            return;
+        }
+        Err(err) => {
+            chat.push(error_item(err));
+            return;
+        }
+    }
+    chat.push(sys(format!("Starting OAuth login for mcp `{name}`…")));
+    *status = format!("mcp `{name}` · waiting for browser authorization");
+
+    let client = Arc::clone(&runtime.mcp_client);
+    let tx_url = tx.clone();
+    let tx_done = tx.clone();
+    let server_name = name.to_string();
+    tokio::spawn(async move {
+        let name_for_url = server_name.clone();
+        let result = client
+            .oauth_login(&server_name, &url, move |auth_url| {
+                let browser_error = open_browser(auth_url).err().map(|err| err.to_string());
+                let _ = tx_url.send(UiEvent::McpAuthUrl {
+                    name: name_for_url,
+                    url: auth_url.to_string(),
+                    browser_error,
+                });
+            })
+            .await;
+        let _ = tx_done.send(UiEvent::McpLoginDone {
+            name: server_name,
+            result,
+        });
+    });
+}
+
+fn open_browser(url: &str) -> std::io::Result<std::process::Child> {
+    #[cfg(target_os = "macos")]
+    {
+        return std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn()
+    }
+}
+
+async fn finish_mcp_login(
+    runtime: &mut CliRuntime,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    name: &str,
+    outcome: loop_mcp::OAuthLoginOutcome,
+) {
+    let disabled = runtime
+        .settings
+        .disabled_mcp_servers
+        .iter()
+        .any(|server| server == name);
+    let note = match outcome {
+        loop_mcp::OAuthLoginOutcome::Authorized => "authorized",
+        loop_mcp::OAuthLoginOutcome::NotRequired => "does not require authorization",
+    };
+    if disabled {
+        chat.push(sys(format!(
+            "mcp `{name}` {note}. It is disabled; /mcp enable {name} to connect."
+        )));
+        *status = "ready".into();
+        return;
+    }
+    let Some(entry) = mcp_entry(runtime, name) else {
+        chat.push(error_item(format!(
+            "mcp `{name}` {note}, but it is no longer configured"
+        )));
+        *status = "ready".into();
+        return;
+    };
+    runtime.mcp_client.disconnect(name).await;
+    match runtime.mcp_client.connect(&entry).await {
+        Ok(count) => {
+            if let Err(err) = runtime.refresh_mcp_tools().await {
+                chat.push(error_item(format!("error setting tools: {err}")));
+            }
+            let noun = if count == 1 { "tool" } else { "tools" };
+            chat.push(sys(format!("mcp `{name}` {note} — {count} {noun}")));
+            *status = "ready".into();
+        }
+        Err(err) => {
+            chat.push(error_item(format!(
+                "mcp `{name}` {note}, but connecting failed: {err}"
+            )));
+            *status = "ready".into();
+        }
+    }
+}
+
+fn mcp_entry(runtime: &CliRuntime, name: &str) -> Option<loop_mcp::McpServerEntry> {
+    let cfg = runtime.settings.mcp_servers.get(name)?.clone();
+    let mut one = std::collections::BTreeMap::new();
+    one.insert(name.to_string(), cfg);
+    crate::runtime::mcp_server_entries(&one).into_iter().next()
+}
+
+async fn logout_mcp(
+    runtime: &mut CliRuntime,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    name: &str,
+) {
+    if !runtime.settings.mcp_servers.contains_key(name) {
+        chat.push(sys(format!("mcp server not found: {name} (see /mcp list)")));
+        return;
+    }
+    match runtime.mcp_client.clear_oauth_credentials(name).await {
+        Ok(true) => {
+            runtime.mcp_client.disconnect(name).await;
+            if let Err(err) = runtime.refresh_mcp_tools().await {
+                chat.push(error_item(format!("error setting tools: {err}")));
+            }
+            chat.push(sys(format!(
+                "mcp `{name}` authorization removed. /mcp reload to reconnect."
+            )));
+            *status = format!("mcp `{name}` logged out");
+        }
+        Ok(false) => chat.push(sys(format!("mcp `{name}` has no saved authorization"))),
+        Err(err) => chat.push(error_item(err)),
+    }
+}
+
+async fn set_mcp_enabled(
+    runtime: &mut CliRuntime,
+    name: &str,
+    enabled: bool,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+) {
+    use crate::runtime::McpToggleOutcome;
+
+    let state = if enabled { "enabled" } else { "disabled" };
+    match runtime.set_mcp_server_enabled(name, enabled).await {
+        Ok(McpToggleOutcome::Updated) => *status = format!("mcp `{name}` {state}"),
+        Ok(McpToggleOutcome::Missing) => {
+            chat.push(sys(format!("mcp server not found: {name} (see /mcp list)")));
+        }
+        Ok(McpToggleOutcome::ConnectFailed(err)) => {
+            *status = format!("mcp `{name}` enabled · connect failed");
+            chat.push(error_item(format!(
+                "mcp `{name}` enabled, but connecting failed: {err}"
+            )));
+        }
+        Err(e) => chat.push(error_item(format!(
+            "mcp `{name}` {state} for this session, but saving settings failed: {e:#}"
+        ))),
+    }
+}
+
+async fn mcp_status_item(
+    runtime: &CliRuntime,
+    kind: &str,
+    mark_ok: bool,
+    connect_errors: &[(String, String)],
+) -> ChatItem {
+    let connected = runtime.mcp_client.list_connection_tools().await;
+    let mut servers = Vec::new();
+    for name in runtime.settings.mcp_servers.keys() {
+        let disabled = runtime
+            .settings
+            .disabled_mcp_servers
+            .iter()
+            .any(|n| n == name);
+        if disabled {
+            servers.push(McpServerListing {
+                name: name.clone(),
+                tools: Vec::new(),
+                error: None,
+                disabled: true,
+            });
+            continue;
+        }
+        if let Some((_, err)) = connect_errors.iter().find(|(n, _)| n == name) {
+            servers.push(McpServerListing {
+                name: name.clone(),
+                tools: Vec::new(),
+                error: Some(err.clone()),
+                disabled: false,
+            });
+            continue;
+        }
+        if let Some((_, tools)) = connected.iter().find(|(n, _)| n == name) {
+            servers.push(McpServerListing {
+                name: name.clone(),
+                tools: tools.clone(),
+                error: None,
+                disabled: false,
+            });
+        } else {
+            servers.push(McpServerListing {
+                name: name.clone(),
+                tools: Vec::new(),
+                error: Some("not connected".into()),
+                disabled: false,
+            });
+        }
+    }
+    let disabled_count = servers.iter().filter(|server| server.disabled).count();
+    let heading = if kind == "reload" {
+        "MCP reload:".into()
+    } else if disabled_count == 0 {
+        format!("MCP servers ({}):", servers.len())
+    } else {
+        format!(
+            "MCP servers ({} configured, {disabled_count} disabled):",
+            servers.len()
+        )
+    };
+    ChatItem::Mcp {
+        heading,
+        servers,
+        mark_ok,
     }
 }
 
@@ -3129,7 +3536,10 @@ async fn apply_logout(provider: Option<String>, runtime: &mut CliRuntime) -> Str
         return if connected.is_empty() {
             "Usage: /logout <provider> · no providers are connected".into()
         } else {
-            format!("Usage: /logout <provider> · connected: {}", connected.join(", "))
+            format!(
+                "Usage: /logout <provider> · connected: {}",
+                connected.join(", ")
+            )
         };
     };
     match runtime.disconnect_provider(&provider).await {
@@ -3175,6 +3585,7 @@ async fn apply_effect(
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
     skill_picker: &mut Option<SkillPickerState>,
+    mcp_picker: &mut Option<McpPickerState>,
     hide_thinking: &mut bool,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
@@ -3292,9 +3703,7 @@ async fn apply_effect(
                     *working = true;
                     *status = format!("enabling sandbox (--{iso_s} --{rt_s})…");
                     chat.push(sys(" "));
-                    chat.push(sys(format!(
-                        "enabling sandbox (--{iso_s} --{rt_s})…"
-                    )));
+                    chat.push(sys(format!("enabling sandbox (--{iso_s} --{rt_s})…")));
                     tokio::spawn(async move {
                         let result = async {
                             let sb = KrunSandbox::new(KrunSandbox::config_for(
@@ -3304,10 +3713,7 @@ async fn apply_effect(
                             ));
                             sb.start().await.map_err(|e| e.to_string())?;
                             let env = sb.env();
-                            if let Err(e) = harness
-                                .set_tools(build_tools(Arc::clone(&env)))
-                                .await
-                            {
+                            if let Err(e) = harness.set_tools(build_tools(Arc::clone(&env))).await {
                                 let _ = sb.destroy().await;
                                 return Err(format!("sandbox: {e}"));
                             }
@@ -3341,7 +3747,12 @@ async fn apply_effect(
         }
         #[cfg(feature = "telemetry")]
         CommandEffect::Tracing(command) => {
-            chat.push(sys(apply_tracing_command(command, runtime, pending_setup, input)));
+            chat.push(sys(apply_tracing_command(
+                command,
+                runtime,
+                pending_setup,
+                input,
+            )));
         }
         CommandEffect::Login(provider) => match ProviderSetup::start(provider.as_deref()) {
             Ok(step) => {
@@ -3362,10 +3773,7 @@ async fn apply_effect(
             *working = false;
             match runtime
                 .harness
-                .start_new_session(
-                    Some(runtime.cwd.to_string_lossy().into_owned()),
-                    None,
-                )
+                .start_new_session(Some(runtime.cwd.to_string_lossy().into_owned()), None)
                 .await
             {
                 Ok(id) => {
@@ -3373,8 +3781,7 @@ async fn apply_effect(
                     runtime.resumed = false;
                     runtime.active_skills.clear();
                     chat.clear();
-                    let policy =
-                        ApprovalPolicy::parse(&runtime.settings.file_edit_review);
+                    let policy = ApprovalPolicy::parse(&runtime.settings.file_edit_review);
                     let enabled = policy.asks_for_session(true);
                     if let Some(bridge) = &runtime.tool_approval {
                         bridge.clear_session_grants();
@@ -3396,38 +3803,37 @@ async fn apply_effect(
                 }
             }
         }
-        CommandEffect::SetFileReview(arg) => {
-            match arg {
-                None => {
-                    let active = runtime
-                        .tool_approval
-                        .as_ref()
-                        .map(|b| b.policy_active())
-                        .unwrap_or(false);
-                    let grants = runtime
-                        .tool_approval
-                        .as_ref()
-                        .map(|b| {
-                            let g = b.auto_approve_groups();
-                            let mut parts = Vec::new();
-                            if g.contains(GROUP_FILE) {
-                                parts.push("file");
-                            }
-                            if g.contains(GROUP_BASH) {
-                                parts.push("bash");
-                            }
-                            if parts.is_empty() {
-                                "(none)".into()
-                            } else {
-                                parts.join(", ")
-                            }
-                        })
-                        .unwrap_or_else(|| "(none)".into());
-                    let mut perms = String::new();
-                    for (k, v) in &runtime.settings.tool_permissions {
-                        perms.push_str(&format!("\n    {k}: {v}"));
-                    }
-                    chat.push(sys(format!(
+        CommandEffect::SetFileReview(arg) => match arg {
+            None => {
+                let active = runtime
+                    .tool_approval
+                    .as_ref()
+                    .map(|b| b.policy_active())
+                    .unwrap_or(false);
+                let grants = runtime
+                    .tool_approval
+                    .as_ref()
+                    .map(|b| {
+                        let g = b.auto_approve_groups();
+                        let mut parts = Vec::new();
+                        if g.contains(GROUP_FILE) {
+                            parts.push("file");
+                        }
+                        if g.contains(GROUP_BASH) {
+                            parts.push("bash");
+                        }
+                        if parts.is_empty() {
+                            "(none)".into()
+                        } else {
+                            parts.join(", ")
+                        }
+                    })
+                    .unwrap_or_else(|| "(none)".into());
+                let mut perms = String::new();
+                for (k, v) in &runtime.settings.tool_permissions {
+                    perms.push_str(&format!("\n    {k}: {v}"));
+                }
+                chat.push(sys(format!(
                         "tool approval policy: {} (session asking: {active})\n  session auto-approve: {grants}\n  /review newSession|always|never\n  settings.toolPermissions:{perms}\n  settings.diffEditor: {}",
                         runtime.settings.file_edit_review,
                         runtime
@@ -3436,62 +3842,59 @@ async fn apply_effect(
                             .as_deref()
                             .unwrap_or("(auto: cursor|code)"),
                     )));
-                }
-                Some(raw) => {
-                    let policy = ApprovalPolicy::parse(&raw);
-                    runtime.settings.file_edit_review = policy.as_str().into();
-                    let enabled = policy.asks_for_session(!runtime.resumed);
-                    if let Some(bridge) = &runtime.tool_approval {
-                        bridge.set_policy_active(enabled);
-                        bridge.set_permissions(permissions_from_settings(
-                            &runtime.settings.tool_permissions,
-                        ));
-                    }
-                    let _ = runtime.save_settings();
-                    chat.push(sys(format!(
-                        "tool approval → {} (this session: {})",
-                        policy.as_str(),
-                        if enabled { "on" } else { "off" }
-                    )));
-                }
             }
-        }
-        CommandEffect::SetResponseHeaderTimeout(arg) => {
-            match arg {
-                None => {
-                    let ms = runtime.harness.response_header_timeout_ms().await;
+            Some(raw) => {
+                let policy = ApprovalPolicy::parse(&raw);
+                runtime.settings.file_edit_review = policy.as_str().into();
+                let enabled = policy.asks_for_session(!runtime.resumed);
+                if let Some(bridge) = &runtime.tool_approval {
+                    bridge.set_policy_active(enabled);
+                    bridge.set_permissions(permissions_from_settings(
+                        &runtime.settings.tool_permissions,
+                    ));
+                }
+                let _ = runtime.save_settings();
+                chat.push(sys(format!(
+                    "tool approval → {} (this session: {})",
+                    policy.as_str(),
+                    if enabled { "on" } else { "off" }
+                )));
+            }
+        },
+        CommandEffect::SetResponseHeaderTimeout(arg) => match arg {
+            None => {
+                let ms = runtime.harness.response_header_timeout_ms().await;
+                let label = if ms == 0 {
+                    "off (unlimited)".into()
+                } else if ms % 1000 == 0 {
+                    format!("{}s", ms / 1000)
+                } else {
+                    format!("{ms}ms")
+                };
+                chat.push(sys(format!(
+                        "response header timeout (TTFB): {label}\n  /ttfb off|on|60s|120000\n  settings.responseHeaderTimeoutMs: {} (0 = unlimited)",
+                        runtime.settings.response_header_timeout_ms
+                    )));
+            }
+            Some(raw) => match parse_response_header_timeout(&raw) {
+                Ok(ms) => {
+                    runtime.settings.response_header_timeout_ms = ms;
+                    runtime.harness.set_response_header_timeout_ms(ms).await;
+                    let _ = runtime.save_settings();
                     let label = if ms == 0 {
-                        "off (unlimited)".into()
+                        "off (unlimited — for long-running workflows)".into()
                     } else if ms % 1000 == 0 {
                         format!("{}s", ms / 1000)
                     } else {
                         format!("{ms}ms")
                     };
-                    chat.push(sys(format!(
-                        "response header timeout (TTFB): {label}\n  /ttfb off|on|60s|120000\n  settings.responseHeaderTimeoutMs: {} (0 = unlimited)",
-                        runtime.settings.response_header_timeout_ms
-                    )));
+                    chat.push(sys(format!("response header timeout → {label}")));
                 }
-                Some(raw) => match parse_response_header_timeout(&raw) {
-                    Ok(ms) => {
-                        runtime.settings.response_header_timeout_ms = ms;
-                        runtime.harness.set_response_header_timeout_ms(ms).await;
-                        let _ = runtime.save_settings();
-                        let label = if ms == 0 {
-                            "off (unlimited — for long-running workflows)".into()
-                        } else if ms % 1000 == 0 {
-                            format!("{}s", ms / 1000)
-                        } else {
-                            format!("{ms}ms")
-                        };
-                        chat.push(sys(format!("response header timeout → {label}")));
-                    }
-                    Err(e) => {
-                        chat.push(sys(e));
-                    }
-                },
-            }
-        }
+                Err(e) => {
+                    chat.push(sys(e));
+                }
+            },
+        },
         CommandEffect::Compact(instructions) => {
             let harness = Arc::clone(&runtime.harness);
             let tx = tx.clone();
@@ -3526,8 +3929,7 @@ async fn apply_effect(
         CommandEffect::SessionInfo => {
             match runtime.harness.session_stats().await {
                 Ok(stats) => {
-                    let mut report =
-                        loop_agent::harness::format_session_stats(&stats);
+                    let mut report = loop_agent::harness::format_session_stats(&stats);
                     report.push_str(&format!(
                         "\nEnvironment\n  Sessions DB: {}\n  Theme: {}\n  Trusted: {}\n  Model: {}\n",
                         runtime.sessions_db.display(),
@@ -3540,7 +3942,9 @@ async fn apply_effect(
                 Err(e) => {
                     chat.push(sys(format!(
                         "model: {}\nsessions db: {}\ntheme: {}\ntrusted: {}\n(stats error: {e})",
-                        runtime.selected_model_spec().unwrap_or_else(|| "none".into()),
+                        runtime
+                            .selected_model_spec()
+                            .unwrap_or_else(|| "none".into()),
                         runtime.sessions_db.display(),
                         runtime.theme.name,
                         runtime.project_trusted
@@ -3616,7 +4020,12 @@ async fn apply_effect(
         }
         CommandEffect::Skills(SkillsCommand::Disable(name)) => {
             set_skill_enabled(runtime, &name, false, chat, status).await;
-            if runtime.resources.disabled_skills.iter().any(|s| s.name == name) {
+            if runtime
+                .resources
+                .disabled_skills
+                .iter()
+                .any(|s| s.name == name)
+            {
                 chat.push(sys(format!("skill `{name}` disabled")));
             }
         }
@@ -3625,6 +4034,7 @@ async fn apply_effect(
         {
             *model_picker = None;
             *fork_picker = None;
+            *mcp_picker = None;
             *skill_picker = Some(SkillPickerState::new(&runtime.resources));
             *status = "skills · toggle on or off".into();
         }
@@ -3664,10 +4074,7 @@ async fn apply_effect(
                 "resume: restart with `loop --resume <session-id>` (picker UI forthcoming)",
             ));
             if !runtime.session_id.is_empty() {
-                chat.push(sys(format!(
-                    "current session id: {}",
-                    runtime.session_id
-                )));
+                chat.push(sys(format!("current session id: {}", runtime.session_id)));
             }
         }
         CommandEffect::Tree => {
@@ -3721,52 +4128,74 @@ async fn apply_effect(
             )
             .await;
         }
-        CommandEffect::Mcp(sub) => {
-            let sub = sub.trim();
-            match sub {
-                "list" | "" => {
-                    let conns = runtime.mcp_client.list_connections().await;
-                    if conns.is_empty() {
-                        chat.push(sys("No MCP servers connected.\n\nConfigure in settings.json under \"mcpServers\", then /reload or /mcp reload."));
-                    } else {
-                        let mut text = format!("MCP connections ({}):\n", conns.len());
-                        for (name, count) in &conns {
-                            text.push_str(&format!("  {name} — {count} tools\n"));
-                        }
-                        chat.push(sys(text));
-                    }
+        CommandEffect::Mcp(McpCommand::Enable(name)) => {
+            set_mcp_enabled(runtime, &name, true, chat, status).await;
+            if runtime.settings.mcp_servers.contains_key(&name)
+                && !runtime
+                    .settings
+                    .disabled_mcp_servers
+                    .iter()
+                    .any(|n| n == &name)
+            {
+                chat.push(sys(format!("mcp `{name}` enabled")));
+            }
+        }
+        CommandEffect::Mcp(McpCommand::Disable(name)) => {
+            set_mcp_enabled(runtime, &name, false, chat, status).await;
+            if runtime
+                .settings
+                .disabled_mcp_servers
+                .iter()
+                .any(|n| n == &name)
+            {
+                chat.push(sys(format!("mcp `{name}` disabled")));
+            }
+        }
+        CommandEffect::Mcp(McpCommand::Picker) if !runtime.settings.mcp_servers.is_empty() => {
+            *model_picker = None;
+            *fork_picker = None;
+            *skill_picker = None;
+            *mcp_picker = Some(McpPickerState::new(&runtime.settings));
+            *status = "mcp · toggle on or off".into();
+        }
+        CommandEffect::Mcp(McpCommand::Picker | McpCommand::List) => {
+            if runtime.settings.mcp_servers.is_empty() {
+                chat.push(sys(
+                    "No MCP servers configured.\n\nAdd them under \"mcpServers\" in settings.json, then /mcp reload.\nToggle with /mcp (picker) or /mcp enable|disable <name>. Disabled servers are not connected.",
+                ));
+            } else {
+                chat.push(mcp_status_item(runtime, "list", false, &[]).await);
+                chat.push(sys(
+                    "Toggle with /mcp (picker) or /mcp enable|disable <name>. Disabled servers are not connected. ctrl+o lists tools. Authorize a remote server with /mcp login <name>.",
+                ));
+            }
+        }
+        CommandEffect::Mcp(McpCommand::Login(name)) => {
+            start_mcp_login(runtime, chat, status, tx, &name);
+        }
+        CommandEffect::Mcp(McpCommand::Logout(name)) => {
+            logout_mcp(runtime, chat, status, &name).await;
+        }
+        CommandEffect::Mcp(McpCommand::Reload) => {
+            runtime.mcp_client.disconnect_all().await;
+            if runtime.settings.mcp_servers.is_empty() {
+                chat.push(sys("No MCP servers configured in settings.json"));
+            } else {
+                let entries = crate::runtime::enabled_mcp_server_entries(
+                    &runtime.settings.mcp_servers,
+                    &runtime.settings.disabled_mcp_servers,
+                );
+                let results = runtime.mcp_client.connect_all(&entries).await;
+                let errors: Vec<(String, String)> = results
+                    .iter()
+                    .filter_map(|(name, result)| {
+                        result.as_ref().err().map(|err| (name.clone(), err.clone()))
+                    })
+                    .collect();
+                if let Err(e) = runtime.refresh_mcp_tools().await {
+                    chat.push(sys(format!("error setting tools: {e}")));
                 }
-                "reload" => {
-                    runtime.mcp_client.disconnect_all().await;
-                    if runtime.settings.mcp_servers.is_empty() {
-                        chat.push(sys("No MCP servers configured in settings.json"));
-                    } else {
-                        let entries = mcp_server_entries(&runtime.settings.mcp_servers);
-                        let results = runtime.mcp_client.connect_all(&entries).await;
-                        let mut text = String::from("MCP reload:\n");
-                        for (name, result) in &results {
-                            match result {
-                                Ok(count) => text.push_str(&format!("  ✓ {name} — {count} tools\n")),
-                                Err(e) => text.push_str(&format!("  ✗ {name} — {e}\n")),
-                            }
-                        }
-                        let mcp_tools = loop_agent::harness::mcp::bridge::mcp_tools_to_agent_tools_async(
-                            runtime.mcp_client.connections(),
-                        ).await;
-                        let mut all_tools: Vec<_> = runtime.harness.get_tools().await
-                            .into_iter()
-                            .filter(|t| !t.name.starts_with("mcp__"))
-                            .collect();
-                        all_tools.extend(mcp_tools);
-                        if let Err(e) = runtime.harness.set_tools(all_tools).await {
-                            text.push_str(&format!("  error setting tools: {e}\n"));
-                        }
-                        chat.push(sys(text));
-                    }
-                }
-                other => {
-                    chat.push(sys(format!("Unknown /mcp sub-command: {other}\n\nUsage: /mcp [list|reload]")));
-                }
+                chat.push(mcp_status_item(runtime, "reload", true, &errors).await);
             }
         }
         CommandEffect::Skill { name, args } => {
@@ -3782,14 +4211,17 @@ async fn apply_effect(
                 let args = args.trim();
                 if !args.is_empty() {
                     let current = input.as_str();
-                    if !current.is_empty()
-                        && !current.ends_with(|c: char| c.is_whitespace())
-                    {
+                    if !current.is_empty() && !current.ends_with(|c: char| c.is_whitespace()) {
                         input.insert_str(" ");
                     }
                     input.insert_str(args);
                 }
-            } else if runtime.resources.disabled_skills.iter().any(|s| s.name == name) {
+            } else if runtime
+                .resources
+                .disabled_skills
+                .iter()
+                .any(|s| s.name == name)
+            {
                 chat.push(sys(format!(
                     "skill `{name}` is disabled. Enable it with /skills enable {name}"
                 )));
@@ -3827,16 +4259,7 @@ async fn apply_effect(
             if agent_is_busy(runtime, *working) {
                 chat.push(sys("cannot start workflow while agent is busy"));
             } else {
-                start_workflow(
-                    runtime,
-                    chat,
-                    status,
-                    working,
-                    tx,
-                    &goal,
-                    concurrency,
-                )
-                .await;
+                start_workflow(runtime, chat, status, working, tx, &goal, concurrency).await;
             }
         }
     }
@@ -3879,9 +4302,13 @@ async fn start_workflow(
                 WorkflowProgressEvent::GraphPlanned { outline, mermaid } => {
                     UiEvent::WorkflowGraph { outline, mermaid }
                 }
-                WorkflowProgressEvent::TaskStarted { task_id, description } => {
-                    UiEvent::WorkflowTaskStarted { task_id, description }
-                }
+                WorkflowProgressEvent::TaskStarted {
+                    task_id,
+                    description,
+                } => UiEvent::WorkflowTaskStarted {
+                    task_id,
+                    description,
+                },
                 WorkflowProgressEvent::TaskCompleted { task_id, output } => {
                     UiEvent::WorkflowTaskCompleted { task_id, output }
                 }
@@ -3902,16 +4329,14 @@ async fn start_workflow(
             .await;
 
         let event = match result {
-            Ok(wf_result) => {
-                UiEvent::WorkflowDone(Ok(WorkflowDoneOk {
-                    success: wf_result.success,
-                    completed_count: wf_result.task_results.len(),
-                    failed_count: wf_result.failed_tasks.len(),
-                    total_count: wf_result.total_task_count,
-                    output: wf_result.output_text(),
-                    artifacts: wf_result.artifact_paths(),
-                }))
-            }
+            Ok(wf_result) => UiEvent::WorkflowDone(Ok(WorkflowDoneOk {
+                success: wf_result.success,
+                completed_count: wf_result.task_results.len(),
+                failed_count: wf_result.failed_tasks.len(),
+                total_count: wf_result.total_task_count,
+                output: wf_result.output_text(),
+                artifacts: wf_result.artifact_paths(),
+            })),
             Err(e) => UiEvent::WorkflowDone(Err(e.to_string())),
         };
 

@@ -253,18 +253,26 @@ mod tests {
         assert!(res.set_skill_enabled("beta", true));
         assert!(!res.set_skill_enabled("missing", true));
 
-        let all: Vec<_> = res.all_skills().into_iter().map(|(s, on)| (s.name.as_str(), on)).collect();
+        let all: Vec<_> = res
+            .all_skills()
+            .into_iter()
+            .map(|(s, on)| (s.name.as_str(), on))
+            .collect();
         assert_eq!(all, [("alpha", false), ("beta", true)]);
     }
 
     #[test]
     fn disabled_skills_serialize_only_when_set() {
         let mut settings = Settings::default();
-        assert!(!serde_json::to_string(&settings).unwrap().contains("disabledSkills"));
+        assert!(!serde_json::to_string(&settings)
+            .unwrap()
+            .contains("disabledSkills"));
         crate::config::settings::set_skill_disabled(&mut settings.disabled_skills, "a", false);
         crate::config::settings::set_skill_disabled(&mut settings.disabled_skills, "a", false);
         assert_eq!(settings.disabled_skills, ["a"]);
-        assert!(serde_json::to_string(&settings).unwrap().contains("\"disabledSkills\":[\"a\"]"));
+        assert!(serde_json::to_string(&settings)
+            .unwrap()
+            .contains("\"disabledSkills\":[\"a\"]"));
         crate::config::settings::set_skill_disabled(&mut settings.disabled_skills, "a", true);
         assert!(settings.disabled_skills.is_empty());
     }

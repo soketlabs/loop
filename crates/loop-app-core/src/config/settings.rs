@@ -183,6 +183,12 @@ pub struct Settings {
     /// External MCP servers keyed by name.
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+    /// Configured MCP server names that are not connected.
+    ///
+    /// Saved in the global `settings.json` as `disabledMcpServers`. A project
+    /// settings file can add more names; they are combined with the global list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_mcp_servers: Vec<String>,
     /// Max wait for the model HTTP response headers (time-to-first-byte), in ms.
     ///
     /// Default `60000`. Set to `0` to wait indefinitely (useful for long-running
@@ -247,6 +253,7 @@ impl Default for Settings {
             tool_permissions: default_tool_permissions_settings(),
             default_project_trust: default_trust(),
             mcp_servers: BTreeMap::new(),
+            disabled_mcp_servers: Vec::new(),
             response_header_timeout_ms: default_response_header_timeout_ms(),
             tracing: TracingSettings::default(),
             providers: Vec::new(),
@@ -257,7 +264,10 @@ impl Default for Settings {
 impl Settings {
     /// The saved `(provider, model id)`, when both are set.
     pub fn selected_model(&self) -> Option<(&str, &str)> {
-        Some((self.default_provider.as_deref()?, self.default_model.as_deref()?))
+        Some((
+            self.default_provider.as_deref()?,
+            self.default_model.as_deref()?,
+        ))
     }
 
     /// `provider/model id` of the saved selection.
@@ -358,12 +368,21 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
             base.mcp_servers.insert(k, v);
         }
     }
+    for name in project.disabled_mcp_servers {
+        if !base.disabled_mcp_servers.contains(&name) {
+            base.disabled_mcp_servers.push(name);
+        }
+    }
     base.response_header_timeout_ms = project.response_header_timeout_ms;
     base
 }
 
 /// Load global settings then overlay trusted project settings.
-pub fn load_settings(agent_dir: &Path, cwd: &Path, project_trusted: bool) -> anyhow::Result<Settings> {
+pub fn load_settings(
+    agent_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+) -> anyhow::Result<Settings> {
     let mut settings = Settings::load_file(&settings_path(agent_dir))?;
     if project_trusted {
         let project_settings = get_project_dir(cwd).join("settings.json");
@@ -375,11 +394,71 @@ pub fn load_settings(agent_dir: &Path, cwd: &Path, project_trusted: bool) -> any
     Ok(settings)
 }
 
-/// Add (`enabled = false`) or remove (`enabled = true`) `name` in a disabled-skills list.
-pub fn set_skill_disabled(list: &mut Vec<String>, name: &str, enabled: bool) {
+/// Add (`enabled = false`) or remove (`enabled = true`) `name` in a disabled-name list.
+pub fn set_disabled_name(list: &mut Vec<String>, name: &str, enabled: bool) {
     if enabled {
         list.retain(|n| n != name);
     } else if !list.iter().any(|n| n == name) {
         list.push(name.to_string());
+    }
+}
+
+/// Add (`enabled = false`) or remove (`enabled = true`) `name` in a disabled-skills list.
+pub fn set_skill_disabled(list: &mut Vec<String>, name: &str, enabled: bool) {
+    set_disabled_name(list, name, enabled);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_mcp_servers_round_trip_and_merge() {
+        let mut settings = Settings::default();
+        assert!(!serde_json::to_string(&settings)
+            .unwrap()
+            .contains("disabledMcpServers"));
+        set_disabled_name(&mut settings.disabled_mcp_servers, "filesystem", false);
+        set_disabled_name(&mut settings.disabled_mcp_servers, "filesystem", false);
+        assert_eq!(settings.disabled_mcp_servers, ["filesystem"]);
+        let raw = serde_json::to_string(&settings).unwrap();
+        assert!(raw.contains("\"disabledMcpServers\":[\"filesystem\"]"));
+        set_disabled_name(&mut settings.disabled_mcp_servers, "filesystem", true);
+        assert!(settings.disabled_mcp_servers.is_empty());
+
+        let mut global = Settings::default();
+        global.disabled_mcp_servers = vec!["filesystem".into()];
+        let mut project = Settings::default();
+        project.disabled_mcp_servers = vec!["filesystem".into(), "remote".into()];
+        global.merge_project(project);
+        assert_eq!(global.disabled_mcp_servers, ["filesystem", "remote"]);
+    }
+
+    #[test]
+    fn enabled_mcp_entries_skip_disabled_names() {
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "filesystem".into(),
+            McpServerConfig {
+                command: Some("npx".into()),
+                args: vec!["server".into()],
+                env: BTreeMap::new(),
+                url: None,
+                headers: BTreeMap::new(),
+            },
+        );
+        servers.insert(
+            "remote".into(),
+            McpServerConfig {
+                command: None,
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                url: Some("http://127.0.0.1:3100/mcp".into()),
+                headers: BTreeMap::new(),
+            },
+        );
+        let entries = crate::runtime::enabled_mcp_server_entries(&servers, &["remote".into()]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "filesystem");
     }
 }

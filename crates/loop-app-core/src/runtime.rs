@@ -12,29 +12,27 @@ use loop_agent::harness::{
     Sandbox, SandboxMode,
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
-use loop_ai::providers::{
-    custom_provider, CustomModelSpec, CustomProviderConfig,
-};
-use loop_ai::{
-    CreateModelsOptions, FileModelsStore, Models, ModelsRefreshOptions,
-};
+use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
+use loop_ai::{CreateModelsOptions, FileModelsStore, Models, ModelsRefreshOptions};
 
 use crate::config::auth::FileCredentialStore;
-use loop_ai::CredentialStore;
+use crate::config::paths::trust_path;
 use crate::config::paths::{
     auth_path, ensure_agent_dirs, get_agent_dir, models_json_path, models_store_path,
     sessions_db_path, settings_path,
 };
-use crate::config::settings::{load_settings, set_skill_disabled, McpServerConfig, Settings};
+use crate::config::settings::{
+    load_settings, set_disabled_name, set_skill_disabled, McpServerConfig, Settings,
+};
 use crate::config::trust::TrustStore;
 use crate::model_selection::StartupModel;
-use crate::config::paths::{trust_path};
 use crate::resources::{load_resources, LoadedResources};
 use crate::system_prompt::{
     build_system_prompt, default_tool_snippets, load_context_files, resolve_system_prompt_files,
     BuildSystemPromptOptions,
 };
 use crate::theme::{theme_search_dirs, Theme};
+use loop_ai::CredentialStore;
 
 /// Fully constructed interactive runtime.
 pub struct Runtime {
@@ -123,6 +121,68 @@ impl Runtime {
         Ok(true)
     }
 
+    /// Enable or disable a configured MCP server for this session and in the global settings file.
+    ///
+    /// Disabling disconnects it and drops its tools. Enabling connects it and registers its tools.
+    /// [`McpToggleOutcome::Missing`] means no server has that name. A connect failure is reported
+    /// after the enabled state has already been saved. `Err` means saving settings failed.
+    pub async fn set_mcp_server_enabled(
+        &mut self,
+        name: &str,
+        enabled: bool,
+    ) -> anyhow::Result<McpToggleOutcome> {
+        if !self.settings.mcp_servers.contains_key(name) {
+            return Ok(McpToggleOutcome::Missing);
+        }
+        set_disabled_name(&mut self.settings.disabled_mcp_servers, name, enabled);
+        let path = settings_path(&self.agent_dir);
+        let mut global = Settings::load_file(&path)?;
+        set_disabled_name(&mut global.disabled_mcp_servers, name, enabled);
+        global.save_file(&path)?;
+
+        let connect_error = if enabled {
+            let cfg = self.settings.mcp_servers.get(name).cloned();
+            if let Some(cfg) = cfg {
+                let mut one = std::collections::BTreeMap::new();
+                one.insert(name.to_string(), cfg);
+                match enabled_mcp_server_entries(&one, &[]).into_iter().next() {
+                    Some(entry) => self.mcp_client.connect(&entry).await.err(),
+                    None => Some(format!("mcp server '{name}' has neither command nor url")),
+                }
+            } else {
+                None
+            }
+        } else {
+            self.mcp_client.disconnect(name).await;
+            None
+        };
+        self.refresh_mcp_tools().await?;
+        Ok(match connect_error {
+            Some(err) => McpToggleOutcome::ConnectFailed(err),
+            None => McpToggleOutcome::Updated,
+        })
+    }
+
+    /// Replace harness `mcp__*` tools with the ones from currently connected servers.
+    pub async fn refresh_mcp_tools(&self) -> anyhow::Result<()> {
+        let mcp_tools = loop_agent::harness::mcp::bridge::mcp_tools_to_agent_tools_async(
+            self.mcp_client.connections(),
+        )
+        .await;
+        let mut all_tools: Vec<_> = self
+            .harness
+            .get_tools()
+            .await
+            .into_iter()
+            .filter(|tool| !tool.name.starts_with("mcp__"))
+            .collect();
+        all_tools.extend(mcp_tools);
+        self.harness
+            .set_tools(all_tools)
+            .await
+            .map_err(|e| anyhow::anyhow!("set MCP tools: {e}"))
+    }
+
     /// `/login`: save the key (and custom entry), register the provider and list its
     /// models. Nothing is kept if the key is rejected or the listing fails.
     pub async fn connect_provider(
@@ -155,9 +215,11 @@ impl Runtime {
             })
             .await;
         let model_count = self.models.get_models(Some(&id)).len();
-        let failure = refresh.errors.get(&id).cloned().or_else(|| {
-            (model_count == 0).then(|| "no models were listed".to_string())
-        });
+        let failure = refresh
+            .errors
+            .get(&id)
+            .cloned()
+            .or_else(|| (model_count == 0).then(|| "no models were listed".to_string()));
         if let Some(err) = failure {
             restore_api_key(self.credentials.as_ref(), &id, previous_key);
             if entry.is_some() {
@@ -203,8 +265,14 @@ impl Runtime {
             }
             None => preset.map_or_else(|| id.clone(), |p| p.name.to_string()),
         };
-        if self.selected_model.as_ref().is_some_and(|m| m.provider == id) {
-            self.model_note = self.selected_model_spec().map(|spec| format!("{spec} was disconnected"));
+        if self
+            .selected_model
+            .as_ref()
+            .is_some_and(|m| m.provider == id)
+        {
+            self.model_note = self
+                .selected_model_spec()
+                .map(|spec| format!("{spec} was disconnected"));
             self.selected_model = None;
             self.harness.clear_model().await;
             self.settings.clear_selected_model();
@@ -214,7 +282,11 @@ impl Runtime {
     }
 
     /// Select `provider/id` for this and future runs (harness + saved settings).
-    pub async fn select_model(&mut self, provider: &str, id: &str) -> anyhow::Result<loop_ai::Model> {
+    pub async fn select_model(
+        &mut self,
+        provider: &str,
+        id: &str,
+    ) -> anyhow::Result<loop_ai::Model> {
         let model = self
             .models
             .get_model(provider, id)
@@ -463,10 +535,7 @@ pub fn resolve_trust(
             if !interactive {
                 return Ok(false);
             }
-            eprintln!(
-                "Trust project config from {}? [y/N]",
-                cwd.display()
-            );
+            eprintln!("Trust project config from {}? [y/N]", cwd.display());
             let mut answer = String::new();
             std::io::Write::write_all(&mut std::io::stderr(), b"> ").ok();
             std::io::stdin().read_line(&mut answer)?;
@@ -695,13 +764,18 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
 
     let theme_dirs = theme_search_dirs(
         &agent_dir,
-        project_trusted.then_some(crate::config::paths::get_project_dir(&opts.cwd)).as_ref().map(|p| p.as_path()),
+        project_trusted
+            .then_some(crate::config::paths::get_project_dir(&opts.cwd))
+            .as_ref()
+            .map(|p| p.as_path()),
     );
     let theme = Theme::load(&settings.theme, &theme_dirs).unwrap_or_else(|_| Theme::dark());
 
-    let mcp_client = Arc::new(loop_mcp::McpClientManager::new());
-    if !settings.mcp_servers.is_empty() {
-        let entries = mcp_server_entries(&settings.mcp_servers);
+    let mcp_client = Arc::new(loop_mcp::McpClientManager::with_oauth_dir(
+        agent_dir.join("mcp-auth"),
+    ));
+    let entries = enabled_mcp_server_entries(&settings.mcp_servers, &settings.disabled_mcp_servers);
+    if !entries.is_empty() {
         let results = mcp_client.connect_all(&entries).await;
         for (name, result) in &results {
             match result {
@@ -711,7 +785,8 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         }
         let mcp_tools = loop_agent::harness::mcp::bridge::mcp_tools_to_agent_tools_async(
             mcp_client.connections(),
-        ).await;
+        )
+        .await;
         if !mcp_tools.is_empty() {
             let mut all_tools = harness.get_tools().await;
             all_tools.extend(mcp_tools);
@@ -747,6 +822,28 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     })
 }
 
+/// Result of enabling or disabling one configured MCP server.
+#[derive(Debug)]
+pub enum McpToggleOutcome {
+    /// No server with that name is configured.
+    Missing,
+    /// The enabled state was saved and the connection matches it.
+    Updated,
+    /// The server was marked enabled, but connecting to it failed.
+    ConnectFailed(String),
+}
+
+/// MCP entries that are configured and not listed in `disabled`.
+pub fn enabled_mcp_server_entries(
+    configs: &std::collections::BTreeMap<String, McpServerConfig>,
+    disabled: &[String],
+) -> Vec<loop_mcp::McpServerEntry> {
+    mcp_server_entries(configs)
+        .into_iter()
+        .filter(|entry| !disabled.iter().any(|name| name == &entry.name))
+        .collect()
+}
+
 /// Convert settings MCP config into client entries.
 pub fn mcp_server_entries(
     configs: &std::collections::BTreeMap<String, McpServerConfig>,
@@ -756,13 +853,21 @@ pub fn mcp_server_entries(
         let transport = if let Some(url) = &cfg.url {
             loop_mcp::McpTransport::Http {
                 url: url.clone(),
-                headers: cfg.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                headers: cfg
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
             }
         } else if let Some(command) = &cfg.command {
             loop_mcp::McpTransport::Stdio {
                 command: command.clone(),
                 args: cfg.args.clone(),
-                env: cfg.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                env: cfg
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
             }
         } else {
             tracing::warn!("mcp: skipping '{name}': neither 'command' nor 'url' configured");

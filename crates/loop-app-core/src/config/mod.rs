@@ -11,9 +11,9 @@ pub use auth::{provider_has_key, FileCredentialStore};
 pub use paths::*;
 pub use providers::{CustomProviderEntry, ProviderLoginRequest};
 pub use settings::{load_settings, Settings};
-pub use tracing::{validate_http_url, TracingBackend, TracingSettings};
 #[cfg(feature = "telemetry")]
 pub use tracing::{
     describe_tracing_status, resolve_tracing_destination, TracingControl, TracingSetupRequest,
 };
+pub use tracing::{validate_http_url, TracingBackend, TracingSettings};
 pub use trust::TrustStore;

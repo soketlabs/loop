@@ -7,9 +7,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-    Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-    ServerInfo, Tool as McpTool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool as McpTool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer};
@@ -134,9 +133,7 @@ impl ServerHandler for McpServer {
                     Ok(CallToolResult::success(content).into())
                 }
             }
-            Err(msg) => {
-                Ok(CallToolResult::error(vec![ContentBlock::text(msg)]).into())
-            }
+            Err(msg) => Ok(CallToolResult::error(vec![ContentBlock::text(msg)]).into()),
         }
     }
 }

@@ -2,9 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::paths::{
-    append_system_md_path, get_agent_dir, get_project_dir, system_md_path,
-};
+use crate::config::paths::{append_system_md_path, get_agent_dir, get_project_dir, system_md_path};
 
 /// Context file candidate names (first match wins per directory).
 const CONTEXT_NAMES: &[&str] = &["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];

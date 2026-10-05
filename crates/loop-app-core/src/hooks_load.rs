@@ -44,7 +44,10 @@ struct HookAction {
 }
 
 /// Load JSON hook files and register them on the harness.
-pub fn register_json_hooks(harness: &loop_agent::harness::AgentHarness, paths: &[std::path::PathBuf]) {
+pub fn register_json_hooks(
+    harness: &loop_agent::harness::AgentHarness,
+    paths: &[std::path::PathBuf],
+) {
     let mut hooks: Vec<HookFile> = Vec::new();
     for path in paths {
         if let Ok(raw) = std::fs::read_to_string(path) {

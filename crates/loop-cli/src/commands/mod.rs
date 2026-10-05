@@ -149,8 +149,10 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "mcp",
-            description: "Manage MCP server connections",
-            args_hint: Some("[list|reload]"),
+            description: "Enable, disable, or authorize MCP server connections",
+            args_hint: Some(
+                "[list|reload|login <name>|logout <name>|enable <name>|disable <name>]",
+            ),
         },
         SlashCommand {
             name: "quit",
@@ -268,9 +270,7 @@ pub fn parse_local_sandbox_flags(
         if raw.is_empty() {
             continue;
         }
-        let key = raw
-            .trim_start_matches('-')
-            .to_ascii_lowercase();
+        let key = raw.trim_start_matches('-').to_ascii_lowercase();
         match key.as_str() {
             "full" => {
                 if isolation.is_some() {
@@ -286,9 +286,7 @@ pub fn parse_local_sandbox_flags(
             }
             "crun" | "runc" | "runsc" | "gvisor" | "krun" => {
                 if runtime.is_some() {
-                    return Err(
-                        "specify only one runtime (--crun|--runc|--runsc|--krun)".into(),
-                    );
+                    return Err("specify only one runtime (--crun|--runc|--runsc|--krun)".into());
                 }
                 runtime = LocalSandboxRuntime::parse(&key);
             }
@@ -369,7 +367,7 @@ pub enum CommandEffect {
     /// Clone.
     CloneSession,
     /// MCP sub-command.
-    Mcp(String),
+    Mcp(McpCommand),
     /// Multi-agent workflow from a goal string.
     #[cfg(feature = "orchestration")]
     Workflow {
@@ -408,7 +406,8 @@ pub enum SkillsCommand {
     Disable(String),
 }
 
-const SKILLS_USAGE: &str = "Usage: /skills [list|enable <name>|disable <name>] — no args opens a picker";
+const SKILLS_USAGE: &str =
+    "Usage: /skills [list|enable <name>|disable <name>] — no args opens a picker";
 
 /// Parse `/skills` arguments; `Err` carries the usage text.
 pub fn parse_skills(args: &str) -> Result<SkillsCommand, String> {
@@ -423,6 +422,41 @@ pub fn parse_skills(args: &str) -> Result<SkillsCommand, String> {
 
 fn skill_arg(name: &str) -> String {
     name.strip_prefix("skill:").unwrap_or(name).to_string()
+}
+
+/// `/mcp` subcommands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpCommand {
+    /// Open the enable/disable picker.
+    Picker,
+    /// Print every configured server with its state.
+    List,
+    /// Disconnect and reconnect enabled servers.
+    Reload,
+    /// Enable a server by name.
+    Enable(String),
+    /// Disable a server by name.
+    Disable(String),
+    /// Open a browser and save OAuth tokens for a remote server.
+    Login(String),
+    /// Delete saved OAuth tokens for a remote server.
+    Logout(String),
+}
+
+const MCP_USAGE: &str = "Usage: /mcp [list|reload|login <name>|logout <name>|enable <name>|disable <name>] — no args opens a picker";
+
+/// Parse `/mcp` arguments; `Err` carries the usage text.
+pub fn parse_mcp(args: &str) -> Result<McpCommand, String> {
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [] => Ok(McpCommand::Picker),
+        ["list" | "ls"] => Ok(McpCommand::List),
+        ["reload"] => Ok(McpCommand::Reload),
+        ["enable" | "on", name] => Ok(McpCommand::Enable((*name).to_string())),
+        ["disable" | "off", name] => Ok(McpCommand::Disable((*name).to_string())),
+        ["login", name] => Ok(McpCommand::Login((*name).to_string())),
+        ["logout", name] => Ok(McpCommand::Logout((*name).to_string())),
+        _ => Err(MCP_USAGE.into()),
+    }
 }
 
 #[cfg(feature = "telemetry")]
@@ -467,7 +501,11 @@ pub fn parse_tracing(args: &str) -> Result<TracingCommand, String> {
 }
 
 /// Dispatch a built-in or dynamic command to an effect.
-pub fn dispatch(cmd: &ParsedCommand, skill_names: &[String], template_names: &[String]) -> CommandEffect {
+pub fn dispatch(
+    cmd: &ParsedCommand,
+    skill_names: &[String],
+    template_names: &[String],
+) -> CommandEffect {
     match cmd.name.as_str() {
         "quit" | "exit" | "q" => CommandEffect::Quit,
         "theme" => {
@@ -548,7 +586,10 @@ pub fn dispatch(cmd: &ParsedCommand, skill_names: &[String], template_names: &[S
         "scoped-models" => CommandEffect::ScopedModels,
         "fork" => CommandEffect::Fork,
         "clone" => CommandEffect::CloneSession,
-        "mcp" => CommandEffect::Mcp(cmd.args.clone()),
+        "mcp" => match parse_mcp(&cmd.args) {
+            Ok(command) => CommandEffect::Mcp(command),
+            Err(usage) => CommandEffect::Status(usage),
+        },
         #[cfg(feature = "orchestration")]
         "workflow" => {
             if cmd.args.is_empty() {
@@ -608,7 +649,11 @@ fn parse_workflow_args(args: &str) -> (String, Option<usize>) {
     let parts: Vec<&str> = args.splitn(3, char::is_whitespace).collect();
     if parts.len() >= 2 && (parts[0] == "--concurrency" || parts[0] == "-c") {
         if let Ok(n) = parts[1].parse::<usize>() {
-            let goal = if parts.len() > 2 { parts[2].to_string() } else { String::new() };
+            let goal = if parts.len() > 2 {
+                parts[2].to_string()
+            } else {
+                String::new()
+            };
             return (goal, Some(n));
         }
     }
@@ -617,3 +662,35 @@ fn parse_workflow_args(args: &str) -> (String, Option<usize>) {
 
 /// Shared Arc alias for command lists in UI.
 pub type SharedCommands = Arc<Vec<SlashCommand>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_mcp_matches_skills_shape() {
+        assert_eq!(parse_mcp(""), Ok(McpCommand::Picker));
+        assert_eq!(parse_mcp("list"), Ok(McpCommand::List));
+        assert_eq!(parse_mcp("ls"), Ok(McpCommand::List));
+        assert_eq!(parse_mcp("reload"), Ok(McpCommand::Reload));
+        assert_eq!(
+            parse_mcp("enable filesystem"),
+            Ok(McpCommand::Enable("filesystem".into()))
+        );
+        assert_eq!(
+            parse_mcp("off remote"),
+            Ok(McpCommand::Disable("remote".into()))
+        );
+        assert_eq!(
+            parse_mcp("login notion"),
+            Ok(McpCommand::Login("notion".into()))
+        );
+        assert_eq!(
+            parse_mcp("logout notion"),
+            Ok(McpCommand::Logout("notion".into()))
+        );
+        assert!(parse_mcp("enable").is_err());
+        assert!(parse_mcp("login").is_err());
+        assert!(parse_mcp("nope").is_err());
+    }
+}

@@ -36,12 +36,11 @@ impl CommandHistory {
     pub fn load(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let mut entries = match std::fs::read_to_string(&path) {
-            Ok(raw) if !raw.trim().is_empty() => {
-                serde_json::from_str::<Vec<String>>(&raw).unwrap_or_else(|e| {
+            Ok(raw) if !raw.trim().is_empty() => serde_json::from_str::<Vec<String>>(&raw)
+                .unwrap_or_else(|e| {
                     tracing::warn!("command history: {e}");
                     Vec::new()
-                })
-            }
+                }),
             _ => Vec::new(),
         };
         if entries.len() > MAX_ENTRIES {

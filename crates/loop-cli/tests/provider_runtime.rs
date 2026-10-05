@@ -133,7 +133,10 @@ async fn connect_reject_restart_and_disconnect() {
     assert!(runtime.harness.model().await.is_none());
     let model = runtime.select_model("gateway", "m-two").await.unwrap();
     assert_eq!(model.id, "m-two");
-    assert_eq!(runtime.selected_model_spec().as_deref(), Some("gateway/m-two"));
+    assert_eq!(
+        runtime.selected_model_spec().as_deref(),
+        Some("gateway/m-two")
+    );
     assert_eq!(runtime.harness.model().await.unwrap().id, "m-two");
     assert!(runtime.select_model("gateway", "nope").await.is_err());
 
@@ -141,13 +144,22 @@ async fn connect_reject_restart_and_disconnect() {
     drop(runtime);
     let mut runtime = boot(cwd.path()).await;
     assert_eq!(runtime.connected_providers(), ["existing", "gateway"]);
-    assert_eq!(runtime.selected_model_spec().as_deref(), Some("gateway/m-two"));
+    assert_eq!(
+        runtime.selected_model_spec().as_deref(),
+        Some("gateway/m-two")
+    );
 
     // Disconnect removes entry, key and provider.
-    assert_eq!(runtime.disconnect_provider("gateway").await.unwrap(), "Gateway");
+    assert_eq!(
+        runtime.disconnect_provider("gateway").await.unwrap(),
+        "Gateway"
+    );
     assert!(runtime.selected_model.is_none(), "its model is deselected");
     assert!(runtime.harness.model().await.is_none());
-    assert_eq!(runtime.model_note.as_deref(), Some("gateway/m-two was disconnected"));
+    assert_eq!(
+        runtime.model_note.as_deref(),
+        Some("gateway/m-two was disconnected")
+    );
     assert_eq!(runtime.connected_providers(), ["existing"]);
     assert!(runtime.models.get_provider("gateway").is_none());
     assert!(!read(auth_path(agent_dir.path())).contains("k-secret"));

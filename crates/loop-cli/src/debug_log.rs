@@ -75,15 +75,15 @@ pub fn init_tracing(
 }
 
 /// Log file under `cwd/target/debug/logs`, teed to stderr when not interactive.
-fn debug_log_writer(cwd: &Path, interactive: bool) -> anyhow::Result<(Box<dyn Write + Send>, PathBuf)> {
+fn debug_log_writer(
+    cwd: &Path,
+    interactive: bool,
+) -> anyhow::Result<(Box<dyn Write + Send>, PathBuf)> {
     let log_dir = cwd.join("target").join("debug").join("logs");
     fs::create_dir_all(&log_dir)?;
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let path = log_dir.join(format!("loop-{ts}.log"));
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
     let writer: Box<dyn Write + Send> = if interactive {
         Box::new(file)
