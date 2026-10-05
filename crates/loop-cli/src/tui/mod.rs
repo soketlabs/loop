@@ -1390,7 +1390,13 @@ fn render_input_lines(
     for (row, line) in logical_lines.iter().enumerate() {
         let line_char_len = line.chars().count();
         let caret_on_line = cursor >= char_at && cursor <= char_at + line_char_len;
-        let cursor_col = caret_on_line.then_some(cursor - char_at);
+        // `then_some` evaluates its argument eagerly, so `cursor - char_at`
+        // would underflow on every line that starts after the caret.
+        let cursor_col = if caret_on_line {
+            Some(cursor - char_at)
+        } else {
+            None
+        };
         let wrapped = if line.is_empty() {
             vec![String::new()]
         } else {
@@ -1936,6 +1942,16 @@ mod tests {
         let lines = render_input_lines(&text, cursor, theme.style("text"), &theme, "", 80, 4);
         assert_eq!(lines.len(), 4);
         assert!(lines.last().unwrap().to_string().contains("line 11"));
+    }
+
+    #[test]
+    fn input_render_caret_on_earlier_line() {
+        let theme = Theme::dark();
+        let text = "hello\nworld";
+        let lines = render_input_lines(&text, 2, theme.style("text"), &theme, "", 80, 4);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].to_string().contains('█'));
+        assert!(!lines[1].to_string().contains('█'));
     }
 
     #[test]
