@@ -4,13 +4,13 @@
 .vscode/
 *.swp
 .DS_Store
-/docs/
-/docs-site/
+# /docs/
+# /docs-site/
 
-# Benchmark run logs (keep template + sample committed)
-/bench/runs/runs.csv
-/bench/runs/scorecard*.md
-/bench/runs/out/
-/bench
+# # Benchmark run logs (keep template + sample committed)
+# /bench/runs/runs.csv
+# /bench/runs/scorecard*.md
+# /bench/runs/out/
+# /bench
 /test-repo
 .loop

@@ -25,7 +25,7 @@ use crate::config::paths::{
     auth_path, ensure_agent_dirs, get_agent_dir, models_json_path, models_store_path,
     sessions_db_path, settings_path,
 };
-use crate::config::settings::{load_settings, McpServerConfig, Settings};
+use crate::config::settings::{load_settings, set_skill_disabled, McpServerConfig, Settings};
 use crate::config::trust::TrustStore;
 use crate::model_selection::StartupModel;
 use crate::config::paths::{trust_path};
@@ -85,6 +85,42 @@ impl Runtime {
     /// Persist the current settings to the global settings file.
     pub fn save_settings(&self) -> anyhow::Result<()> {
         self.settings.save_file(&settings_path(&self.agent_dir))
+    }
+
+    /// Push the loaded skills and prompt templates to the harness.
+    pub async fn sync_harness_resources(&self) {
+        self.harness
+            .set_resources(AgentHarnessResources {
+                skills: self.resources.skills.clone(),
+                prompt_templates: self.resources.prompts.clone(),
+            })
+            .await;
+    }
+
+    /// Enable or disable a discovered skill for this session and in the global settings file.
+    ///
+    /// Disabling also deactivates the skill if it was turned on with `/skill:name`.
+    /// Returns `Ok(false)` when no skill has that name.
+    pub async fn set_skill_enabled(&mut self, name: &str, enabled: bool) -> anyhow::Result<bool> {
+        if !self.resources.set_skill_enabled(name, enabled) {
+            return Ok(false);
+        }
+        set_skill_disabled(&mut self.settings.disabled_skills, name, enabled);
+        if !enabled && self.active_skills.iter().any(|n| n == name) {
+            self.active_skills.retain(|n| n != name);
+            self.harness.clear_active_skills().await;
+        }
+        self.sync_harness_resources().await;
+        for active in &self.active_skills {
+            self.harness.activate_skill(active).await;
+        }
+
+        // Edit only the global file so project overrides are not copied into it.
+        let path = settings_path(&self.agent_dir);
+        let mut global = Settings::load_file(&path)?;
+        set_skill_disabled(&mut global.disabled_skills, name, enabled);
+        global.save_file(&path)?;
+        Ok(true)
     }
 
     /// `/login`: save the key (and custom entry), register the provider and list its
