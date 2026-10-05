@@ -12,8 +12,10 @@ use crate::config::Settings;
 /// Loaded resources for a session.
 #[derive(Debug, Clone, Default)]
 pub struct LoadedResources {
-    /// Skills.
+    /// Enabled skills (offered to the model and as `/skill:` commands).
     pub skills: Vec<Skill>,
+    /// Discovered skills turned off via `disabledSkills` in settings.
+    pub disabled_skills: Vec<Skill>,
     /// Prompt templates.
     pub prompts: Vec<PromptTemplate>,
     /// Extension script paths.
@@ -22,6 +24,36 @@ pub struct LoadedResources {
     pub hook_paths: Vec<PathBuf>,
     /// Theme search dirs.
     pub theme_dirs: Vec<PathBuf>,
+}
+
+impl LoadedResources {
+    /// Move a discovered skill between the enabled and disabled lists.
+    ///
+    /// Returns `false` when no skill has that name.
+    pub fn set_skill_enabled(&mut self, name: &str, enabled: bool) -> bool {
+        let (from, to) = if enabled {
+            (&mut self.disabled_skills, &mut self.skills)
+        } else {
+            (&mut self.skills, &mut self.disabled_skills)
+        };
+        if let Some(i) = from.iter().position(|s| s.name == name) {
+            to.push(from.remove(i));
+            return true;
+        }
+        to.iter().any(|s| s.name == name)
+    }
+
+    /// All discovered skills with their enabled flag, sorted by name.
+    pub fn all_skills(&self) -> Vec<(&Skill, bool)> {
+        let mut all: Vec<_> = self
+            .skills
+            .iter()
+            .map(|s| (s, true))
+            .chain(self.disabled_skills.iter().map(|s| (s, false)))
+            .collect();
+        all.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        all
+    }
 }
 
 /// Load skills, prompts, extensions, hooks for agent + optional trusted project.
@@ -66,7 +98,12 @@ pub fn load_resources(
         }
         let (skills, _) = load_skills(&dir);
         for skill in skills {
-            if seen_skills.insert(skill.name.clone()) {
+            if !seen_skills.insert(skill.name.clone()) {
+                continue;
+            }
+            if settings.disabled_skills.contains(&skill.name) {
+                out.disabled_skills.push(skill);
+            } else {
                 out.skills.push(skill);
             }
         }
@@ -173,5 +210,62 @@ fn collect_json(dir: &Path, out: &mut Vec<PathBuf>) {
                 out.push(path);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_skill(agent_dir: &Path, name: &str) {
+        let dir = agent_dir.join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {name} skill\n---\nbody"),
+        )
+        .unwrap();
+    }
+
+    fn names(skills: &[Skill]) -> Vec<&str> {
+        skills.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    #[test]
+    fn disabled_skills_are_loaded_separately_and_toggle() {
+        let agent = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        write_skill(agent.path(), "alpha");
+        write_skill(agent.path(), "beta");
+        let settings = Settings {
+            disabled_skills: vec!["beta".into()],
+            ..Settings::default()
+        };
+
+        let mut res = load_resources(agent.path(), cwd.path(), false, &settings);
+        assert_eq!(names(&res.skills), ["alpha"]);
+        assert_eq!(names(&res.disabled_skills), ["beta"]);
+
+        assert!(res.set_skill_enabled("beta", true));
+        assert!(res.set_skill_enabled("alpha", false));
+        assert_eq!(names(&res.skills), ["beta"]);
+        assert_eq!(names(&res.disabled_skills), ["alpha"]);
+        assert!(res.set_skill_enabled("beta", true));
+        assert!(!res.set_skill_enabled("missing", true));
+
+        let all: Vec<_> = res.all_skills().into_iter().map(|(s, on)| (s.name.as_str(), on)).collect();
+        assert_eq!(all, [("alpha", false), ("beta", true)]);
+    }
+
+    #[test]
+    fn disabled_skills_serialize_only_when_set() {
+        let mut settings = Settings::default();
+        assert!(!serde_json::to_string(&settings).unwrap().contains("disabledSkills"));
+        crate::config::settings::set_skill_disabled(&mut settings.disabled_skills, "a", false);
+        crate::config::settings::set_skill_disabled(&mut settings.disabled_skills, "a", false);
+        assert_eq!(settings.disabled_skills, ["a"]);
+        assert!(serde_json::to_string(&settings).unwrap().contains("\"disabledSkills\":[\"a\"]"));
+        crate::config::settings::set_skill_disabled(&mut settings.disabled_skills, "a", true);
+        assert!(settings.disabled_skills.is_empty());
     }
 }

@@ -137,6 +137,9 @@ pub struct Settings {
     /// Extra skill paths / globs.
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Skill names hidden from the model and from `/skill:` commands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_skills: Vec<String>,
     /// Extra extension paths.
     #[serde(default)]
     pub extensions: Vec<String>,
@@ -229,6 +232,7 @@ impl Default for Settings {
             compaction: CompactionSettingsJson::default(),
             enabled_models: Vec::new(),
             skills: Vec::new(),
+            disabled_skills: Vec::new(),
             extensions: Vec::new(),
             prompts: Vec::new(),
             themes: Vec::new(),
@@ -320,6 +324,11 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
     if !project.skills.is_empty() {
         base.skills = project.skills;
     }
+    for name in project.disabled_skills {
+        if !base.disabled_skills.contains(&name) {
+            base.disabled_skills.push(name);
+        }
+    }
     if !project.extensions.is_empty() {
         base.extensions = project.extensions;
     }
@@ -364,4 +373,13 @@ pub fn load_settings(agent_dir: &Path, cwd: &Path, project_trusted: bool) -> any
         }
     }
     Ok(settings)
+}
+
+/// Add (`enabled = false`) or remove (`enabled = true`) `name` in a disabled-skills list.
+pub fn set_skill_disabled(list: &mut Vec<String>, name: &str, enabled: bool) {
+    if enabled {
+        list.retain(|n| n != name);
+    } else if !list.iter().any(|n| n == name) {
+        list.push(name.to_string());
+    }
 }

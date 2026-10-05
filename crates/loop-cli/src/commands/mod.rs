@@ -144,8 +144,8 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "skills",
-            description: "List loaded skills (SKILL.md)",
-            args_hint: None,
+            description: "Enable or disable skills (SKILL.md)",
+            args_hint: Some("[list|enable <name>|disable <name>]"),
         },
         SlashCommand {
             name: "mcp",
@@ -348,8 +348,8 @@ pub enum CommandEffect {
     Trust(Option<String>),
     /// Reload resources.
     Reload,
-    /// List loaded skills.
-    ListSkills,
+    /// `/skills` sub-command.
+    Skills(SkillsCommand),
     /// Resume picker.
     Resume,
     /// Tree view.
@@ -393,6 +393,36 @@ pub enum CommandEffect {
         /// Args.
         args: String,
     },
+}
+
+/// `/skills` subcommands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillsCommand {
+    /// Open the enable/disable picker.
+    Picker,
+    /// Print every discovered skill with its state.
+    List,
+    /// Enable a skill by name.
+    Enable(String),
+    /// Disable a skill by name.
+    Disable(String),
+}
+
+const SKILLS_USAGE: &str = "Usage: /skills [list|enable <name>|disable <name>] — no args opens a picker";
+
+/// Parse `/skills` arguments; `Err` carries the usage text.
+pub fn parse_skills(args: &str) -> Result<SkillsCommand, String> {
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [] => Ok(SkillsCommand::Picker),
+        ["list" | "ls"] => Ok(SkillsCommand::List),
+        ["enable" | "on", name] => Ok(SkillsCommand::Enable(skill_arg(name))),
+        ["disable" | "off", name] => Ok(SkillsCommand::Disable(skill_arg(name))),
+        _ => Err(SKILLS_USAGE.into()),
+    }
+}
+
+fn skill_arg(name: &str) -> String {
+    name.strip_prefix("skill:").unwrap_or(name).to_string()
 }
 
 #[cfg(feature = "telemetry")]
@@ -495,7 +525,10 @@ pub fn dispatch(cmd: &ParsedCommand, skill_names: &[String], template_names: &[S
             Some(cmd.args.clone())
         }),
         "reload" => CommandEffect::Reload,
-        "skills" => CommandEffect::ListSkills,
+        "skills" => match parse_skills(&cmd.args) {
+            Ok(command) => CommandEffect::Skills(command),
+            Err(usage) => CommandEffect::Status(usage),
+        },
         "resume" => CommandEffect::Resume,
         "tree" => CommandEffect::Tree,
         "name" => CommandEffect::SetName(cmd.args.clone()),

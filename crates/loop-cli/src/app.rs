@@ -28,7 +28,7 @@ use loop_ai::{
     ToolResultContent, Usage,
 };
 
-use crate::commands::{self, AutocompleteEntry, CommandEffect};
+use crate::commands::{self, AutocompleteEntry, CommandEffect, SkillsCommand};
 #[cfg(feature = "telemetry")]
 use crate::commands::TracingCommand;
 #[cfg(feature = "telemetry")]
@@ -393,6 +393,7 @@ async fn run_loop(
     };
     let mut model_picker: Option<ModelPickerState> = None;
     let mut fork_picker: Option<ForkPickerState> = None;
+    let mut skill_picker: Option<SkillPickerState> = None;
     let mut active_approval: Option<ActiveApproval> = None;
     let mut ac_selected: usize = 0;
     let mut last_ac_filter = String::new();
@@ -461,6 +462,7 @@ async fn run_loop(
             && pending_setup.is_none()
             && model_picker.is_none()
             && fork_picker.is_none()
+            && skill_picker.is_none()
             && active_approval.is_none()
         {
             let extra = dynamic_command_entries(runtime);
@@ -472,6 +474,7 @@ async fn run_loop(
             && pending_setup.is_none()
             && model_picker.is_none()
             && fork_picker.is_none()
+            && skill_picker.is_none()
             && active_approval.is_none()
         {
             find_at_mention(input.as_str(), input.cursor())
@@ -546,6 +549,25 @@ async fn run_loop(
                 hint: "Fork: edit this user message and continue (prior history kept)."
                     .into(),
             }
+        } else if let Some(p) = &skill_picker {
+            PickerView::Models {
+                rows: p
+                    .filtered
+                    .iter()
+                    .filter_map(|&i| p.skills.get(i))
+                    .map(|(name, desc)| {
+                        let enabled = runtime.resources.skills.iter().any(|s| &s.name == name);
+                        PickerRow {
+                            label: format!("[{}] {name}", if enabled { "x" } else { " " }),
+                            description: desc.clone(),
+                            mark: None,
+                        }
+                    })
+                    .collect(),
+                selected: p.selected,
+                hint: "Skills: [x] enabled · [ ] disabled. Changes are saved to settings.json."
+                    .into(),
+            }
         } else if let Some(prompt) = &pending_setup {
             PickerView::Setup {
                 prompt: prompt.clone(),
@@ -585,6 +607,8 @@ async fn run_loop(
             "↑↓ select · enter confirm · esc cancel".into()
         } else if fork_picker.is_some() {
             "↑↓ select · enter edit · esc cancel".into()
+        } else if skill_picker.is_some() {
+            "↑↓ select · space/enter toggle · type to filter · esc close".into()
         } else if let Some(prompt) = &pending_setup {
             prompt.status_hint(runtime.needs_provider_setup)
         } else if !ac_entries.is_empty() {
@@ -724,6 +748,7 @@ async fn run_loop(
                         &pending_setup,
                         &mut model_picker,
                         &mut fork_picker,
+                        &mut skill_picker,
                         &mut active_approval,
                     );
                     for ev in &batch {
@@ -753,6 +778,7 @@ async fn run_loop(
                             &pending_setup,
                             &mut model_picker,
                             &mut fork_picker,
+                            &mut skill_picker,
                             &mut active_approval,
                         );
                         token_bar.sync_window(runtime);
@@ -778,6 +804,7 @@ async fn run_loop(
                             &mut pending_setup,
                             &mut model_picker,
                             &mut fork_picker,
+                            &mut skill_picker,
                             &mut active_approval,
                             &mut working,
                             &mut message_queue,
@@ -1669,6 +1696,7 @@ fn insert_pasted_text(
     pending_setup: &Option<SetupPrompt>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
+    skill_picker: &mut Option<SkillPickerState>,
     active_approval: &mut Option<ActiveApproval>,
 ) {
     if let Some(review) = active_approval.as_mut() {
@@ -1689,6 +1717,14 @@ fn insert_pasted_text(
         return;
     }
     if let Some(picker) = fork_picker.as_mut() {
+        let line = pasted_single_line(text);
+        if !line.is_empty() {
+            picker.query.push_str(&line);
+            picker.refilter();
+        }
+        return;
+    }
+    if let Some(picker) = skill_picker.as_mut() {
         let line = pasted_single_line(text);
         if !line.is_empty() {
             picker.query.push_str(&line);
@@ -1732,6 +1768,7 @@ async fn handle_key(
     pending_setup: &mut Option<SetupPrompt>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
+    skill_picker: &mut Option<SkillPickerState>,
     active_approval: &mut Option<ActiveApproval>,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
@@ -1912,6 +1949,39 @@ async fn handle_key(
                         refresh_token_bar,
                     )
                     .await;
+                }
+            }
+            KeyCode::Char(c) => {
+                picker.query.push(c);
+                picker.refilter();
+            }
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.refilter();
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if let Some(picker) = skill_picker.as_mut() {
+        match key.code {
+            KeyCode::Esc => {
+                *skill_picker = None;
+                *status = "ready".into();
+            }
+            KeyCode::Up => {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if picker.selected + 1 < picker.filtered.len() {
+                    picker.selected += 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(name) = picker.selected_name().map(str::to_string) {
+                    let enabled = !runtime.resources.skills.iter().any(|s| s.name == name);
+                    set_skill_enabled(runtime, &name, enabled, chat, status).await;
                 }
             }
             KeyCode::Char(c) => {
@@ -2188,6 +2258,7 @@ async fn handle_key(
                             pending_setup,
                             model_picker,
                             fork_picker,
+                            skill_picker,
                             hide_thinking,
                             working,
                             message_queue,
@@ -2484,6 +2555,72 @@ impl ForkPickerState {
         self.filtered
             .get(self.selected)
             .and_then(|&i| self.points.get(i))
+    }
+}
+
+struct SkillPickerState {
+    /// `(name, description)` for every discovered skill, sorted by name.
+    skills: Vec<(String, String)>,
+    /// Indices into `skills` after filter.
+    filtered: Vec<usize>,
+    selected: usize,
+    query: String,
+}
+
+impl SkillPickerState {
+    fn new(resources: &crate::resources::LoadedResources) -> Self {
+        let skills: Vec<_> = resources
+            .all_skills()
+            .into_iter()
+            .map(|(s, _)| (s.name.clone(), s.description.clone()))
+            .collect();
+        let filtered = (0..skills.len()).collect();
+        Self {
+            skills,
+            filtered,
+            selected: 0,
+            query: String::new(),
+        }
+    }
+
+    fn refilter(&mut self) {
+        let q = self.query.to_lowercase();
+        self.filtered = self
+            .skills
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, desc))| {
+                name.to_lowercase().contains(&q) || desc.to_lowercase().contains(&q)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if self.selected >= self.filtered.len() {
+            self.selected = self.filtered.len().saturating_sub(1);
+        }
+    }
+
+    fn selected_name(&self) -> Option<&str> {
+        self.filtered
+            .get(self.selected)
+            .and_then(|&i| self.skills.get(i))
+            .map(|(name, _)| name.as_str())
+    }
+}
+
+async fn set_skill_enabled(
+    runtime: &mut CliRuntime,
+    name: &str,
+    enabled: bool,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+) {
+    let state = if enabled { "enabled" } else { "disabled" };
+    match runtime.set_skill_enabled(name, enabled).await {
+        Ok(true) => *status = format!("skill `{name}` {state}"),
+        Ok(false) => chat.push(sys(format!("skill not found: {name} (see /skills list)"))),
+        Err(e) => chat.push(error_item(format!(
+            "skill `{name}` {state} for this session, but saving settings failed: {e:#}"
+        ))),
     }
 }
 
@@ -3037,6 +3174,7 @@ async fn apply_effect(
     pending_setup: &mut Option<SetupPrompt>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
+    skill_picker: &mut Option<SkillPickerState>,
     hide_thinking: &mut bool,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
@@ -3467,25 +3605,57 @@ async fn apply_effect(
                 runtime.project_trusted,
                 &runtime.settings,
             );
+            runtime.sync_harness_resources().await;
             chat.push(sys("reloaded models, skills, prompts, themes"));
         }
-        CommandEffect::ListSkills => {
-            if runtime.resources.skills.is_empty() {
+        CommandEffect::Skills(SkillsCommand::Enable(name)) => {
+            set_skill_enabled(runtime, &name, true, chat, status).await;
+            if runtime.resources.skills.iter().any(|s| s.name == name) {
+                chat.push(sys(format!("skill `{name}` enabled")));
+            }
+        }
+        CommandEffect::Skills(SkillsCommand::Disable(name)) => {
+            set_skill_enabled(runtime, &name, false, chat, status).await;
+            if runtime.resources.disabled_skills.iter().any(|s| s.name == name) {
+                chat.push(sys(format!("skill `{name}` disabled")));
+            }
+        }
+        CommandEffect::Skills(SkillsCommand::Picker)
+            if runtime.resources.skills.len() + runtime.resources.disabled_skills.len() > 0 =>
+        {
+            *model_picker = None;
+            *fork_picker = None;
+            *skill_picker = Some(SkillPickerState::new(&runtime.resources));
+            *status = "skills · toggle on or off".into();
+        }
+        CommandEffect::Skills(SkillsCommand::Picker | SkillsCommand::List) => {
+            let all = runtime.resources.all_skills();
+            if all.is_empty() {
                 chat.push(sys(format!(
                     "No skills loaded.\n\nAdd folders containing a SKILL.md (with YAML frontmatter: name, description) under:\n  {}/skills\n  ~/.agents/skills\n  .agents/skills or .loop/skills in trusted projects\nor list extra paths (e.g. ~/.claude/skills) under \"skills\" in settings.json,\nthen run /reload.",
                     runtime.agent_dir.display()
                 )));
             } else {
-                let mut text = format!("Skills ({} loaded)\n", runtime.resources.skills.len());
-                for s in &runtime.resources.skills {
+                let mut text = format!(
+                    "Skills ({} enabled, {} disabled)\n",
+                    runtime.resources.skills.len(),
+                    runtime.resources.disabled_skills.len()
+                );
+                for (s, enabled) in all {
                     let desc = if s.description.is_empty() {
                         "(no description)".to_string()
                     } else {
                         s.description.clone()
                     };
-                    text.push_str(&format!("\n  /skill:{} — {}\n      {}", s.name, desc, s.path.display()));
+                    let state = if enabled { "" } else { " [disabled]" };
+                    text.push_str(&format!(
+                        "\n  /skill:{}{state} — {}\n      {}",
+                        s.name,
+                        desc,
+                        s.path.display()
+                    ));
                 }
-                text.push_str("\n\nActivate with /skill:<name> [optional args for the input]. Skills stay active until /new; the model sees them under <available_skills> and can read SKILL.md when relevant.");
+                text.push_str("\n\nActivate with /skill:<name> [optional args for the input]. Skills stay active until /new; the model sees them under <available_skills> and can read SKILL.md when relevant.\nToggle with /skills (picker) or /skills enable|disable <name>. Disabled skills are hidden from the model.");
                 chat.push(sys(text));
             }
         }
@@ -3619,6 +3789,10 @@ async fn apply_effect(
                     }
                     input.insert_str(args);
                 }
+            } else if runtime.resources.disabled_skills.iter().any(|s| s.name == name) {
+                chat.push(sys(format!(
+                    "skill `{name}` is disabled. Enable it with /skills enable {name}"
+                )));
             } else {
                 chat.push(sys(format!("skill not found: {name}")));
             }

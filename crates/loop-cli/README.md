@@ -57,11 +57,19 @@ Claude skills are **opt-in** via settings:
 { "skills": ["~/.claude/skills"] }
 ```
 
+Turn individual skills on or off with `/skills` (an interactive picker: space or enter toggles), or `/skills enable <name>` / `/skills disable <name>`. `/skills list` shows every discovered skill and its state. Disabled skills are hidden from the model and from `/skill:` commands, and are saved under `disabledSkills` in the global `settings.json`:
+
+```json
+{ "disabledSkills": ["pdf", "frontend-design"] }
+```
+
+A project `.loop/settings.json` can add more names to `disabledSkills`; they are combined with the global list.
+
 `AGENTS.md` / `CLAUDE.md` are loaded automatically from the agent dir and cwd ancestors.
 
 ## Slash commands (highlights)
 
-`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/new`, `/review`, `/compact`, `/resume`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
+`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/new`, `/review`, `/compact`, `/resume`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
 
 ## Local shell (`!command`)
 
