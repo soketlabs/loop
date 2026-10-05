@@ -78,6 +78,11 @@ impl CommandHistory {
         self.draft.clear();
     }
 
+    /// True after Up has recalled an entry, until the draft is restored or submitted.
+    pub fn is_browsing(&self) -> bool {
+        self.cursor.is_some()
+    }
+
     /// Older entry. Saves `current` as the draft on the first step.
     pub fn previous(&mut self, current: &str) -> Option<String> {
         if self.entries.is_empty() {
@@ -143,11 +148,14 @@ mod tests {
         let mut h = CommandHistory::new();
         h.push("one");
         h.push("two");
+        assert!(!h.is_browsing());
         assert_eq!(h.previous("draft").as_deref(), Some("two"));
+        assert!(h.is_browsing());
         assert_eq!(h.previous("two").as_deref(), Some("one"));
         assert_eq!(h.previous("one"), None);
         assert_eq!(h.next().as_deref(), Some("two"));
         assert_eq!(h.next().as_deref(), Some("draft"));
+        assert!(!h.is_browsing());
         assert_eq!(h.next(), None);
     }
 
