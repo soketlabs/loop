@@ -1,4 +1,4 @@
-//! Keybinding IDs and defaults (pi-inspired).
+//! Keybinding IDs and defaults.
 
 use std::collections::HashMap;
 use std::path::Path;

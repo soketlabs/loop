@@ -1,4 +1,4 @@
-//! Rhai extension host (pi ExtensionAPI subset).
+//! Rhai extension host.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};

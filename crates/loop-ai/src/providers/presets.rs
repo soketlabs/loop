@@ -122,7 +122,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: OPENROUTER_PROVIDER_ID,
         name: "OpenRouter",
-        description: "Hundreds of models (Claude, GPT, Gemini, Llama, …) with one key",
+        description: "Hundreds of models with one key",
         base_url: "https://openrouter.ai/api/v1",
         api_key_envs: &["OPENROUTER_API_KEY"],
         headers: &[
@@ -143,7 +143,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: OPENAI_PROVIDER_ID,
         name: "OpenAI",
-        description: "GPT and o-series models",
+        description: "Chat models",
         base_url: "https://api.openai.com/v1",
         api_key_envs: &["OPENAI_API_KEY"],
         headers: &[],

@@ -1,4 +1,4 @@
-//! Theme loading and color resolution (pi-compatible JSON themes).
+//! Theme loading and color resolution (JSON themes).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

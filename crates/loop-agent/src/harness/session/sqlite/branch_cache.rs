@@ -1,4 +1,4 @@
-//! Derived branch path cache (root-to-tip) mirroring pi-storage-sqlite-node.
+//! Derived branch path cache (root-to-tip).
 
 use rusqlite::{params, Connection, OptionalExtension};
 

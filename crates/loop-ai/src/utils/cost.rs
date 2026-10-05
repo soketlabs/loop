@@ -13,7 +13,7 @@ pub fn calculate_cost(model: &Model, usage: &mut Usage) -> Cost {
         total: 0.0,
     };
     let mut cost = cost;
-    // Anthropic-style 1h cache writes charged at 2× input rate when present.
+    // 1h cache writes are charged at 2× input rate when present.
     if let Some(cache_write_1h) = usage.cache_write_1h {
         cost.cache_write += (rates.input * 2.0 / 1_000_000.0) * cache_write_1h as f64;
     }
