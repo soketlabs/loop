@@ -127,6 +127,7 @@ cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli \
 
 Notes:
 
+- CI (`.github/workflows/ci.yml`) runs these same checks on every pull request, on Linux, macOS, and Windows. Run them locally first to avoid a red build.
 - **`--locked` is mandatory.** Do not change `Cargo.lock` unless your PR intentionally adds or updates a dependency. For version bumps use `cargo update -w`, not `cargo generate-lockfile`; the GPUI git dependencies must not be re-resolved (see the comment in `Cargo.toml`).
 - **Live tests** that call real providers or krun microVMs are opt-in through `LOOP_TEST_*` environment variables (for example `LOOP_TEST_BASE_URL`, `LOOP_TEST_MODEL`, `LOOP_TEST_KRUN`). They must skip cleanly when those variables are unset, and they must never run in default CI.
 - If you touch `loop-desktop`, also run `cargo clippy -p loop-desktop -- -D warnings` from `crates/loop-desktop` (nightly).
