@@ -33,6 +33,8 @@ pub struct ProviderPreset {
     pub headers: &'static [(&'static str, &'static str)],
     /// What a key looks like, for prompts (e.g. `sk-or-…`).
     pub key_hint: &'static str,
+    /// Lead-in shown before `key_url` in the login prompt (e.g. `get one at`).
+    pub key_cta: &'static str,
     /// Where to create a key.
     pub key_url: &'static str,
     /// Defaults for listed models without metadata.
@@ -104,12 +106,13 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: SOKET_PROVIDER_ID,
         name: SOKET_PROVIDER_NAME,
-        description: "Soket / TensorStudio inference",
+        description: "Soket's inference Studio",
         base_url: SOKET_BASE_URL,
         api_key_envs: SOKET_API_KEY_ENVS,
         headers: &[],
         key_hint: "your Soket API key",
-        key_url: "https://tensorstudio.ai",
+        key_cta: "get your free credits at",
+        key_url: "http://console.soket.ai/",
         defaults: ModelDefaults {
             context_window: 128_000,
             max_tokens: 16_384,
@@ -130,6 +133,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
             ("X-Title", "Loop"),
         ],
         key_hint: "sk-or-…",
+        key_cta: "get one at",
         key_url: "https://openrouter.ai/keys",
         defaults: ModelDefaults {
             context_window: 128_000,
@@ -148,6 +152,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         api_key_envs: &["OPENAI_API_KEY"],
         headers: &[],
         key_hint: "sk-…",
+        key_cta: "get one at",
         key_url: "https://platform.openai.com/api-keys",
         defaults: ModelDefaults {
             context_window: 128_000,
