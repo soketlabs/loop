@@ -9,10 +9,13 @@ use loop_agent::harness::types::{
     ExecutionError, ExecutionErrorCode, ShellExecOptions, ShellOutput,
 };
 use loop_agent::harness::{
-    create_read_tool, create_write_tool, KrunIsolation, KrunSandbox, KrunSandboxFactory,
-    LocalSandboxRuntime, PodmanClient, PodmanExecOpts, PodmanRunOpts, Sandbox, SandboxConfig,
-    SandboxError, SandboxInfo, SandboxMode, SandboxRegistry, SandboxStatus,
+    KrunIsolation, KrunSandbox, KrunSandboxFactory, LocalSandboxRuntime, PodmanClient,
+    PodmanExecOpts, PodmanRunOpts, Sandbox, SandboxConfig, SandboxError, SandboxMode,
+    SandboxRegistry,
 };
+// Only used by the Linux-gated `krun_full_fs_via_exec` test.
+#[cfg(target_os = "linux")]
+use loop_agent::harness::{create_read_tool, create_write_tool, SandboxInfo, SandboxStatus};
 use parking_lot::Mutex;
 use serde_json::json;
 
@@ -143,11 +146,7 @@ impl PodmanClient for FakePodman {
                 };
             }
             if script.contains("if [ ! -e ") && script.contains("echo DIR") {
-                let path = script
-                    .split('\'')
-                    .nth(1)
-                    .unwrap_or("")
-                    .to_string();
+                let path = script.split('\'').nth(1).unwrap_or("").to_string();
                 if let Some(data) = self.files.lock().get(&path) {
                     return Ok(ShellOutput {
                         stdout: format!("FILE\n{}\n", data.len()),
@@ -169,11 +168,7 @@ impl PodmanClient for FakePodman {
                 });
             }
             if script.contains("if [ -e ") {
-                let path = script
-                    .split('\'')
-                    .nth(1)
-                    .unwrap_or("")
-                    .to_string();
+                let path = script.split('\'').nth(1).unwrap_or("").to_string();
                 let exists =
                     self.files.lock().contains_key(&path) || self.dirs.lock().contains(&path);
                 return Ok(ShellOutput {
@@ -244,8 +239,20 @@ async fn krun_full_fs_via_exec() {
 
     let info = sb.info();
     let box_text = info.format_box();
-    assert_eq!(info.fields.iter().find(|(k, _)| k == "Mode").map(|(_, v)| v.as_str()), Some("on"));
-    assert_eq!(info.fields.iter().find(|(k, _)| k == "Kind").map(|(_, v)| v.as_str()), Some("local"));
+    assert_eq!(
+        info.fields
+            .iter()
+            .find(|(k, _)| k == "Mode")
+            .map(|(_, v)| v.as_str()),
+        Some("on")
+    );
+    assert_eq!(
+        info.fields
+            .iter()
+            .find(|(k, _)| k == "Kind")
+            .map(|(_, v)| v.as_str()),
+        Some("local")
+    );
     assert!(box_text.contains("full"));
     assert!(box_text.contains("runc"));
     assert!(box_text.contains("ready"));
@@ -278,7 +285,11 @@ async fn krun_full_fs_via_exec() {
         .await
         .unwrap();
     assert_eq!(out.exit_code, 0);
-    assert!(client.shell_log.lock().iter().any(|s| s.contains("echo hi")));
+    assert!(client
+        .shell_log
+        .lock()
+        .iter()
+        .any(|s| s.contains("echo hi")));
 
     let tool = create_write_tool(Arc::clone(&env));
     let result = (tool.execute)(
@@ -319,7 +330,9 @@ async fn krun_partial_uses_host_fs_and_exec_shell() {
     assert_eq!(sb.isolation(), KrunIsolation::Partial);
 
     let env = sb.env();
-    env.write_file(Path::new("host.txt"), b"on-host").await.unwrap();
+    env.write_file(Path::new("host.txt"), b"on-host")
+        .await
+        .unwrap();
     let host_text = std::fs::read_to_string(dir.path().join("host.txt")).unwrap();
     assert_eq!(host_text, "on-host");
 

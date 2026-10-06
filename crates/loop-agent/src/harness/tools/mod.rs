@@ -36,19 +36,27 @@ pub fn create_read_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
         "read",
         "Read",
         "Read a file's contents (text or image).",
-        schema_object(json!({"path": {"type": "string", "description": "File path"}}), &["path"]),
+        schema_object(
+            json!({"path": {"type": "string", "description": "File path"}}),
+            &["path"],
+        ),
         move |_id, args, _cancel, _on_update| {
             let env = Arc::clone(&env);
             async move {
                 let path = arg_str(&args, "path")?;
-                let abs = env.absolute_path(Path::new(&path)).map_err(|e| e.to_string())?;
+                let abs = env
+                    .absolute_path(Path::new(&path))
+                    .map_err(|e| e.to_string())?;
                 let info = env.file_info(&abs).await.map_err(|e| e.to_string())?;
                 if info.is_dir {
                     return Err(format!("path is a directory: {}", abs.display()));
                 }
                 let mime = mime_guess::from_path(&abs).first_or_octet_stream();
                 if mime.type_() == mime_guess::mime::IMAGE {
-                    let bytes = env.read_binary_file(&abs).await.map_err(|e| e.to_string())?;
+                    let bytes = env
+                        .read_binary_file(&abs)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     use base64::Engine as _;
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                     return Ok(AgentToolResult {
@@ -97,7 +105,9 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
             async move {
                 let path = arg_str(&args, "path")?;
                 let content = arg_str(&args, "content")?;
-                let abs = env.absolute_path(Path::new(&path)).map_err(|e| e.to_string())?;
+                let abs = env
+                    .absolute_path(Path::new(&path))
+                    .map_err(|e| e.to_string())?;
                 with_file_mutation_queue(abs.clone(), || {
                     let env = Arc::clone(&env);
                     let content = content.clone();
@@ -106,8 +116,8 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                             Ok(text) => (false, text),
                             Err(_) => (true, String::new()),
                         };
-                        let previous_path = write_review_snapshot(&abs, &previous)
-                            .map_err(|e| e.to_string())?;
+                        let previous_path =
+                            write_review_snapshot(&abs, &previous).map_err(|e| e.to_string())?;
                         let diff = unified_diff(&previous, &content, &abs);
                         env.write_file(&abs, content.as_bytes())
                             .await
@@ -164,7 +174,9 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                     .and_then(|v| v.as_str())
                     .ok_or("missing newText")?
                     .to_string();
-                let abs = env.absolute_path(Path::new(&path)).map_err(|e| e.to_string())?;
+                let abs = env
+                    .absolute_path(Path::new(&path))
+                    .map_err(|e| e.to_string())?;
                 with_file_mutation_queue(abs.clone(), || {
                     let env = Arc::clone(&env);
                     async move {
@@ -174,8 +186,8 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         } else {
                             fuzzy_replace(&original, &old_text, &new_text)?
                         };
-                        let previous_path = write_review_snapshot(&abs, &original)
-                            .map_err(|e| e.to_string())?;
+                        let previous_path =
+                            write_review_snapshot(&abs, &original).map_err(|e| e.to_string())?;
                         let diff = unified_diff(&original, &updated, &abs);
                         env.write_file(&abs, updated.as_bytes())
                             .await
@@ -207,10 +219,7 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
 fn write_review_snapshot(path: &Path, contents: &str) -> std::io::Result<PathBuf> {
     let dir = std::env::temp_dir().join("loop-file-review");
     std::fs::create_dir_all(&dir)?;
-    let stem = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file");
+    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     let id = loop_ai::new_id();
     let out = dir.join(format!("{id}-{stem}.before"));
     std::fs::write(&out, contents)?;
@@ -245,8 +254,14 @@ fn fuzzy_replace(original: &str, old_text: &str, new_text: &str) -> Result<Strin
             let orig_start = norm_to_orig.get(norm_start).copied().unwrap_or(0);
             // Find the original end: skip any trailing whitespace in the original that was
             // collapsed during normalization.
-            let raw_orig_end = norm_to_orig.get(norm_end).copied().unwrap_or(original.len());
-            let _orig_end = original[..raw_orig_end].trim_end().len().max(raw_orig_end.min(original.len()));
+            let raw_orig_end = norm_to_orig
+                .get(norm_end)
+                .copied()
+                .unwrap_or(original.len());
+            let _orig_end = original[..raw_orig_end]
+                .trim_end()
+                .len()
+                .max(raw_orig_end.min(original.len()));
 
             let mut out = String::with_capacity(original.len() + new_text.len());
             out.push_str(&original[..orig_start]);
@@ -366,10 +381,7 @@ pub fn create_bash_tool_with_prepare(
             let prepare = prepare.clone();
             async move {
                 let mut command = arg_str(&args, "command")?;
-                let mut cwd = args
-                    .get("cwd")
-                    .and_then(|v| v.as_str())
-                    .map(PathBuf::from);
+                let mut cwd = args.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
 
                 check_command_policy(&command, &[])?;
 
@@ -407,9 +419,7 @@ pub fn create_bash_tool_with_prepare(
                         });
                     }));
                 }
-                let captured = execute_shell_with_capture(env, &command, options, None)
-                    .await
-                    .map_err(|e| e)?;
+                let captured = execute_shell_with_capture(env, &command, options, None).await?;
                 Ok(AgentToolResult {
                     content: vec![ToolResultContent::Text(TextContent {
                         text: captured.text.clone(),

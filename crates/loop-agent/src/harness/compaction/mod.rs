@@ -48,7 +48,11 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
 }
 
 /// Whether compaction should run.
-pub fn should_compact(total_tokens: u64, context_window: u64, settings: &CompactionSettings) -> bool {
+pub fn should_compact(
+    total_tokens: u64,
+    context_window: u64,
+    settings: &CompactionSettings,
+) -> bool {
     if !settings.enabled || context_window == 0 {
         return false;
     }
@@ -72,12 +76,10 @@ pub fn find_cut_point(messages: &[Message], keep_recent_tokens: u64) -> usize {
             }
             // Backward snap hit 0; look forward for a valid turn boundary
             // so compaction doesn't treat cut=0 as "nothing to compact".
-            for j in (i + 1)..messages.len() {
-                if messages[j].role() == "user" {
-                    return j;
-                }
-            }
-            return 0;
+            return messages[i + 1..]
+                .iter()
+                .position(|m| m.role() == "user")
+                .map_or(0, |offset| i + 1 + offset);
         }
     }
     // The whole history fits within keep_recent_tokens. Fall back to cutting at

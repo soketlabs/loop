@@ -51,9 +51,9 @@ pub mod types;
 pub mod utils;
 
 pub use api::{
-    detect_compat, http_client, list_openai_models, map_remote_model, resolve_compat, verify_api_key,
-    streaming_http_client, transform_messages, ListModelsError, MapRemoteModelOptions,
-    OpenAICompletionsAdapter,
+    detect_compat, http_client, list_openai_models, map_remote_model, resolve_compat,
+    streaming_http_client, transform_messages, verify_api_key, ListModelsError,
+    MapRemoteModelOptions, OpenAICompletionsAdapter,
 };
 pub use auth::{
     env_api_key_auth, AuthCheck, AuthResult, Credential, CredentialStore, InMemoryCredentialStore,
@@ -75,6 +75,6 @@ pub use stream::{
 pub use types::*;
 pub use utils::{
     calculate_context_tokens, estimate_context_tokens, estimate_message_tokens,
-    is_context_overflow, new_id, now_ms,
-    parse_streaming_json, validate_tool_arguments, validate_tool_call, ToolValidationError,
+    is_context_overflow, new_id, now_ms, parse_streaming_json, validate_tool_arguments,
+    validate_tool_call, ToolValidationError,
 };

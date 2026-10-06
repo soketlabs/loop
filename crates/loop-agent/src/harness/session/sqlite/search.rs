@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::harness::session::search::{create_scanning_session_search, SessionSearch, SessionSearchHit};
+use crate::harness::session::search::{
+    create_scanning_session_search, SessionSearch, SessionSearchHit,
+};
 use crate::harness::session::types::{SessionMetadata, SessionStore};
 use crate::harness::types::SessionError;
 
@@ -51,8 +53,11 @@ fn ensure_search_schema(conn: &Connection) -> Result<bool, SessionError> {
     conn.execute_batch(ENSURE_FTS_SCHEMA)
         .map_err(|e| SessionError::Storage(e.to_string()))?;
     if !fts_exists {
-        conn.execute("INSERT INTO session_search_fts(session_search_fts) VALUES('rebuild')", [])
-            .map_err(|e| SessionError::Storage(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO session_search_fts(session_search_fts) VALUES('rebuild')",
+            [],
+        )
+        .map_err(|e| SessionError::Storage(e.to_string()))?;
     }
     Ok(true)
 }
@@ -117,27 +122,20 @@ impl SessionSearch for SqliteSessionSearch {
                 )
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
             let rows = stmt
-                .query_map(
-                    params![fts_query, cwd_owned, limit as i64],
-                    |row| {
-                        Ok(SessionSearchHit {
-                            session: SessionMetadata {
-                                id: row.get(0)?,
-                                cwd: row.get(1)?,
-                                name: row.get(2)?,
-                                parent_session_id: row.get(3)?,
-                                created_at: row.get(4)?,
-                                path: None,
-                            },
-                            entry_id: row.get(5)?,
-                            snippet: row
-                                .get::<_, String>(6)?
-                                .chars()
-                                .take(200)
-                                .collect(),
-                        })
-                    },
-                )
+                .query_map(params![fts_query, cwd_owned, limit as i64], |row| {
+                    Ok(SessionSearchHit {
+                        session: SessionMetadata {
+                            id: row.get(0)?,
+                            cwd: row.get(1)?,
+                            name: row.get(2)?,
+                            parent_session_id: row.get(3)?,
+                            created_at: row.get(4)?,
+                            path: None,
+                        },
+                        entry_id: row.get(5)?,
+                        snippet: row.get::<_, String>(6)?.chars().take(200).collect(),
+                    })
+                })
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
             let mut hits = Vec::new();
             for row in rows {

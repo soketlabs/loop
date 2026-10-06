@@ -18,10 +18,7 @@ pub fn is_untitled(name: Option<&str>) -> bool {
         None => true,
         Some(n) => {
             let t = n.trim();
-            t.is_empty()
-                || PLACEHOLDERS
-                    .iter()
-                    .any(|p| t.eq_ignore_ascii_case(p))
+            t.is_empty() || PLACEHOLDERS.iter().any(|p| t.eq_ignore_ascii_case(p))
         }
     }
 }
@@ -122,8 +119,8 @@ pub async fn persist_session_name(
     if trimmed.is_empty() {
         return Ok(());
     }
-    let store = create_sqlite_session_store(&runtime.sessions_db)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let store =
+        create_sqlite_session_store(&runtime.sessions_db).map_err(|e| anyhow::anyhow!(e))?;
     store
         .append_entry(
             session_id,
@@ -137,10 +134,7 @@ pub async fn persist_session_name(
 }
 
 /// First user prompt stored on a session, if any.
-pub async fn first_user_message_text(
-    runtime: &Runtime,
-    session_id: &str,
-) -> Option<String> {
+pub async fn first_user_message_text(runtime: &Runtime, session_id: &str) -> Option<String> {
     let store = create_sqlite_session_store(&runtime.sessions_db).ok()?;
     let reader = store.load(session_id).await.ok()?;
     let entries = reader.read_entries(None).await.ok()?;
@@ -156,8 +150,8 @@ pub async fn first_user_message_text(
 
 /// Name every untitled session from its first user message.
 pub async fn backfill_untitled_sessions(runtime: &Runtime) -> anyhow::Result<usize> {
-    let store = create_sqlite_session_store(&runtime.sessions_db)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let store =
+        create_sqlite_session_store(&runtime.sessions_db).map_err(|e| anyhow::anyhow!(e))?;
     let repo = loop_agent::harness::create_session_repository(store, None);
     let list = repo.list(None).await.map_err(|e| anyhow::anyhow!(e))?;
     let mut named = 0usize;

@@ -32,7 +32,11 @@ impl LlmPlanner {
         self
     }
 
-    async fn call_llm(&self, system_prompt: &str, user_prompt: &str) -> Result<String, PlannerError> {
+    async fn call_llm(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<String, PlannerError> {
         let context = Context {
             system_prompt: Some(system_prompt.to_string()),
             messages: vec![Message::user_text(user_prompt)],
@@ -91,7 +95,9 @@ impl LlmPlanner {
         let tasks = value
             .get("tasks")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| PlannerError::DecompositionFailed("missing 'tasks' array".to_string()))?;
+            .ok_or_else(|| {
+                PlannerError::DecompositionFailed("missing 'tasks' array".to_string())
+            })?;
 
         let mut graph = TaskGraph::new();
 
@@ -123,8 +129,15 @@ impl LlmPlanner {
                     let tools: Option<Vec<String>> = task_val
                         .get("tools")
                         .and_then(|v| serde_json::from_value(v.clone()).ok());
-                    let model = task_val.get("model").and_then(|v| v.as_str()).map(String::from);
-                    TaskKind::AgentTurn { prompt, tools, model }
+                    let model = task_val
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    TaskKind::AgentTurn {
+                        prompt,
+                        tools,
+                        model,
+                    }
                 }
                 "shell_command" => {
                     let command = task_val
@@ -168,9 +181,7 @@ impl LlmPlanner {
             }
         }
 
-        graph
-            .validate()
-            .map_err(PlannerError::InvalidPlan)?;
+        graph.validate().map_err(PlannerError::InvalidPlan)?;
 
         Ok(graph)
     }

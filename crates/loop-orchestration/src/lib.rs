@@ -10,9 +10,9 @@ pub mod planner;
 pub mod scheduler;
 pub mod workflow;
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::future::Future;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -63,17 +63,21 @@ pub struct ShellRunResult {
 /// wire `ExecutionEnv` into the orchestration scheduler.
 #[async_trait]
 pub trait ShellRunner: Send + Sync {
-    async fn exec(&self, command: &str, cancel: CancellationToken) -> Result<ShellRunResult, String>;
+    async fn exec(
+        &self,
+        command: &str,
+        cancel: CancellationToken,
+    ) -> Result<ShellRunResult, String>;
 }
 
 // ── Re-exports ──────────────────────────────────────────────────────
 
-pub use planner::{LlmPlanner, ManualPlanner, Planner, PlannerContext, PlannerError, TaskGraph, TaskNode, TaskKind};
+pub use memory::{MemoryBus, SharedMemory, TaskMemory};
+pub use planner::{
+    LlmPlanner, ManualPlanner, Planner, PlannerContext, PlannerError, TaskGraph, TaskKind, TaskNode,
+};
+pub use scheduler::{Scheduler, SchedulerConfig, Worker, WorkerContext, WorkerError, WorkerPool};
 pub use workflow::{
     EventLog, MemoryEventLog, SignalRouter, WorkflowEngine, WorkflowEvent, WorkflowId,
     WorkflowResult, WorkflowState,
 };
-pub use scheduler::{
-    Scheduler, SchedulerConfig, Worker, WorkerContext, WorkerError, WorkerPool,
-};
-pub use memory::{MemoryBus, SharedMemory, TaskMemory};

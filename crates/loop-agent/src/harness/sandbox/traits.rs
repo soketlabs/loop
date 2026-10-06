@@ -73,10 +73,7 @@ impl SandboxInfo {
 
     /// Build an info card for an enabled sandbox.
     pub fn enabled(kind: impl Into<String>, fields: Vec<(String, String)>) -> Self {
-        let mut rows = vec![
-            ("Mode".into(), "on".into()),
-            ("Kind".into(), kind.into()),
-        ];
+        let mut rows = vec![("Mode".into(), "on".into()), ("Kind".into(), kind.into())];
         rows.extend(fields);
         Self {
             title: "Sandbox".into(),

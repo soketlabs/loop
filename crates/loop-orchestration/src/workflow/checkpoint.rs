@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::types::{SeqNo, WorkflowState, WorkflowId};
+use super::types::{SeqNo, WorkflowId, WorkflowState};
 
 /// A serialized checkpoint of workflow state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,8 +22,8 @@ pub struct Checkpoint {
 impl Checkpoint {
     /// Create a checkpoint from the current workflow state.
     pub fn from_state(state: &WorkflowState) -> Result<Self, String> {
-        let state_json = serde_json::to_string(state)
-            .map_err(|e| format!("failed to serialize state: {e}"))?;
+        let state_json =
+            serde_json::to_string(state).map_err(|e| format!("failed to serialize state: {e}"))?;
         Ok(Self {
             workflow_id: state.workflow_id.clone(),
             snapshot_id: format!("cp_{}", uuid::Uuid::now_v7()),

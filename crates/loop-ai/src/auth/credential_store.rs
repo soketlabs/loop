@@ -38,7 +38,9 @@ impl CredentialStore for InMemoryCredentialStore {
     }
 
     fn set(&self, provider_id: &str, credential: Credential) {
-        self.inner.lock().insert(provider_id.to_string(), credential);
+        self.inner
+            .lock()
+            .insert(provider_id.to_string(), credential);
     }
 
     fn remove(&self, provider_id: &str) {

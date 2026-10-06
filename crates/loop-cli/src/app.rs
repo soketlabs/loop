@@ -54,6 +54,10 @@ use crate::tui::{
 };
 use crate::{build_tools, CliRuntime};
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "short-lived channel message wrapping AgentEvent"
+)]
 enum UiEvent {
     Agent(AgentEvent),
     /// Background `prompt()` finished with an error (no AgentEnd emitted).
@@ -145,7 +149,7 @@ impl ActiveApproval {
         }
     }
 
-    fn into_picker(&self) -> PickerView {
+    fn to_picker(&self) -> PickerView {
         PickerView::FileReview {
             path: format!("{} · {}", self.tool_name, self.summary),
             selected: self.selected,
@@ -524,7 +528,7 @@ async fn run_loop(
         }
 
         let picker = if let Some(review) = &active_approval {
-            review.into_picker()
+            review.to_picker()
         } else if let Some(p) = &model_picker {
             let current = runtime.selected_model_spec().unwrap_or_default();
             PickerView::Models {
@@ -1495,6 +1499,10 @@ fn dequeue_last_message(
     Some(item.display)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pre-existing signature; refactor tracked separately"
+)]
 fn start_user_turn(
     runtime: &CliRuntime,
     chat: &mut Vec<ChatItem>,
@@ -1541,6 +1549,10 @@ fn start_user_turn(
     });
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pre-existing signature; refactor tracked separately"
+)]
 fn try_drain_message_queue(
     runtime: &CliRuntime,
     chat: &mut Vec<ChatItem>,
@@ -1574,6 +1586,10 @@ fn try_drain_message_queue(
     );
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pre-existing signature; refactor tracked separately"
+)]
 fn submit_user_text(
     runtime: &CliRuntime,
     chat: &mut Vec<ChatItem>,
@@ -1737,6 +1753,10 @@ fn note_terminal_resize(
 
 /// Insert pasted text without submitting. Newlines stay in the composer so one
 /// Enter sends the whole paragraph.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pre-existing signature; refactor tracked separately"
+)]
 fn insert_pasted_text(
     text: &str,
     runtime: &CliRuntime,
@@ -1805,6 +1825,10 @@ fn insert_pasted_text(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pre-existing signature; refactor tracked separately"
+)]
 async fn handle_key(
     key: crossterm::event::KeyEvent,
     runtime: &mut CliRuntime,
@@ -2177,7 +2201,7 @@ async fn handle_key(
             } else {
                 *pending_setup = None;
                 input.clear();
-                *status = prompt.cancelled_message().into();
+                *status = prompt.cancelled_message();
             }
             return Ok(());
         }
@@ -2414,7 +2438,7 @@ async fn handle_key(
             }
             Action::MoveDown => {
                 if !input.move_down() {
-                    if let Some(text) = history.next() {
+                    if let Some(text) = history.next_entry() {
                         input.set(text);
                     }
                 }
@@ -2828,7 +2852,7 @@ fn start_mcp_login(
 fn open_browser(url: &str) -> std::io::Result<std::process::Child> {
     #[cfg(target_os = "macos")]
     {
-        return std::process::Command::new("open").arg(url).spawn();
+        std::process::Command::new("open").arg(url).spawn()
     }
     #[cfg(target_os = "windows")]
     {
@@ -3131,6 +3155,10 @@ fn endpoint_for(runtime: &CliRuntime) -> String {
         .unwrap_or_else(|| SOKET_BASE_URL.to_string())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pre-existing signature; refactor tracked separately"
+)]
 fn handle_agent_event(
     ev: AgentEvent,
     chat: &mut Vec<ChatItem>,
@@ -3393,6 +3421,10 @@ fn handle_agent_event(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pre-existing signature; refactor tracked separately"
+)]
 fn upsert_tool(
     chat: &mut Vec<ChatItem>,
     streaming_assistant: &mut Option<usize>,
@@ -3578,6 +3610,10 @@ fn apply_tracing_command(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pre-existing signature; refactor tracked separately"
+)]
 async fn apply_effect(
     effect: CommandEffect,
     runtime: &mut CliRuntime,
@@ -3610,8 +3646,7 @@ async fn apply_effect(
                     runtime
                         .project_trusted
                         .then_some(crate::config::paths::get_project_dir(&runtime.cwd))
-                        .as_ref()
-                        .map(|p| p.as_path()),
+                        .as_deref(),
                 );
                 let list = Theme::list(&dirs);
                 chat.push(sys(format!("themes: {}\n{s}", list.join(", "))));
@@ -3625,8 +3660,7 @@ async fn apply_effect(
                 runtime
                     .project_trusted
                     .then_some(crate::config::paths::get_project_dir(&runtime.cwd))
-                    .as_ref()
-                    .map(|p| p.as_path()),
+                    .as_deref(),
             );
             match Theme::load(&name, &dirs) {
                 Ok(t) => {

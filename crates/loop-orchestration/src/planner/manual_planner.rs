@@ -138,12 +138,7 @@ impl ManualPlanner {
     }
 
     /// Declare a data flow from one task to another.
-    pub fn data_flows(
-        &mut self,
-        from: &str,
-        to: &str,
-        key: impl Into<String>,
-    ) -> &mut Self {
+    pub fn data_flows(&mut self, from: &str, to: &str, key: impl Into<String>) -> &mut Self {
         self.graph.add_data_flow(from, to, key);
         self
     }
@@ -238,7 +233,11 @@ mod tests {
             "do it carefully",
             Some(vec!["read".into(), "write".into()]),
             Some("gpt-4".into()),
-            TaskConfig { max_retries: 5, timeout_ms: 60000, priority: 10 },
+            TaskConfig {
+                max_retries: 5,
+                timeout_ms: 60000,
+                priority: 10,
+            },
         );
         let graph = p.build().unwrap();
         let node = graph.tasks.get(&t).unwrap();
@@ -268,7 +267,10 @@ mod tests {
     async fn decompose_returns_built_graph() {
         let mut p = ManualPlanner::new();
         p.add_agent_turn("task", "hello");
-        let graph = p.decompose("any goal", &PlannerContext::default()).await.unwrap();
+        let graph = p
+            .decompose("any goal", &PlannerContext::default())
+            .await
+            .unwrap();
         assert_eq!(graph.tasks.len(), 1);
     }
 

@@ -14,8 +14,8 @@ use loop_agent::types::AgentTool;
 
 fn make_test_tools() -> (tempfile::TempDir, Vec<AgentTool>) {
     let dir = tempfile::tempdir().unwrap();
-    let env = Arc::new(HostExecutionEnv::new(dir.path()))
-        as Arc<dyn loop_agent::harness::ExecutionEnv>;
+    let env =
+        Arc::new(HostExecutionEnv::new(dir.path())) as Arc<dyn loop_agent::harness::ExecutionEnv>;
     let tools = vec![
         create_read_tool(Arc::clone(&env)),
         create_write_tool(Arc::clone(&env)),

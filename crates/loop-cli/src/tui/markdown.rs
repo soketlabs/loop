@@ -896,7 +896,7 @@ mod tests {
                 l.width() <= width,
                 "line too wide ({}): {:?}",
                 l.width(),
-                plain(&[l.clone()])
+                plain(std::slice::from_ref(l))
             );
         }
         // Cell text must survive (wrapped across rows), not be truncated away.

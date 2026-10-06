@@ -16,7 +16,7 @@ use crate::harness::sandbox::traits::{
     Sandbox, SandboxConfig, SandboxError, SandboxFactory, SandboxInfo, SandboxStatus,
 };
 use crate::harness::types::{
-    ExecutionError, ExecutionErrorCode, ExecutionEnv, FileError, FileErrorCode, FileInfo,
+    ExecutionEnv, ExecutionError, ExecutionErrorCode, FileError, FileErrorCode, FileInfo,
     FileSystem, Shell, ShellExecOptions, ShellOutput,
 };
 
@@ -151,12 +151,20 @@ impl KrunSandbox {
         let cpus = config
             .options
             .get("cpus")
-            .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_u64().map(|n| n.to_string())))
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+            })
             .unwrap_or_else(|| "2".into());
         let ram_mib = config
             .options
             .get("ram_mib")
-            .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_u64().map(|n| n.to_string())))
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+            })
             .unwrap_or_else(|| "2048".into());
         let workdir = if config.workdir.as_os_str().is_empty() {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -280,9 +288,8 @@ impl Sandbox for KrunSandbox {
                 ram_mib: self.ram_mib.clone(),
             })
             .await
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 *self.status.write() = SandboxStatus::Failed;
-                e
             })?;
 
         let env: Arc<dyn ExecutionEnv> = Arc::new(KrunExecutionEnv::new(
@@ -395,9 +402,9 @@ impl KrunExecutionEnv {
                 "cwd path escape rejected",
             ));
         }
-        let guest = self.guest_path(&cwd).map_err(|e| {
-            ExecutionError::new(ExecutionErrorCode::Other, e.to_string())
-        })?;
+        let guest = self
+            .guest_path(&cwd)
+            .map_err(|e| ExecutionError::new(ExecutionErrorCode::Other, e.to_string()))?;
         Ok(guest.to_string_lossy().into_owned())
     }
 
@@ -474,7 +481,11 @@ impl FileSystem for KrunExecutionEnv {
         }
         let guest = self.guest_path(path)?;
         let out = self
-            .exec_sh(&format!("cat -- {}", sh_quote(&guest.to_string_lossy())), None, None)
+            .exec_sh(
+                &format!("cat -- {}", sh_quote(&guest.to_string_lossy())),
+                None,
+                None,
+            )
             .await
             .map_err(map_exec_file)?;
         if out.exit_code != 0 {
@@ -578,7 +589,10 @@ impl FileSystem for KrunExecutionEnv {
              stat -c %s -- {p} 2>/dev/null || wc -c < {p}",
             p = sh_quote(&guest.to_string_lossy())
         );
-        let out = self.exec_sh(&script, None, None).await.map_err(map_exec_file)?;
+        let out = self
+            .exec_sh(&script, None, None)
+            .await
+            .map_err(map_exec_file)?;
         if out.exit_code != 0 || out.stdout.contains("MISSING") {
             return Err(FileError::new(
                 FileErrorCode::NotFound,
@@ -587,12 +601,7 @@ impl FileSystem for KrunExecutionEnv {
         }
         let mut lines = out.stdout.lines();
         let kind = lines.next().unwrap_or("").trim();
-        let size: u64 = lines
-            .next()
-            .unwrap_or("0")
-            .trim()
-            .parse()
-            .unwrap_or(0);
+        let size: u64 = lines.next().unwrap_or("0").trim().parse().unwrap_or(0);
         Ok(FileInfo {
             path: host_abs,
             is_dir: kind == "DIR",
@@ -611,7 +620,10 @@ impl FileSystem for KrunExecutionEnv {
              find {p} -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%P\\n'",
             p = sh_quote(&guest.to_string_lossy())
         );
-        let out = self.exec_sh(&script, None, None).await.map_err(map_exec_file)?;
+        let out = self
+            .exec_sh(&script, None, None)
+            .await
+            .map_err(map_exec_file)?;
         if out.exit_code != 0 {
             return Err(FileError::new(
                 FileErrorCode::NotADirectory,

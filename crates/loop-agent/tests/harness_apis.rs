@@ -13,10 +13,7 @@ use loop_agent::AgentMessage;
 use loop_ai::providers::{faux_provider, FauxResponse, FauxScript};
 use loop_ai::Models;
 
-async fn make_harness(
-    script: FauxScript,
-    resources: AgentHarnessResources,
-) -> AgentHarness {
+async fn make_harness(script: FauxScript, resources: AgentHarnessResources) -> AgentHarness {
     let models = Arc::new(Models::new());
     models.set_provider(faux_provider(script));
     let model = models.get_model("faux", "faux-model").unwrap();
@@ -75,7 +72,10 @@ async fn prompt_from_template_with_resources() {
     };
 
     let harness = make_harness(script, resources).await;
-    let msg = harness.prompt_from_template("greet", "world").await.unwrap();
+    let msg = harness
+        .prompt_from_template("greet", "world")
+        .await
+        .unwrap();
     assert_eq!(msg.role(), "assistant");
 }
 

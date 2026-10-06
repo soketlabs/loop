@@ -11,6 +11,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --exclude loop-desktop --all-targets --locked -- -D warnings
+
+      - name: clippy (telemetry)
+        run: cargo clippy -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli --all-targets --features loop-agent/telemetry,loop-app-core/telemetry,loop-cli/telemetry --locked -- -D warnings
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

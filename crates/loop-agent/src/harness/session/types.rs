@@ -34,6 +34,10 @@ pub struct SessionMetadata {
 /// Tree entry stored in a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "public serde type; boxing variants would break the API"
+)]
 pub enum SessionTreeEntry {
     /// Transcript message.
     Message {
@@ -204,6 +208,10 @@ impl SessionTreeEntry {
 /// Pending write without generated fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "public serde type; boxing variants would break the API"
+)]
 pub enum PendingSessionWrite {
     /// Message.
     Message {
@@ -349,7 +357,10 @@ impl Session {
     }
 
     /// Append a message.
-    pub async fn append_message(&self, message: AgentMessage) -> Result<SessionTreeEntry, SessionError> {
+    pub async fn append_message(
+        &self,
+        message: AgentMessage,
+    ) -> Result<SessionTreeEntry, SessionError> {
         self.store
             .append_entry(
                 &self.metadata().id,
@@ -359,12 +370,12 @@ impl Session {
     }
 
     /// Move leaf.
-    pub async fn move_to(&self, target_id: Option<String>) -> Result<SessionTreeEntry, SessionError> {
+    pub async fn move_to(
+        &self,
+        target_id: Option<String>,
+    ) -> Result<SessionTreeEntry, SessionError> {
         self.store
-            .append_entry(
-                &self.metadata().id,
-                PendingSessionWrite::Leaf { target_id },
-            )
+            .append_entry(&self.metadata().id, PendingSessionWrite::Leaf { target_id })
             .await
     }
 

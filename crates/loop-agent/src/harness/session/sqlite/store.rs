@@ -198,9 +198,7 @@ fn load_all(conn: &Connection, sid: &str) -> Result<Vec<SessionTreeEntry>, Sessi
     let mut out = Vec::new();
     for row in rows {
         let payload = row.map_err(|e| SessionError::Storage(e.to_string()))?;
-        out.push(
-            serde_json::from_str(&payload).map_err(|e| SessionError::Storage(e.to_string()))?,
-        );
+        out.push(serde_json::from_str(&payload).map_err(|e| SessionError::Storage(e.to_string()))?);
     }
     Ok(out)
 }
@@ -380,9 +378,7 @@ impl SessionReader for SqliteReader {
                 .optional()
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
             payload
-                .map(|p| {
-                    serde_json::from_str(&p).map_err(|e| SessionError::Storage(e.to_string()))
-                })
+                .map(|p| serde_json::from_str(&p).map_err(|e| SessionError::Storage(e.to_string())))
                 .transpose()
         })
         .await
@@ -644,12 +640,8 @@ impl SessionStore for SqliteSessionStore {
         let reader = self.load(source_id).await?;
         let leaf = reader.read_head().await?;
         let entries = reader.read_entries(None).await?;
-        let selected = entries_for_fork_selection(
-            &entries,
-            leaf.as_deref(),
-            selection,
-            through_entry_id,
-        )?;
+        let selected =
+            entries_for_fork_selection(&entries, leaf.as_deref(), selection, through_entry_id)?;
         let meta = reader.metadata().clone();
         let new_reader = self.create(meta.cwd.clone(), name).await?;
         for entry in selected {
@@ -662,10 +654,7 @@ impl SessionStore for SqliteSessionStore {
                 }
                 SessionTreeEntry::ModelChange {
                     provider, model_id, ..
-                } => PendingSessionWrite::ModelChange {
-                    provider,
-                    model_id,
-                },
+                } => PendingSessionWrite::ModelChange { provider, model_id },
                 SessionTreeEntry::ActiveToolsChange { tool_names, .. } => {
                     PendingSessionWrite::ActiveToolsChange { tool_names }
                 }

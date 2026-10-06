@@ -40,10 +40,7 @@ pub fn stream_proxy(options: ProxyStreamOptions) -> StreamFn {
             let stream = create_assistant_message_event_stream();
             let handle = stream.handle();
             let client = loop_ai::streaming_http_client();
-            let url = format!(
-                "{}/api/stream",
-                options.proxy_url.trim_end_matches('/')
-            );
+            let url = format!("{}/api/stream", options.proxy_url.trim_end_matches('/'));
             let body = ProxyRequest {
                 model: model.clone(),
                 context,
@@ -67,11 +64,7 @@ pub fn stream_proxy(options: ProxyStreamOptions) -> StreamFn {
                     }
                 };
                 if !res.status().is_success() {
-                    push_error(
-                        &handle,
-                        &model,
-                        format!("proxy status {}", res.status()),
-                    );
+                    push_error(&handle, &model, format!("proxy status {}", res.status()));
                     return;
                 }
                 let mut byte_stream = res.bytes_stream();
@@ -88,9 +81,7 @@ pub fn stream_proxy(options: ProxyStreamOptions) -> StreamFn {
                             if data.trim() == "[DONE]" {
                                 continue;
                             }
-                            if let Ok(event) =
-                                serde_json::from_str::<AssistantMessageEvent>(data)
-                            {
+                            if let Ok(event) = serde_json::from_str::<AssistantMessageEvent>(data) {
                                 let terminal = event.is_terminal();
                                 handle.push(event);
                                 if terminal {
@@ -115,11 +106,7 @@ pub fn stream_proxy(options: ProxyStreamOptions) -> StreamFn {
     })
 }
 
-fn push_error(
-    handle: &loop_ai::AssistantMessageEventStreamHandle,
-    model: &Model,
-    message: String,
-) {
+fn push_error(handle: &loop_ai::AssistantMessageEventStreamHandle, model: &Model, message: String) {
     let mut partial = AssistantMessage::pending(model);
     partial.stop_reason = StopReason::Error;
     partial.error_message = Some(message);

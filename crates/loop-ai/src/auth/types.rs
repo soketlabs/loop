@@ -77,9 +77,8 @@ pub struct AuthResult {
 }
 
 /// Async resolve function for ambient API-key auth.
-pub type ApiKeyResolveFn = Arc<
-    dyn Fn() -> Pin<Box<dyn Future<Output = Result<AuthResult, String>> + Send>> + Send + Sync,
->;
+pub type ApiKeyResolveFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<AuthResult, String>> + Send>> + Send + Sync>;
 
 /// API-key auth method on a provider.
 #[derive(Clone)]

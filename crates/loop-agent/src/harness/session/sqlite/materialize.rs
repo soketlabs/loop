@@ -23,9 +23,9 @@ fn empty_summary_json() -> String {
 }
 
 fn serialize_summary(state: &MaterializedState) -> String {
-    let current_model = state.current_model.as_ref().map(|(provider, model_id)| {
-        serde_json::json!({ "provider": provider, "modelId": model_id })
-    });
+    let current_model = state.current_model.as_ref().map(
+        |(provider, model_id)| serde_json::json!({ "provider": provider, "modelId": model_id }),
+    );
     serde_json::json!({
         "name": state.name,
         "messageCount": state.message_count,
@@ -38,9 +38,9 @@ fn serialize_summary(state: &MaterializedState) -> String {
 fn parse_summary(json: &str) -> Result<MaterializedState, SessionError> {
     let value: serde_json::Value =
         serde_json::from_str(json).map_err(|e| SessionError::Storage(e.to_string()))?;
-    let obj = value
-        .as_object()
-        .ok_or_else(|| SessionError::Invalid("materialized session summary is not an object".into()))?;
+    let obj = value.as_object().ok_or_else(|| {
+        SessionError::Invalid("materialized session summary is not an object".into())
+    })?;
     let message_count = obj
         .get("messageCount")
         .and_then(|v| v.as_u64())
@@ -101,19 +101,15 @@ fn apply_entry(state: &mut MaterializedState, entry: &SessionTreeEntry) {
 
 fn entry_materialized_rows(entry: &SessionTreeEntry) -> Vec<(&'static str, String)> {
     match entry {
-        SessionTreeEntry::Label { label, .. } => vec![(
-            "label",
-            serde_json::json!({ "label": label }).to_string(),
-        )],
+        SessionTreeEntry::Label { label, .. } => {
+            vec![("label", serde_json::json!({ "label": label }).to_string())]
+        }
         _ => vec![],
     }
 }
 
 /// Insert an empty materialized row for a new session.
-pub fn insert_empty_materialized(
-    conn: &Connection,
-    session_id: &str,
-) -> Result<(), SessionError> {
+pub fn insert_empty_materialized(conn: &Connection, session_id: &str) -> Result<(), SessionError> {
     conn.execute(
         "INSERT INTO session_materialized (session_id, payload) VALUES (?1, ?2)",
         params![session_id, empty_summary_json()],

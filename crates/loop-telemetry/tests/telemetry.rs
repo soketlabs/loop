@@ -14,11 +14,10 @@ use tracing_subscriber::layer::SubscriberExt;
 struct FailingExporter;
 
 impl SpanExporter for FailingExporter {
-    fn export(
-        &self,
-        _batch: Vec<SpanData>,
-    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
-        async { Err(OTelSdkError::InternalFailure("expected test failure".into())) }
+    async fn export(&self, _batch: Vec<SpanData>) -> OTelSdkResult {
+        Err(OTelSdkError::InternalFailure(
+            "expected test failure".into(),
+        ))
     }
 }
 
@@ -307,7 +306,10 @@ fn export_one_span(
     });
     handle.flush();
     let request = server.requests().pop().expect("one export request");
-    assert!(request.body.windows(b"loop.run".len()).any(|w| w == b"loop.run"));
+    assert!(request
+        .body
+        .windows(b"loop.run".len())
+        .any(|w| w == b"loop.run"));
     (handle, request)
 }
 
@@ -328,9 +330,15 @@ fn langfuse_exporter_posts_protobuf_with_auth_headers() {
         (request.method.as_str(), request.path.as_str()),
         ("POST", "/api/public/otel/v1/traces")
     );
-    assert_eq!(request.header("authorization"), Some("Basic cGstbGYtMTpzay1sZi0y"));
+    assert_eq!(
+        request.header("authorization"),
+        Some("Basic cGstbGYtMTpzay1sZi0y")
+    );
     assert_eq!(request.header("x-langfuse-ingestion-version"), Some("4"));
-    assert_eq!(request.header("content-type"), Some("application/x-protobuf"));
+    assert_eq!(
+        request.header("content-type"),
+        Some("application/x-protobuf")
+    );
     assert_eq!(
         handle.status().destination,
         Some(format!("Langfuse · {host}"))
@@ -341,9 +349,12 @@ fn langfuse_exporter_posts_protobuf_with_auth_headers() {
 #[test]
 fn otlp_exporter_posts_to_collector_with_optional_auth() {
     let server = otlp_receiver();
-    let destination =
-        TelemetryDestination::otlp(server.base_url(), Some("Bearer tok"), CredentialSource::Config)
-            .unwrap();
+    let destination = TelemetryDestination::otlp(
+        server.base_url(),
+        Some("Bearer tok"),
+        CredentialSource::Config,
+    )
+    .unwrap();
     let (_, request) = export_one_span(&destination, &server);
     assert_eq!(request.path, "/v1/traces");
     assert_eq!(request.header("authorization"), Some("Bearer tok"));

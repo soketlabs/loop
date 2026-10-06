@@ -426,10 +426,14 @@ mod tests {
         set_disabled_name(&mut settings.disabled_mcp_servers, "filesystem", true);
         assert!(settings.disabled_mcp_servers.is_empty());
 
-        let mut global = Settings::default();
-        global.disabled_mcp_servers = vec!["filesystem".into()];
-        let mut project = Settings::default();
-        project.disabled_mcp_servers = vec!["filesystem".into(), "remote".into()];
+        let mut global = Settings {
+            disabled_mcp_servers: vec!["filesystem".into()],
+            ..Default::default()
+        };
+        let project = Settings {
+            disabled_mcp_servers: vec!["filesystem".into(), "remote".into()],
+            ..Default::default()
+        };
         global.merge_project(project);
         assert_eq!(global.disabled_mcp_servers, ["filesystem", "remote"]);
     }

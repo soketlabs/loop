@@ -258,20 +258,12 @@ pub fn create_provider(input: CreateProviderOptions) -> Provider {
 }
 
 /// Options when constructing a [`Models`] collection.
+#[derive(Default)]
 pub struct CreateModelsOptions {
     /// Credential store (defaults to in-memory).
     pub credentials: Option<Arc<dyn CredentialStore>>,
     /// Optional persistent model catalog store.
     pub models_store: Option<SharedModelsStore>,
-}
-
-impl Default for CreateModelsOptions {
-    fn default() -> Self {
-        Self {
-            credentials: None,
-            models_store: None,
-        }
-    }
 }
 
 /// Runtime collection of providers plus auth application and stream convenience.
@@ -446,10 +438,7 @@ impl Models {
         options: StreamOptions,
     ) -> AssistantMessageEventStream {
         let Some(provider) = self.get_provider(&model.provider) else {
-            return error_stream(
-                model,
-                format!("provider not found: {}", model.provider),
-            );
+            return error_stream(model, format!("provider not found: {}", model.provider));
         };
         self.stream_with_provider(provider, model, context, options)
     }
@@ -541,10 +530,7 @@ impl Models {
         options: SimpleStreamOptions,
     ) -> AssistantMessageEventStream {
         let Some(provider) = self.get_provider(&model.provider) else {
-            return error_stream(
-                model,
-                format!("provider not found: {}", model.provider),
-            );
+            return error_stream(model, format!("provider not found: {}", model.provider));
         };
 
         use crate::stream::create_assistant_message_event_stream;

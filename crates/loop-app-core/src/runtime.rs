@@ -766,8 +766,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         &agent_dir,
         project_trusted
             .then_some(crate::config::paths::get_project_dir(&opts.cwd))
-            .as_ref()
-            .map(|p| p.as_path()),
+            .as_deref(),
     );
     let theme = Theme::load(&settings.theme, &theme_dirs).unwrap_or_else(|_| Theme::dark());
 

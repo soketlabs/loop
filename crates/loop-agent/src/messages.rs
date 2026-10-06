@@ -70,9 +70,7 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<Message> {
                 }));
             }
             AgentMessage::Custom(CustomAgentMessage::Custom {
-                content,
-                timestamp,
-                ..
+                content, timestamp, ..
             }) => {
                 out.push(Message::User(UserMessage {
                     content: UserMessageContent::Text(content.clone()),
@@ -87,10 +85,7 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<Message> {
                     timestamp: *timestamp,
                 }));
             }
-            AgentMessage::Custom(CustomAgentMessage::CompactionSummary {
-                summary,
-                timestamp,
-            }) => {
+            AgentMessage::Custom(CustomAgentMessage::CompactionSummary { summary, timestamp }) => {
                 out.push(Message::User(UserMessage {
                     content: UserMessageContent::Text(format!(
                         "{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}"

@@ -2,8 +2,8 @@
 
 use loop_ai::{
     transform_messages, AssistantContent, AssistantMessage, ImageContent, InputModality, Message,
-    Model, ModelCost, StopReason, TextContent, ThinkingContent, ToolCall, ToolResultContent,
-    Usage, UserContent, UserMessage, UserMessageContent,
+    Model, ModelCost, StopReason, TextContent, ThinkingContent, ToolCall, ToolResultContent, Usage,
+    UserContent, UserMessage, UserMessageContent,
 };
 use serde_json::json;
 

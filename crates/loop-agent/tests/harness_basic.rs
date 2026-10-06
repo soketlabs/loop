@@ -36,7 +36,10 @@ async fn harness_prompt_persists() {
     let msg = harness.prompt("hello").await.unwrap();
     assert_eq!(msg.role(), "assistant");
     harness.wait_for_idle().await;
-    assert_eq!(harness.phase(), loop_agent::harness::AgentHarnessPhase::Idle);
+    assert_eq!(
+        harness.phase(),
+        loop_agent::harness::AgentHarnessPhase::Idle
+    );
 }
 
 #[tokio::test]
@@ -229,9 +232,15 @@ async fn prompt_without_model_fails_cleanly_until_one_is_selected() {
 
     assert!(harness.model().await.is_none());
     let err = harness.prompt("hello").await.unwrap_err();
-    assert!(matches!(err, loop_agent::harness::AgentHarnessError::NoModelSelected));
+    assert!(matches!(
+        err,
+        loop_agent::harness::AgentHarnessError::NoModelSelected
+    ));
     assert!(err.to_string().contains("/model"));
-    assert_eq!(harness.phase(), loop_agent::harness::AgentHarnessPhase::Idle);
+    assert_eq!(
+        harness.phase(),
+        loop_agent::harness::AgentHarnessPhase::Idle
+    );
     assert!(
         harness.session_context().await.unwrap().messages.is_empty(),
         "a rejected prompt must not be recorded"

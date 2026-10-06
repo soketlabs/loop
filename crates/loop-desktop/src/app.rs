@@ -14,13 +14,13 @@ use gpui_component::input::{InputEvent, Textarea, TextareaState};
 use gpui_component::menu::DropdownMenu;
 use gpui_component::menu::PopupMenuItem;
 use gpui_component::progress::ProgressCircle;
-use gpui_component::scroll::{Scrollbar, ScrollableElement};
+use gpui_component::scroll::{ScrollableElement, Scrollbar};
 use gpui_component::separator::Separator;
 use gpui_component::spinner::Spinner;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::v_flex;
 use gpui_component::{
-    Icon, IconName, Sizable, Theme, ThemeMode, VirtualListScrollHandle, v_virtual_list, *,
+    v_virtual_list, Icon, IconName, Sizable, Theme, ThemeMode, VirtualListScrollHandle, *,
 };
 
 use crate::controller::{DesktopCommand, DesktopController, DesktopSnapshot};
@@ -82,7 +82,10 @@ impl DesktopApp {
 
     fn sync_session_sizes(&mut self, count: usize) {
         self.session_item_sizes =
-            Rc::new(vec![size(px(SIDEBAR_WIDTH - 16.), px(SESSION_ROW_HEIGHT)); count.max(1)]);
+            Rc::new(vec![
+                size(px(SIDEBAR_WIDTH - 16.), px(SESSION_ROW_HEIGHT));
+                count.max(1)
+            ]);
     }
 
     fn run_command(&self, cmd: DesktopCommand) {
@@ -142,8 +145,12 @@ fn chat_scroll_signature(snap: &DesktopSnapshot) -> (usize, usize, bool) {
         .map(|row| match row {
             ChatRow::User { text, .. } | ChatRow::Assistant { text, .. } => text.len(),
             ChatRow::Thinking { text, .. } => text.len(),
-            ChatRow::Tool { detail, summary, .. } => detail.len().saturating_add(summary.len()),
-            ChatRow::Shell { output, command, .. } => output.len().saturating_add(command.len()),
+            ChatRow::Tool {
+                detail, summary, ..
+            } => detail.len().saturating_add(summary.len()),
+            ChatRow::Shell {
+                output, command, ..
+            } => output.len().saturating_add(command.len()),
             _ => 0,
         })
         .unwrap_or(0);
@@ -452,7 +459,10 @@ fn render_sidebar(
         )
 }
 
-fn render_session_row(s: crate::state::SessionRow, cx: &mut Context<DesktopApp>) -> impl IntoElement {
+fn render_session_row(
+    s: crate::state::SessionRow,
+    cx: &mut Context<DesktopApp>,
+) -> impl IntoElement {
     let label = crate::session_title::display_title(s.name.as_deref());
     let session_id = s.id.clone();
     let active = s.active;
@@ -507,11 +517,7 @@ fn render_session_row(s: crate::state::SessionRow, cx: &mut Context<DesktopApp>)
                                 .child(label),
                         )
                         .when(running, |el| {
-                            el.child(
-                                Spinner::new()
-                                    .xsmall()
-                                    .color(cx.theme().accent),
-                            )
+                            el.child(Spinner::new().xsmall().color(cx.theme().accent))
                         }),
                 )
                 .child(
@@ -537,7 +543,9 @@ fn render_chat_panel(
     let selected = snap.selected_change_id.clone();
     let show_working = streaming
         && !rows.iter().any(|r| match r {
-            ChatRow::Assistant { streaming: true, .. } => true,
+            ChatRow::Assistant {
+                streaming: true, ..
+            } => true,
             ChatRow::Thinking { done: false, .. } => true,
             ChatRow::Tool {
                 status: ToolCardStatus::Running | ToolCardStatus::Pending,
@@ -555,7 +563,9 @@ fn render_chat_panel(
         .px_4()
         .py_3()
         .gap_3()
-        .when(empty && !streaming, |el| el.child(render_empty_state(snap, cx)))
+        .when(empty && !streaming, |el| {
+            el.child(render_empty_state(snap, cx))
+        })
         .children(rows.iter().map(|row| {
             render_chat_row(
                 row,
@@ -635,7 +645,9 @@ fn render_empty_state(snap: &DesktopSnapshot, cx: &mut Context<DesktopApp>) -> i
             div()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child(format!("Ask Loop to edit, search, or run commands in {project}")),
+                .child(format!(
+                    "Ask Loop to edit, search, or run commands in {project}"
+                )),
         )
 }
 
@@ -671,19 +683,27 @@ fn render_chat_row(
     cx: &mut Context<DesktopApp>,
 ) -> impl IntoElement {
     match row {
-        ChatRow::User { text, .. } => h_flex().w_full().justify_end().child(
-            div()
-                .max_w(px(560.))
-                .px_4()
-                .py_3()
-                .rounded_xl()
-                .border_1()
-                .border_color(cx.theme().border)
-                .bg(cx.theme().accent.opacity(0.16))
-                .text_color(cx.theme().foreground)
-                .child(text.clone()),
-        ).into_any_element(),
-        ChatRow::Assistant { id, text, streaming } => v_flex()
+        ChatRow::User { text, .. } => h_flex()
+            .w_full()
+            .justify_end()
+            .child(
+                div()
+                    .max_w(px(560.))
+                    .px_4()
+                    .py_3()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().accent.opacity(0.16))
+                    .text_color(cx.theme().foreground)
+                    .child(text.clone()),
+            )
+            .into_any_element(),
+        ChatRow::Assistant {
+            id,
+            text,
+            streaming,
+        } => v_flex()
             .w_full()
             .gap_1()
             .child(crate::markdown::render_markdown(
@@ -691,7 +711,9 @@ fn render_chat_row(
                 text.clone(),
                 cx,
             ))
-            .when(*streaming, |el| el.child(crate::markdown::streaming_caret(cx)))
+            .when(*streaming, |el| {
+                el.child(crate::markdown::streaming_caret(cx))
+            })
             .into_any_element(),
         ChatRow::Thinking { id, text, done } => {
             let open = row_expanded;
@@ -743,9 +765,7 @@ fn render_chat_row(
                                     Animation::new(Duration::from_millis(1100)).repeat(),
                                     move |this, delta| {
                                         if still_thinking && !open {
-                                            let t = (delta * std::f32::consts::PI * 2.)
-                                                .sin()
-                                                .abs();
+                                            let t = (delta * std::f32::consts::PI * 2.).sin().abs();
                                             this.opacity(0.45 + 0.55 * t)
                                         } else {
                                             this.opacity(1.)
@@ -780,8 +800,9 @@ fn render_chat_row(
             summary,
             detail,
             status,
-        } => render_tool_row(id, name, summary, detail, *status, row_expanded, cx)
-            .into_any_element(),
+        } => {
+            render_tool_row(id, name, summary, detail, *status, row_expanded, cx).into_any_element()
+        }
         ChatRow::Shell {
             id,
             command,
@@ -987,19 +1008,18 @@ fn render_tool_row(
         let body = body
             .id(body_id)
             .when(can_expand || !detail.is_empty(), |el| {
-                el.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
-                    if this.expanded_rows.contains(&card_id) {
-                        this.expanded_rows.remove(&card_id);
-                    } else {
-                        this.expanded_rows.insert(card_id.clone());
-                        this.follow_chat = true;
-                    }
-                    cx.notify();
-                }))
+                el.cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.expanded_rows.contains(&card_id) {
+                            this.expanded_rows.remove(&card_id);
+                        } else {
+                            this.expanded_rows.insert(card_id.clone());
+                            this.follow_chat = true;
+                        }
+                        cx.notify();
+                    }))
             })
-            .when(!expanded, |el| {
-                el.max_h(collapsed_max).overflow_hidden()
-            });
+            .when(!expanded, |el| el.max_h(collapsed_max).overflow_hidden());
 
         v_flex()
             .w_full()
@@ -1099,21 +1119,13 @@ fn render_diff_preview_body(
         .text_xs();
     for line in lines {
         let (sign, fg, bg) = match line.tag {
-            similar::ChangeTag::Insert => (
-                "+",
-                cx.theme().success,
-                cx.theme().success.opacity(0.12),
-            ),
-            similar::ChangeTag::Delete => (
-                "−",
-                cx.theme().danger,
-                cx.theme().danger.opacity(0.12),
-            ),
-            similar::ChangeTag::Equal => (
-                " ",
-                cx.theme().muted_foreground,
-                gpui::transparent_black(),
-            ),
+            similar::ChangeTag::Insert => {
+                ("+", cx.theme().success, cx.theme().success.opacity(0.12))
+            }
+            similar::ChangeTag::Delete => ("−", cx.theme().danger, cx.theme().danger.opacity(0.12)),
+            similar::ChangeTag::Equal => {
+                (" ", cx.theme().muted_foreground, gpui::transparent_black())
+            }
         };
         let gutter = line
             .new_no
@@ -1133,11 +1145,14 @@ fn render_diff_preview_body(
                         .text_color(cx.theme().muted_foreground.opacity(0.7))
                         .child(gutter),
                 )
-                .child(
-                    div()
-                        .text_color(fg)
-                        .child(format!("{sign}{}", if line.text.is_empty() { " " } else { &line.text })),
-                ),
+                .child(div().text_color(fg).child(format!(
+                    "{sign}{}",
+                    if line.text.is_empty() {
+                        " "
+                    } else {
+                        &line.text
+                    }
+                ))),
         );
     }
     body
@@ -1146,7 +1161,9 @@ fn render_diff_preview_body(
 fn short_path(path: &str) -> String {
     let p = std::path::Path::new(path);
     match (p.parent().and_then(|d| d.file_name()), p.file_name()) {
-        (Some(parent), Some(name)) => format!("{}/{}", parent.to_string_lossy(), name.to_string_lossy()),
+        (Some(parent), Some(name)) => {
+            format!("{}/{}", parent.to_string_lossy(), name.to_string_lossy())
+        }
         (_, Some(name)) => name.to_string_lossy().into_owned(),
         _ => path.to_string(),
     }
@@ -1255,22 +1272,21 @@ fn render_composer(
                                     } else {
                                         format!("{name} ({provider}/{model_id})")
                                     };
-                                    let checked =
-                                        format!("{provider}/{model_id}") == current_model;
+                                    let checked = format!("{provider}/{model_id}") == current_model;
                                     let p = provider.clone();
                                     let m = model_id.clone();
                                     let app = app.clone();
                                     menu = menu.item(
-                                        PopupMenuItem::new(label)
-                                            .checked(checked)
-                                            .on_click(move |_, _, cx| {
+                                        PopupMenuItem::new(label).checked(checked).on_click(
+                                            move |_, _, cx| {
                                                 app.update(cx, |this, _| {
                                                     this.run_command(DesktopCommand::SetModel {
                                                         provider: p.clone(),
                                                         model_id: m.clone(),
                                                     });
                                                 });
-                                            }),
+                                            },
+                                        ),
                                     );
                                 }
                                 menu
@@ -1335,13 +1351,7 @@ fn render_queue_bar(
         .border_b_1()
         .border_color(cx.theme().border)
         .bg(muted.opacity(0.45))
-        .child(
-            div()
-                .flex_shrink_0()
-                .size_1_5()
-                .rounded_full()
-                .bg(accent),
-        )
+        .child(div().flex_shrink_0().size_1_5().rounded_full().bg(accent))
         .child(
             v_flex()
                 .flex_1()
@@ -1481,15 +1491,11 @@ fn render_diff_panel(snap: &DesktopSnapshot, cx: &mut Context<DesktopApp>) -> im
                 .border_b_1()
                 .border_color(cx.theme().border)
                 .child(
-                    div()
-                        .text_sm()
-                        .font_medium()
-                        .text_ellipsis()
-                        .child(
-                            selected
-                                .map(|c| short_path(&c.path.display().to_string()))
-                                .unwrap_or_else(|| "Review".into()),
-                        ),
+                    div().text_sm().font_medium().text_ellipsis().child(
+                        selected
+                            .map(|c| short_path(&c.path.display().to_string()))
+                            .unwrap_or_else(|| "Review".into()),
+                    ),
                 )
                 .child(
                     h_flex()
@@ -1577,15 +1583,21 @@ fn render_diff_panel(snap: &DesktopSnapshot, cx: &mut Context<DesktopApp>) -> im
                             diff.iter_all_changes()
                                 .map(|change| {
                                     let (sign, color, bg) = match change.tag() {
-                                        similar::ChangeTag::Insert => {
-                                            ("+", cx.theme().success, cx.theme().success.opacity(0.08))
-                                        }
-                                        similar::ChangeTag::Delete => {
-                                            ("−", cx.theme().danger, cx.theme().danger.opacity(0.08))
-                                        }
-                                        similar::ChangeTag::Equal => {
-                                            (" ", cx.theme().muted_foreground, cx.theme().background)
-                                        }
+                                        similar::ChangeTag::Insert => (
+                                            "+",
+                                            cx.theme().success,
+                                            cx.theme().success.opacity(0.08),
+                                        ),
+                                        similar::ChangeTag::Delete => (
+                                            "−",
+                                            cx.theme().danger,
+                                            cx.theme().danger.opacity(0.08),
+                                        ),
+                                        similar::ChangeTag::Equal => (
+                                            " ",
+                                            cx.theme().muted_foreground,
+                                            cx.theme().background,
+                                        ),
                                     };
                                     div()
                                         .px_1()
@@ -1699,50 +1711,42 @@ fn render_approval_overlay(
                                 .child(format!("Allow {}?", prompt.tool_name)),
                         ),
                 )
-                .child(
-                    v_flex()
-                        .gap_2()
-                        .p_4()
-                        .child(prompt.summary.clone())
-                        .when(!prompt.detail.is_empty(), |el| {
-                            el.child(
-                                div()
-                                    .text_sm()
-                                    .font_family(cx.theme().mono_font_family.clone())
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(prompt.detail.clone()),
-                            )
-                        }),
-                )
+                .child(v_flex().gap_2().p_4().child(prompt.summary.clone()).when(
+                    !prompt.detail.is_empty(),
+                    |el| {
+                        el.child(
+                            div()
+                                .text_sm()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_color(cx.theme().muted_foreground)
+                                .child(prompt.detail.clone()),
+                        )
+                    },
+                ))
                 .child(Separator::horizontal())
                 .child(
                     h_flex()
                         .gap_2()
                         .p_4()
                         .justify_end()
-                        .child(
-                            Button::new("reject")
-                                .label("Reject")
-                                .on_click(cx.listener(|this, _, _, _| {
-                                    this.run_command(DesktopCommand::ResolveApproval {
-                                        accept: false,
-                                        session: false,
-                                        reason: None,
-                                    });
-                                })),
-                        )
-                        .child(
-                            Button::new("accept")
-                                .primary()
-                                .label("Allow")
-                                .on_click(cx.listener(|this, _, _, _| {
-                                    this.run_command(DesktopCommand::ResolveApproval {
-                                        accept: true,
-                                        session: false,
-                                        reason: None,
-                                    });
-                                })),
-                        )
+                        .child(Button::new("reject").label("Reject").on_click(cx.listener(
+                            |this, _, _, _| {
+                                this.run_command(DesktopCommand::ResolveApproval {
+                                    accept: false,
+                                    session: false,
+                                    reason: None,
+                                });
+                            },
+                        )))
+                        .child(Button::new("accept").primary().label("Allow").on_click(
+                            cx.listener(|this, _, _, _| {
+                                this.run_command(DesktopCommand::ResolveApproval {
+                                    accept: true,
+                                    session: false,
+                                    reason: None,
+                                });
+                            }),
+                        ))
                         .child(
                             Button::new("accept-session")
                                 .outline()
@@ -1776,9 +1780,8 @@ pub async fn run_desktop(cwd: PathBuf) -> anyhow::Result<()> {
             cx.spawn(async move |cx| {
                 let mut options = WindowOptions::default();
                 options.window_min_size = Some(size(px(840.), px(560.)));
-                options.window_bounds = Some(cx.update(|cx| {
-                    WindowBounds::centered(size(px(1280.), px(840.)), cx)
-                }));
+                options.window_bounds =
+                    Some(cx.update(|cx| WindowBounds::centered(size(px(1280.), px(840.)), cx)));
 
                 cx.open_window(options, move |window, cx| {
                     Theme::change(initial_theme, Some(window), cx);
@@ -1824,17 +1827,15 @@ pub async fn run_desktop(cwd: PathBuf) -> anyhow::Result<()> {
 
                     let poll_rx = ui_rx.clone();
                     let view_entity = view.clone();
-                    cx.spawn(async move |cx| {
-                        loop {
-                            if poll_rx.recv().await.is_err() {
-                                break;
-                            }
-                            while poll_rx.try_recv().is_ok() {}
-                            let _ = view_entity.update(cx, |_, cx| cx.notify());
-                            cx.background_executor()
-                                .timer(Duration::from_millis(16))
-                                .await;
+                    cx.spawn(async move |cx| loop {
+                        if poll_rx.recv().await.is_err() {
+                            break;
                         }
+                        while poll_rx.try_recv().is_ok() {}
+                        let _ = view_entity.update(cx, |_, cx| cx.notify());
+                        cx.background_executor()
+                            .timer(Duration::from_millis(16))
+                            .await;
                     })
                     .detach();
 

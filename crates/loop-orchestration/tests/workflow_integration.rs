@@ -42,10 +42,16 @@ impl Worker for EchoWorker {
         };
 
         ctx.shared_memory
-            .set(&format!("output:{}", task.id), Value::String(prompt.clone()), &task.id)
+            .set(
+                &format!("output:{}", task.id),
+                Value::String(prompt.clone()),
+                &task.id,
+            )
             .await;
 
-        Ok(TaskResult::with_output(Value::String(format!("echo: {prompt}"))))
+        Ok(TaskResult::with_output(Value::String(format!(
+            "echo: {prompt}"
+        ))))
     }
 }
 

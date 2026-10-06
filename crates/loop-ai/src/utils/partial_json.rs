@@ -44,10 +44,8 @@ fn try_repair(input: &str) -> Option<String> {
             '"' => in_string = true,
             '{' => stack.push('}'),
             '[' => stack.push(']'),
-            '}' | ']' => {
-                if stack.last() == Some(&ch) {
-                    stack.pop();
-                }
+            '}' | ']' if stack.last() == Some(&ch) => {
+                stack.pop();
             }
             _ => {}
         }

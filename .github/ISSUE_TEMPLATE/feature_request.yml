@@ -1,0 +1,123 @@
+name: 🚀 Feature request
+description: Propose a new capability, tool, provider, sandbox backend, or API change for Loop.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Good proposals start from a concrete problem, sketch the API, and weigh the trade-offs. For open-ended ideas, start in [Discussions](https://github.com/soketlabs/loop/discussions) first.
+
+        Changes to public traits, the session format, tool approval, or sandboxing are reviewed against the [security and sandboxing invariants](https://github.com/soketlabs/loop/blob/main/CONTRIBUTING.md#security-and-sandboxing-invariants).
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched [existing issues](https://github.com/soketlabs/loop/issues?q=is%3Aissue) and [discussions](https://github.com/soketlabs/loop/discussions) and this has not been proposed.
+          required: true
+        - label: I checked the [documentation](https://loop.soket.ai/) and this is not already supported.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and why is it hard or impossible today? Describe the workload (e.g. long-running agents, CI automation, multi-agent pipelines).
+      placeholder: I run Loop headless in CI with `--print`, but there's no way to cap total tool wall-clock time per run, so a stuck test suite burns the whole job timeout.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior from the user's point of view, including the CLI flags, config keys, or TUI commands it adds.
+    validations:
+      required: true
+
+  - type: textarea
+    id: api-design
+    attributes:
+      label: API / trait design
+      description: |
+        For library-facing changes, sketch the public types, traits, or function signatures. Note which crate owns them (`loop-ai`, `loop-agent`, `loop-mcp`, `loop-orchestration`, `loop-app-core`, ...) and whether the change is breaking.
+      placeholder: |
+        // loop-agent::harness
+        pub struct RunBudget {
+            pub max_tool_wall_time: Duration,
+            pub max_turns: Option<u32>,
+        }
+
+        impl AgentHarness {
+            pub fn with_budget(self, budget: RunBudget) -> Self;
+        }
+      render: rust
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      multiple: true
+      options:
+        - Agent loop / tools
+        - Sandbox (podman / krun)
+        - Tool approval
+        - Sessions / compaction
+        - LLM providers / streaming
+        - MCP (client or mcp-serve)
+        - Skills
+        - Orchestration
+        - TUI (loop-cli)
+        - Desktop app
+        - Telemetry / tracing
+        - Installer / release
+    validations:
+      required: true
+
+  - type: dropdown
+    id: breaking
+    attributes:
+      label: Compatibility impact
+      options:
+        - Additive (no breaking changes)
+        - Breaking change to a public Rust API
+        - Breaking change to config, session format, or CLI flags
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and trade-offs
+      description: |
+        What other designs did you consider, and why is this one better? Cover performance (latency, memory, allocations on hot paths), security/isolation impact, platform support (Linux/macOS/Windows), and maintenance cost. Mention prior art in other agent runtimes, if any.
+    validations:
+      required: true
+
+  - type: textarea
+    id: security
+    attributes:
+      label: Security considerations
+      description: Does this execute new processes, open network listeners, read credentials, widen sandbox mounts, or change approval behavior? If so, how are those risks contained?
+      placeholder: N/A, purely a config-level timeout enforced inside the existing ExecutionEnv.
+
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Willingness to contribute
+      options:
+        - Yes, I'd like to implement this and submit a PR
+        - Yes, with guidance from a maintainer
+        - I can help test or review, but not implement
+        - No, I'm only proposing it
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links, benchmarks, related issues, screenshots, or mockups.

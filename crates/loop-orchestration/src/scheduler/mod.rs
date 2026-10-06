@@ -221,6 +221,10 @@ impl Scheduler {
         results
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pre-existing signature; refactor tracked separately"
+    )]
     async fn execute_task(
         engine: Arc<WorkflowEngine>,
         pool: Arc<RwLock<WorkerPool>>,

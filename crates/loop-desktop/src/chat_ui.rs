@@ -60,7 +60,10 @@ pub fn activity_label(
         summary,
         status: ToolCardStatus::Running | ToolCardStatus::Pending,
         ..
-    }) = rows.iter().rev().find(|r| matches!(r, ChatRow::Tool { .. }))
+    }) = rows
+        .iter()
+        .rev()
+        .find(|r| matches!(r, ChatRow::Tool { .. }))
     {
         return Some(tool_activity_label(name, summary, ToolCardStatus::Running));
     }
@@ -143,7 +146,9 @@ pub fn tool_args_summary(name: &str, args: &Value) -> String {
         None
     };
     match name {
-        "read" | "write" | "edit" => pick(&["path", "file_path", "file"]).unwrap_or_else(|| "…".into()),
+        "read" | "write" | "edit" => {
+            pick(&["path", "file_path", "file"]).unwrap_or_else(|| "…".into())
+        }
         "bash" | "shell" => pick(&["command"]).unwrap_or_else(|| "…".into()),
         "grep" | "search" => pick(&["pattern", "query"]).unwrap_or_else(|| "…".into()),
         _ => {
@@ -184,7 +189,10 @@ mod tests {
 
     #[test]
     fn truncate_keeps_tail() {
-        let detail = (1..=30).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        let detail = (1..=30)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let (preview, more) = truncate_tool_detail(&detail, 5);
         assert_eq!(more, 25);
         assert!(!preview.starts_with("…"));

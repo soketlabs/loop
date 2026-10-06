@@ -184,7 +184,10 @@ impl SessionStore for InMemorySessionStore {
             .lock()
             .sessions
             .values()
-            .filter(|s| cwd.map(|c| s.meta.cwd.as_deref() == Some(c)).unwrap_or(true))
+            .filter(|s| {
+                cwd.map(|c| s.meta.cwd.as_deref() == Some(c))
+                    .unwrap_or(true)
+            })
             .map(|s| s.meta.clone())
             .collect())
     }

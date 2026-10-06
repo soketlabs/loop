@@ -149,7 +149,7 @@ pub fn highlight_line_stateful(
     theme: &Theme,
     fallback: Style,
 ) -> Vec<Span<'static>> {
-    highlight_one_line(line, state, &*SYNTAX_SET, theme, fallback)
+    highlight_one_line(line, state, &SYNTAX_SET, theme, fallback)
 }
 
 /// Mutable highlighter state for multi-line / streaming blocks.
