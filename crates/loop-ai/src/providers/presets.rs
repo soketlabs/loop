@@ -106,13 +106,13 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: SOKET_PROVIDER_ID,
         name: SOKET_PROVIDER_NAME,
-        description: "Soket / TensorStudio inference",
+        description: "Soket's inference Studio",
         base_url: SOKET_BASE_URL,
         api_key_envs: SOKET_API_KEY_ENVS,
         headers: &[],
         key_hint: "your Soket API key",
-        key_cta: "get free credits at",
-        key_url: "https://api.soket.ai/v1",
+        key_cta: "get your free credits at",
+        key_url: "http://console.soket.ai/",
         defaults: ModelDefaults {
             context_window: 128_000,
             max_tokens: 16_384,
