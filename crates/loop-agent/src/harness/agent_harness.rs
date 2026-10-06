@@ -103,7 +103,9 @@ pub struct AgentHarness {
     host_env: Arc<dyn ExecutionEnv>,
     model: RwLock<Option<Model>>,
     thinking_level: RwLock<AgentThinkingLevel>,
-    tools: RwLock<Vec<AgentTool>>,
+    /// Synchronous lock: `tools_snapshot` runs inside the MCP server factory on a
+    /// Tokio worker, and `tokio::sync::RwLock::blocking_read` panics there.
+    tools: parking_lot::RwLock<Vec<AgentTool>>,
     active_tool_names: RwLock<Option<Vec<String>>>,
     system_prompt: RwLock<String>,
     resources: RwLock<AgentHarnessResources>,
@@ -148,7 +150,7 @@ impl AgentHarness {
             host_env: options.host_env,
             model: RwLock::new(options.model),
             thinking_level: RwLock::new(AgentThinkingLevel::Off),
-            tools: RwLock::new(options.tools),
+            tools: parking_lot::RwLock::new(options.tools),
             active_tool_names: RwLock::new(None),
             system_prompt: RwLock::new(options.system_prompt),
             resources: RwLock::new(options.resources),
@@ -434,18 +436,18 @@ impl AgentHarness {
                 )));
             }
         }
-        *self.tools.write().await = tools;
+        *self.tools.write() = tools;
         Ok(())
     }
 
     /// Get the current set of tools (cloned, async).
     pub async fn get_tools(&self) -> Vec<AgentTool> {
-        self.tools.read().await.clone()
+        self.tools.read().clone()
     }
 
     /// Synchronous snapshot of the current tools (for factory closures).
     pub fn tools_snapshot(&self) -> Vec<AgentTool> {
-        self.tools.blocking_read().clone()
+        self.tools.read().clone()
     }
 
     /// Connect to configured MCP servers and merge their tools into the tool list.
@@ -506,7 +508,7 @@ impl AgentHarness {
         )
         .await;
 
-        let mut tools = self.tools.write().await;
+        let mut tools = self.tools.write();
         tools.retain(|t| !t.name.starts_with("mcp__"));
         tools.extend(mcp_tools);
         Ok(())
@@ -789,7 +791,7 @@ impl AgentHarness {
 
         let model = self.require_model().await?;
         let system_prompt = self.system_prompt.read().await.clone();
-        let tools = self.tools.read().await.clone();
+        let tools = self.tools.read().clone();
         let llm_tools: Vec<loop_ai::Tool> = tools.iter().map(|t| t.to_llm_tool()).collect();
 
         Ok(compute_session_stats(SessionStatsInput {
@@ -1038,7 +1040,7 @@ impl AgentHarness {
         };
 
         let resources = self.resources.read().await.clone();
-        let all_tools = self.tools.read().await.clone();
+        let all_tools = self.tools.read().clone();
         let active = self.active_tool_names.read().await.clone();
         let tools = if let Some(names) = active {
             all_tools
@@ -1353,7 +1355,7 @@ impl AgentHarness {
 
         let model = self.require_model().await?;
         let system_prompt = self.system_prompt.read().await.clone();
-        let tools = self.tools.read().await.clone();
+        let tools = self.tools.read().clone();
         let host_env = Arc::clone(&self.host_env);
         let thinking_level = *self.thinking_level.read().await;
         let mut stream_options = self.stream_options.read().await.clone();
