@@ -265,3 +265,29 @@ async fn tool_env_is_available_without_a_model() {
     // Startup and /sandbox rebuild tools before any model is chosen.
     assert!(harness.tool_env().await.is_ok());
 }
+
+#[tokio::test]
+async fn tools_snapshot_from_runtime_worker() {
+    let models = Arc::new(Models::new());
+    let store = create_in_memory_session_store();
+    let repo = create_session_repository(store, None);
+    let session = repo.create(None, Some("h".into())).await.unwrap();
+    let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
+        models,
+        model: None,
+        session,
+        host_env: Arc::new(HostExecutionEnv::new(std::env::temp_dir())),
+        tools: vec![],
+        system_prompt: "sys".into(),
+        sandbox: SandboxMode::Disabled,
+        resources: Default::default(),
+    }));
+    // The MCP serve factory calls this on a Tokio worker. A blocking lock panics there.
+    let snapshot = tokio::spawn({
+        let harness = Arc::clone(&harness);
+        async move { harness.tools_snapshot() }
+    })
+    .await
+    .expect("tools_snapshot panicked on a runtime worker");
+    assert!(snapshot.is_empty());
+}
