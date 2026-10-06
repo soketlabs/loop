@@ -1,0 +1,192 @@
+name: 🐛 Bug report
+description: Report a crash, panic, incorrect behavior, hang, or performance regression in Loop.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. A precise, minimal report gets fixed fastest.
+
+        > [!CAUTION]
+        > **Security issues** (sandbox escape, tool-approval bypass, credential leak) must **not** be filed here. [Report them privately](https://github.com/soketlabs/loop/security/advisories/new).
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched [existing issues](https://github.com/soketlabs/loop/issues?q=is%3Aissue) (open and closed) and this is not a duplicate.
+          required: true
+        - label: I reproduced this on the [latest release](https://github.com/soketlabs/loop/releases/latest) or on `main`.
+          required: true
+        - label: I removed API keys (`*_API_KEY`), tokens, and private prompts or file contents from everything I paste below.
+          required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What went wrong? Include the exact error message, if any.
+      placeholder: Running a bash tool inside the local sandbox hangs forever after the command exits...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproducible example
+      description: |
+        The smallest set of steps, config, prompt, or Rust code that triggers the bug. If you use Loop as a library, a self-contained `main.rs` or failing test is ideal. If the bug depends on model output, say which model and paste the relevant tool call.
+      placeholder: |
+        1. `loop`, then `/sandbox local --full --runc`
+        2. Prompt: "run `sleep 1 && echo done`"
+        3. Approve the bash tool
+        4. TUI shows "running" indefinitely
+      render: markdown
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: The tool result "done" is returned to the model and the turn continues.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Screenshots or recordings are welcome for TUI rendering issues.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Runtime logs
+      description: |
+        Re-run with debug logging (`loop --debug` or `LOOP_DEBUG=1 loop`). Logs are written to `target/debug/logs/` under the current working directory. Paste the relevant section. **Redact secrets and private content.**
+      render: text
+
+  - type: textarea
+    id: backtrace
+    attributes:
+      label: Panic backtrace
+      description: For panics or crashes, re-run with `RUST_BACKTRACE=1` (or `full`) and paste the complete output.
+      placeholder: |
+        thread 'tokio-runtime-worker' panicked at crates/loop-agent/src/...:
+        ...
+        stack backtrace:
+           0: rust_begin_unwind
+        ...
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: Loop version
+      description: Output of `loop --version`, or the commit SHA if built from source.
+      placeholder: loop 0.3.4
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation method
+      options:
+        - Install script (loop.soket.ai/install or ./install.sh)
+        - GitHub release asset (manual download)
+        - Built from source (cargo build / cargo run)
+        - Used as a library crate
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: OS / architecture
+      options:
+        - macOS, Apple Silicon (aarch64)
+        - macOS, Intel (x86_64)
+        - Linux glibc, x86_64
+        - Linux glibc, aarch64
+        - Linux via WSL
+        - Windows native, x86_64
+        - Other (specify below)
+    validations:
+      required: true
+
+  - type: input
+    id: os-details
+    attributes:
+      label: OS and terminal details
+      description: Distro/OS version, kernel (`uname -a`), and terminal emulator, which matters for TUI bugs.
+      placeholder: Ubuntu 24.04, Linux 6.8.0-45 x86_64, Alacritty 0.14
+    validations:
+      required: true
+
+  - type: dropdown
+    id: sandbox
+    attributes:
+      label: Sandbox mode
+      description: Shown by `/sandbox status` in the TUI. If a sandbox was on, put the isolation (`--full` / `--partial`) under "Additional context".
+      options:
+        - Off (host execution)
+        - local, runc
+        - local, crun
+        - local, runsc (gVisor)
+        - local, krun (microVM)
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Model provider
+      options:
+        - Soket
+        - OpenRouter
+        - OpenAI
+        - Other OpenAI-compatible API
+        - Not applicable
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Model ID used when the bug occurred, if relevant.
+      placeholder: e.g. openai/gpt-5.1
+
+  - type: dropdown
+    id: components
+    attributes:
+      label: Affected area
+      multiple: true
+      options:
+        - Agent loop / tools
+        - Sandbox (podman / krun)
+        - Tool approval
+        - Sessions / compaction
+        - LLM providers / streaming
+        - MCP (client or mcp-serve)
+        - Skills
+        - Orchestration
+        - TUI rendering / input
+        - Desktop app
+        - Telemetry / tracing
+        - Installer / release binaries
+        - Performance / memory
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: |
+        Rust toolchain (`rustc -V`) if built from source, `--features` used (e.g. `telemetry`), MCP servers configured, regressions ("worked in 0.3.2"), or anything else relevant.
