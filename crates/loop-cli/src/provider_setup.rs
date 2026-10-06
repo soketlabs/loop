@@ -212,8 +212,8 @@ impl WizardView for ProviderSetup {
             Self::ApiKey {
                 target: LoginTarget::Preset(preset),
             } => format!(
-                "Paste your {} API key ({}) — input stays hidden · get one at {}",
-                preset.name, preset.key_hint, preset.key_url
+                "Paste your {} API key ({}) — input stays hidden · {} {}",
+                preset.name, preset.key_hint, preset.key_cta, preset.key_url
             ),
             Self::ApiKey {
                 target: LoginTarget::Custom { name, .. },
@@ -257,13 +257,9 @@ impl WizardView for ProviderSetup {
         matches!(self, Self::ApiKey { .. })
     }
 
+    /// No env-var tip on login; preset key envs are still read at startup.
     fn env_hint(&self) -> Option<String> {
-        match self {
-            Self::ApiKey {
-                target: LoginTarget::Preset(preset),
-            } => Some(preset.api_key_envs.join(" / ")),
-            _ => None,
-        }
+        None
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -315,7 +311,7 @@ mod tests {
         let key = next(step.submit(""));
         assert!(key.masked());
         assert_eq!(key.title(), "Connect OpenRouter");
-        assert_eq!(key.env_hint().as_deref(), Some("OPENROUTER_API_KEY"));
+        assert_eq!(key.env_hint(), None);
         assert!(key.instructions().contains("openrouter.ai/keys"));
         assert!(retry_error(key.clone().submit("  ")).contains("needs an API key"));
         assert_eq!(
