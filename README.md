@@ -3,7 +3,7 @@
 Open-source Rust agent harness by [**Soket AI**](https://soket.ai): an agent loop with tool use, sessions, sandboxing, and a unified LLM provider API. Designed to be performant and memory-efficient for long-running agents on the most critical workloads.
 
 <picture>
-  <img src="resources/bitmap.png" alt="Loop logo">
+  <img src="resources/loop.gif" alt="Loop demo" width="420">
 </picture>
 
 Docs: [https://loop.soket.ai/](https://loop.soket.ai/)
@@ -51,6 +51,14 @@ First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, or an
 | Linux via WSL | x86_64, arm64 | Supported (uses the Linux build) | `curl -fsSL https://loop.soket.ai/install \| bash` inside WSL |
 | Windows (native) | x86_64 | In testing | Not yet officially supported; the `x86_64-pc-windows-msvc` build is published but its installer is still being tested |
 | Linux (musl, e.g. Alpine) | any | Not supported | [Build from source](#build--test) |
+
+### Feature support
+
+| Feature | Linux | macOS | Windows |
+|---------|-------|-------|---------|
+| Sandboxing | Supported | Planned | Planned |
+| Compaction (manual) | — | Supported | In testing |
+| mcp-serve | Supported | Supported | In testing |
 
 The installer detects your OS and CPU, downloads the latest matching release from GitHub, verifies its SHA-256 checksum, installs to `~/.loop/bin`, and adds that directory to your `PATH`. Re-running it is safe: it skips the download if you already have the latest version (use `--force` to reinstall).
 
