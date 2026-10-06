@@ -1,5 +1,6 @@
 //! Run Loop as a streamable-HTTP MCP server.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::extract::Request;
@@ -39,12 +40,45 @@ async fn bearer_auth(expected: Arc<Option<String>>, req: Request, next: Next) ->
     next.run(req).await
 }
 
+/// Bind address and normalized bearer token for `--serve-mcp`.
+#[derive(Debug)]
+struct McpListen {
+    addr: SocketAddr,
+    token: Option<String>,
+}
+
+/// Resolve the MCP listen address.
+///
+/// Loopback binds may omit a token. Any other address, including `0.0.0.0` and
+/// `::`, requires a non-empty bearer token.
+fn resolve_mcp_listen(host: IpAddr, port: u16, token: Option<String>) -> anyhow::Result<McpListen> {
+    let token = token.and_then(|raw| {
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+    if !host.is_loopback() && token.is_none() {
+        anyhow::bail!(
+            "refusing to listen on {host}: pass --mcp-token to bind a non-loopback address"
+        );
+    }
+    Ok(McpListen {
+        addr: SocketAddr::from((host, port)),
+        token,
+    })
+}
+
 /// Start the MCP HTTP server and block until shutdown.
 pub async fn run_mcp_server(
     runtime: Runtime,
+    host: IpAddr,
     port: u16,
     token: Option<String>,
 ) -> anyhow::Result<()> {
+    let listen = resolve_mcp_listen(host, port, token)?;
     let harness = Arc::clone(&runtime.harness);
     let ct = CancellationToken::new();
 
@@ -58,7 +92,9 @@ pub async fn run_mcp_server(
         StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
     );
 
-    let expected_token = Arc::new(token.clone());
+    let addr = listen.addr;
+    let auth_enabled = listen.token.is_some();
+    let expected_token = Arc::new(listen.token);
     let router = axum::Router::new()
         .nest_service("/mcp", service)
         .layer(middleware::from_fn(move |req, next| {
@@ -66,8 +102,7 @@ pub async fn run_mcp_server(
             bearer_auth(expected, req, next)
         }));
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    if token.is_some() {
+    if auth_enabled {
         eprintln!("Loop MCP server listening on http://{addr}/mcp (auth: Bearer token)");
     } else {
         eprintln!("Loop MCP server listening on http://{addr}/mcp (auth: none)");
@@ -83,4 +118,61 @@ pub async fn run_mcp_server(
 
     runtime.mcp_client.disconnect_all().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use super::resolve_mcp_listen;
+
+    fn v4(octets: [u8; 4]) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::from(octets))
+    }
+
+    #[test]
+    fn loopback_without_token_listens() {
+        let listen = resolve_mcp_listen(v4([127, 0, 0, 1]), 3100, None).unwrap();
+        assert_eq!(listen.addr.to_string(), "127.0.0.1:3100");
+        assert!(listen.token.is_none());
+    }
+
+    #[test]
+    fn loopback_with_token_keeps_auth() {
+        let listen = resolve_mcp_listen(v4([127, 0, 0, 1]), 3100, Some("secret".into())).unwrap();
+        assert_eq!(listen.addr.to_string(), "127.0.0.1:3100");
+        assert_eq!(listen.token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn wildcard_with_token_listens() {
+        let listen = resolve_mcp_listen(v4([0, 0, 0, 0]), 3100, Some("secret".into())).unwrap();
+        assert_eq!(listen.addr.to_string(), "0.0.0.0:3100");
+        assert_eq!(listen.token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn wildcard_without_token_is_refused() {
+        let err = resolve_mcp_listen(v4([0, 0, 0, 0]), 3100, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("0.0.0.0"), "{msg}");
+        assert!(msg.contains("--mcp-token"), "{msg}");
+    }
+
+    #[test]
+    fn blank_token_counts_as_missing() {
+        let listen = resolve_mcp_listen(v4([127, 0, 0, 1]), 3100, Some("  ".into())).unwrap();
+        assert!(listen.token.is_none());
+
+        let err = resolve_mcp_listen(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 3100, Some("".into()))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("::"));
+    }
+
+    #[test]
+    fn ipv6_loopback_without_token_listens() {
+        let listen = resolve_mcp_listen(IpAddr::V6(Ipv6Addr::LOCALHOST), 3100, None).unwrap();
+        assert!(listen.addr.ip().is_loopback());
+        assert!(listen.token.is_none());
+    }
 }
