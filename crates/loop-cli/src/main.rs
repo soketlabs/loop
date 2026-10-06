@@ -58,12 +58,19 @@ struct Cli {
     #[arg(long)]
     serve_mcp: bool,
 
+    /// Interface for the MCP server (default: 127.0.0.1).
+    ///
+    /// A non-loopback address requires `--mcp-token`.
+    #[arg(long, default_value = "127.0.0.1")]
+    mcp_host: std::net::IpAddr,
+
     /// Port for the MCP server (default: 3100).
     #[arg(long, default_value = "3100")]
     mcp_port: u16,
 
     /// Bearer token for MCP server authentication. When set, all HTTP requests
     /// to the MCP endpoint must include `Authorization: Bearer <token>`.
+    /// Required when `--mcp-host` is not a loopback address.
     #[arg(long)]
     mcp_token: Option<String>,
 
@@ -154,7 +161,13 @@ async fn real_main() -> anyhow::Result<()> {
     }
 
     let result = if cli.serve_mcp {
-        loop_cli::mcp_serve::run_mcp_server(runtime.inner, cli.mcp_port, cli.mcp_token).await
+        loop_cli::mcp_serve::run_mcp_server(
+            runtime.inner,
+            cli.mcp_host,
+            cli.mcp_port,
+            cli.mcp_token,
+        )
+        .await
     } else if let Some(prompt) = cli.print {
         print_mode::run_print(&runtime, prompt, &cli.trace).await
     } else {
