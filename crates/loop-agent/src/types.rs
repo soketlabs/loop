@@ -193,8 +193,7 @@ impl AgentToolResult {
 }
 
 /// Callback for streaming tool progress updates.
-pub type AgentToolUpdateCallback =
-    Arc<dyn Fn(AgentToolResult) + Send + Sync>;
+pub type AgentToolUpdateCallback = Arc<dyn Fn(AgentToolResult) + Send + Sync>;
 
 /// Async tool execute function.
 pub type AgentToolExecuteFn = Arc<
@@ -507,9 +506,8 @@ impl AgentEvent {
 }
 
 /// Awaited event sink used by `run_agent_loop`.
-pub type AgentEventSink = Arc<
-    dyn Fn(AgentEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
->;
+pub type AgentEventSink =
+    Arc<dyn Fn(AgentEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Convert AgentMessage[] to LLM Message[] (must not fail hard — return safe fallback).
 pub type ConvertToLlmFn = Arc<
@@ -536,7 +534,9 @@ pub struct AgentLoopConfig {
     /// Optional context transform.
     pub transform_context: Option<TransformContextFn>,
     /// Dynamic API key resolution.
-    pub get_api_key: Option<Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>>,
+    pub get_api_key: Option<
+        Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>,
+    >,
     /// Stop after turn predicate.
     pub should_stop_after_turn: Option<
         Arc<
@@ -550,7 +550,8 @@ pub struct AgentLoopConfig {
         Arc<
             dyn Fn(
                     ShouldStopAfterTurnContext,
-                ) -> Pin<Box<dyn Future<Output = Option<AgentLoopTurnUpdate>> + Send>>
+                )
+                    -> Pin<Box<dyn Future<Output = Option<AgentLoopTurnUpdate>> + Send>>
                 + Send
                 + Sync,
         >,
@@ -571,7 +572,8 @@ pub struct AgentLoopConfig {
             dyn Fn(
                     BeforeToolCallContext,
                     Option<CancellationToken>,
-                ) -> Pin<Box<dyn Future<Output = Option<BeforeToolCallResult>> + Send>>
+                )
+                    -> Pin<Box<dyn Future<Output = Option<BeforeToolCallResult>> + Send>>
                 + Send
                 + Sync,
         >,
@@ -582,7 +584,8 @@ pub struct AgentLoopConfig {
             dyn Fn(
                     AfterToolCallContext,
                     Option<CancellationToken>,
-                ) -> Pin<Box<dyn Future<Output = Option<AfterToolCallResult>> + Send>>
+                )
+                    -> Pin<Box<dyn Future<Output = Option<AfterToolCallResult>> + Send>>
                 + Send
                 + Sync,
         >,
@@ -724,4 +727,3 @@ impl From<AgentMessage> for PromptInput {
         Self::Message(value)
     }
 }
-

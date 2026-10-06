@@ -65,8 +65,7 @@ impl Worker for SubWorkflowWorker {
         let event_log = Arc::new(MemoryEventLog::new());
         let signal_router = Arc::new(SignalRouter::new());
         let engine = Arc::new(
-            WorkflowEngine::new(event_log as Arc<dyn EventLog>)
-                .with_signal_router(signal_router),
+            WorkflowEngine::new(event_log as Arc<dyn EventLog>).with_signal_router(signal_router),
         );
 
         let agent_worker = Arc::new(AgentWorker::new(
@@ -88,12 +87,7 @@ impl Worker for SubWorkflowWorker {
             .await
             .map_err(|e| WorkerError::ExecutionFailed(e.to_string()))?;
 
-        let scheduler = Scheduler::new(
-            engine,
-            pool,
-            ctx.shared_memory,
-            SchedulerConfig::default(),
-        );
+        let scheduler = Scheduler::new(engine, pool, ctx.shared_memory, SchedulerConfig::default());
 
         let cancel = ctx.cancel.clone();
         let sched_cancel = scheduler.cancel_token();

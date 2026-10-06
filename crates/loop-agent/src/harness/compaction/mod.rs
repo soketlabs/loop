@@ -48,7 +48,11 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
 }
 
 /// Whether compaction should run.
-pub fn should_compact(total_tokens: u64, context_window: u64, settings: &CompactionSettings) -> bool {
+pub fn should_compact(
+    total_tokens: u64,
+    context_window: u64,
+    settings: &CompactionSettings,
+) -> bool {
     if !settings.enabled || context_window == 0 {
         return false;
     }

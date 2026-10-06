@@ -39,7 +39,10 @@ pub fn validate_tool_call(tools: &[Tool], call: &ToolCall) -> Result<Value, Tool
 }
 
 /// Validate arguments against a tool's parameter schema.
-pub fn validate_tool_arguments(tool: &Tool, arguments: &Value) -> Result<Value, ToolValidationError> {
+pub fn validate_tool_arguments(
+    tool: &Tool,
+    arguments: &Value,
+) -> Result<Value, ToolValidationError> {
     let validator = jsonschema::validator_for(&tool.parameters).map_err(|e| {
         ToolValidationError::InvalidSchema {
             tool: tool.name.clone(),

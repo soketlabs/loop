@@ -217,7 +217,11 @@ pub async fn list_openai_models(
 
 /// Check an API key against an authenticated endpoint (`GET {base}{path}`, bearer auth).
 /// Needed where `/models` is public and so can't tell a bad key from a good one.
-pub async fn verify_api_key(base_url: &str, path: &str, api_key: &str) -> Result<(), ListModelsError> {
+pub async fn verify_api_key(
+    base_url: &str,
+    path: &str,
+    api_key: &str,
+) -> Result<(), ListModelsError> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
     let resp = super::http::http_client()
         .get(&url)
@@ -323,7 +327,8 @@ mod tests {
 
     #[test]
     fn parses_openai_list_payload() {
-        let body = r#"{"object":"list","data":[{"id":"a","object":"model"},{"id":"b","name":"Bee"}]}"#;
+        let body =
+            r#"{"object":"list","data":[{"id":"a","object":"model"},{"id":"b","name":"Bee"}]}"#;
         let parsed: ModelsResponse = serde_json::from_str(body).unwrap();
         assert_eq!(parsed.data.len(), 2);
         assert_eq!(parsed.data[1].name.as_deref(), Some("Bee"));

@@ -446,10 +446,7 @@ impl Models {
         options: StreamOptions,
     ) -> AssistantMessageEventStream {
         let Some(provider) = self.get_provider(&model.provider) else {
-            return error_stream(
-                model,
-                format!("provider not found: {}", model.provider),
-            );
+            return error_stream(model, format!("provider not found: {}", model.provider));
         };
         self.stream_with_provider(provider, model, context, options)
     }
@@ -541,10 +538,7 @@ impl Models {
         options: SimpleStreamOptions,
     ) -> AssistantMessageEventStream {
         let Some(provider) = self.get_provider(&model.provider) else {
-            return error_stream(
-                model,
-                format!("provider not found: {}", model.provider),
-            );
+            return error_stream(model, format!("provider not found: {}", model.provider));
         };
 
         use crate::stream::create_assistant_message_event_stream;

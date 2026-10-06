@@ -471,8 +471,11 @@ mod tests {
 
     #[test]
     fn task_node_with_config() {
-        let node = TaskNode::new("t1", TaskKind::Barrier, "sync")
-            .with_config(TaskConfig { max_retries: 5, timeout_ms: 30000, priority: 10 });
+        let node = TaskNode::new("t1", TaskKind::Barrier, "sync").with_config(TaskConfig {
+            max_retries: 5,
+            timeout_ms: 30000,
+            priority: 10,
+        });
         assert_eq!(node.config.max_retries, 5);
         assert_eq!(node.config.timeout_ms, 30000);
         assert_eq!(node.config.priority, 10);
@@ -484,7 +487,9 @@ mod tests {
         g.add_task(agent_task("a", "first"));
         g.add_task(TaskNode::new(
             "b",
-            TaskKind::ShellCommand { command: "echo hi".to_string() },
+            TaskKind::ShellCommand {
+                command: "echo hi".to_string(),
+            },
             "shell task",
         ));
         g.add_dependency("b", "a");

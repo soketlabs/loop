@@ -207,7 +207,10 @@ impl JsonlSessionStoreInner {
             .read_text_file(Path::new(path))
             .await
             .map_err(|e| SessionError::Io(e.message))?;
-        let lines: Vec<&str> = content.lines().filter(|line| !line.trim().is_empty()).collect();
+        let lines: Vec<&str> = content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
         if lines.is_empty() {
             return Err(invalid_session(path, "missing session header"));
         }
@@ -294,8 +297,8 @@ impl JsonlSessionStoreInner {
             },
         };
         let created_at = parse_header_timestamp(&header.timestamp)?;
-        let mut content = serde_json::to_string(&header)
-            .map_err(|e| SessionError::Storage(e.to_string()))?;
+        let mut content =
+            serde_json::to_string(&header).map_err(|e| SessionError::Storage(e.to_string()))?;
         for entry in &entries {
             content.push('\n');
             content.push_str(
@@ -378,9 +381,7 @@ impl SessionReader for JsonlReader {
                 if let Some(c) = cached {
                     if let Some(leaf) = &c.leaf_id {
                         if !c.entries.iter().any(|e| e.id() == leaf) {
-                            return Err(SessionError::Invalid(format!(
-                                "Entry {leaf} not found"
-                            )));
+                            return Err(SessionError::Invalid(format!("Entry {leaf} not found")));
                         }
                     }
                     return Ok(c.leaf_id.clone());
@@ -781,7 +782,13 @@ fn encode_cwd(cwd: &str) -> String {
     let stripped = cwd.trim_start_matches(['/', '\\']);
     let encoded: String = stripped
         .chars()
-        .map(|c| if c == '/' || c == '\\' || c == ':' { '-' } else { c })
+        .map(|c| {
+            if c == '/' || c == '\\' || c == ':' {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect();
     format!("--{encoded}--")
 }
@@ -839,9 +846,8 @@ fn invalid_entry(path: &str, line: usize, message: &str) -> SessionError {
 }
 
 fn parse_header(line: &str, path: &str) -> Result<SessionHeader, SessionError> {
-    let header: SessionHeader = serde_json::from_str(line).map_err(|_| {
-        invalid_session(path, "first line is not a valid session header")
-    })?;
+    let header: SessionHeader = serde_json::from_str(line)
+        .map_err(|_| invalid_session(path, "first line is not a valid session header"))?;
     if header.kind != "session" || header.version != 3 {
         return Err(invalid_session(
             path,
@@ -864,9 +870,12 @@ fn parse_header(line: &str, path: &str) -> Result<SessionHeader, SessionError> {
     Ok(header)
 }
 
-fn parse_entry(line: &str, path: &str, line_number: usize) -> Result<SessionTreeEntry, SessionError> {
-    serde_json::from_str(line)
-        .map_err(|_| invalid_entry(path, line_number, "is not valid JSON"))
+fn parse_entry(
+    line: &str,
+    path: &str,
+    line_number: usize,
+) -> Result<SessionTreeEntry, SessionError> {
+    serde_json::from_str(line).map_err(|_| invalid_entry(path, line_number, "is not valid JSON"))
 }
 
 fn metadata_from_header(header: SessionHeader, path: &str) -> SessionMetadata {

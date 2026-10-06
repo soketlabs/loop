@@ -115,10 +115,7 @@ impl OpenAICompletionsAdapter {
                 };
                 msg.stop_reason = reason;
                 msg.error_message = Some(err.message);
-                handle.push(AssistantMessageEvent::Error {
-                    reason,
-                    error: msg,
-                });
+                handle.push(AssistantMessageEvent::Error { reason, error: msg });
             }
         });
 
@@ -330,7 +327,10 @@ async fn run_stream(
                 Ok(inner) => inner,
                 Err(_) => {
                     return Err(StreamFail {
-                        message: format!("server stopped responding (no data for {}s)", SSE_IDLE_TIMEOUT.as_secs()),
+                        message: format!(
+                            "server stopped responding (no data for {}s)",
+                            SSE_IDLE_TIMEOUT.as_secs()
+                        ),
                         aborted: false,
                     });
                 }
@@ -390,11 +390,13 @@ async fn run_stream(
                 if !reasoning_text.is_empty() {
                     if thinking_index.is_none() {
                         let idx = partial.content.len();
-                        partial.content.push(AssistantContent::Thinking(ThinkingContent {
-                            thinking: String::new(),
-                            thinking_signature: None,
-                            redacted: None,
-                        }));
+                        partial
+                            .content
+                            .push(AssistantContent::Thinking(ThinkingContent {
+                                thinking: String::new(),
+                                thinking_signature: None,
+                                redacted: None,
+                            }));
                         thinking_index = Some(idx);
                         handle.push(AssistantMessageEvent::ThinkingStart {
                             content_index: idx,
@@ -512,7 +514,8 @@ async fn run_stream(
                                 call.name = name.to_string();
                             }
                         }
-                        if let Some(args) = tc.pointer("/function/arguments").and_then(|v| v.as_str())
+                        if let Some(args) =
+                            tc.pointer("/function/arguments").and_then(|v| v.as_str())
                         {
                             if let Some(buf) = tool_args.get_mut(&content_index) {
                                 buf.push_str(args);
@@ -700,9 +703,7 @@ fn map_finish_reason(
         Some("length") | Some("max_tokens") => StopReason::Length,
         Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
         Some("content_filter") => StopReason::Stop,
-        Some(other) => {
-            partial_raw_fallback(other, has_tools)
-        }
+        Some(other) => partial_raw_fallback(other, has_tools),
         None if !compat.supports_finish_reason => {
             if has_tools {
                 StopReason::ToolUse
@@ -944,10 +945,8 @@ fn convert_message(
                     AssistantContent::Text(t) => text_parts.push_str(&t.text),
                     AssistantContent::Thinking(t) => {
                         if compat.requires_thinking_as_text {
-                            text_parts.push_str(&format!(
-                                "<thinking>\n{}\n</thinking>\n",
-                                t.thinking
-                            ));
+                            text_parts
+                                .push_str(&format!("<thinking>\n{}\n</thinking>\n", t.thinking));
                         }
                         // else: omit thinking on replay unless same-model signatures retained upstream
                     }

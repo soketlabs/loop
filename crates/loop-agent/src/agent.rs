@@ -14,12 +14,11 @@ use crate::messages::user_message_with_images;
 use crate::stream_fn::StreamFn;
 use crate::types::{
     AfterToolCallContext, AfterToolCallResult, AgentContext, AgentEvent, AgentEventSink,
-    AgentLoopConfig, AgentMessage, AgentState, AgentThinkingLevel, AgentTool, BeforeToolCallContext,
-    BeforeToolCallResult, PromptInput, QueueMode, ToolExecutionMode,
+    AgentLoopConfig, AgentMessage, AgentState, AgentThinkingLevel, AgentTool,
+    BeforeToolCallContext, BeforeToolCallResult, PromptInput, QueueMode, ToolExecutionMode,
 };
 
-type Subscriber =
-    Arc<dyn Fn(AgentEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+type Subscriber = Arc<dyn Fn(AgentEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 type BeforeHook = Arc<
     dyn Fn(

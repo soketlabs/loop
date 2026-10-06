@@ -127,14 +127,14 @@ async fn live_agent_tool_loop() {
         "Get Time",
         "Returns the current UTC time as an ISO-ish string. No arguments.",
         serde_json::json!({"type":"object","properties":{}}),
-        |_id, _args, _c, _u| async move {
-            Ok(AgentToolResult::text(chrono::Utc::now().to_rfc3339()))
-        },
+        |_id, _args, _c, _u| async move { Ok(AgentToolResult::text(chrono::Utc::now().to_rfc3339())) },
     );
 
     let mut state = AgentState::new(model);
     state.set_tools(vec![tool]);
-    state.system_prompt = "You are a helpful assistant. Keep replies short. When asked the time, call get_time.".into();
+    state.system_prompt =
+        "You are a helpful assistant. Keep replies short. When asked the time, call get_time."
+            .into();
 
     let agent = Agent::new(AgentOptions::new(
         state,
@@ -172,7 +172,10 @@ async fn live_agent_tool_loop() {
         roles.iter().any(|r| *r == "toolResult") || roles.iter().any(|r| *r == "assistant"),
         "expected tool or assistant messages, got {roles:?}"
     );
-    eprintln!("\n=== full transcript ({} messages) ===", state.messages().len());
+    eprintln!(
+        "\n=== full transcript ({} messages) ===",
+        state.messages().len()
+    );
     for m in state.messages() {
         eprintln!("[{}] {}", m.role(), format_agent_message(m));
     }
@@ -249,7 +252,10 @@ async fn live_harness_sqlite_persist_and_search() {
         "expected search hits for persisted transcript text"
     );
 
-    eprintln!("\n=== reopened context ({} messages) ===", ctx.messages.len());
+    eprintln!(
+        "\n=== reopened context ({} messages) ===",
+        ctx.messages.len()
+    );
     for m in &ctx.messages {
         eprintln!("[{}] {}", m.role(), format_agent_message(m));
     }

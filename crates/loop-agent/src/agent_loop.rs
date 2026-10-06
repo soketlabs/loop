@@ -5,7 +5,8 @@ use std::sync::Arc;
 use futures::StreamExt;
 use loop_ai::{
     now_ms, validate_tool_arguments, AssistantContent, AssistantMessage, AssistantMessageEvent,
-    Context, Message, StopReason, TextContent, Tool, ToolCall, ToolResultContent, ToolResultMessage,
+    Context, Message, StopReason, TextContent, Tool, ToolCall, ToolResultContent,
+    ToolResultMessage,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -15,9 +16,9 @@ use crate::telemetry::{
     preflight_span, record_tool_result, tool_span, turn_span, GenerationObserver, RunObserver,
 };
 use crate::types::{
-    AgentContext, AgentEvent, AgentEventSink, AgentLoopConfig, AgentLoopTurnUpdate, AgentMessage,
-    AgentTool, AgentToolResult, AgentToolUpdateCallback, BeforeToolCallContext, BeforeToolCallResult,
-    AfterToolCallContext, ToolExecutionMode,
+    AfterToolCallContext, AgentContext, AgentEvent, AgentEventSink, AgentLoopConfig,
+    AgentLoopTurnUpdate, AgentMessage, AgentTool, AgentToolResult, AgentToolUpdateCallback,
+    BeforeToolCallContext, BeforeToolCallResult, ToolExecutionMode,
 };
 
 /// Observational event stream (Unpin).
@@ -33,16 +34,18 @@ pub fn agent_loop(
 ) -> AgentEventStream {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let stream_fn = resolve_stream_fn(stream_fn);
-    tokio::spawn(async move {
-        let emit: AgentEventSink = Arc::new(move |event| {
-            let tx = tx.clone();
-            Box::pin(async move {
-                let _ = tx.send(event);
-            })
-        });
-        let _ = run_agent_loop(prompts, context, config, emit, cancel, Some(stream_fn)).await;
-    }
-    .in_current_span());
+    tokio::spawn(
+        async move {
+            let emit: AgentEventSink = Arc::new(move |event| {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(event);
+                })
+            });
+            let _ = run_agent_loop(prompts, context, config, emit, cancel, Some(stream_fn)).await;
+        }
+        .in_current_span(),
+    );
     tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
 }
 
@@ -55,16 +58,18 @@ pub fn agent_loop_continue(
 ) -> AgentEventStream {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let stream_fn = resolve_stream_fn(stream_fn);
-    tokio::spawn(async move {
-        let emit: AgentEventSink = Arc::new(move |event| {
-            let tx = tx.clone();
-            Box::pin(async move {
-                let _ = tx.send(event);
-            })
-        });
-        let _ = run_agent_loop_continue(context, config, emit, cancel, Some(stream_fn)).await;
-    }
-    .in_current_span());
+    tokio::spawn(
+        async move {
+            let emit: AgentEventSink = Arc::new(move |event| {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(event);
+                })
+            });
+            let _ = run_agent_loop_continue(context, config, emit, cancel, Some(stream_fn)).await;
+        }
+        .in_current_span(),
+    );
     tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
 }
 
@@ -124,7 +129,9 @@ pub async fn run_agent_loop_continue(
     stream_fn: Option<StreamFn>,
 ) -> Result<Vec<AgentMessage>, AgentLoopError> {
     if context.messages.is_empty() {
-        return Err(AgentLoopError::CannotContinue("no messages in context".into()));
+        return Err(AgentLoopError::CannotContinue(
+            "no messages in context".into(),
+        ));
     }
     if context.messages.last().map(|m| m.role()) == Some("assistant") {
         return Err(AgentLoopError::CannotContinue(
@@ -139,7 +146,12 @@ pub async fn run_agent_loop_continue(
     emit(AgentEvent::AgentStart).await;
     emit(AgentEvent::TurnStart).await;
 
-    let resumed_from: Vec<AgentMessage> = current_context.messages.last().cloned().into_iter().collect();
+    let resumed_from: Vec<AgentMessage> = current_context
+        .messages
+        .last()
+        .cloned()
+        .into_iter()
+        .collect();
     run_loop_observed(
         &resumed_from,
         &mut current_context,
@@ -180,9 +192,16 @@ async fn run_loop_observed(
         input,
         config.stream_options.base.session_id.as_deref(),
     );
-    let result = run_loop(current_context, new_messages, config, cancel, emit, stream_fn)
-        .instrument(run.span().clone())
-        .await;
+    let result = run_loop(
+        current_context,
+        new_messages,
+        config,
+        cancel,
+        emit,
+        stream_fn,
+    )
+    .instrument(run.span().clone())
+    .await;
     run.finish(new_messages);
     result
 }
@@ -242,10 +261,7 @@ async fn run_loop(
                     .await;
             new_messages.push(AgentMessage::assistant(message.clone()));
 
-            if matches!(
-                message.stop_reason,
-                StopReason::Error | StopReason::Aborted
-            ) {
+            if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
                 emit_ev(
                     emit,
                     AgentEvent::TurnEnd {
@@ -615,8 +631,14 @@ async fn execute_tool_calls_sequential(
         )
         .await;
 
-        let preparation =
-            prepare_tool_call(current_context, assistant_message, tool_call, config, cancel).await;
+        let preparation = prepare_tool_call(
+            current_context,
+            assistant_message,
+            tool_call,
+            config,
+            cancel,
+        )
+        .await;
         let finalized = match preparation {
             PrepOutcome::Immediate { result, is_error } => FinalizedToolCall {
                 tool_call: tool_call.clone(),
@@ -691,8 +713,14 @@ async fn execute_tool_calls_parallel(
         )
         .await;
 
-        let preparation =
-            prepare_tool_call(current_context, assistant_message, tool_call, config, cancel).await;
+        let preparation = prepare_tool_call(
+            current_context,
+            assistant_message,
+            tool_call,
+            config,
+            cancel,
+        )
+        .await;
         match preparation {
             PrepOutcome::Immediate { result, is_error } => {
                 let finalized = FinalizedToolCall {
@@ -812,10 +840,15 @@ async fn prepare_tool_call(
     cancel: Option<&CancellationToken>,
 ) -> PrepOutcome {
     let span = preflight_span(tool_call);
-    let outcome =
-        prepare_tool_call_inner(current_context, assistant_message, tool_call, config, cancel)
-            .instrument(span.clone())
-            .await;
+    let outcome = prepare_tool_call_inner(
+        current_context,
+        assistant_message,
+        tool_call,
+        config,
+        cancel,
+    )
+    .instrument(span.clone())
+    .await;
     if let PrepOutcome::Immediate { result, is_error } = &outcome {
         record_tool_result(&span, result, *is_error);
     }
@@ -942,14 +975,9 @@ async fn execute_prepared_tool_call(
     });
 
     let span = tool_span(tool_call, &args);
-    let result = (tool.execute)(
-        tool_call.id.clone(),
-        args,
-        cancel.cloned(),
-        Some(on_update),
-    )
-    .instrument(span.clone())
-    .await;
+    let result = (tool.execute)(tool_call.id.clone(), args, cancel.cloned(), Some(on_update))
+        .instrument(span.clone())
+        .await;
 
     accepting.store(false, std::sync::atomic::Ordering::SeqCst);
 

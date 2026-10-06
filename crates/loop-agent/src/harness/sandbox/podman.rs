@@ -170,19 +170,13 @@ fn missing_deps_message(runtime: &str, missing: &[MissingDep]) -> String {
             }
             MissingDep::Runsc => {
                 lines.push("  • runsc (gVisor) — not found in PATH".into());
-                lines.push(
-                    "      install: see https://gvisor.dev/docs/user_guide/install/".into(),
-                );
-                lines.push(
-                    "               then use: /sandbox local --runsc".into(),
-                );
+                lines.push("      install: see https://gvisor.dev/docs/user_guide/install/".into());
+                lines.push("               then use: /sandbox local --runsc".into());
             }
             MissingDep::CrunKrun => {
                 lines.push("  • crun-krun / krun runtime — not found".into());
                 lines.push("      install: sudo dnf install crun-krun   (Fedora)".into());
-                lines.push(
-                    "               (provides `krun` for `podman --runtime=krun`)".into(),
-                );
+                lines.push("               (provides `krun` for `podman --runtime=krun`)".into());
             }
             MissingDep::KvmDevice => {
                 lines.push("  • /dev/kvm — not found (required for --krun)".into());
@@ -298,11 +292,7 @@ impl PodmanClient for RealPodmanClient {
     }
 
     async fn run(&self, opts: PodmanRunOpts) -> Result<String, SandboxError> {
-        let volume = format!(
-            "{}:{}:U,z",
-            opts.host_workdir.display(),
-            opts.guest_workdir
-        );
+        let volume = format!("{}:{}:U,z", opts.host_workdir.display(), opts.guest_workdir);
         let mut args: Vec<String> = vec![
             "run".into(),
             "-d".into(),
@@ -388,9 +378,9 @@ impl PodmanClient for RealPodmanClient {
             }
         } else if let Some(ms) = opts.timeout_ms {
             match tokio::time::timeout(Duration::from_millis(ms), output_fut).await {
-                Ok(res) => res.map_err(|e| {
-                    ExecutionError::new(ExecutionErrorCode::Io, e.to_string())
-                })?,
+                Ok(res) => {
+                    res.map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?
+                }
                 Err(_) => {
                     return Err(ExecutionError::new(
                         ExecutionErrorCode::TimedOut,

@@ -67,9 +67,7 @@ impl FileSystem for HostExecutionEnv {
 
     async fn read_text_file(&self, path: &Path) -> Result<String, FileError> {
         let path = self.absolute_path(path)?;
-        tokio::fs::read_to_string(&path)
-            .await
-            .map_err(Self::map_io)
+        tokio::fs::read_to_string(&path).await.map_err(Self::map_io)
     }
 
     async fn read_binary_file(&self, path: &Path) -> Result<Vec<u8>, FileError> {
@@ -138,18 +136,14 @@ impl FileSystem for HostExecutionEnv {
 
     async fn create_dir(&self, path: &Path) -> Result<(), FileError> {
         let path = self.absolute_path(path)?;
-        tokio::fs::create_dir_all(&path)
-            .await
-            .map_err(Self::map_io)
+        tokio::fs::create_dir_all(&path).await.map_err(Self::map_io)
     }
 
     async fn remove(&self, path: &Path) -> Result<(), FileError> {
         let path = self.absolute_path(path)?;
         let meta = tokio::fs::metadata(&path).await.map_err(Self::map_io)?;
         if meta.is_dir() {
-            tokio::fs::remove_dir_all(&path)
-                .await
-                .map_err(Self::map_io)
+            tokio::fs::remove_dir_all(&path).await.map_err(Self::map_io)
         } else {
             tokio::fs::remove_file(&path).await.map_err(Self::map_io)
         }
@@ -157,9 +151,7 @@ impl FileSystem for HostExecutionEnv {
 
     async fn canonical_path(&self, path: &Path) -> Result<PathBuf, FileError> {
         let path = self.absolute_path(path)?;
-        tokio::fs::canonicalize(&path)
-            .await
-            .map_err(Self::map_io)
+        tokio::fs::canonicalize(&path).await.map_err(Self::map_io)
     }
 
     async fn create_temp_dir(&self, prefix: &str) -> Result<PathBuf, FileError> {
@@ -208,23 +200,27 @@ impl Shell for HostExecutionEnv {
             }
         }
 
-        let mut child = cmd.spawn().map_err(|e| {
-            ExecutionError::new(ExecutionErrorCode::SpawnFailed, e.to_string())
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ExecutionError::new(ExecutionErrorCode::SpawnFailed, e.to_string()))?;
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            ExecutionError::new(ExecutionErrorCode::Io, "missing stdout pipe")
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            ExecutionError::new(ExecutionErrorCode::Io, "missing stderr pipe")
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::Io, "missing stdout pipe"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::Io, "missing stderr pipe"))?;
 
         let combined = Arc::new(Mutex::new(String::new()));
         let stdout_acc = Arc::new(Mutex::new(String::new()));
         let stderr_acc = Arc::new(Mutex::new(String::new()));
-        let last_emit = Arc::new(Mutex::new(Instant::now()
-            .checked_sub(OUTPUT_EMIT_INTERVAL)
-            .unwrap_or_else(Instant::now)));
+        let last_emit = Arc::new(Mutex::new(
+            Instant::now()
+                .checked_sub(OUTPUT_EMIT_INTERVAL)
+                .unwrap_or_else(Instant::now),
+        ));
         let on_output = options.on_output.clone();
 
         let stdout_task = {
@@ -290,9 +286,9 @@ impl Shell for HostExecutionEnv {
             }
             (None, Some(ms)) => {
                 match tokio::time::timeout(Duration::from_millis(ms), child.wait()).await {
-                    Ok(res) => res.map_err(|e| {
-                        ExecutionError::new(ExecutionErrorCode::Io, e.to_string())
-                    })?,
+                    Ok(res) => {
+                        res.map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?
+                    }
                     Err(_) => {
                         let _ = child.start_kill();
                         let _ = child.wait().await;

@@ -19,8 +19,8 @@ pub mod orchestration;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
-pub use skills::{format_skill_invocation, load_skills};
 pub use prompt_templates::{format_prompt_template_invocation, load_prompt_templates};
+pub use skills::{format_skill_invocation, load_skills};
 pub use system_prompt::format_skills_for_system_prompt;
 
 pub use agent_harness::{AgentHarness, AgentHarnessOptions, TurnSnapshot};
@@ -28,8 +28,8 @@ pub use compaction::{
     default_compaction_settings, find_cut_point, prepare_compaction, should_compact,
     CompactionSettings,
 };
-pub use hooks::{HarnessHookEvent, HookOutcome, HookRegistry};
 pub use env::HostExecutionEnv;
+pub use hooks::{HarnessHookEvent, HookOutcome, HookRegistry};
 pub use sandbox::{
     check_krun_deps, check_local_sandbox_deps, KrunIsolation, KrunSandbox, KrunSandboxFactory,
     LocalSandboxRuntime, PodmanClient, PodmanExecOpts, PodmanRunOpts, Sandbox, SandboxConfig,
@@ -37,15 +37,15 @@ pub use sandbox::{
     KRUN_DEFAULT_IMAGE, KRUN_DEFAULT_RUNTIME, LOCAL_DEFAULT_RUNTIME,
 };
 pub use session::{
-    create_in_memory_session_store, create_jsonl_session_store, create_scanning_session_search,
-    create_session_repository, fork_points_from_branch, format_session_stats, compute_session_stats,
-    Session, SessionContext, SessionForkPoint, SessionForkSelection, SessionRepository,
-    SessionStats, SessionStore, SessionTreeEntry,
+    compute_session_stats, create_in_memory_session_store, create_jsonl_session_store,
+    create_scanning_session_search, create_session_repository, fork_points_from_branch,
+    format_session_stats, Session, SessionContext, SessionForkPoint, SessionForkSelection,
+    SessionRepository, SessionStats, SessionStore, SessionTreeEntry,
 };
 pub use tools::{create_bash_tool, create_edit_tool, create_read_tool, create_write_tool};
 pub use types::{
     AgentHarnessError, AgentHarnessPhase, AgentHarnessResources, CompactResult, ExecutionEnv,
-    ExecutionToolContext, FileSystem, NavigateTreeResult, Shell, Skill, PromptTemplate,
+    ExecutionToolContext, FileSystem, NavigateTreeResult, PromptTemplate, Shell, Skill,
 };
 
 #[cfg(feature = "sqlite")]

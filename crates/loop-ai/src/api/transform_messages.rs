@@ -1,8 +1,8 @@
 //! Mid-session / cross-model message hand-off.
 
 use crate::types::{
-    AssistantContent, AssistantMessage, Message, Model, StopReason, TextContent,
-    ToolResultContent, ToolResultMessage, UserContent, UserMessageContent,
+    AssistantContent, AssistantMessage, Message, Model, StopReason, TextContent, ToolResultContent,
+    ToolResultMessage, UserContent, UserMessageContent,
 };
 
 const NON_VISION_USER_IMAGE_PLACEHOLDER: &str = "(image omitted: model does not support images)";
@@ -144,7 +144,11 @@ fn normalize_tool_call_id(id: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
         .collect();
     if filtered.is_empty() {
-        return crate::utils::id::new_id().replace('-', "").chars().take(64).collect();
+        return crate::utils::id::new_id()
+            .replace('-', "")
+            .chars()
+            .take(64)
+            .collect();
     }
     filtered.chars().take(64).collect()
 }
@@ -159,12 +163,9 @@ fn downgrade_unsupported_images(messages: &[Message], model: &Model) -> Vec<Mess
             Message::User(u) => {
                 let content = match &u.content {
                     UserMessageContent::Text(t) => UserMessageContent::Text(t.clone()),
-                    UserMessageContent::Blocks(blocks) => {
-                        UserMessageContent::Blocks(replace_user_images(
-                            blocks,
-                            NON_VISION_USER_IMAGE_PLACEHOLDER,
-                        ))
-                    }
+                    UserMessageContent::Blocks(blocks) => UserMessageContent::Blocks(
+                        replace_user_images(blocks, NON_VISION_USER_IMAGE_PLACEHOLDER),
+                    ),
                 };
                 Message::User(crate::types::UserMessage {
                     content,
@@ -235,9 +236,7 @@ fn replace_tool_images(content: &[ToolResultContent], placeholder: &str) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{
-        InputModality, ModelCost, ThinkingContent, ToolCall, Usage,
-    };
+    use crate::types::{InputModality, ModelCost, ThinkingContent, ToolCall, Usage};
     use serde_json::json;
 
     fn model(id: &str, provider: &str) -> Model {

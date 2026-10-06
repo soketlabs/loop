@@ -2,12 +2,14 @@
 
 use std::sync::Arc;
 
-use loop_ai::providers::{soket_provider, soket_seed_models, SOKET_DEFAULT_MODEL_ID, SOKET_PROVIDER_ID};
+use loop_ai::providers::{
+    soket_provider, soket_seed_models, SOKET_DEFAULT_MODEL_ID, SOKET_PROVIDER_ID,
+};
+use loop_ai::utils::now_ms;
 use loop_ai::{
     CreateModelsOptions, InMemoryModelsStore, Models, ModelsRefreshOptions, ModelsStore,
     ModelsStoreEntry,
 };
-use loop_ai::utils::now_ms;
 
 #[tokio::test]
 async fn offline_refresh_keeps_seed_or_cache() {

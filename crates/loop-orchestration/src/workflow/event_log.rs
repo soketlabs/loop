@@ -13,11 +13,8 @@ use crate::planner::task_graph::TaskGraph;
 #[async_trait]
 pub trait EventLog: Send + Sync {
     /// Append an event and return its sequence number.
-    async fn append(
-        &self,
-        workflow_id: &str,
-        event: WorkflowEvent,
-    ) -> Result<SeqNo, WorkflowError>;
+    async fn append(&self, workflow_id: &str, event: WorkflowEvent)
+        -> Result<SeqNo, WorkflowError>;
 
     /// Read events after a given sequence number.
     async fn read(
@@ -131,12 +128,18 @@ mod tests {
         let mut g = TaskGraph::new();
         g.add_task(TaskNode::new(
             "t1",
-            TaskKind::AgentTurn { prompt: "hello".into(), tools: None, model: None },
+            TaskKind::AgentTurn {
+                prompt: "hello".into(),
+                tools: None,
+                model: None,
+            },
             "task 1",
         ));
         g.add_task(TaskNode::new(
             "t2",
-            TaskKind::ShellCommand { command: "echo done".into() },
+            TaskKind::ShellCommand {
+                command: "echo done".into(),
+            },
             "task 2",
         ));
         g.add_dependency("t2", "t1");
@@ -148,18 +151,30 @@ mod tests {
         let log = MemoryEventLog::new();
         let graph = test_graph();
 
-        let seq1 = log.append("wf1", WorkflowEvent::WorkflowStarted {
-            workflow_id: "wf1".into(),
-            plan: graph,
-            timestamp: 100,
-        }).await.unwrap();
+        let seq1 = log
+            .append(
+                "wf1",
+                WorkflowEvent::WorkflowStarted {
+                    workflow_id: "wf1".into(),
+                    plan: graph,
+                    timestamp: 100,
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(seq1, 1);
 
-        let seq2 = log.append("wf1", WorkflowEvent::TaskScheduled {
-            task_id: "t1".into(),
-            dependencies: vec![],
-            timestamp: 101,
-        }).await.unwrap();
+        let seq2 = log
+            .append(
+                "wf1",
+                WorkflowEvent::TaskScheduled {
+                    task_id: "t1".into(),
+                    dependencies: vec![],
+                    timestamp: 101,
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(seq2, 2);
 
         let events = log.read("wf1", 0).await.unwrap();
@@ -174,23 +189,38 @@ mod tests {
         let log = MemoryEventLog::new();
         let graph = test_graph();
 
-        log.append("wf1", WorkflowEvent::WorkflowStarted {
-            workflow_id: "wf1".into(),
-            plan: graph,
-            timestamp: 100,
-        }).await.unwrap();
+        log.append(
+            "wf1",
+            WorkflowEvent::WorkflowStarted {
+                workflow_id: "wf1".into(),
+                plan: graph,
+                timestamp: 100,
+            },
+        )
+        .await
+        .unwrap();
 
-        log.append("wf1", WorkflowEvent::TaskScheduled {
-            task_id: "t1".into(),
-            dependencies: vec![],
-            timestamp: 101,
-        }).await.unwrap();
+        log.append(
+            "wf1",
+            WorkflowEvent::TaskScheduled {
+                task_id: "t1".into(),
+                dependencies: vec![],
+                timestamp: 101,
+            },
+        )
+        .await
+        .unwrap();
 
-        log.append("wf1", WorkflowEvent::TaskCompleted {
-            task_id: "t1".into(),
-            result: crate::workflow::types::TaskResult::empty(),
-            timestamp: 102,
-        }).await.unwrap();
+        log.append(
+            "wf1",
+            WorkflowEvent::TaskCompleted {
+                task_id: "t1".into(),
+                result: crate::workflow::types::TaskResult::empty(),
+                timestamp: 102,
+            },
+        )
+        .await
+        .unwrap();
 
         let state = log.replay("wf1").await.unwrap();
         assert_eq!(state.workflow_id, "wf1");
@@ -226,13 +256,27 @@ mod tests {
         let mut g2 = TaskGraph::new();
         g2.add_task(TaskNode::new("x", TaskKind::Barrier, "barrier"));
 
-        log.append("wf1", WorkflowEvent::WorkflowStarted {
-            workflow_id: "wf1".into(), plan: g1, timestamp: 0,
-        }).await.unwrap();
+        log.append(
+            "wf1",
+            WorkflowEvent::WorkflowStarted {
+                workflow_id: "wf1".into(),
+                plan: g1,
+                timestamp: 0,
+            },
+        )
+        .await
+        .unwrap();
 
-        log.append("wf2", WorkflowEvent::WorkflowStarted {
-            workflow_id: "wf2".into(), plan: g2, timestamp: 0,
-        }).await.unwrap();
+        log.append(
+            "wf2",
+            WorkflowEvent::WorkflowStarted {
+                workflow_id: "wf2".into(),
+                plan: g2,
+                timestamp: 0,
+            },
+        )
+        .await
+        .unwrap();
 
         let s1 = log.replay("wf1").await.unwrap();
         let s2 = log.replay("wf2").await.unwrap();

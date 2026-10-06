@@ -62,9 +62,7 @@ pub fn read_cached_branch_rows(
     let mut out = Vec::new();
     for row in rows {
         let payload = row.map_err(|e| SessionError::Storage(e.to_string()))?;
-        out.push(
-            serde_json::from_str(&payload).map_err(|e| SessionError::Storage(e.to_string()))?,
-        );
+        out.push(serde_json::from_str(&payload).map_err(|e| SessionError::Storage(e.to_string()))?);
     }
     Ok(out)
 }

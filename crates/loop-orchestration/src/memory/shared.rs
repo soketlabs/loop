@@ -125,7 +125,8 @@ mod tests {
     async fn set_and_get() {
         let bus = create_memory_bus();
         let mem = SharedMemory::new(bus);
-        mem.set_entry("key1", serde_json::json!("hello"), &"task_a".into()).await;
+        mem.set_entry("key1", serde_json::json!("hello"), &"task_a".into())
+            .await;
         let entry = mem.get_entry("key1").await.unwrap();
         assert_eq!(entry.value, serde_json::json!("hello"));
         assert_eq!(entry.written_by, "task_a");
@@ -148,9 +149,12 @@ mod tests {
     async fn list_by_prefix() {
         let bus = create_memory_bus();
         let mem = SharedMemory::new(bus);
-        mem.set_entry("result:a", serde_json::json!(1), &"t".into()).await;
-        mem.set_entry("result:b", serde_json::json!(2), &"t".into()).await;
-        mem.set_entry("config:x", serde_json::json!(3), &"t".into()).await;
+        mem.set_entry("result:a", serde_json::json!(1), &"t".into())
+            .await;
+        mem.set_entry("result:b", serde_json::json!(2), &"t".into())
+            .await;
+        mem.set_entry("config:x", serde_json::json!(3), &"t".into())
+            .await;
 
         let mut keys = mem.list("result:").await;
         keys.sort();
@@ -184,7 +188,8 @@ mod tests {
 
         let mut rx = bus.subscribe_key("key1").await;
 
-        mem.set_entry("key1", serde_json::json!("v"), &"writer".into()).await;
+        mem.set_entry("key1", serde_json::json!("v"), &"writer".into())
+            .await;
 
         let event = rx.try_recv().unwrap();
         assert_eq!(event.key, "key1");
