@@ -9,10 +9,13 @@ use loop_agent::harness::types::{
     ExecutionError, ExecutionErrorCode, ShellExecOptions, ShellOutput,
 };
 use loop_agent::harness::{
-    create_read_tool, create_write_tool, KrunIsolation, KrunSandbox, KrunSandboxFactory,
-    LocalSandboxRuntime, PodmanClient, PodmanExecOpts, PodmanRunOpts, Sandbox, SandboxConfig,
-    SandboxError, SandboxInfo, SandboxMode, SandboxRegistry, SandboxStatus,
+    KrunIsolation, KrunSandbox, KrunSandboxFactory, LocalSandboxRuntime, PodmanClient,
+    PodmanExecOpts, PodmanRunOpts, Sandbox, SandboxConfig, SandboxError, SandboxMode,
+    SandboxRegistry,
 };
+// Only used by the Linux-gated `krun_full_fs_via_exec` test.
+#[cfg(target_os = "linux")]
+use loop_agent::harness::{create_read_tool, create_write_tool, SandboxInfo, SandboxStatus};
 use parking_lot::Mutex;
 use serde_json::json;
 

@@ -311,17 +311,7 @@ impl ToolApprovalBridge {
     }
 
     /// Hook for [`AgentHarness::set_after_tool_call`] (file edits).
-    pub fn after_tool_hook(
-        self: &Arc<Self>,
-    ) -> Arc<
-        dyn Fn(
-                AfterToolCallContext,
-                Option<CancellationToken>,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Option<AfterToolCallResult>> + Send>,
-            > + Send
-            + Sync,
-    > {
+    pub fn after_tool_hook(self: &Arc<Self>) -> loop_agent::AfterToolCallFn {
         let bridge = Arc::clone(self);
         Arc::new(move |ctx, cancel| {
             let bridge = Arc::clone(&bridge);
@@ -330,17 +320,7 @@ impl ToolApprovalBridge {
     }
 
     /// Hook for [`AgentHarness::set_before_tool_call`] (bash + deny).
-    pub fn before_tool_hook(
-        self: &Arc<Self>,
-    ) -> Arc<
-        dyn Fn(
-                BeforeToolCallContext,
-                Option<CancellationToken>,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Option<BeforeToolCallResult>> + Send>,
-            > + Send
-            + Sync,
-    > {
+    pub fn before_tool_hook(self: &Arc<Self>) -> loop_agent::BeforeToolCallFn {
         let bridge = Arc::clone(self);
         Arc::new(move |ctx, cancel| {
             let bridge = Arc::clone(&bridge);

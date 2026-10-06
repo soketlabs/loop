@@ -469,7 +469,7 @@ async fn stream_assistant_response(
             | AssistantMessageEvent::ToolcallStart { partial, .. }
             | AssistantMessageEvent::ToolcallDelta { partial, .. }
             | AssistantMessageEvent::ToolcallEnd { partial, .. } => {
-                if let Some(_) = &partial_message {
+                if partial_message.is_some() {
                     partial_message = Some(partial.clone());
                     if let Some(last) = context.messages.last_mut() {
                         *last = AgentMessage::assistant(partial.clone());
@@ -1008,7 +1008,7 @@ async fn finalize_executed_tool_call(
     let mut is_error = executed.is_error;
 
     if let Some(after) = &config.after_tool_call {
-        match after(
+        if let Some(patch) = after(
             AfterToolCallContext {
                 assistant_message: assistant_message.clone(),
                 tool_call: tool_call.clone(),
@@ -1021,24 +1021,21 @@ async fn finalize_executed_tool_call(
         )
         .await
         {
-            Some(patch) => {
-                if let Some(content) = patch.content {
-                    result.content = content;
-                }
-                if let Some(details) = patch.details {
-                    result.details = details;
-                }
-                if let Some(usage) = patch.usage {
-                    result.usage = Some(usage);
-                }
-                if let Some(terminate) = patch.terminate {
-                    result.terminate = Some(terminate);
-                }
-                if let Some(flag) = patch.is_error {
-                    is_error = flag;
-                }
+            if let Some(content) = patch.content {
+                result.content = content;
             }
-            None => {}
+            if let Some(details) = patch.details {
+                result.details = details;
+            }
+            if let Some(usage) = patch.usage {
+                result.usage = Some(usage);
+            }
+            if let Some(terminate) = patch.terminate {
+                result.terminate = Some(terminate);
+            }
+            if let Some(flag) = patch.is_error {
+                is_error = flag;
+            }
         }
     }
 

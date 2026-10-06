@@ -869,8 +869,7 @@ fn footer_layout(
     let status_h = 2u16;
     let max_input_body = area_height
         .saturating_sub(picker_h + status_h + 2)
-        .max(1)
-        .min(MAX_INPUT_BODY_LINES);
+        .clamp(1, MAX_INPUT_BODY_LINES);
     let input_body_lines = count_input_visual_lines(input, area_width.max(1) as usize)
         .clamp(1, max_input_body as usize) as u16;
     let input_h = input_body_lines + 2; // top + bottom rules
@@ -894,6 +893,10 @@ pub fn footer_live_height(
 }
 
 /// Format uncommitted transcript items (plus a spinner when idle-working).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pre-existing signature; refactor tracked separately"
+)]
 pub fn format_live_lines(
     live: &[ChatItem],
     theme: &Theme,
@@ -1354,9 +1357,7 @@ fn count_input_visual_lines(input: &str, term_width: usize) -> usize {
 }
 
 fn input_scroll_top(total: usize, cursor_row: usize, visible: usize) -> usize {
-    if total <= visible {
-        0
-    } else if cursor_row < visible {
+    if total <= visible || cursor_row < visible {
         0
     } else {
         (cursor_row + 1)
@@ -1948,7 +1949,7 @@ mod tests {
     fn input_render_caret_on_earlier_line() {
         let theme = Theme::dark();
         let text = "hello\nworld";
-        let lines = render_input_lines(&text, 2, theme.style("text"), &theme, "", 80, 4);
+        let lines = render_input_lines(text, 2, theme.style("text"), &theme, "", 80, 4);
         assert_eq!(lines.len(), 2);
         assert!(lines[0].to_string().contains('█'));
         assert!(!lines[1].to_string().contains('█'));

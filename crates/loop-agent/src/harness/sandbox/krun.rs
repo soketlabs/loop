@@ -288,9 +288,8 @@ impl Sandbox for KrunSandbox {
                 ram_mib: self.ram_mib.clone(),
             })
             .await
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 *self.status.write() = SandboxStatus::Failed;
-                e
             })?;
 
         let env: Arc<dyn ExecutionEnv> = Arc::new(KrunExecutionEnv::new(

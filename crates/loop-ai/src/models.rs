@@ -258,20 +258,12 @@ pub fn create_provider(input: CreateProviderOptions) -> Provider {
 }
 
 /// Options when constructing a [`Models`] collection.
+#[derive(Default)]
 pub struct CreateModelsOptions {
     /// Credential store (defaults to in-memory).
     pub credentials: Option<Arc<dyn CredentialStore>>,
     /// Optional persistent model catalog store.
     pub models_store: Option<SharedModelsStore>,
-}
-
-impl Default for CreateModelsOptions {
-    fn default() -> Self {
-        Self {
-            credentials: None,
-            models_store: None,
-        }
-    }
 }
 
 /// Runtime collection of providers plus auth application and stream convenience.

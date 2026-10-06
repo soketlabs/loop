@@ -45,7 +45,7 @@ fn load_skill_and_format() {
         path: skill_dir.join("SKILL.md"),
         disable_model_invocation: true,
     };
-    assert!(format_skills_for_system_prompt(&[muted.clone()], &[]).is_empty());
+    assert!(format_skills_for_system_prompt(std::slice::from_ref(&muted), &[]).is_empty());
     let forced = format_skills_for_system_prompt(&[muted], &["hidden".into()]);
     assert!(forced.contains("<name>hidden</name>"));
     assert!(forced.contains("<description>secret</description>"));

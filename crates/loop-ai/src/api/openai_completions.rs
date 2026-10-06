@@ -975,9 +975,9 @@ fn convert_message(
             let text = t
                 .content
                 .iter()
-                .filter_map(|c| match c {
-                    ToolResultContent::Text(t) => Some(t.text.as_str()),
-                    ToolResultContent::Image(_) => Some("[image]"),
+                .map(|c| match c {
+                    ToolResultContent::Text(t) => t.text.as_str(),
+                    ToolResultContent::Image(_) => "[image]",
                 })
                 .collect::<Vec<_>>()
                 .join("\n");

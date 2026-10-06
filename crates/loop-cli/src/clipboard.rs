@@ -23,10 +23,8 @@ pub fn copy_text(text: &str) -> Result<(), String> {
         copied = try_platform_clipboard(text);
     }
 
-    if remote || !copied {
-        if emit_osc52(text) {
-            copied = true;
-        }
+    if (remote || !copied) && emit_osc52(text) {
+        copied = true;
     }
 
     if copied {

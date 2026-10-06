@@ -14,15 +14,10 @@ use tracing_subscriber::layer::SubscriberExt;
 struct FailingExporter;
 
 impl SpanExporter for FailingExporter {
-    fn export(
-        &self,
-        _batch: Vec<SpanData>,
-    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
-        async {
-            Err(OTelSdkError::InternalFailure(
-                "expected test failure".into(),
-            ))
-        }
+    async fn export(&self, _batch: Vec<SpanData>) -> OTelSdkResult {
+        Err(OTelSdkError::InternalFailure(
+            "expected test failure".into(),
+        ))
     }
 }
 

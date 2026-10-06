@@ -169,7 +169,7 @@ async fn live_agent_tool_loop() {
     let state = agent.state().await;
     let roles: Vec<_> = state.messages().iter().map(|m| m.role()).collect();
     assert!(
-        roles.iter().any(|r| *r == "toolResult") || roles.iter().any(|r| *r == "assistant"),
+        roles.contains(&"toolResult") || roles.contains(&"assistant"),
         "expected tool or assistant messages, got {roles:?}"
     );
     eprintln!(

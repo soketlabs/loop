@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 const MAX_ENTRIES: usize = 1000;
 
 /// Submitted prompts recalled with up/down, persisted across sessions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CommandHistory {
     entries: Vec<String>,
     /// Index into `entries` while browsing; `None` means the live draft.
@@ -13,17 +13,6 @@ pub struct CommandHistory {
     /// Input saved when first stepping into history from a fresh draft.
     draft: String,
     path: Option<PathBuf>,
-}
-
-impl Default for CommandHistory {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            cursor: None,
-            draft: String::new(),
-            path: None,
-        }
-    }
 }
 
 impl CommandHistory {
@@ -105,7 +94,7 @@ impl CommandHistory {
     }
 
     /// Newer entry, or the saved draft after the newest.
-    pub fn next(&mut self) -> Option<String> {
+    pub fn next_entry(&mut self) -> Option<String> {
         match self.cursor {
             None => None,
             Some(i) if i + 1 >= self.entries.len() => {
@@ -153,10 +142,10 @@ mod tests {
         assert!(h.is_browsing());
         assert_eq!(h.previous("two").as_deref(), Some("one"));
         assert_eq!(h.previous("one"), None);
-        assert_eq!(h.next().as_deref(), Some("two"));
-        assert_eq!(h.next().as_deref(), Some("draft"));
+        assert_eq!(h.next_entry().as_deref(), Some("two"));
+        assert_eq!(h.next_entry().as_deref(), Some("draft"));
         assert!(!h.is_browsing());
-        assert_eq!(h.next(), None);
+        assert_eq!(h.next_entry(), None);
     }
 
     #[test]

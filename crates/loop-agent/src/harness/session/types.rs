@@ -34,6 +34,10 @@ pub struct SessionMetadata {
 /// Tree entry stored in a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "public serde type; boxing variants would break the API"
+)]
 pub enum SessionTreeEntry {
     /// Transcript message.
     Message {
@@ -204,6 +208,10 @@ impl SessionTreeEntry {
 /// Pending write without generated fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "public serde type; boxing variants would break the API"
+)]
 pub enum PendingSessionWrite {
     /// Message.
     Message {

@@ -419,9 +419,7 @@ pub fn create_bash_tool_with_prepare(
                         });
                     }));
                 }
-                let captured = execute_shell_with_capture(env, &command, options, None)
-                    .await
-                    .map_err(|e| e)?;
+                let captured = execute_shell_with_capture(env, &command, options, None).await?;
                 Ok(AgentToolResult {
                     content: vec![ToolResultContent::Text(TextContent {
                         text: captured.text.clone(),

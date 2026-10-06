@@ -742,9 +742,8 @@ impl AgentHarness {
         let result = self
             .compact_inner(settings, custom_instructions)
             .await
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 self.release_to_idle();
-                e
             });
 
         self.release_to_idle();
@@ -875,9 +874,8 @@ impl AgentHarness {
         let result = self
             .navigate_tree_inner(target_id, summarize)
             .await
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 self.release_to_idle();
-                e
             });
 
         self.release_to_idle();

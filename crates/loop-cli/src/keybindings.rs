@@ -139,12 +139,11 @@ impl Keybindings {
     pub fn resolve(&self, key: KeyEvent) -> Option<Action> {
         // Prefer Shift+Enter / Ctrl+Enter as newline even when the terminal
         // reports odd modifier combinations.
-        if matches!(key.code, KeyCode::Enter) {
-            if key.modifiers.contains(KeyModifiers::SHIFT)
-                || key.modifiers.contains(KeyModifiers::CONTROL)
-            {
-                return Some(Action::NewLine);
-            }
+        if matches!(key.code, KeyCode::Enter)
+            && (key.modifiers.contains(KeyModifiers::SHIFT)
+                || key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            return Some(Action::NewLine);
         }
         // Some terminals emit `\n` for Shift+Enter.
         if matches!(key.code, KeyCode::Char('\n')) {

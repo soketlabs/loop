@@ -330,6 +330,10 @@ impl CustomAgentMessage {
 /// Agent transcript message: LLM message or custom role.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "public serde type; boxing variants would break the API"
+)]
 pub enum AgentMessage {
     /// Standard LLM message.
     Llm(Message),
@@ -409,6 +413,10 @@ pub struct AgentContext {
 
 /// Events emitted by the agent for UI updates.
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "public serde type; boxing variants would break the API"
+)]
 pub enum AgentEvent {
     /// Agent begins processing.
     AgentStart,
@@ -524,6 +532,48 @@ pub type TransformContextFn = Arc<
         + Sync,
 >;
 
+/// Dynamic API key resolution by provider name.
+pub type GetApiKeyFn =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
+
+/// Predicate deciding whether to stop after a turn.
+pub type ShouldStopAfterTurnFn = Arc<
+    dyn Fn(ShouldStopAfterTurnContext) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync,
+>;
+
+/// Produces an optional update applied before the next turn.
+pub type PrepareNextTurnFn = Arc<
+    dyn Fn(
+            ShouldStopAfterTurnContext,
+        ) -> Pin<Box<dyn Future<Output = Option<AgentLoopTurnUpdate>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Async getter for queued messages (steering, follow-up).
+pub type AgentMessagesFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>> + Send + Sync>;
+
+/// Hook run before a tool call executes.
+pub type BeforeToolCallFn = Arc<
+    dyn Fn(
+            BeforeToolCallContext,
+            Option<CancellationToken>,
+        ) -> Pin<Box<dyn Future<Output = Option<BeforeToolCallResult>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Hook run after a tool call executes.
+pub type AfterToolCallFn = Arc<
+    dyn Fn(
+            AfterToolCallContext,
+            Option<CancellationToken>,
+        ) -> Pin<Box<dyn Future<Output = Option<AfterToolCallResult>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Configuration for the agent loop.
 #[derive(Clone)]
 pub struct AgentLoopConfig {
@@ -534,62 +584,21 @@ pub struct AgentLoopConfig {
     /// Optional context transform.
     pub transform_context: Option<TransformContextFn>,
     /// Dynamic API key resolution.
-    pub get_api_key: Option<
-        Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>,
-    >,
+    pub get_api_key: Option<GetApiKeyFn>,
     /// Stop after turn predicate.
-    pub should_stop_after_turn: Option<
-        Arc<
-            dyn Fn(ShouldStopAfterTurnContext) -> Pin<Box<dyn Future<Output = bool> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
+    pub should_stop_after_turn: Option<ShouldStopAfterTurnFn>,
     /// Prepare next turn snapshot.
-    pub prepare_next_turn: Option<
-        Arc<
-            dyn Fn(
-                    ShouldStopAfterTurnContext,
-                )
-                    -> Pin<Box<dyn Future<Output = Option<AgentLoopTurnUpdate>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
+    pub prepare_next_turn: Option<PrepareNextTurnFn>,
     /// Steering message getter.
-    pub get_steering_messages: Option<
-        Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>> + Send + Sync>,
-    >,
+    pub get_steering_messages: Option<AgentMessagesFn>,
     /// Follow-up message getter.
-    pub get_follow_up_messages: Option<
-        Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>> + Send + Sync>,
-    >,
+    pub get_follow_up_messages: Option<AgentMessagesFn>,
     /// Tool execution mode.
     pub tool_execution: ToolExecutionMode,
     /// Before tool call hook.
-    pub before_tool_call: Option<
-        Arc<
-            dyn Fn(
-                    BeforeToolCallContext,
-                    Option<CancellationToken>,
-                )
-                    -> Pin<Box<dyn Future<Output = Option<BeforeToolCallResult>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
+    pub before_tool_call: Option<BeforeToolCallFn>,
     /// After tool call hook.
-    pub after_tool_call: Option<
-        Arc<
-            dyn Fn(
-                    AfterToolCallContext,
-                    Option<CancellationToken>,
-                )
-                    -> Pin<Box<dyn Future<Output = Option<AfterToolCallResult>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
+    pub after_tool_call: Option<AfterToolCallFn>,
     /// Stream options passthrough (session_id, headers, reasoning, etc.).
     pub stream_options: SimpleStreamOptions,
     /// Thinking budgets.
@@ -694,6 +703,10 @@ impl AgentState {
 }
 
 /// Prompt input variants.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "public serde type; boxing variants would break the API"
+)]
 pub enum PromptInput {
     /// Plain text.
     Text(String),
