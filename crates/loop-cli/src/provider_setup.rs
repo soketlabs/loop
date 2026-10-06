@@ -212,8 +212,8 @@ impl WizardView for ProviderSetup {
             Self::ApiKey {
                 target: LoginTarget::Preset(preset),
             } => format!(
-                "Paste your {} API key ({}) — input stays hidden · get one at {}",
-                preset.name, preset.key_hint, preset.key_url
+                "Paste your {} API key ({}) — input stays hidden · {} {}",
+                preset.name, preset.key_hint, preset.key_cta, preset.key_url
             ),
             Self::ApiKey {
                 target: LoginTarget::Custom { name, .. },
