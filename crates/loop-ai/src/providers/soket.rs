@@ -8,7 +8,7 @@ pub const SOKET_PROVIDER_ID: &str = "soket";
 /// Display name.
 pub const SOKET_PROVIDER_NAME: &str = "Soket";
 /// OpenAI-compatible base URL.
-pub const SOKET_BASE_URL: &str = "https://api.tensorstudio.ai/v1";
+pub const SOKET_BASE_URL: &str = "https://api.soket.ai/v1";
 /// Default model id (settings / first-run default).
 pub const SOKET_DEFAULT_MODEL_ID: &str = "qwen3-30b";
 

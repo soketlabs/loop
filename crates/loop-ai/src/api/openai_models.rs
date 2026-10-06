@@ -242,7 +242,7 @@ mod tests {
     fn maps_remote_model() {
         let opts = MapRemoteModelOptions {
             provider: "soket".into(),
-            base_url: "https://api.tensorstudio.ai/v1".into(),
+            base_url: "https://api.soket.ai/v1".into(),
             ..Default::default()
         };
         let m = map_remote_model("qwen3-30b", Some("Qwen 3 30B"), &opts);
