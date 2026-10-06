@@ -31,7 +31,7 @@ On first start, Loop asks you to **connect a model provider** (unless a provider
 
 Models are listed from each provider's `/models` endpoint; `/model` shows Soket first, then other connected providers. `/logout <provider>` disconnects one. Keys are stored in `~/.loop/agent/auth.json` (mode `0600`); custom providers are saved in `settings.json`.
 
-Default provider/model: **`soket` / `qwen3-30b`** at `https://api.tensorstudio.ai/v1`. The model catalog is refreshed from `GET /v1/models` and cached in `models-store.json`.
+Default provider/model: **`soket` / `qwen3-30b`** at `https://api.soket.ai/v1`. The model catalog is refreshed from `GET /v1/models` and cached in `models-store.json`.
 
 ## Config layout
 

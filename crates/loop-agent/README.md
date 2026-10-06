@@ -64,7 +64,7 @@ A future `remote` kind is reserved but not implemented.
 ## Live tests
 
 ```bash
-LOOP_TEST_BASE_URL="https://api.tensorstudio.ai/v1" \
+LOOP_TEST_BASE_URL="https://api.soket.ai/v1" \
 LOOP_TEST_MODEL="qwen3-30b" \
 LOOP_TEST_API_KEY_ENV="OPENAI_API_KEY" \
 cargo test -p loop-agent --test live_agent -- --ignored --nocapture
