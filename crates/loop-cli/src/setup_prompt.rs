@@ -121,7 +121,7 @@ mod tests {
 
         let key = SetupPrompt::Provider(ProviderSetup::start(Some("openai")).unwrap());
         assert!(key.masked());
-        assert_eq!(key.env_hint().as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(key.env_hint(), None);
         assert!(key.status_hint(false).contains("enter save"));
     }
 
