@@ -12,6 +12,17 @@ members = [
     "crates/loop-desktop"
 ]
 
+default-members = [
+    "crates/loop-ai",
+    "crates/loop-orchestration",
+    "crates/loop-mcp",
+    "crates/loop-agent",
+    "crates/loop-app-core",
+    "crates/loop-telemetry",
+    "crates/loop-test-support",
+    "crates/loop-cli",
+]
+
 [workspace.package]
 version = "0.3.4"
 edition = "2021"
