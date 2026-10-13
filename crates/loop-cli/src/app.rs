@@ -303,12 +303,17 @@ async fn run_loop(
 ) -> anyhow::Result<Option<String>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     // A best-effort notification. Never replace files or block startup.
-    if std::env::var_os("LOOP_NO_UPDATE_CHECK").is_none() {
+    if loop_update::Installation::is_managed()
+        && !loop_update::update_check_disabled(
+            std::env::var("LOOP_NO_UPDATE_CHECK").ok().as_deref(),
+        )
+    {
         let update_tx = tx.clone();
         tokio::spawn(async move {
             let result = async {
                 let client = loop_update::ReleaseClient::github(Duration::from_secs(5))?;
-                let release = client.latest().await?;
+                let cache = loop_update::Installation::notification_cache_path()?;
+                let release = client.latest_cached(&cache).await?;
                 if loop_update::is_newer(env!("CARGO_PKG_VERSION"), &release)? {
                     let _ = update_tx.send(UiEvent::UpdateAvailable(format!(
                         "Loop {} is available (installed: {}). Exit this session and run `loop update` to install it.",

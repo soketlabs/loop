@@ -1,12 +1,12 @@
 use std::{
     io::{Read, Write},
     path::Path,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::Url;
 use semver::Version;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{checksum, sha256_file, Error, Result};
 
@@ -30,7 +30,9 @@ impl ReleaseVersion {
 }
 
 pub fn is_newer(current: &str, available: &ReleaseVersion) -> Result<bool> {
-    Ok(available.version > Version::parse(current.trim_start_matches('v'))?)
+    Ok(Version::parse(current.trim_start_matches('v'))?
+        .cmp_precedence(&available.version)
+        .is_lt())
 }
 
 pub fn platform_target() -> Result<&'static str> {
@@ -51,6 +53,8 @@ pub struct ReleaseClient {
     client: reqwest::Client,
     api: Url,
     downloads: Url,
+    latest_redirect: Option<Url>,
+    metadata_timeout: Duration,
 }
 
 #[derive(Deserialize)]
@@ -60,13 +64,20 @@ struct GithubRelease {
     prerelease: bool,
 }
 
+#[derive(Serialize, Deserialize)]
+struct CachedRelease {
+    checked_at: u64,
+    tag: String,
+}
+
 impl ReleaseClient {
     pub fn github(timeout: Duration) -> Result<Self> {
         Self::new(
             "https://api.github.com/repos/soketlabs/loop/releases/",
             "https://github.com/soketlabs/loop/releases/download/",
             timeout,
-        )
+        )?
+        .with_latest_redirect("https://github.com/soketlabs/loop/releases/latest")
     }
 
     /// Custom origins are for mirrors and local release fixtures. HTTP is only
@@ -91,10 +102,49 @@ impl ReleaseClient {
                 .build()?,
             api: origin(api)?,
             downloads: origin(downloads)?,
+            latest_redirect: None,
+            metadata_timeout: timeout.min(Duration::from_secs(10)),
         })
     }
 
+    pub fn with_latest_redirect(mut self, url: &str) -> Result<Self> {
+        let url = Url::parse(url).map_err(|e| Error::Invalid(e.to_string()))?;
+        let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+        if (!local && url.scheme() != "https") || !url.path().ends_with("/latest") {
+            return Err(Error::Invalid(
+                "Latest-release URL must use HTTPS and end with /latest".into(),
+            ));
+        }
+        self.latest_redirect = Some(url);
+        Ok(self)
+    }
+
     pub async fn latest(&self) -> Result<ReleaseVersion> {
+        if let Some(url) = &self.latest_redirect {
+            let response = self
+                .client
+                .head(url.clone())
+                .timeout(self.metadata_timeout)
+                .send()
+                .await?
+                .error_for_status()?;
+            let final_url = response.url();
+            let prefix = format!("{}tag/", url.path().trim_end_matches("latest"));
+            if url.host_str() != final_url.host_str()
+                || url.port_or_known_default() != final_url.port_or_known_default()
+            {
+                return Err(Error::Invalid(
+                    "Latest release redirected to a different origin".into(),
+                ));
+            }
+            let tag = final_url.path().strip_prefix(&prefix).ok_or_else(|| {
+                Error::Invalid("Latest release did not resolve to a release tag".into())
+            })?;
+            let tag = percent_encoding::percent_decode_str(tag)
+                .decode_utf8()
+                .map_err(|_| Error::Invalid("Invalid release tag encoding".into()))?;
+            return ReleaseVersion::parse(&tag);
+        }
         let body = self
             .small_file(self.endpoint(&self.api, "latest")?, 1024 * 1024)
             .await?;
@@ -107,6 +157,44 @@ impl ReleaseClient {
         ReleaseVersion::parse(&release.tag_name)
     }
 
+    /// Startup checks reuse a valid result for one day. Explicit update commands
+    /// call latest directly. Cache I/O failure never prevents release lookup.
+    pub async fn latest_cached(&self, path: &Path) -> Result<ReleaseVersion> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Ok(file) = std::fs::File::open(path) {
+            let mut bytes = Vec::new();
+            if file.take(4097).read_to_end(&mut bytes).is_ok() && bytes.len() <= 4096 {
+                if let Ok(cache) = serde_json::from_slice::<CachedRelease>(&bytes) {
+                    if cache.checked_at <= now && now - cache.checked_at < 24 * 60 * 60 {
+                        if let Ok(release) = ReleaseVersion::parse(&cache.tag) {
+                            return Ok(release);
+                        }
+                    }
+                }
+            }
+        }
+        let release = self.latest().await?;
+        if let Some(parent) = path.parent() {
+            let write = || -> Result<()> {
+                let mut file = tempfile::NamedTempFile::new_in(parent)?;
+                serde_json::to_writer(
+                    &mut file,
+                    &CachedRelease {
+                        checked_at: now,
+                        tag: release.tag.clone(),
+                    },
+                )?;
+                file.persist(path).map_err(|e| e.error)?;
+                Ok(())
+            };
+            let _ = write();
+        }
+        Ok(release)
+    }
+
     fn endpoint(&self, origin: &Url, path: &str) -> Result<Url> {
         origin
             .join(path)
@@ -114,7 +202,13 @@ impl ReleaseClient {
     }
 
     async fn small_file(&self, url: Url, limit: usize) -> Result<Vec<u8>> {
-        let mut response = self.client.get(url).send().await?.error_for_status()?;
+        let mut response = self
+            .client
+            .get(url)
+            .timeout(self.metadata_timeout)
+            .send()
+            .await?
+            .error_for_status()?;
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await? {
             if body.len() + chunk.len() > limit {
@@ -132,6 +226,15 @@ impl ReleaseClient {
         release: &ReleaseVersion,
         dir: &Path,
     ) -> Result<std::path::PathBuf> {
+        self.download_with_progress(release, dir, |_, _| {}).await
+    }
+
+    pub async fn download_with_progress(
+        &self,
+        release: &ReleaseVersion,
+        dir: &Path,
+        mut progress: impl FnMut(u64, Option<u64>),
+    ) -> Result<std::path::PathBuf> {
         let target = platform_target()?;
         let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
         let asset = format!("loop-{target}.{ext}");
@@ -147,6 +250,7 @@ impl ReleaseClient {
         let archive = dir.join(&asset);
         let mut file = std::fs::File::create(&archive)?;
         let mut response = self.client.get(url).send().await?.error_for_status()?;
+        let total = response.content_length();
         let mut size = 0u64;
         while let Some(chunk) = response.chunk().await? {
             size += chunk.len() as u64;
@@ -154,6 +258,7 @@ impl ReleaseClient {
                 return Err(Error::Invalid("Release archive is too large".into()));
             }
             file.write_all(&chunk)?;
+            progress(size, total);
         }
         file.sync_all()?;
         drop(file);
@@ -188,7 +293,8 @@ fn extract_binary(archive: &Path, binary: &Path, target: &str) -> Result<()> {
         Ok(())
     };
     let file = std::fs::File::open(archive)?;
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
         let mut zip = zip::ZipArchive::new(file)?;
         for index in 0..zip.len() {
             let mut entry = zip.by_index(index)?;
@@ -202,7 +308,9 @@ fn extract_binary(archive: &Path, binary: &Path, target: &str) -> Result<()> {
                 copy(&mut entry, size)?;
             }
         }
-    } else {
+    }
+    #[cfg(not(windows))]
+    {
         let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
         for entry in tar.entries()? {
             let mut entry = entry?;

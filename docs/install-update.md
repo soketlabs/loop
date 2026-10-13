@@ -26,9 +26,10 @@ This applies to releases made after these changes are merged; older releases
 contain only the existing archives and checksums.
 
 The default program directory is `~/.loop/bin` (`$HOME\.loop\bin` on Windows).
-Set `LOOP_INSTALL_DIR` to use a custom directory. Keep this variable set when
-you run update, rollback or uninstall. On Windows, `-InstallDir` also selects
-the install directory; set `LOOP_INSTALL_DIR` to the same path for later commands.
+Set `LOOP_INSTALL_DIR` to use a custom directory. On Windows, `-InstallDir` also
+selects the install directory. Later commands recognize custom installs through
+the real `.loop-update` directory beside the running executable. The variable
+does not need to stay set. The default path is also recognized for legacy installs.
 The installers can add this directory to shell or user PATH. Use the option
 above to skip PATH edits.
 
@@ -48,16 +49,21 @@ published value; they are not an independent publisher signature.
 
 ## Check and update
 
-Each terminal chat startup, including `--resume`, checks the latest stable
-GitHub release in the background. A newer version produces a chat notice:
+Installer-owned terminal chat startup, including `--resume`, checks the latest
+stable GitHub release in the background. Source and package-manager launches
+skip it. A newer version produces a chat notice:
 
 ```text
 Loop 0.3.5 is available (installed: 0.3.4).
 Exit this session and run `loop update` to install it.
 ```
 
-The check has a five-second timeout. Offline and rate-limited checks are silent.
-Set `LOOP_NO_UPDATE_CHECK=1` to disable it. `--print`, MCP server mode, config,
+The check follows GitHub's latest-release redirect, without using the API quota.
+Startup caches a successful result for 24 hours in `.loop-update/update-check.json`.
+Explicit update commands always check again. Background checks have a five-second
+timeout; failed and offline checks are silent. Set `LOOP_NO_UPDATE_CHECK=1`,
+`true`, `yes` or `on` to disable them. Empty values, `0`, and `false` keep checks
+enabled. `--print`, MCP server mode, config,
 and version commands do not perform a startup check or alter their output.
 
 ```bash
@@ -72,7 +78,7 @@ Version comparisons use semantic versions. Normal updates never downgrade.
 sessions before updating. The update command ends after replacement; the next
 `loop` command starts the new binary.
 
-The updater only replaces a binary in the installer directory. Cargo installs,
+The updater only replaces an installer-owned binary. Cargo installs,
 source checkouts, and package-manager installs must use their original install
 method. For example, rebuild a source checkout with `cargo build -p loop-cli
 --release`, then use the installer with `--binary` and `--checksum`.
@@ -90,7 +96,10 @@ the current and saved binary hashes and checks that the saved binary runs.
 Rollback also saves the outgoing binary, so a second rollback can undo it when
 both versions contain the update commands. If you restore an older release
 without these commands, use the installer to install a newer release again.
-Re-running either installer also records the previous binary in this format.
+Re-running either installer also records a usable previous binary in this format.
+If the old binary cannot run, the installer repairs it after checking the new
+binary and removes the unusable rollback record. A failed final check restores
+the previous working binary when one is available.
 
 Rollback changes only the binary. This work does not change settings or session
 schemas. Future data migrations must define compatibility and recovery before
@@ -98,7 +107,10 @@ they are included in updates.
 
 An atomic directory lock at `bin/.loop-update/operation.lock` prevents concurrent
 install, update, rollback and uninstall operations. A hard crash can leave this
-lock behind. Confirm that no such operation is running, then remove this empty
+lock behind. Downloads do not hold the lock. Ctrl-C, SIGHUP and SIGTERM cancel
+the Rust update operation and clean up staging files and locks; Ctrl-C applies
+on Windows. An uncatchable kill or power loss can leave the lock behind.
+Confirm that no such operation is running, then remove this empty
 lock directory and retry. Do not remove it during an active operation.
 
 A failed download or preflight leaves the current binary intact. An interruption
@@ -123,14 +135,17 @@ directory can hold other commands; remove them manually if no longer needed.
 
 `cargo test -p loop-update --locked` runs a local release fixture and checks:
 
-- Bash or PowerShell installation of a checked local binary.
+- Bash or PowerShell installation and repair of a broken binary.
 - Release lookup and checked archive download.
 - Rejection of missing and incorrect checksums.
 - Replacement of a running executable and version validation.
 - Checked rollback, including rejection of a damaged backup.
 - Operation locking and rejection of invalid candidate binaries.
+- Cancellation during a stalled download and while holding a lock (Unix signals).
+- Redirect lookup and reuse, expiration and repair of the startup cache.
 - Uninstall with settings, credentials, skills and sessions preserved.
 
-CI runs these tests on Linux, macOS and Windows. Platform support should be
+CI runs these tests on Linux, macOS and Windows, with both PowerShell 7 and
+Windows PowerShell 5.1 on Windows. Platform support should be
 confirmed from that run before release; local macOS results do not establish
 Linux or Windows success.

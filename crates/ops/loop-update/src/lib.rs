@@ -1,9 +1,11 @@
 //! Distribution operations. This crate depends on no runtime or surface crate.
 //! User configuration and sessions are deliberately outside its ownership.
 
+mod control;
 mod install;
 mod release;
 
+pub use control::{cancellable, plan, update_check_disabled, UpdatePlan};
 pub use install::{default_install_dir, Installation};
 pub use release::{is_newer, platform_target, ReleaseClient, ReleaseVersion};
 
@@ -19,6 +21,9 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Version(#[from] semver::Error),
+    #[error("Update cancelled; current binary kept")]
+    Cancelled,
+    #[cfg(windows)]
     #[error(transparent)]
     Zip(#[from] zip::result::ZipError),
 }

@@ -36,11 +36,22 @@ function Get-Sha256([string]$Path) {
 }
 function Add-LoopToPath {
     if ($NoModifyPath) { return }
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if ($InstallDir -notin ($userPath -split ';')) {
-        [Environment]::SetEnvironmentVariable('Path', ($InstallDir + ';' + $userPath), 'User')
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+    try {
+        $userPath = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($InstallDir -notin ($userPath -split ';')) {
+            $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+            if ('Path' -in $key.GetValueNames()) { $kind = $key.GetValueKind('Path') }
+            $value = $InstallDir
+            if ($userPath) { $value += ';' + $userPath }
+            $key.SetValue('Path', $value, $kind)
+            [UIntPtr]$result = [UIntPtr]::Zero
+            [Soket.LoopInstallLock]::SendMessageTimeoutW([IntPtr]0xffff, 0x1a, [UIntPtr]::Zero, 'Environment', 2, 1000, [ref]$result) | Out-Null
+        }
+    } finally { $key.Dispose() }
+    if ($InstallDir -notin ($env:Path -split ';')) {
+        $env:Path = if ($env:Path) { "$InstallDir;$env:Path" } else { $InstallDir }
     }
-    if ($InstallDir -notin ($env:Path -split ';')) { $env:Path = "$InstallDir;$env:Path" }
 }
 
 try {
@@ -63,6 +74,8 @@ try {
 [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
 [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
 public static extern bool CreateDirectoryW(string path, System.IntPtr attributes);
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+public static extern System.IntPtr SendMessageTimeoutW(System.IntPtr window, uint message, System.UIntPtr wParam, string lParam, uint flags, uint timeout, out System.UIntPtr result);
 '@
     }
     if (-not [Soket.LoopInstallLock]::CreateDirectoryW($lockDir, [IntPtr]::Zero)) {
@@ -70,6 +83,10 @@ public static extern bool CreateDirectoryW(string path, System.IntPtr attributes
         throw "Cannot acquire installation lock (Windows error $code). If a prior operation crashed, remove $lockDir only after confirming no installer or updater is running."
     }
     $lockHeld = $true
+    # Locked executables cannot be removed until their process exits. Retry
+    # retirement cleanup on each later installer/update operation.
+    Get-ChildItem -LiteralPath $stateDir -Filter 'retired-*.exe' -File |
+        Remove-Item -Force -ErrorAction SilentlyContinue
     $stageDir = Join-Path $stateDir ('stage-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $stageDir | Out-Null
     $candidate = Join-Path $stageDir 'loop.exe'
@@ -96,7 +113,9 @@ public static extern bool CreateDirectoryW(string path, System.IntPtr attributes
         }
         if ((Test-Path -LiteralPath $destination) -and -not $Force) {
             Assert-Regular $destination
-            if ((Get-LoopVersion $destination) -eq $Version) {
+            $installedVersion = $null
+            try { $installedVersion = Get-LoopVersion $destination } catch { }
+            if ($installedVersion -eq $Version) {
                 Write-Host "Loop $Version is already installed. Use -Force to reinstall."
                 Add-LoopToPath
                 return
@@ -132,14 +151,23 @@ public static extern bool CreateDirectoryW(string path, System.IntPtr attributes
     $retired = $null
     if (Test-Path -LiteralPath $destination) {
         Assert-Regular $destination
-        $oldVersion = Get-LoopVersion $destination
-        $oldHash = Get-Sha256 $destination
-        $backup = Join-Path $stateDir "previous-$oldHash.exe"
-        Copy-Item -LiteralPath $destination -Destination $backup -Force
         if (Test-Path -LiteralPath $recordPath) { $savedRecord = [IO.File]::ReadAllBytes($recordPath) }
-        $record = @{ schema = 1; current_sha256 = (Get-Sha256 $candidate); previous_sha256 = $oldHash; previous_version = $oldVersion }
-        $record | ConvertTo-Json -Compress | Set-Content -LiteralPath "$recordPath.new" -Encoding ascii
-        Move-Item -LiteralPath "$recordPath.new" -Destination $recordPath -Force
+        $oldVersion = $null
+        try { $oldVersion = Get-LoopVersion $destination } catch { }
+        if ($oldVersion) {
+            $oldHash = Get-Sha256 $destination
+            $backup = Join-Path $stateDir "previous-$oldHash.exe"
+            if (Test-Path -LiteralPath $backup) {
+                Assert-Regular $backup
+                if ((Get-Sha256 $backup) -ne $oldHash) { throw 'Previous binary checksum mismatch' }
+            } else { Copy-Item -LiteralPath $destination -Destination $backup }
+            $record = @{ schema = 1; current_sha256 = (Get-Sha256 $candidate); previous_sha256 = $oldHash; previous_version = $oldVersion }
+            $record | ConvertTo-Json -Compress | Set-Content -LiteralPath "$recordPath.new" -Encoding ascii
+            Move-Item -LiteralPath "$recordPath.new" -Destination $recordPath -Force
+        } else {
+            Write-Warning 'Repairing an unusable installation; no rollback record will be created'
+            if (Test-Path -LiteralPath $recordPath) { Remove-Item -LiteralPath $recordPath -Force }
+        }
         $retired = Join-Path $stateDir ('retired-' + [Guid]::NewGuid().ToString('N') + '.exe')
         try { Move-Item -LiteralPath $destination -Destination $retired } catch {
             if ($savedRecord) { [IO.File]::WriteAllBytes($recordPath, $savedRecord) }

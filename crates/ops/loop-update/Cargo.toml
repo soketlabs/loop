@@ -14,12 +14,19 @@ serde_json.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-sha2 = "0.10"
-semver = "1"
-self-replace = "1.5"
-flate2 = "1"
-tar = "0.4"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2.workspace = true
+semver.workspace = true
+self-replace.workspace = true
+percent-encoding.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+zip.workspace = true
+# Enable the Rust backend for zip's optional flate2 reader.
+flate2.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+flate2.workspace = true
+tar.workspace = true
 
 [[test]]
 name = "lifecycle"

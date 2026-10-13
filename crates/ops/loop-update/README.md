@@ -3,8 +3,10 @@
 Distribution operations for Loop. This operations crate depends on no runtime
 or surface crate. The CLI displays notices and invokes the public operations.
 
-- `ReleaseClient`: stable release lookup, checked download and bounded extraction.
+- `ReleaseClient`: redirect lookup, startup cache, checked download and bounded extraction.
 - `Installation`: operation lock, binary preflight, replacement, rollback and uninstall.
+- `plan`: tested version, reinstall and downgrade decisions.
+- `cancellable`: ordinary signal handling with guard cleanup.
 - `Error`: typed failures, including checksum and version errors.
 
 The installation owns only its executable and reserved `.loop-update/` folder.

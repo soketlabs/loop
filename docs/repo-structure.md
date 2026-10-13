@@ -9,11 +9,10 @@ It exposes operations and typed errors. It does not depend on the agent,
 app-core, protocol or CLI. The CLI owns commands and the visible update notice.
 Settings and session files remain owned by their current crates.
 
-The workspace's `default-members` now includes all existing non-desktop crates
-and the updater. A plain build skips desktop. Desktop remains at its current
-path and can still be built with `cargo build -p loop-desktop` and its required
-nightly toolchain. Cargo can still resolve workspace dependencies, including
-desktop dependencies, when the lockfile is updated.
+The change to workspace default members is reviewed separately. This updater
+change keeps the existing default build selection. Desktop remains at its
+current path and can still be built with `cargo build -p loop-desktop` and its
+required nightly toolchain.
 
 Existing crate paths and names are retained in this step. Later P0 work can
 define and extract the protocol and policy interfaces. Config, session, tools,

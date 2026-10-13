@@ -50,7 +50,7 @@ On native Windows, run the PowerShell installer from a clone:
 .\install.ps1 -Version 0.3.4 -NoModifyPath
 ```
 
-When you open the terminal chat, Loop checks GitHub in the background. If a newer
+For installer-owned binaries, opening the terminal chat checks GitHub in the background. If a newer
 release is available, it shows a notice with the `loop update` command. It does
 not install updates at startup. Offline checks do not block the chat.
 

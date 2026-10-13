@@ -32,30 +32,44 @@ async fn main() {
             return;
         }
         Some("--update") => {
-            async {
-                let installation = Installation::at(std::env::current_exe()?)?;
-                let dir = installation.staging()?;
+            loop_update::cancellable(async {
+                Installation::managed_executable()?;
+                let dir = tempfile::Builder::new()
+                    .prefix("stage-download-")
+                    .tempdir_in(std::env::current_exe()?.parent().unwrap())?;
                 let client = ReleaseClient::new(&args[2], &args[2], Duration::from_secs(5))?;
                 let release = client.latest().await?;
                 let candidate = client.download(&release, dir.path()).await?;
+                let installation = Installation::current()?;
                 installation
                     .install(&candidate, &release.version.to_string())
                     .await
-            }
+            })
+            .await
+        }
+        Some("--hold-lock") => {
+            loop_update::cancellable(async {
+                let installation = Installation::current()?;
+                let stage = installation.staging()?;
+                fs::write(
+                    installation.executable().parent().unwrap().join("ready"),
+                    "ready",
+                )?;
+                std::future::pending::<()>().await;
+                drop(stage);
+                drop(installation);
+                Ok(())
+            })
             .await
         }
         Some("--rollback") => {
             async {
-                Installation::at(std::env::current_exe()?)?
-                    .rollback()
-                    .await?;
+                Installation::current()?.rollback().await?;
                 Ok(())
             }
             .await
         }
-        Some("--uninstall") => {
-            Installation::at(std::env::current_exe().unwrap()).and_then(Installation::uninstall)
-        }
+        Some("--uninstall") => Installation::current().and_then(Installation::uninstall),
         _ => {
             run_lifecycle().await;
             return;
@@ -67,9 +81,17 @@ async fn main() {
     }
 }
 
+#[derive(Clone)]
+struct Reply {
+    body: Vec<u8>,
+    location: Option<String>,
+    stalled: bool,
+}
+
 struct Server {
     url: String,
-    bodies: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    bodies: Arc<Mutex<HashMap<String, Reply>>>,
+    requests: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -78,11 +100,13 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
-        let bodies = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
+        let bodies = Arc::new(Mutex::new(HashMap::<String, Reply>::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let thread = {
             let bodies = bodies.clone();
             let stop = stop.clone();
+            let requests = requests.clone();
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match listener.accept() {
@@ -101,16 +125,31 @@ impl Server {
                             }
                             let request = String::from_utf8_lossy(&request);
                             let path = request.split_whitespace().nth(1).unwrap_or("");
-                            let body = bodies.lock().unwrap().get(path).cloned();
-                            let status = if body.is_some() {
-                                "200 OK"
-                            } else {
-                                "404 Not Found"
+                            requests.lock().unwrap().push(path.into());
+                            let reply = bodies.lock().unwrap().get(path).cloned();
+                            let status = match &reply {
+                                Some(r) if r.location.is_some() => "302 Found",
+                                Some(_) => "200 OK",
+                                None => "404 Not Found",
                             };
-                            let body = body.unwrap_or_default();
-                            let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
-                            if let Err(error) = stream.write_all(&body) {
-                                eprintln!("Fixture response {path}: {error}");
+                            let reply = reply.unwrap_or(Reply {
+                                body: Vec::new(),
+                                location: None,
+                                stalled: false,
+                            });
+                            if reply.stalled {
+                                while !stop.load(Ordering::Relaxed) {
+                                    std::thread::sleep(Duration::from_millis(10));
+                                }
+                                continue;
+                            }
+                            let location = reply
+                                .location
+                                .map(|s| format!("Location: {s}\r\n"))
+                                .unwrap_or_default();
+                            let _ = write!(stream, "HTTP/1.1 {status}\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n", reply.body.len());
+                            if !request.starts_with("HEAD ") {
+                                let _ = stream.write_all(&reply.body);
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -124,12 +163,43 @@ impl Server {
         Self {
             url,
             bodies,
+            requests,
             stop,
             thread: Some(thread),
         }
     }
     fn set(&self, path: &str, body: Vec<u8>) {
-        self.bodies.lock().unwrap().insert(path.into(), body);
+        self.bodies.lock().unwrap().insert(
+            path.into(),
+            Reply {
+                body,
+                location: None,
+                stalled: false,
+            },
+        );
+    }
+    fn redirect(&self, path: &str, location: &str) {
+        self.bodies.lock().unwrap().insert(
+            path.into(),
+            Reply {
+                body: Vec::new(),
+                location: Some(location.into()),
+                stalled: false,
+            },
+        );
+    }
+    fn stall(&self, path: &str) {
+        self.bodies.lock().unwrap().insert(
+            path.into(),
+            Reply {
+                body: Vec::new(),
+                location: None,
+                stalled: true,
+            },
+        );
+    }
+    fn request_count(&self) -> usize {
+        self.requests.lock().unwrap().len()
     }
 }
 impl Drop for Server {
@@ -183,7 +253,8 @@ fn fixture(dir: &Path, version: &str) -> PathBuf {
 fn archive(binary: &Path) -> (String, Vec<u8>) {
     let target = loop_update::platform_target().unwrap();
     let member = format!("loop-{target}/loop{}", std::env::consts::EXE_SUFFIX);
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         zip.start_file(member, zip::write::SimpleFileOptions::default())
             .unwrap();
@@ -192,7 +263,9 @@ fn archive(binary: &Path) -> (String, Vec<u8>) {
             format!("loop-{target}.zip"),
             zip.finish().unwrap().into_inner(),
         )
-    } else {
+    }
+    #[cfg(not(windows))]
+    {
         let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         let mut tar = tar::Builder::new(gzip);
         tar.append_path_with_name(binary, member).unwrap();
@@ -200,6 +273,31 @@ fn archive(binary: &Path) -> (String, Vec<u8>) {
             format!("loop-{target}.tar.gz"),
             tar.into_inner().unwrap().finish().unwrap(),
         )
+    }
+}
+
+fn installer_command(repo: &Path, bin: &Path, binary: &Path, hash: &str) -> Command {
+    if cfg!(windows) {
+        let shell = std::env::var("LOOP_TEST_POWERSHELL").unwrap_or_else(|_| "pwsh".into());
+        let mut command = Command::new(shell);
+        command
+            .args(["-NoProfile", "-File"])
+            .arg(repo.join("install.ps1"))
+            .arg("-InstallDir")
+            .arg(bin)
+            .arg("-Binary")
+            .arg(binary)
+            .args(["-Checksum", hash, "-NoModifyPath"]);
+        command
+    } else {
+        let mut command = Command::new("bash");
+        command
+            .arg(repo.join("install.sh"))
+            .arg("--binary")
+            .arg(binary)
+            .args(["--checksum", hash, "--no-modify-path"])
+            .env("LOOP_INSTALL_DIR", bin);
+        command
     }
 }
 
@@ -225,25 +323,7 @@ async fn run_lifecycle() {
     let exe = bin.join(format!("loop{}", std::env::consts::EXE_SUFFIX));
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let hash = loop_update::sha256_file(&v1).unwrap();
-    let mut installer = if cfg!(windows) {
-        let mut c = Command::new("pwsh");
-        c.args(["-NoProfile", "-File"])
-            .arg(repo.join("install.ps1"))
-            .arg("-InstallDir")
-            .arg(&bin)
-            .arg("-Binary")
-            .arg(&v1)
-            .args(["-Checksum", &hash, "-NoModifyPath"]);
-        c
-    } else {
-        let mut c = Command::new("bash");
-        c.arg(repo.join("install.sh"))
-            .arg("--binary")
-            .arg(&v1)
-            .args(["--checksum", &hash, "--no-modify-path"])
-            .env("LOOP_INSTALL_DIR", &bin);
-        c
-    };
+    let mut installer = installer_command(&repo, &bin, &v1, &hash);
     let output = installer.output().unwrap();
     assert!(
         output.status.success(),
@@ -255,25 +335,7 @@ async fn run_lifecycle() {
 
     // Both installers must preserve the current binary on bad checksums.
     let bad_hash = "0".repeat(64);
-    let mut bad_installer = if cfg!(windows) {
-        let mut c = Command::new("pwsh");
-        c.args(["-NoProfile", "-File"])
-            .arg(repo.join("install.ps1"))
-            .arg("-InstallDir")
-            .arg(&bin)
-            .arg("-Binary")
-            .arg(&v2)
-            .args(["-Checksum", &bad_hash, "-NoModifyPath"]);
-        c
-    } else {
-        let mut c = Command::new("bash");
-        c.arg(repo.join("install.sh"))
-            .arg("--binary")
-            .arg(&v2)
-            .args(["--checksum", &bad_hash, "--no-modify-path"])
-            .env("LOOP_INSTALL_DIR", &bin);
-        c
-    };
+    let mut bad_installer = installer_command(&repo, &bin, &v2, &bad_hash);
     assert!(!bad_installer.output().unwrap().status.success());
     assert_eq!(loop_update::sha256_file(&exe).unwrap(), hash);
 
@@ -312,6 +374,82 @@ async fn run_lifecycle() {
         assert_eq!(loop_update::sha256_file(&exe).unwrap(), hash);
     }
 
+    // Repair a truncated installed binary even when a stale rollback record exists.
+    fs::write(&exe, "garbage executable").unwrap();
+    fs::write(bin.join(".loop-update/rollback.json"), "stale record").unwrap();
+    let output = installer_command(&repo, &bin, &v1, &hash).output().unwrap();
+    assert!(
+        output.status.success(),
+        "repair failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(loop_update::sha256_file(&exe).unwrap(), hash);
+    assert!(!bin.join(".loop-update/rollback.json").exists());
+    assert!(!bin.join(".loop-update/operation.lock").exists());
+    assert!(run(&exe, &["--version"], true).contains("0.3.4"));
+
+    // Installer records remain compatible with the Rust rollback operation.
+    let output = installer_command(&repo, &bin, &v2, &loop_update::sha256_file(&v2).unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "upgrade failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    run(&exe, &["--rollback"], true);
+    assert!(run(&exe, &["--version"], true).contains("0.3.4"));
+
+    #[cfg(unix)]
+    {
+        for signal in ["INT", "HUP", "TERM"] {
+            let ready = bin.join("ready");
+            let mut child = Command::new(&exe)
+                .arg("--hold-lock")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            for _ in 0..200 {
+                if ready.exists() {
+                    break;
+                }
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "child exited before acquiring lock"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            assert!(ready.exists());
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(Command::new("kill")
+                .args([format!("-{signal}"), child.id().to_string()])
+                .status()
+                .unwrap()
+                .success());
+            for _ in 0..200 {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            assert!(
+                child.try_wait().unwrap().is_some(),
+                "signal cleanup timed out"
+            );
+            fs::remove_file(ready).unwrap();
+            assert!(
+                !bin.join(".loop-update/operation.lock").exists(),
+                "signal {signal} left a lock"
+            );
+            assert!(!fs::read_dir(bin.join(".loop-update"))
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("stage-")));
+            assert_eq!(loop_update::sha256_file(&exe).unwrap(), hash);
+        }
+    }
+
     let server = Server::new();
     server.set(
         "/latest",
@@ -319,6 +457,69 @@ async fn run_lifecycle() {
     );
     let client = ReleaseClient::new(&server.url, &server.url, Duration::from_secs(5)).unwrap();
     assert!(loop_update::is_newer("0.3.4", &client.latest().await.unwrap()).unwrap());
+    // HEAD redirect lookup needs no API quota, and startup reuses a one-day cache.
+    server.redirect(
+        "/releases/latest",
+        &format!("{}releases/tag/v0.3.5", server.url),
+    );
+    server.set("/releases/tag/v0.3.5", Vec::new());
+    let redirect = client
+        .clone()
+        .with_latest_redirect(&format!("{}releases/latest", server.url))
+        .unwrap();
+    let cache = bin.join(".loop-update/update-check.json");
+    let before = server.request_count();
+    assert_eq!(
+        redirect
+            .latest_cached(&cache)
+            .await
+            .unwrap()
+            .version
+            .to_string(),
+        "0.3.5"
+    );
+    let checked = server.request_count();
+    assert_eq!(checked - before, 2);
+    assert_eq!(
+        redirect
+            .latest_cached(&cache)
+            .await
+            .unwrap()
+            .version
+            .to_string(),
+        "0.3.5"
+    );
+    assert_eq!(
+        server.request_count(),
+        checked,
+        "fresh cache must avoid network requests"
+    );
+    fs::write(&cache, r#"{"checked_at":0,"tag":"v0.3.4"}"#).unwrap();
+    assert_eq!(
+        redirect
+            .latest_cached(&cache)
+            .await
+            .unwrap()
+            .version
+            .to_string(),
+        "0.3.5"
+    );
+    assert_eq!(
+        server.request_count(),
+        checked + 2,
+        "stale cache must refresh"
+    );
+    fs::write(&cache, "invalid cache").unwrap();
+    assert_eq!(
+        redirect
+            .latest_cached(&cache)
+            .await
+            .unwrap()
+            .version
+            .to_string(),
+        "0.3.5"
+    );
+
     let (asset, bytes) = archive(&v2);
     let asset_path = format!("/v0.3.5/{asset}");
     let hash_path = format!("{asset_path}.sha256");
@@ -336,6 +537,53 @@ async fn run_lifecycle() {
     fs::write(&archive_file, &bytes).unwrap();
     let archive_hash = loop_update::sha256_file(&archive_file).unwrap();
     server.set(&hash_path, format!("{archive_hash}  {asset}").into_bytes());
+    #[cfg(unix)]
+    {
+        // Cancel an in-flight download. No install lock may be held, and the
+        // temporary download directory must be removed without replacing loop.
+        let slow = Server::new();
+        slow.set(
+            "/latest",
+            br#"{"tag_name":"v0.3.5","draft":false,"prerelease":false}"#.to_vec(),
+        );
+        slow.set(&hash_path, format!("{archive_hash}  {asset}").into_bytes());
+        slow.stall(&asset_path);
+        let mut child = Command::new(&exe)
+            .args(["--update", &slow.url])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        for _ in 0..200 {
+            if slow.request_count() >= 3 {
+                break;
+            }
+            assert!(child.try_wait().unwrap().is_none());
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(slow.request_count(), 3);
+        assert!(
+            !bin.join(".loop-update/operation.lock").exists(),
+            "download must not hold installation lock"
+        );
+        assert!(Command::new("kill")
+            .args(["-INT".into(), child.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        for _ in 0..200 {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(!fs::read_dir(&bin).unwrap().flatten().any(|e| e
+            .file_name()
+            .to_string_lossy()
+            .starts_with("stage-download-")));
+        assert_eq!(loop_update::sha256_file(&exe).unwrap(), hash);
+    }
     run(&exe, &["--update", &server.url], true);
     assert!(run(&exe, &["--version"], true).contains("0.3.5"));
     assert_eq!(
@@ -354,7 +602,9 @@ async fn run_lifecycle() {
     run(&exe, &["--rollback"], true);
     assert!(run(&exe, &["--version"], true).contains("0.3.4"));
 
+    fs::write(bin.join(".loop-update/retired-fixture.exe"), "retired").unwrap();
     let installation = Installation::at(exe.clone()).unwrap();
+    assert!(!bin.join(".loop-update/retired-fixture.exe").exists());
     assert!(
         Installation::at(exe.clone()).is_err(),
         "operations must be serialized"

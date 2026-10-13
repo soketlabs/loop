@@ -123,39 +123,56 @@ async fn real_main() -> anyhow::Result<()> {
                 version,
                 force,
             } => {
+                // Establish ownership before network traffic. The download has
+                // no installation lock; replacement rechecks ownership later.
+                loop_update::Installation::managed_executable()?;
+                loop_update::cancellable(async {
                 let client =
                     loop_update::ReleaseClient::github(std::time::Duration::from_secs(300))?;
                 let release = match version {
                     Some(value) => loop_update::ReleaseVersion::parse(value)?,
-                    None => client.latest().await?,
+                    None => { eprintln!("Checking GitHub for the latest release..."); client.latest().await? },
                 };
                 let current = env!("CARGO_PKG_VERSION");
                 println!("Installed: {current}\nAvailable: {}", release.version);
-                let newer = loop_update::is_newer(current, &release)?;
                 if *check {
-                    if newer {
+                    if loop_update::is_newer(current, &release)? {
                         println!("Run `loop update` to install the new release.");
                     }
                     return Ok(());
                 }
-                if !newer && !force {
-                    if release.version.to_string() == current {
+                match loop_update::plan(current, &release, *force)? {
+                    loop_update::UpdatePlan::UpToDate => {
                         println!("Loop is up to date.");
                         return Ok(());
-                    }
-                    anyhow::bail!("Use --force for an explicit downgrade, or `loop rollback` to restore the previous binary");
+                    },
+                    loop_update::UpdatePlan::DowngradeBlocked => return Err(loop_update::Error::Invalid("Use --force for an explicit downgrade, or `loop rollback` to restore the previous binary".into())),
+                    loop_update::UpdatePlan::Install => (),
                 }
+                let staging = tempfile::Builder::new().prefix("loop-update-").tempdir()?;
+                eprintln!("Downloading Loop {}...", release.version);
+                let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                let binary = client.download_with_progress(&release, staging.path(), |bytes, total| {
+                    if last.elapsed() >= std::time::Duration::from_secs(1) || total == Some(bytes) {
+                        eprintln!("Downloaded {} KiB{}", bytes / 1024, total.map(|n| format!(" / {} KiB", n / 1024)).unwrap_or_default());
+                        last = std::time::Instant::now();
+                    }
+                }).await?;
+                eprintln!("Verifying and replacing the installed binary...");
                 let installation = loop_update::Installation::current()?;
-                let staging = installation.staging()?;
-                let binary = client.download(&release, staging.path()).await?;
                 installation
                     .install(&binary, &release.version.to_string())
                     .await?;
                 println!("Installed Loop {}. Run `loop` to start it, or `loop rollback` to restore the previous binary.", release.version);
+                Ok(())
+                }).await?;
                 return Ok(());
             }
             Commands::Rollback => {
-                let version = loop_update::Installation::current()?.rollback().await?;
+                let version = loop_update::cancellable(async {
+                    loop_update::Installation::current()?.rollback().await
+                })
+                .await?;
                 println!("Restored Loop {version}. Run `loop` to start it.");
                 return Ok(());
             }

@@ -292,29 +292,34 @@ place_binary() {
     STAGED_PATH="$staged"
     cp "$src" "$staged"
     chmod 755 "$staged"
-    candidate_version=$(installed_version_of "$staged")
+    candidate_version=$(installed_version_of "$staged") || die "Staged binary failed its version check; current binary kept"
     [[ "$candidate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.-]+)?$ ]] || die "Staged binary failed its version check; current binary kept"
     if [ -n "${tag:-}" ]; then
         [ "$candidate_version" = "${tag#v}" ] || die "Staged binary version does not match ${tag}; current binary kept"
     fi
     new_hash=$(sha256_of "$staged") || die "Cannot verify staged binary"
+    backup=""
+    [ ! -L "$STATE_DIR/rollback.json" ] && [ ! -L "$STATE_DIR/rollback.json.new" ] && [ ! -L "$STATE_DIR/rollback.json.saved" ] || die "Rollback records must not be symlinks"
+    [ ! -f "$STATE_DIR/rollback.json" ] || cp "$STATE_DIR/rollback.json" "$STATE_DIR/rollback.json.saved"
     if [ -f "$dest" ]; then
         [ ! -L "$dest" ] || die "Refusing to replace a symlink"
-        old_hash=$(sha256_of "$dest") || die "Cannot verify previous binary"
-        old_version=$(installed_version_of "$dest")
-        [[ "$old_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.-]+)?$ ]] || die "Installed binary failed its version check; current binary kept"
-        backup="$STATE_DIR/previous-${old_hash}"
-        [ "$OS" != windows ] || backup="${backup}.exe"
-        if [ -e "$backup" ] || [ -L "$backup" ]; then
-            [ -f "$backup" ] && [ ! -L "$backup" ] || die "Previous binary must be a regular file"
-            [ "$(sha256_of "$backup")" = "$old_hash" ] || die "Previous binary checksum mismatch"
+        old_version=$(installed_version_of "$dest") || old_version=""
+        if [[ "$old_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.-]+)?$ ]]; then
+            old_hash=$(sha256_of "$dest") || die "Cannot verify previous binary"
+            backup="$STATE_DIR/previous-${old_hash}"
+            [ "$OS" != windows ] || backup="${backup}.exe"
+            if [ -e "$backup" ] || [ -L "$backup" ]; then
+                [ -f "$backup" ] && [ ! -L "$backup" ] || die "Previous binary must be a regular file"
+                [ "$(sha256_of "$backup")" = "$old_hash" ] || die "Previous binary checksum mismatch"
+            else
+                cp "$dest" "$backup"
+            fi
+            printf '{"schema":1,"current_sha256":"%s","previous_sha256":"%s","previous_version":"%s"}\n' "$new_hash" "$old_hash" "$old_version" > "$STATE_DIR/rollback.json.new"
+            mv -f "$STATE_DIR/rollback.json.new" "$STATE_DIR/rollback.json"
         else
-            cp "$dest" "$backup"
+            warn "Repairing an unusable installation; no rollback record will be created"
+            rm -f "$STATE_DIR/rollback.json"
         fi
-        [ ! -L "$STATE_DIR/rollback.json" ] && [ ! -L "$STATE_DIR/rollback.json.new" ] && [ ! -L "$STATE_DIR/rollback.json.saved" ] || die "Rollback records must not be symlinks"
-        printf '{"schema":1,"current_sha256":"%s","previous_sha256":"%s","previous_version":"%s"}\n' "$new_hash" "$old_hash" "$old_version" > "$STATE_DIR/rollback.json.new"
-        [ ! -f "$STATE_DIR/rollback.json" ] || cp "$STATE_DIR/rollback.json" "$STATE_DIR/rollback.json.saved"
-        mv -f "$STATE_DIR/rollback.json.new" "$STATE_DIR/rollback.json"
     fi
     if ! mv -f "$staged" "$dest"; then
         if [ -f "$STATE_DIR/rollback.json.saved" ]; then
@@ -323,6 +328,21 @@ place_binary() {
             rm -f "$STATE_DIR/rollback.json"
         fi
         die "Cannot replace binary; close running Loop processes and retry"
+    fi
+    local installed
+    if ! installed=$(installed_version_of "$dest") || [ "$installed" != "$candidate_version" ]; then
+        if [ -n "$backup" ]; then
+            cp "$backup" "$staged"
+            chmod 755 "$staged"
+            mv -f "$staged" "$dest"
+            if [ -f "$STATE_DIR/rollback.json.saved" ]; then
+                mv -f "$STATE_DIR/rollback.json.saved" "$STATE_DIR/rollback.json"
+            else
+                rm -f "$STATE_DIR/rollback.json"
+            fi
+            die "Installed binary failed its final check; previous binary restored from $backup"
+        fi
+        die "Installed binary failed its final check; rerun the installer to restore a checked release"
     fi
     rm -f "$STATE_DIR/rollback.json.saved"
     STAGED_PATH=""
@@ -345,11 +365,7 @@ download_and_install() {
     local start=$SECONDS
 
     archive_name="${APP}-${TARGET}.${EXT}"
-    if [ -n "$tag" ]; then
-        url="${RELEASES_URL}/download/${tag}/${archive_name}"
-    else
-        url="${RELEASES_URL}/latest/download/${archive_name}"
-    fi
+    url="${RELEASES_URL}/download/${tag}/${archive_name}"
     checksum_url="${url}.sha256"
 
     TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/loop_install.XXXXXX")
@@ -517,7 +533,7 @@ LOCK_HELD=true
 dest_bin="$INSTALL_DIR/$BIN_NAME"
 [ ! -L "$dest_bin" ] || die "Refusing to replace a symlink"
 if [ -e "$dest_bin" ]; then [ -f "$dest_bin" ] || die "Install destination is not a regular file"; fi
-current="$(installed_version_of "$dest_bin")"
+current="$(installed_version_of "$dest_bin")" || current=""
 [ -z "$current" ] || info "    currently installed: ${current}"
 
 if [ -n "$binary_path" ]; then
@@ -535,12 +551,11 @@ else
         if [ -n "$tag" ]; then
             ok "Latest release is ${tag}"
         else
-        die "Could not resolve a release version; retry or use --version"
+            die "Could not resolve a release version; retry or use --version"
         fi
     fi
     label="${tag#v}"
     [[ "$label" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.-]+)?$ ]] || die "Invalid release version"
-    [ -n "$label" ] || label="latest"
 
     if [ -n "$tag" ] && [ "$current" = "${tag#v}" ] && [ "$force" != "true" ]; then
         ok "Already up to date (${current}); use --force to reinstall"
@@ -557,13 +572,6 @@ configure_path
 if [ -n "${GITHUB_ACTIONS-}" ] && [ "${GITHUB_ACTIONS}" = "true" ] && [ -n "${GITHUB_PATH-}" ]; then
     echo "$INSTALL_DIR" >> "$GITHUB_PATH"
     ok "Added ${INSTALL_DIR} to \$GITHUB_PATH"
-fi
-
-# Prove the binary actually runs here (catches glibc/musl or arch mismatches).
-if out=$("$dest_bin" --version 2>&1 | head -n 1); then
-    ok "Sanity check: ${out}"
-else
-    die "Installed binary did not run cleanly; use loop rollback"
 fi
 
 print_done "$label"

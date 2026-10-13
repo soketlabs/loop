@@ -24,12 +24,14 @@ pub fn default_install_dir() -> Result<PathBuf> {
 pub struct Installation {
     executable: PathBuf,
     state_dir: PathBuf,
-    lock_dir: PathBuf,
+    lock_dir: Option<PathBuf>,
 }
 
 impl Drop for Installation {
     fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.lock_dir);
+        if let Some(path) = self.lock_dir.take() {
+            let _ = fs::remove_dir(path);
+        }
     }
 }
 
@@ -56,23 +58,44 @@ fn valid_hash(hash: &str) -> bool {
 }
 
 impl Installation {
-    /// Accept only the installer location. Cargo/package-manager installs must
-    /// be updated by their owner rather than overwritten by this command.
-    pub fn current() -> Result<Self> {
+    /// Check ownership without taking a lock or creating state. A real marker
+    /// supports custom directories without a persistent environment variable.
+    pub fn is_managed() -> bool {
+        Self::managed_executable().is_ok()
+    }
+
+    pub fn managed_executable() -> Result<PathBuf> {
         let executable = std::env::current_exe()?;
         let dir = default_install_dir()?;
         let expected = dir.join(if cfg!(windows) { "loop.exe" } else { "loop" });
-        regular(&expected).map_err(|_| {
-            Error::Invalid(
-                "Installer binary is missing or is a symlink; use install.sh/install.ps1".into(),
-            )
-        })?;
-        if fs::canonicalize(&executable)? != fs::canonicalize(&expected).map_err(|_| {
-            Error::Invalid("This binary is not in the installer directory. Use its package manager or install.sh/install.ps1".into())
-        })? {
-            return Err(Error::Invalid("This binary is not in the installer directory. Use its package manager or install.sh/install.ps1".into()));
+        if !managed_at(&executable, &expected) {
+            return Err(Error::Invalid(format!(
+                "Cannot self-update {}: no installer ownership marker (.loop-update/). Use its package manager or install.sh/install.ps1. LOOP_INSTALL_DIR currently resolves to {}",
+                executable.display(), dir.display()
+            )));
         }
-        Self::at(executable)
+        Ok(executable)
+    }
+
+    pub fn current() -> Result<Self> {
+        Self::at(Self::managed_executable()?)
+    }
+
+    pub fn notification_cache_path() -> Result<PathBuf> {
+        let executable = Self::managed_executable()?;
+        let state = executable
+            .parent()
+            .ok_or_else(|| Error::Invalid("Missing install directory".into()))?
+            .join(".loop-update");
+        if !state.exists() {
+            fs::create_dir(&state)?;
+        }
+        if !fs::symlink_metadata(&state)?.file_type().is_dir() {
+            return Err(Error::Invalid(
+                "Update marker must be a real directory".into(),
+            ));
+        }
+        Ok(state.join("update-check.json"))
     }
 
     /// Acquire the installation lock. The caller must establish ownership of
@@ -99,11 +122,13 @@ impl Installation {
                 Error::Invalid("Another installation operation is running. If it crashed, remove .loop-update/operation.lock after checking that no installer or updater is running".into())
             } else { e.into() }
         })?;
-        Ok(Self {
+        let installation = Self {
             executable,
             state_dir,
-            lock_dir,
-        })
+            lock_dir: Some(lock_dir),
+        };
+        installation.prune_retired();
+        Ok(installation)
     }
 
     pub fn staging(&self) -> Result<tempfile::TempDir> {
@@ -120,6 +145,18 @@ impl Installation {
         self.executable
             .parent()
             .ok_or_else(|| Error::Invalid("Missing installation directory".into()))
+    }
+
+    fn prune_retired(&self) {
+        if let Ok(entries) = fs::read_dir(&self.state_dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with("retired-")
+                    && entry.path().extension().is_some_and(|ext| ext == "exe")
+                {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 
     /// Validate the candidate before any replacement. Save a checked previous
@@ -255,19 +292,60 @@ impl Installation {
         Ok(record.previous_version)
     }
 
-    pub fn uninstall(self) -> Result<()> {
+    pub fn uninstall(mut self) -> Result<()> {
         regular(&self.executable)?;
         if fs::canonicalize(std::env::current_exe()?)? == fs::canonicalize(&self.executable)? {
             self_replace::self_delete()?;
         } else {
             fs::remove_file(&self.executable)?;
         }
-        // Drop the file lock before removing the state directory on Windows.
-        let state_dir = self.state_dir.clone();
-        drop(self);
-        fs::remove_dir_all(state_dir)?;
+        // Keep the mkdir lock until every other entry has been removed. A
+        // recursive deletion of the whole directory could delete the lock first.
+        for entry in fs::read_dir(&self.state_dir)? {
+            let entry = entry?;
+            if self.lock_dir.as_ref() == Some(&entry.path()) {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        if let Some(lock) = self.lock_dir.take() {
+            fs::remove_dir(lock)?;
+        }
+        // A new installer may start now. Never recursively delete its files.
+        match fs::remove_dir(&self.state_dir) {
+            Ok(()) => (),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(e) => return Err(e.into()),
+        }
         Ok(())
     }
+}
+
+fn managed_at(executable: &Path, default: &Path) -> bool {
+    if regular(executable).is_err()
+        || executable.file_name()
+            != Some(std::ffi::OsStr::new(if cfg!(windows) {
+                "loop.exe"
+            } else {
+                "loop"
+            }))
+    {
+        return false;
+    }
+    let marker = executable.parent().map(|p| p.join(".loop-update"));
+    let has_marker =
+        marker.is_some_and(|p| fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir()));
+    has_marker
+        || (regular(default).is_ok()
+            && fs::canonicalize(executable).ok() == fs::canonicalize(default).ok())
 }
 
 async fn binary_version(path: &Path) -> Result<String> {
@@ -289,4 +367,38 @@ async fn binary_version(path: &Path) -> Result<String> {
         ));
     }
     Ok(version.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ownership_is_lock_free_and_supports_custom_installs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp
+            .path()
+            .join(if cfg!(windows) { "loop.exe" } else { "loop" });
+        let default = tmp.path().join("other/loop");
+        fs::write(&exe, "fixture").unwrap();
+        assert!(!managed_at(&exe, &default));
+        fs::create_dir(tmp.path().join(".loop-update")).unwrap();
+        assert!(managed_at(&exe, &default));
+        assert!(!tmp.path().join(".loop-update/operation.lock").exists());
+        assert!(
+            managed_at(&exe, &exe),
+            "legacy default location remains managed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_markers_do_not_establish_ownership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("loop");
+        fs::write(&exe, "fixture").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join(".loop-update")).unwrap();
+        assert!(!managed_at(&exe, &tmp.path().join("other")));
+    }
 }
