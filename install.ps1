@@ -56,8 +56,19 @@ try {
             throw 'Update state directory must be a real directory'
         }
     } else { New-Item -ItemType Directory -Path $stateDir | Out-Null }
-    # Directory creation is atomic and matches the Rust and Bash locks.
-    New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop | Out-Null
+    # CreateDirectoryW fails if the directory exists. Directory.CreateDirectory
+    # and New-Item's existence check cannot establish exclusive ownership.
+    if (-not ('Soket.LoopInstallLock' -as [type])) {
+        Add-Type -Namespace Soket -Name LoopInstallLock -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+[return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+public static extern bool CreateDirectoryW(string path, System.IntPtr attributes);
+'@
+    }
+    if (-not [Soket.LoopInstallLock]::CreateDirectoryW($lockDir, [IntPtr]::Zero)) {
+        $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Cannot acquire installation lock (Windows error $code). If a prior operation crashed, remove $lockDir only after confirming no installer or updater is running."
+    }
     $lockHeld = $true
     $stageDir = Join-Path $stateDir ('stage-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $stageDir | Out-Null
