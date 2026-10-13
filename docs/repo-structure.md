@@ -1,8 +1,7 @@
 # Repository structure migration
 
-The [Loop Roadmap](https://docs.google.com/document/d/1yHXZBc0i6DEjh8xAPE53i2c4kMYiwIOETmlSyriEfpE/edit)
-defines the target layout. Move one responsibility at a time when it gives a
-clear build, test or reuse benefit.
+Move one responsibility at a time when it gives a clear build, test or reuse
+benefit. Keep the target layout and dependency rules in this repository.
 
 The first install/update step adds `crates/ops/loop-update`. It owns release
 lookup, integrity verification, binary replacement, rollback and uninstall.
