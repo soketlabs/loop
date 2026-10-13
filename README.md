@@ -24,6 +24,7 @@ loop is a **developer preview (alpha)**. Settings, session files and CLI flags c
 | **loop-ai** | [`crates/loop-ai`](crates/loop-ai) | Unified LLM API, Soket provider (`/v1/models` refresh), OpenAI-compat + faux |
 | **loop-agent** | [`crates/loop-agent`](crates/loop-agent) | Agent loop, AgentHarness, tools, sessions, sandbox, skills |
 | **loop-cli** | [`crates/loop-cli`](crates/loop-cli) | Interactive `loop` TUI (ratatui) |
+| **loop-update** | [`crates/ops/loop-update`](crates/ops/loop-update) | Release checks, verified updates, rollback and uninstall |
 
 ## Quick start
 
@@ -42,6 +43,27 @@ curl -fsSL https://loop.soket.ai/install | bash -s -- --no-modify-path
 
 From a clone of this repo you can also run `./install.sh`. Assets come from [soketlabs/loop releases](https://github.com/soketlabs/loop/releases).
 
+On native Windows, run the PowerShell installer from a clone:
+
+```powershell
+.\install.ps1
+.\install.ps1 -Version 0.3.4 -NoModifyPath
+```
+
+When you open the terminal chat, Loop checks GitHub in the background. If a newer
+release is available, it shows a notice with the `loop update` command. It does
+not install updates at startup. Offline checks do not block the chat.
+
+```bash
+loop update --check          # show the latest release
+loop update                  # verify and install it
+loop rollback                # restore the previous binary
+loop uninstall               # remove program files; keep all user data
+```
+
+See [Install and update](docs/install-update.md) for custom paths, pinned
+versions, recovery and package-manager installs.
+
 Build from source:
 
 ```bash
@@ -58,7 +80,7 @@ First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, or an
 | macOS (Intel) | x86_64 | Supported | `curl -fsSL https://loop.soket.ai/install \| bash` |
 | Linux (glibc) | x86_64, arm64 | Supported | `curl -fsSL https://loop.soket.ai/install \| bash` |
 | Linux via WSL | x86_64, arm64 | Supported (uses the Linux build) | `curl -fsSL https://loop.soket.ai/install \| bash` inside WSL |
-| Windows (native) | x86_64 | In testing | Not yet officially supported; the `x86_64-pc-windows-msvc` build is published but its installer is still being tested |
+| Windows (native) | x86_64 | Installer and lifecycle tests in CI | `./install.ps1` in PowerShell |
 | Linux (musl, e.g. Alpine) | any | Not supported | [Build from source](#build--test) |
 
 ### Feature support

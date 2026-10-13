@@ -57,7 +57,11 @@ jobs:
         run: cargo build -p loop-cli -p loop-app-core --locked
 
       - name: Test
-        run: cargo test -p loop-ai -p loop-agent -p loop-mcp -p loop-orchestration -p loop-app-core -p loop-cli --locked
+        run: cargo test -p loop-ai -p loop-agent -p loop-mcp -p loop-orchestration -p loop-app-core -p loop-cli -p loop-update --locked
+
+      - name: Check Unix installer syntax
+        if: runner.os != 'Windows'
+        run: bash -n install.sh
 
       - name: Build (telemetry)
         run: cargo build -p loop-cli --features telemetry --locked

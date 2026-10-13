@@ -28,4 +28,11 @@ git tag v0.3.4
 git push origin v0.3.4
 ```
 
-That starts the Release workflow, builds all targets, and creates a GitHub Release with archives + `.sha256` checksums.
+That starts the Release workflow, builds all targets, and creates a GitHub Release
+with archives, `.sha256` checksums, `install.sh` and `install.ps1`.
+
+Before tagging, require the Linux, macOS and Windows lifecycle tests in CI to
+pass (`cargo test -p loop-update --locked`). They check running-binary updates,
+rollback, uninstall and preservation of user data. See
+[Install and update](install-update.md) and the incremental
+[repository structure migration](repo-structure.md).

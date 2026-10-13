@@ -59,6 +59,7 @@ use crate::{build_tools, CliRuntime};
     reason = "short-lived channel message wrapping AgentEvent"
 )]
 enum UiEvent {
+    UpdateAvailable(String),
     Agent(AgentEvent),
     /// Background `prompt()` finished with an error (no AgentEnd emitted).
     TurnFailed(String),
@@ -301,6 +302,26 @@ async fn run_loop(
     runtime: &mut CliRuntime,
 ) -> anyhow::Result<Option<String>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
+    // A best-effort notification. Never replace files or block startup.
+    if std::env::var_os("LOOP_NO_UPDATE_CHECK").is_none() {
+        let update_tx = tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let client = loop_update::ReleaseClient::github(Duration::from_secs(5))?;
+                let release = client.latest().await?;
+                if loop_update::is_newer(env!("CARGO_PKG_VERSION"), &release)? {
+                    let _ = update_tx.send(UiEvent::UpdateAvailable(format!(
+                        "Loop {} is available (installed: {}). Exit this session and run `loop update` to install it.",
+                        release.version, env!("CARGO_PKG_VERSION")
+                    )));
+                }
+                Ok::<_, loop_update::Error>(())
+            }.await;
+            if let Err(error) = result {
+                tracing::debug!(%error, "Update check skipped");
+            }
+        });
+    }
     let tx_agent = tx.clone();
     let debug_log = runtime.debug_log_path.clone();
     runtime.harness.subscribe(move |ev| {
@@ -1269,6 +1290,9 @@ async fn drain_ui_events(
 ) {
     while let Ok(ev) = rx.try_recv() {
         match ev {
+            UiEvent::UpdateAvailable(message) => {
+                push_before_queued(chat, sys(message));
+            }
             UiEvent::Agent(ev) => {
                 handle_agent_event(
                     ev,

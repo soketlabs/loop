@@ -20,7 +20,7 @@ fi
 
 usage() {
     cat <<EOF
-Loop Installer (macOS, Linux, WSL; Windows via Git Bash is experimental)
+Loop Installer (macOS, Linux, WSL; use install.ps1 for native Windows)
 
 Usage:
     ./install.sh [options]
@@ -31,13 +31,13 @@ Options:
     -h, --help              Display this help message
     -v, --version <version> Install a specific version (e.g., 0.3.2 or v0.3.2)
     -b, --binary <path>     Install from a local binary instead of downloading
+        --checksum <hash>   Required SHA-256 for --binary
     -f, --force             Reinstall even if the requested version is already installed
         --no-modify-path    Don't modify shell config files (.zshrc, .bashrc, etc.)
 
 Environment:
     LOOP_INSTALL_DIR        Install directory (default: ~/.loop/bin)
     LOOP_VERSION            Same as --version
-    LOOP_ALLOW_UNVERIFIED=1 Continue if no checksum is published for the release
     GITHUB_TOKEN            Used for GitHub API calls (avoids rate limits)
     NO_COLOR                Disable colored output
 EOF
@@ -47,6 +47,7 @@ requested_version="${LOOP_VERSION:-}"
 no_modify_path=false
 force=false
 binary_path=""
+binary_checksum=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -75,6 +76,11 @@ while [[ $# -gt 0 ]]; do
         -f|--force)
             force=true
             shift
+            ;;
+        --checksum)
+            [[ -n "${2:-}" ]] || { echo "--checksum requires a SHA-256 hash" >&2; exit 1; }
+            binary_checksum="$2"
+            shift 2
             ;;
         --no-modify-path)
             no_modify_path=true
@@ -236,7 +242,8 @@ latest_tag() {
 installed_version_of() {
     local bin="$1" v
     [ -x "$bin" ] || return 0
-    v=$("$bin" --version 2>/dev/null | head -n 1 || true)
+    v=$("$bin" --version 2>/dev/null) || return 1
+    v=$(printf '%s\n' "$v" | head -n 1)
     v="${v##* }"
     printf '%s' "${v#v}"
 }
@@ -258,11 +265,15 @@ sha256_of() {
 verify_checksum() {
     local archive="$1" checksum_file="$2" expected actual
     expected=$(awk 'NR==1 {print tolower($1)}' "$checksum_file" | tr -d '[:space:]')
-    [ -n "$expected" ] || die "Checksum file was empty"
+    [[ "$expected" =~ ^[a-f0-9]{64}$ ]] || die "Checksum file did not contain a valid SHA-256 hash"
+    [ "$(awk 'NF {n++} END {print n+0}' "$checksum_file")" = 1 ] || die "Checksum file must contain one entry"
+    [ "$(awk 'NF {print NF}' "$checksum_file")" -le 2 ] || die "Checksum file contains extra fields"
+    local checksum_name
+    checksum_name=$(awk '{print $2}' "$checksum_file")
+    [ -z "$checksum_name" ] || [ "${checksum_name#\*}" = "$(basename "$archive")" ] || die "Checksum names a different asset"
 
     if ! actual=$(sha256_of "$archive"); then
-        warn "No sha256 tool found (sha256sum/shasum/openssl); skipping verification"
-        return 0
+        die "No SHA-256 tool found (sha256sum/shasum/openssl); refusing installation"
     fi
 
     if [ "$expected" != "$actual" ]; then
@@ -273,42 +284,64 @@ verify_checksum() {
 
 # ---------------------------------------------------------------- install ----
 
-extract_archive() {
-    local archive="$1" dest="$2"
-    case "$archive" in
-        *.tar.gz)
-            command -v tar >/dev/null 2>&1 || die "'tar' is required but not installed."
-            tar -xzf "$archive" -C "$dest"
-            ;;
-        *.zip)
-            if command -v unzip >/dev/null 2>&1; then
-                unzip -q "$archive" -d "$dest"
-            elif command -v tar >/dev/null 2>&1; then
-                tar -xf "$archive" -C "$dest"
-            else
-                die "'unzip' is required to install the Windows archive."
-            fi
-            ;;
-        *) die "Unknown archive format: $archive" ;;
-    esac
-}
-
 # Copy to a temp name in the destination directory, then rename. The rename is
 # atomic and works even if the old binary is currently running.
 place_binary() {
-    local src="$1" dest="$INSTALL_DIR/$BIN_NAME" staged
-    staged="$INSTALL_DIR/.${BIN_NAME}.new.$$"
+    local src="$1" dest="$INSTALL_DIR/$BIN_NAME" staged candidate_version new_hash old_hash old_version backup
+    staged=$(mktemp "$INSTALL_DIR/.${BIN_NAME}.new.XXXXXX")
+    STAGED_PATH="$staged"
     cp "$src" "$staged"
     chmod 755 "$staged"
-    mv -f "$staged" "$dest"
+    candidate_version=$(installed_version_of "$staged")
+    [[ "$candidate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.-]+)?$ ]] || die "Staged binary failed its version check; current binary kept"
+    if [ -n "${tag:-}" ]; then
+        [ "$candidate_version" = "${tag#v}" ] || die "Staged binary version does not match ${tag}; current binary kept"
+    fi
+    new_hash=$(sha256_of "$staged") || die "Cannot verify staged binary"
+    if [ -f "$dest" ]; then
+        [ ! -L "$dest" ] || die "Refusing to replace a symlink"
+        old_hash=$(sha256_of "$dest") || die "Cannot verify previous binary"
+        old_version=$(installed_version_of "$dest")
+        [[ "$old_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.-]+)?$ ]] || die "Installed binary failed its version check; current binary kept"
+        backup="$STATE_DIR/previous-${old_hash}"
+        [ "$OS" != windows ] || backup="${backup}.exe"
+        if [ -e "$backup" ] || [ -L "$backup" ]; then
+            [ -f "$backup" ] && [ ! -L "$backup" ] || die "Previous binary must be a regular file"
+            [ "$(sha256_of "$backup")" = "$old_hash" ] || die "Previous binary checksum mismatch"
+        else
+            cp "$dest" "$backup"
+        fi
+        [ ! -L "$STATE_DIR/rollback.json" ] && [ ! -L "$STATE_DIR/rollback.json.new" ] && [ ! -L "$STATE_DIR/rollback.json.saved" ] || die "Rollback records must not be symlinks"
+        printf '{"schema":1,"current_sha256":"%s","previous_sha256":"%s","previous_version":"%s"}\n' "$new_hash" "$old_hash" "$old_version" > "$STATE_DIR/rollback.json.new"
+        [ ! -f "$STATE_DIR/rollback.json" ] || cp "$STATE_DIR/rollback.json" "$STATE_DIR/rollback.json.saved"
+        mv -f "$STATE_DIR/rollback.json.new" "$STATE_DIR/rollback.json"
+    fi
+    if ! mv -f "$staged" "$dest"; then
+        if [ -f "$STATE_DIR/rollback.json.saved" ]; then
+            mv -f "$STATE_DIR/rollback.json.saved" "$STATE_DIR/rollback.json"
+        else
+            rm -f "$STATE_DIR/rollback.json"
+        fi
+        die "Cannot replace binary; close running Loop processes and retry"
+    fi
+    rm -f "$STATE_DIR/rollback.json.saved"
+    STAGED_PATH=""
 }
 
 TMP_DIR=""
-cleanup() { [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"; return 0; }
+STATE_DIR="" LOCK_HELD=false STAGED_PATH=""
+cleanup() {
+    [ -z "$TMP_DIR" ] || rm -rf "$TMP_DIR"
+    [ -z "$STAGED_PATH" ] || rm -f "$STAGED_PATH"
+    [ "$LOCK_HELD" != true ] || rmdir "$STATE_DIR/operation.lock"
+    return 0
+}
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 download_and_install() {
-    local tag="$1" archive_name url checksum_url archive extracted found
+    local tag="$1" archive_name url checksum_url archive extracted
     local start=$SECONDS
 
     archive_name="${APP}-${TARGET}.${EXT}"
@@ -337,20 +370,19 @@ download_and_install() {
     step 4 "Verifying integrity"
     if wait "$ck_pid" && [ -s "${archive}.sha256" ]; then
         verify_checksum "$archive" "${archive}.sha256"
-    elif [ "${LOOP_ALLOW_UNVERIFIED:-}" = "1" ]; then
-        warn "No checksum published; continuing because LOOP_ALLOW_UNVERIFIED=1"
     else
         die "No checksum found at ${checksum_url}" \
-            "Refusing to install an unverified binary." \
-            "Set LOOP_ALLOW_UNVERIFIED=1 to override."
+            "Refusing to install an unverified binary."
     fi
 
     step 5 "Installing to ${INSTALL_DIR}"
     info "    Extracting..."
-    extract_archive "$archive" "$TMP_DIR"
-    found=$(find "$TMP_DIR" -type f -name "$BIN_NAME" | head -n 1)
-    [ -n "$found" ] || die "Extracted archive did not contain ${BIN_NAME}"
-    extracted="$found"
+    extracted="$TMP_DIR/$BIN_NAME"
+    if [ "$EXT" = tar.gz ]; then
+        tar -xzOf "$archive" "${APP}-${TARGET}/${BIN_NAME}" > "$extracted" || die "Archive did not contain ${BIN_NAME}"
+    else
+        unzip -p "$archive" "${APP}-${TARGET}/${BIN_NAME}" > "$extracted" || die "Archive did not contain ${BIN_NAME}"
+    fi
     place_binary "$extracted"
     ok "Installed ${INSTALL_DIR}/${BIN_NAME}"
 }
@@ -359,7 +391,10 @@ install_from_binary() {
     step 3 "Installing from local binary"
     [ -f "$binary_path" ] || die "Binary not found at ${binary_path}"
     step 4 "Verifying integrity"
-    info "    skipped (local binary)"
+    [[ "$binary_checksum" =~ ^[a-fA-F0-9]{64}$ ]] || die "--binary requires --checksum with a SHA-256 hash"
+    local actual
+    actual=$(sha256_of "$binary_path") || die "No SHA-256 tool found; refusing installation"
+    [ "$actual" = "$(printf '%s' "$binary_checksum" | tr 'A-F' 'a-f')" ] || die "Local binary checksum mismatch"
     step 5 "Installing to ${INSTALL_DIR}"
     place_binary "$binary_path"
     ok "Installed ${INSTALL_DIR}/${BIN_NAME}"
@@ -421,9 +456,11 @@ configure_path() {
         return
     fi
 
+    local quoted_install_dir
+    printf -v quoted_install_dir '%q' "$INSTALL_DIR"
     case "$current_shell" in
-        fish) add_to_path "$config_file" "fish_add_path $INSTALL_DIR" ;;
-        zsh|bash|ash|sh) add_to_path "$config_file" "export PATH=$INSTALL_DIR:\$PATH" ;;
+        fish) add_to_path "$config_file" "fish_add_path $quoted_install_dir" ;;
+        zsh|bash|ash|sh) add_to_path "$config_file" "export PATH=$quoted_install_dir:\$PATH" ;;
         *)
             warn "Manually add the directory to ${config_file} (or similar):"
             info "    export PATH=$INSTALL_DIR:\$PATH"
@@ -472,7 +509,14 @@ fi
 ok "${OS}/${ARCH}${LIBC:+ (${LIBC})} -> ${TARGET}"
 
 mkdir -p "$INSTALL_DIR"
+STATE_DIR="$INSTALL_DIR/.loop-update"
+[ ! -L "$STATE_DIR" ] || die "Update state directory must not be a symlink"
+mkdir -p "$STATE_DIR"
+mkdir "$STATE_DIR/operation.lock" 2>/dev/null || die "Another installation operation is running" "After a crash, remove $STATE_DIR/operation.lock only when no installer or updater is running."
+LOCK_HELD=true
 dest_bin="$INSTALL_DIR/$BIN_NAME"
+[ ! -L "$dest_bin" ] || die "Refusing to replace a symlink"
+if [ -e "$dest_bin" ]; then [ -f "$dest_bin" ] || die "Install destination is not a regular file"; fi
 current="$(installed_version_of "$dest_bin")"
 [ -z "$current" ] || info "    currently installed: ${current}"
 
@@ -491,10 +535,11 @@ else
         if [ -n "$tag" ]; then
             ok "Latest release is ${tag}"
         else
-            warn "Could not resolve the tag; falling back to the 'latest' download URL"
+        die "Could not resolve a release version; retry or use --version"
         fi
     fi
     label="${tag#v}"
+    [[ "$label" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.-]+)?$ ]] || die "Invalid release version"
     [ -n "$label" ] || label="latest"
 
     if [ -n "$tag" ] && [ "$current" = "${tag#v}" ] && [ "$force" != "true" ]; then
@@ -518,7 +563,7 @@ fi
 if out=$("$dest_bin" --version 2>&1 | head -n 1); then
     ok "Sanity check: ${out}"
 else
-    warn "Installed, but '${BIN_NAME} --version' did not run cleanly on this machine"
+    die "Installed binary did not run cleanly; use loop rollback"
 fi
 
 print_done "$label"
