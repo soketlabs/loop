@@ -299,7 +299,9 @@ place_binary() {
     fi
     new_hash=$(sha256_of "$staged") || die "Cannot verify staged binary"
     backup=""
-    [ ! -L "$STATE_DIR/rollback.json" ] && [ ! -L "$STATE_DIR/rollback.json.new" ] && [ ! -L "$STATE_DIR/rollback.json.saved" ] || die "Rollback records must not be symlinks"
+    if [ -L "$STATE_DIR/rollback.json" ] || [ -L "$STATE_DIR/rollback.json.new" ] || [ -L "$STATE_DIR/rollback.json.saved" ]; then
+        die "Rollback records must not be symlinks"
+    fi
     [ ! -f "$STATE_DIR/rollback.json" ] || cp "$STATE_DIR/rollback.json" "$STATE_DIR/rollback.json.saved"
     if [ -f "$dest" ]; then
         [ ! -L "$dest" ] || die "Refusing to replace a symlink"
@@ -309,7 +311,9 @@ place_binary() {
             backup="$STATE_DIR/previous-${old_hash}"
             [ "$OS" != windows ] || backup="${backup}.exe"
             if [ -e "$backup" ] || [ -L "$backup" ]; then
-                [ -f "$backup" ] && [ ! -L "$backup" ] || die "Previous binary must be a regular file"
+                if [ ! -f "$backup" ] || [ -L "$backup" ]; then
+                    die "Previous binary must be a regular file"
+                fi
                 [ "$(sha256_of "$backup")" = "$old_hash" ] || die "Previous binary checksum mismatch"
             else
                 cp "$dest" "$backup"
