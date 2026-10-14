@@ -13,23 +13,34 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+  # CI never runs a debugger: line tables keep file and line numbers in
+  # panics but make target/ (and so the cache) much smaller.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   lint:
     name: Lint (fmt + clippy)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
+      # Only main saves caches. PRs restore main's cache, so per-PR copies
+      # don't push main's out of the 10 GB repo limit.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -46,6 +57,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -54,13 +66,17 @@ jobs:
           - os: macos-latest
           - os: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Only main saves caches. PRs restore main's cache, so per-PR copies
+      # don't push main's out of the 10 GB repo limit.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build
         run: cargo build --locked
