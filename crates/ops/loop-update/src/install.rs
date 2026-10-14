@@ -207,24 +207,15 @@ impl Installation {
         let old_record = fs::read(&record_path).ok();
         self.write_record(&record)?;
         if let Err(error) = self.replace_executable(candidate) {
-            // Windows replacement can move the old executable before a later
-            // copy/rename fails. Restore its public path before returning.
-            if !self.executable.exists() {
-                let mut temp = tempfile::NamedTempFile::new_in(self.install_dir()?)?;
-                std::io::copy(&mut fs::File::open(&backup)?, &mut temp)?;
-                fs::set_permissions(temp.path(), fs::metadata(&backup)?.permissions())?;
-                temp.as_file().sync_all()?;
-                temp.persist(&self.executable).map_err(|e| e.error)?;
+            let failures =
+                self.restore_after_failed_replace(&backup, &record_path, old_record, &record);
+            if failures.is_empty() {
+                return Err(error);
             }
-            if let Some(bytes) = old_record {
-                let mut temp = tempfile::NamedTempFile::new_in(&self.state_dir)?;
-                temp.write_all(&bytes)?;
-                temp.as_file().sync_all()?;
-                temp.persist(record_path).map_err(|e| e.error)?;
-            } else {
-                fs::remove_file(record_path)?;
-            }
-            return Err(error);
+            return Err(Error::Invalid(format!(
+                "{error}; additionally failed to restore: {}",
+                failures.join("; ")
+            )));
         }
         // Keep only the rollback binary. Cleanup failures do not turn a
         // completed replacement into a reported update failure.
@@ -238,6 +229,55 @@ impl Installation {
             }
         }
         Ok(())
+    }
+
+    /// Best-effort recovery after a failed replacement. Every step runs even
+    /// if an earlier one fails, so the caller can still report the original
+    /// error; the failed steps are returned for that report.
+    fn restore_after_failed_replace(
+        &self,
+        backup: &Path,
+        record_path: &Path,
+        old_record: Option<Vec<u8>>,
+        record: &Rollback,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        // Windows replacement can move the old executable before a later
+        // copy/rename fails. Restore its public path before returning.
+        if !self.executable.exists() {
+            let restore = || -> Result<()> {
+                let mut temp = tempfile::NamedTempFile::new_in(self.install_dir()?)?;
+                std::io::copy(&mut fs::File::open(backup)?, &mut temp)?;
+                fs::set_permissions(temp.path(), fs::metadata(backup)?.permissions())?;
+                temp.as_file().sync_all()?;
+                temp.persist(&self.executable).map_err(|e| e.error)?;
+                Ok(())
+            };
+            if let Err(e) = restore() {
+                failures.push(format!("previous binary: {e}"));
+            }
+        }
+        // The record must describe the binary actually on disk. If the
+        // candidate landed despite the error, the new record is correct.
+        if sha256_file(&self.executable).ok().as_deref() == Some(&record.current_sha256) {
+            return failures;
+        }
+        let restore = || -> Result<()> {
+            match old_record {
+                Some(bytes) => {
+                    let mut temp = tempfile::NamedTempFile::new_in(&self.state_dir)?;
+                    temp.write_all(&bytes)?;
+                    temp.as_file().sync_all()?;
+                    temp.persist(record_path).map_err(|e| e.error)?;
+                }
+                None => fs::remove_file(record_path)?,
+            }
+            Ok(())
+        };
+        if let Err(e) = restore() {
+            failures.push(format!("rollback record: {e}"));
+        }
+        failures
     }
 
     fn write_record(&self, record: &Rollback) -> Result<()> {
@@ -389,6 +429,39 @@ mod tests {
             managed_at(&exe, &exe),
             "legacy default location remains managed"
         );
+    }
+
+    #[test]
+    fn failed_replace_keeps_original_error_and_record() {
+        for old_record in [Some(b"{\"previous\":true}".to_vec()), None] {
+            let tmp = tempfile::tempdir().unwrap();
+            let exe = tmp
+                .path()
+                .join(if cfg!(windows) { "loop.exe" } else { "loop" });
+            fs::write(&exe, "old").unwrap();
+            let installation = Installation::at(exe.clone()).unwrap();
+            let record_path = installation.state_dir.join("rollback.json");
+            if let Some(bytes) = &old_record {
+                fs::write(&record_path, bytes).unwrap();
+            }
+            let record = Rollback {
+                schema: 1,
+                current_sha256: "a".repeat(64),
+                previous_sha256: sha256_file(&exe).unwrap(),
+                previous_version: "0.0.1".into(),
+            };
+
+            let error = installation
+                .replace(&tmp.path().join("missing-candidate"), record)
+                .unwrap_err();
+
+            assert!(
+                matches!(&error, Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
+                "original error should be returned unchanged, got {error}"
+            );
+            assert_eq!(fs::read(&exe).unwrap(), b"old");
+            assert_eq!(fs::read(&record_path).ok(), old_record);
+        }
     }
 
     #[cfg(unix)]
