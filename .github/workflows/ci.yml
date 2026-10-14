@@ -5,7 +5,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
   workflow_dispatch:
+
+# A new push to a PR cancels that PR's older run. Runs on main always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -35,7 +41,7 @@ jobs:
         run: cargo clippy --workspace --exclude loop-desktop --all-targets --locked -- -D warnings
 
       - name: clippy (telemetry)
-        run: cargo clippy -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli --all-targets --features loop-agent/telemetry,loop-app-core/telemetry,loop-cli/telemetry --locked -- -D warnings
+        run: cargo clippy --workspace --exclude loop-desktop --all-targets --features loop-agent/telemetry,loop-app-core/telemetry,loop-cli/telemetry --locked -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -60,7 +66,7 @@ jobs:
         run: cargo build --locked
 
       - name: Test
-        run: cargo test -p loop-ai -p loop-agent -p loop-mcp -p loop-orchestration -p loop-app-core -p loop-cli -p loop-update --locked
+        run: cargo test --locked
 
       - name: Check Unix installer syntax
         if: runner.os != 'Windows'
@@ -73,8 +79,16 @@ jobs:
           LOOP_TEST_POWERSHELL: powershell.exe
         run: cargo test -p loop-update --test lifecycle --locked
 
+      # Telemetry code has no OS-specific parts: run its tests on Linux only,
+      # and only check that it compiles on macOS and Windows.
+      - name: Check (telemetry)
+        if: runner.os != 'Linux'
+        run: cargo check --workspace --exclude loop-desktop --all-targets --features loop-agent/telemetry,loop-app-core/telemetry,loop-cli/telemetry --locked
+
       - name: Build (telemetry)
+        if: runner.os == 'Linux'
         run: cargo build -p loop-cli --features telemetry --locked
 
       - name: Test (telemetry)
+        if: runner.os == 'Linux'
         run: cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli --features loop-agent/telemetry,loop-app-core/telemetry,loop-cli/telemetry --locked

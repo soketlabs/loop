@@ -117,8 +117,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --exclude loop-desktop --all-targets --locked -- -D warnings
 
 # 3. Tests (mirrors .github/workflows/ci.yml)
-cargo test -p loop-ai -p loop-agent -p loop-mcp -p loop-orchestration \
-           -p loop-app-core -p loop-cli -p loop-update --locked
+cargo test --locked                        # every crate except loop-desktop
 
 # 4. Telemetry feature build + tests (if you touched tracing, spans, or loop-telemetry)
 cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli \
