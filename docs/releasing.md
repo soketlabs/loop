@@ -28,4 +28,21 @@ git tag v0.3.4
 git push origin v0.3.4
 ```
 
-That starts the Release workflow, builds all targets, and creates a GitHub Release with archives + `.sha256` checksums.
+That starts the Release workflow, builds all targets, and creates a GitHub Release
+with archives, `.sha256` checksums, `install.sh` and `install.ps1`.
+
+Before tagging, require the Linux, macOS and Windows lifecycle tests in CI to
+pass (`cargo test -p loop-update --locked`). They check running-binary updates,
+rollback, uninstall and preservation of user data. See
+[Install and update](install-update.md) and the incremental
+[repository structure migration](repo-structure.md).
+
+## Publisher verification follow-up
+
+Release SHA-256 files verify integrity against the value published on GitHub.
+They do not independently verify publisher identity. Before claiming publisher
+verification, choose GitHub artifact attestations or signed manifests with an
+embedded verification key. Define key rotation and revocation, verify before
+running the staged binary, and test rejection of an unsigned, altered or
+incorrectly signed artifact on all supported platforms. Keep this separate from
+the current integrity-checking updater.

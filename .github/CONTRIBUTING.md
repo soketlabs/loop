@@ -118,7 +118,7 @@ cargo clippy --workspace --exclude loop-desktop --all-targets --locked -- -D war
 
 # 3. Tests (mirrors .github/workflows/ci.yml)
 cargo test -p loop-ai -p loop-agent -p loop-mcp -p loop-orchestration \
-           -p loop-app-core -p loop-cli --locked
+           -p loop-app-core -p loop-cli -p loop-update --locked
 
 # 4. Telemetry feature build + tests (if you touched tracing, spans, or loop-telemetry)
 cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli \

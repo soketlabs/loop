@@ -28,6 +28,9 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all -- --check
 
+      - name: ShellCheck
+        run: shellcheck install.sh
+
       - name: clippy
         run: cargo clippy --workspace --exclude loop-desktop --all-targets --locked -- -D warnings
 
@@ -57,7 +60,18 @@ jobs:
         run: cargo build --locked
 
       - name: Test
-        run: cargo test -p loop-ai -p loop-agent -p loop-mcp -p loop-orchestration -p loop-app-core -p loop-cli --locked
+        run: cargo test -p loop-ai -p loop-agent -p loop-mcp -p loop-orchestration -p loop-app-core -p loop-cli -p loop-update --locked
+
+      - name: Check Unix installer syntax
+        if: runner.os != 'Windows'
+        run: bash -n install.sh
+
+      - name: Lifecycle (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          LOOP_TEST_POWERSHELL: powershell.exe
+        run: cargo test -p loop-update --test lifecycle --locked
 
       - name: Build (telemetry)
         run: cargo build -p loop-cli --features telemetry --locked

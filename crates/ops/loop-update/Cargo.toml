@@ -1,0 +1,34 @@
+[package]
+name = "loop-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Verified Loop updates, rollback, and program removal"
+
+[dependencies]
+dirs.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+sha2.workspace = true
+semver.workspace = true
+self-replace.workspace = true
+percent-encoding.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+zip.workspace = true
+# Enable the Rust backend for zip's optional flate2 reader.
+flate2.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+flate2.workspace = true
+tar.workspace = true
+
+[[test]]
+name = "lifecycle"
+path = "tests/lifecycle.rs"
+harness = false

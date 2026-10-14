@@ -87,6 +87,22 @@ enum Commands {
     Config,
     /// Print version (same as --version).
     Version,
+    /// Check for or install a verified GitHub release.
+    Update {
+        /// Show the available version without changing the installation.
+        #[arg(long, conflicts_with = "version")]
+        check: bool,
+        /// Install a specific release, for example 0.3.5.
+        #[arg(long)]
+        version: Option<String>,
+        /// Reinstall the same version or allow a downgrade.
+        #[arg(long, conflicts_with = "check")]
+        force: bool,
+    },
+    /// Restore the previous installed binary.
+    Rollback,
+    /// Remove the installed program; keep settings, credentials and sessions.
+    Uninstall,
 }
 
 #[tokio::main]
@@ -99,6 +115,75 @@ async fn main() {
 
 async fn real_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // Distribution commands do not load agent settings, providers or sessions.
+    if let Some(command) = &cli.command {
+        match command {
+            Commands::Update {
+                check,
+                version,
+                force,
+            } => {
+                // Establish ownership before network traffic. The download has
+                // no installation lock; replacement rechecks ownership later.
+                loop_update::Installation::managed_executable()?;
+                loop_update::cancellable(async {
+                let client =
+                    loop_update::ReleaseClient::github(std::time::Duration::from_secs(300))?;
+                let release = match version {
+                    Some(value) => loop_update::ReleaseVersion::parse(value)?,
+                    None => { eprintln!("Checking GitHub for the latest release..."); client.latest().await? },
+                };
+                let current = env!("CARGO_PKG_VERSION");
+                println!("Installed: {current}\nAvailable: {}", release.version);
+                if *check {
+                    if loop_update::is_newer(current, &release)? {
+                        println!("Run `loop update` to install the new release.");
+                    }
+                    return Ok(());
+                }
+                match loop_update::plan(current, &release, *force)? {
+                    loop_update::UpdatePlan::UpToDate => {
+                        println!("Loop is up to date.");
+                        return Ok(());
+                    },
+                    loop_update::UpdatePlan::DowngradeBlocked => return Err(loop_update::Error::Invalid("Use --force for an explicit downgrade, or `loop rollback` to restore the previous binary".into())),
+                    loop_update::UpdatePlan::Install => (),
+                }
+                let staging = tempfile::Builder::new().prefix("loop-update-").tempdir()?;
+                eprintln!("Downloading Loop {}...", release.version);
+                let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                let binary = client.download_with_progress(&release, staging.path(), |bytes, total| {
+                    if last.elapsed() >= std::time::Duration::from_secs(1) || total == Some(bytes) {
+                        eprintln!("Downloaded {} KiB{}", bytes / 1024, total.map(|n| format!(" / {} KiB", n / 1024)).unwrap_or_default());
+                        last = std::time::Instant::now();
+                    }
+                }).await?;
+                eprintln!("Verifying and replacing the installed binary...");
+                let installation = loop_update::Installation::current()?;
+                installation
+                    .install(&binary, &release.version.to_string())
+                    .await?;
+                println!("Installed Loop {}. Run `loop` to start it, or `loop rollback` to restore the previous binary.", release.version);
+                Ok(())
+                }).await?;
+                return Ok(());
+            }
+            Commands::Rollback => {
+                let version = loop_update::cancellable(async {
+                    loop_update::Installation::current()?.rollback().await
+                })
+                .await?;
+                println!("Restored Loop {version}. Run `loop` to start it.");
+                return Ok(());
+            }
+            Commands::Uninstall => {
+                loop_update::Installation::current()?.uninstall()?;
+                println!("Loop program files removed. User settings, credentials, skills and sessions kept.");
+                return Ok(());
+            }
+            _ => (),
+        }
+    }
     let cwd = cli
         .cwd
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
