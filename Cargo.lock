@@ -4378,7 +4378,7 @@ dependencies = [
 
 [[package]]
 name = "loop-agent"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4416,7 +4416,7 @@ dependencies = [
 
 [[package]]
 name = "loop-ai"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4439,7 +4439,7 @@ dependencies = [
 
 [[package]]
 name = "loop-app-core"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "dirs",
@@ -4464,7 +4464,7 @@ dependencies = [
 
 [[package]]
 name = "loop-cli"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
@@ -4514,7 +4514,7 @@ dependencies = [
 
 [[package]]
 name = "loop-desktop"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4539,7 +4539,7 @@ dependencies = [
 
 [[package]]
 name = "loop-mcp"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-trait",
  "axum",
@@ -4557,7 +4557,7 @@ dependencies = [
 
 [[package]]
 name = "loop-orchestration"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4575,7 +4575,7 @@ dependencies = [
 
 [[package]]
 name = "loop-telemetry"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4596,11 +4596,11 @@ dependencies = [
 
 [[package]]
 name = "loop-test-support"
-version = "0.3.4"
+version = "0.3.5"
 
 [[package]]
 name = "loop-update"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "dirs",
  "flate2",
@@ -7306,9 +7306,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -8419,7 +8419,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
