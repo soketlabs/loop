@@ -79,14 +79,11 @@ jobs:
           LOOP_TEST_POWERSHELL: powershell.exe
         run: cargo test -p loop-update --test lifecycle --locked
 
-      # Telemetry code has no OS-specific parts: run its tests on Linux only,
-      # and only check that it compiles on macOS and Windows.
-      - name: Check (telemetry)
-        if: runner.os != 'Linux'
-        run: cargo check --workspace --exclude loop-desktop --all-targets --features loop-agent/telemetry,loop-app-core/telemetry,loop-cli/telemetry --locked
-
+      # Build with telemetry on every OS, which reuses the artifacts from the
+      # Build step. Telemetry code has no OS-specific parts, so its tests
+      # only run on Linux. (cargo check would be slower here: it cannot reuse
+      # build artifacts and recompiles every dependency.)
       - name: Build (telemetry)
-        if: runner.os == 'Linux'
         run: cargo build -p loop-cli --features telemetry --locked
 
       - name: Test (telemetry)
