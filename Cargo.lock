@@ -4392,6 +4392,7 @@ dependencies = [
  "loop-mcp",
  "loop-orchestration",
  "loop-telemetry",
+ "loop-test-support",
  "mime_guess",
  "opentelemetry_sdk",
  "parking_lot",

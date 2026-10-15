@@ -594,6 +594,10 @@ pub struct OpenAICompletionsCompat {
     /// Whether the provider supports the `store` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_store: Option<bool>,
+    /// Whether the provider accepts a `metadata` object on requests
+    /// (currently a Soket extension; strict servers reject unknown fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_metadata: Option<bool>,
     /// Whether the provider supports the `developer` role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_developer_role: Option<bool>,
@@ -631,6 +635,8 @@ pub struct OpenAICompletionsCompat {
 pub struct ResolvedOpenAICompletionsCompat {
     /// Supports `store`.
     pub supports_store: bool,
+    /// Accepts a `metadata` object on requests.
+    pub supports_metadata: bool,
     /// Supports `developer` role.
     pub supports_developer_role: bool,
     /// Supports `reasoning_effort`.

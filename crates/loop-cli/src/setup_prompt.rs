@@ -111,7 +111,7 @@ mod tests {
     #[test]
     fn provider_prompt_delegates_to_login_wizard() {
         let prompt = SetupPrompt::Provider(ProviderSetup::start(None).unwrap());
-        assert_eq!(prompt.title(), "Connect a model provider");
+        assert_eq!(prompt.title(), "Connect a model or search provider");
         assert!(prompt.options().is_some());
         assert!(prompt.esc_quits(true));
         assert!(!prompt.esc_quits(false));

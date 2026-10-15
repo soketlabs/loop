@@ -7,9 +7,10 @@ use anyhow::bail;
 
 use loop_agent::harness::{
     create_bash_tool, create_edit_tool, create_read_tool, create_session_repository,
-    create_sqlite_session_store, create_write_tool, AgentHarness, AgentHarnessOptions,
-    AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime,
-    Sandbox, SandboxMode,
+    create_sqlite_session_store, create_web_fetch_tool, create_web_search_tool, create_write_tool,
+    verify_web_search_key, AgentHarness, AgentHarnessOptions, AgentHarnessResources,
+    HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime, Sandbox, SandboxMode,
+    WebFetchConfig, WebSearchConfig,
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
 use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
@@ -245,6 +246,86 @@ impl Runtime {
         })
     }
 
+    /// `/login tavily|brave`: verify the key with a probe search, save it in the
+    /// credential store (auth.json), enable `webSearch` in settings and
+    /// register the `web_search` tool on the live harness. Nothing is kept if
+    /// the key is rejected.
+    pub async fn connect_web_search(
+        &mut self,
+        provider: &str,
+        api_key: &str,
+    ) -> anyhow::Result<String> {
+        let provider = provider.trim().to_ascii_lowercase();
+        let name = crate::config::web_search_display_name(&provider);
+        if !crate::config::is_web_search_provider(&provider) {
+            anyhow::bail!("unknown web-search provider '{provider}'");
+        }
+        if api_key.trim().is_empty() {
+            anyhow::bail!("{name} needs an API key");
+        }
+        // Keep a same-backend baseUrl / private-address opt-in when re-logging in.
+        let mut config = match &self.settings.web_search {
+            Some(existing) if existing.provider.eq_ignore_ascii_case(&provider) => existing.clone(),
+            _ => WebSearchConfig {
+                provider: provider.clone(),
+                ..Default::default()
+            },
+        };
+        config.provider = provider.clone();
+        verify_web_search_key(&config, api_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("{name} rejected the key: {e}"))?;
+
+        self.credentials
+            .set(&provider, loop_ai::Credential::api_key(api_key));
+        self.settings.web_search = Some(config);
+        self.save_settings()?;
+        self.rebuild_tools().await?;
+        Ok(name)
+    }
+
+    /// `/logout tavily|brave`: forget the key; when it was the active backend,
+    /// disable `web_search` and drop the tool from the live harness.
+    pub async fn disconnect_web_search(&mut self, provider: &str) -> anyhow::Result<String> {
+        let provider = provider.trim().to_ascii_lowercase();
+        let name = crate::config::web_search_display_name(&provider);
+        let active = self
+            .settings
+            .web_search
+            .as_ref()
+            .is_some_and(|c| c.provider.eq_ignore_ascii_case(&provider));
+        if !active && self.credentials.get(&provider).is_none() {
+            anyhow::bail!("{provider} is not connected");
+        }
+        self.credentials.remove(&provider);
+        if active {
+            self.settings.web_search = None;
+            self.save_settings()?;
+            self.rebuild_tools().await?;
+        }
+        Ok(name)
+    }
+
+    /// Swap the harness tool set for a freshly built one (keeps MCP tools).
+    async fn rebuild_tools(&self) -> anyhow::Result<()> {
+        let env = self
+            .harness
+            .tool_env()
+            .await
+            .map_err(|e| anyhow::anyhow!("tool env: {e}"))?;
+        let tools = build_tools(
+            env,
+            self.settings.web_fetch,
+            self.settings.web_search.as_ref(),
+            Some(self.credentials.as_ref()),
+        );
+        self.harness
+            .set_tools(tools)
+            .await
+            .map_err(|e| anyhow::anyhow!("set tools: {e}"))?;
+        self.refresh_mcp_tools().await
+    }
+
     /// `/logout`: forget the provider's key; custom providers are removed entirely. A
     /// selected model from that provider is deselected.
     pub async fn disconnect_provider(&mut self, id: &str) -> anyhow::Result<String> {
@@ -404,13 +485,42 @@ pub struct BootstrapOpts {
 }
 
 /// Build the standard tool set bound to an execution environment.
-pub fn build_tools(env: Arc<dyn loop_agent::harness::ExecutionEnv>) -> Vec<AgentTool> {
-    vec![
+///
+/// `web_fetch` is always included (subject to `web_fetch` settings); `web_search`
+/// is included only when a backend is configured and its API key resolves
+/// (`apiKeyEnv` env vars → saved `/login` key → backend default env var).
+pub fn build_tools(
+    env: Arc<dyn loop_agent::harness::ExecutionEnv>,
+    web_fetch: WebFetchConfig,
+    web_search: Option<&WebSearchConfig>,
+    credentials: Option<&FileCredentialStore>,
+) -> Vec<AgentTool> {
+    let mut tools = vec![
         create_read_tool(Arc::clone(&env)),
         create_write_tool(Arc::clone(&env)),
         create_edit_tool(Arc::clone(&env)),
         create_bash_tool(env),
-    ]
+    ];
+    match create_web_fetch_tool(web_fetch) {
+        Ok(tool) => tools.push(tool),
+        Err(e) => tracing::warn!("web_fetch disabled: {e}"),
+    }
+    if let Some(config) = web_search {
+        let stored_key = credentials
+            .and_then(|store| store.get(&config.provider.trim().to_ascii_lowercase()))
+            .and_then(|credential| match credential {
+                loop_ai::Credential::ApiKey { key } => Some(key),
+                _ => None,
+            });
+        match create_web_search_tool(config.clone(), stored_key.as_deref()) {
+            Ok(tool) => tools.push(tool),
+            Err(e) => {
+                tracing::warn!("web_search disabled: {e}");
+                eprintln!("note: web_search not enabled: {e}");
+            }
+        }
+    }
+    tools
 }
 
 /// Ensure at least one LLM provider is connected, or defer to the TUI's `/login` wizard.
@@ -458,7 +568,10 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
     }
     let raw = std::fs::read_to_string(path)?;
     let value: serde_json::Value = serde_json::from_str(&raw)?;
-    // Support { "providers": [ { id, baseUrl, apiKeyEnv, models: ["id"] } ] }
+    // Support { "providers": [ { id, baseUrl, apiKeyEnv, models: ["id" | { id,
+    // name?, contextWindow?, maxTokens?, reasoning? }] } ] }. Model entries as
+    // objects pin metadata that the `/models` listing cannot provide (most
+    // OpenAI-compatible servers return bare ids), e.g. the real context window.
     if let Some(arr) = value.get("providers").and_then(|v| v.as_array()) {
         for p in arr {
             let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("custom");
@@ -484,11 +597,10 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
                     a.iter()
                         .filter_map(|m| {
                             if let Some(s) = m.as_str() {
-                                Some(CustomModelSpec::new(s))
-                            } else {
-                                let id = m.get("id")?.as_str()?;
-                                Some(CustomModelSpec::new(id))
+                                return Some(CustomModelSpec::new(s));
                             }
+                            let id = m.get("id")?.as_str()?;
+                            Some(parse_model_spec(m, id))
                         })
                         .collect::<Vec<_>>()
                 })
@@ -510,6 +622,25 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
         }
     }
     Ok(())
+}
+
+/// Build a pinned model spec from a `models.json` object entry, accepting
+/// camelCase and snake_case keys (like the provider fields).
+fn parse_model_spec(m: &serde_json::Value, id: &str) -> CustomModelSpec {
+    let field = |camel: &str, snake: &str| {
+        m.get(camel)
+            .or_else(|| m.get(snake))
+            .and_then(|v| v.as_u64())
+    };
+    CustomModelSpec::new(id)
+        .with_reasoning(
+            m.get("reasoning")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        )
+        .with_name(m.get("name").and_then(|v| v.as_str()))
+        .with_context_window(field("contextWindow", "context_window"))
+        .with_max_tokens(field("maxTokens", "max_tokens"))
 }
 
 /// Resolve project trust (ask interactively when needed).
@@ -647,16 +778,6 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         opts.system_prompt.as_deref(),
         opts.append_system_prompt.as_deref(),
     );
-    let snippets = default_tool_snippets();
-    let selected = ["read", "bash", "edit", "write"];
-    let system_prompt = build_system_prompt(BuildSystemPromptOptions {
-        custom_prompt: custom.as_deref(),
-        append_system_prompt: append.as_deref(),
-        cwd: &opts.cwd,
-        selected_tools: &selected,
-        tool_snippets: &snippets,
-        context_files: &context_files,
-    });
 
     let sessions_db = sessions_db_path(&agent_dir);
     let store = create_sqlite_session_store(&sessions_db)
@@ -733,7 +854,25 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
             }
         };
 
-    let tools = build_tools(Arc::clone(&tool_env));
+    let tools = build_tools(
+        Arc::clone(&tool_env),
+        settings.web_fetch,
+        settings.web_search.as_ref(),
+        Some(credentials.as_ref()),
+    );
+
+    // The prompt lists the tools that were actually built (web_search may be
+    // unconfigured), so it can never promise a tool the agent cannot call.
+    let snippets = default_tool_snippets();
+    let selected: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    let system_prompt = build_system_prompt(BuildSystemPromptOptions {
+        custom_prompt: custom.as_deref(),
+        append_system_prompt: append.as_deref(),
+        cwd: &opts.cwd,
+        selected_tools: &selected,
+        tool_snippets: &snippets,
+        context_files: &context_files,
+    });
 
     let session_id = session.metadata().id.clone();
     let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
@@ -878,4 +1017,42 @@ pub fn mcp_server_entries(
         });
     }
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_json_pins_model_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            models_json_path(dir.path()),
+            r#"{
+                "providers": [{
+                    "id": "zai",
+                    "baseUrl": "https://api.z.ai/api/paas/v4",
+                    "models": [
+                        { "id": "glm-5.3-flash", "contextWindow": 1000000, "maxTokens": 65536, "reasoning": true },
+                        "plain-model"
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let models = Models::create(CreateModelsOptions {
+            credentials: None,
+            models_store: None,
+        });
+        load_custom_models_json(dir.path(), &models).unwrap();
+
+        let pinned = models.get_model("zai", "glm-5.3-flash").unwrap();
+        assert_eq!(pinned.context_window, 1_000_000);
+        assert_eq!(pinned.max_tokens, 65_536);
+        assert!(pinned.reasoning);
+
+        // String entries keep the listing defaults.
+        let plain = models.get_model("zai", "plain-model").unwrap();
+        assert_eq!(plain.context_window, 128_000);
+    }
 }

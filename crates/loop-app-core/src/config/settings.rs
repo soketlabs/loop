@@ -167,6 +167,13 @@ pub struct Settings {
     /// Sandbox.
     #[serde(default)]
     pub sandbox: SandboxSettings,
+    /// `web_fetch` tool (`webFetch` in settings.json).
+    #[serde(default)]
+    pub web_fetch: loop_agent::harness::WebFetchConfig,
+    /// `web_search` tool backend (`webSearch` in settings.json). The tool is
+    /// only registered when this is set and the backend's API key resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<loop_agent::harness::WebSearchConfig>,
     /// When to prompt for `ask`-mode tools: `newSession`, `always`, or `never`.
     #[serde(default = "default_file_edit_review")]
     pub file_edit_review: String,
@@ -248,6 +255,8 @@ impl Default for Settings {
             double_escape_action: default_double_escape(),
             ui_mode: default_ui_mode(),
             sandbox: SandboxSettings::default(),
+            web_fetch: loop_agent::harness::WebFetchConfig::default(),
+            web_search: None,
             file_edit_review: default_file_edit_review(),
             diff_editor: None,
             tool_permissions: default_tool_permissions_settings(),
@@ -354,6 +363,10 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
     base.double_escape_action = project.double_escape_action;
     base.ui_mode = project.ui_mode;
     base.sandbox = project.sandbox;
+    base.web_fetch = project.web_fetch;
+    if project.web_search.is_some() {
+        base.web_search = project.web_search;
+    }
     base.file_edit_review = project.file_edit_review;
     if project.diff_editor.is_some() {
         base.diff_editor = project.diff_editor;

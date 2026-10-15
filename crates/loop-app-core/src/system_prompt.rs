@@ -45,6 +45,14 @@ pub fn default_tool_snippets() -> Vec<(&'static str, &'static str)> {
         ("bash", "Run shell commands"),
         ("edit", "Apply exact string replacements in a file"),
         ("write", "Create or overwrite a file"),
+        (
+            "web_fetch",
+            "Fetch a URL and return its text content (HTML becomes plain text)",
+        ),
+        (
+            "web_search",
+            "Search the web and return titles, URLs and snippets",
+        ),
     ]
 }
 

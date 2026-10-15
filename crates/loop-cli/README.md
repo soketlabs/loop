@@ -28,8 +28,10 @@ On first start, Loop asks you to **connect a model provider** (unless a provider
 | OpenRouter | `/login openrouter` | `OPENROUTER_API_KEY` |
 | OpenAI | `/login openai` | `OPENAI_API_KEY` |
 | Any OpenAI-compatible API (Together, Groq, vLLM, Ollama, LM Studio, …) | `/login custom` (name, base URL, optional key) | — |
+| Tavily (web search) | `/login tavily` | `TAVILY_API_KEY` |
+| Brave Search (web search) | `/login brave` | `BRAVE_API_KEY` |
 
-Models are listed from each provider's `/models` endpoint; `/model` shows Soket first, then other connected providers. `/logout <provider>` disconnects one. Keys are stored in `~/.loop/agent/auth.json` (mode `0600`); custom providers are saved in `settings.json`.
+Models are listed from each provider's `/models` endpoint; `/model` shows Soket first, then other connected providers. `/logout <provider>` disconnects one. Keys are stored in `~/.loop/agent/auth.json` (mode `0600`); custom providers are saved in `settings.json`. The web-search keys enable the `web_search` tool (see [Web tools](#web-tools)).
 
 Default provider/model: **`soket` / `qwen3-30b`** at `https://api.soket.ai/v1`. The model catalog is refreshed from `GET /v1/models` and cached in `models-store.json`.
 
@@ -124,7 +126,7 @@ If deps for the chosen runtime are missing, Loop prints install instructions and
 
 ## File edit review / tool approval
 
-On **new sessions**, `write` / `edit` / `bash` pause for approval (per `toolPermissions`). File edits open Cursor or VS Code with `--diff`. Options:
+On **new sessions**, `write` / `edit` / `bash` / `web_fetch` / `web_search` pause for approval (per `toolPermissions`). File edits open Cursor or VS Code with `--diff`. Options:
 
 1. **Accept** — this change only  
 2. **Accept all … for this session** — remembered on the session (survives resume)  
@@ -145,8 +147,46 @@ On **new sessions**, `write` / `edit` / `bash` pause for approval (per `toolPerm
 
 - `fileEditReview`: `newSession` (default) · `always` · `never` — when `ask` tools prompt  
 - `toolPermissions`: per-tool `ask` | `allow` | `deny` in `~/.loop/agent/settings.json`  
-- Interactive workflows are wired for `write`, `edit`, and `bash` (others can be configured for later)  
+- Interactive workflows are wired for `write`, `edit`, `bash`, `web_fetch`, and `web_search`  
 - `/review [newSession|always|never]` toggles the ask policy
+
+## Web tools
+
+`web_fetch` is built in: it fetches an http(s) URL and returns the body as text
+(HTML pages become plain text). Only public internet hosts are reachable —
+loopback, private, link-local and reserved addresses are refused before any
+connection (redirects re-checked per hop), and bodies are capped and truncated.
+It runs in the Loop process, not inside the sandbox.
+
+`web_search` returns ranked results (title, URL, snippet). Connect a backend
+with the login wizard — the key is verified with a probe search, stored in
+`auth.json`, and the tool is enabled immediately (no restart):
+
+| Provider | Connect | Env alternative |
+|---|---|---|
+| Tavily | `/login tavily` | `TAVILY_API_KEY` |
+| Brave Search | `/login brave` | `BRAVE_API_KEY` |
+
+`/logout tavily` (or `brave`) disables the tool again. Hand-written config in
+`settings.json` is also supported:
+
+```json
+{
+  "webFetch": { "allowPrivateAddresses": false },
+  "webSearch": { "provider": "tavily" }
+}
+```
+
+- `webFetch.allowPrivateAddresses`: `true` permits localhost/intranet URLs (for
+  self-hosted mirrors; fails closed by default)  
+- `webSearch.apiKeyEnv`: custom env-var names, checked before the saved key  
+- `webSearch.baseUrl`: point at a self-hosted search proxy  
+- `webSearch.allowPrivateAddresses`: allow a private `baseUrl`  
+- Both tools default to `ask` in `toolPermissions`; the approval prompt shows
+  the URL / query, with an *Accept all web requests for this session* option  
+- Key resolution order: `webSearch.apiKeyEnv` env vars → the saved `/login`
+  key → the provider's default env var. With none present, Loop starts
+  without `web_search` and prints a note
 
 ## Extensions & hooks
 

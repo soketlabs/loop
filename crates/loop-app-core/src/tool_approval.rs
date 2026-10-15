@@ -23,6 +23,8 @@ pub const AUTO_APPROVE_LABEL_PREFIX: &str = "loop.toolApproval:auto:";
 pub const GROUP_FILE: &str = "file";
 /// Bash tool group.
 pub const GROUP_BASH: &str = "bash";
+/// Web tool group (`web_fetch` + `web_search`).
+pub const GROUP_WEB: &str = "web";
 
 /// Policy for when `ask`-mode tools prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,12 +104,14 @@ pub fn default_tool_permissions() -> BTreeMap<String, String> {
         ("edit".into(), "ask".into()),
         ("bash".into(), "ask".into()),
         ("read".into(), "allow".into()),
+        ("web_fetch".into(), "ask".into()),
+        ("web_search".into(), "ask".into()),
     ])
 }
 
 /// Tools that currently have an interactive approval workflow.
 pub fn interactive_tools() -> &'static [&'static str] {
-    &["write", "edit", "bash"]
+    &["write", "edit", "bash", "web_fetch", "web_search"]
 }
 
 /// Map a tool name to its session auto-approve group.
@@ -115,6 +119,7 @@ pub fn approval_group(tool: &str) -> Option<&'static str> {
     match tool {
         "write" | "edit" => Some(GROUP_FILE),
         "bash" => Some(GROUP_BASH),
+        "web_fetch" | "web_search" => Some(GROUP_WEB),
         _ => None,
     }
 }
@@ -137,6 +142,8 @@ pub enum ApprovalKind {
     FileEdit,
     /// Before bash — approve the command.
     Bash,
+    /// Before web_fetch / web_search — approve the outbound request.
+    Web,
 }
 
 impl ApprovalKind {
@@ -145,6 +152,7 @@ impl ApprovalKind {
         match self {
             Self::FileEdit => "file edit",
             Self::Bash => "bash",
+            Self::Web => "web",
         }
     }
 
@@ -153,6 +161,7 @@ impl ApprovalKind {
         match self {
             Self::FileEdit => "Accept all file changes for this session",
             Self::Bash => "Accept all bash for this session",
+            Self::Web => "Accept all web requests for this session",
         }
     }
 
@@ -161,6 +170,7 @@ impl ApprovalKind {
         match self {
             Self::FileEdit => GROUP_FILE,
             Self::Bash => GROUP_BASH,
+            Self::Web => GROUP_WEB,
         }
     }
 }
@@ -342,27 +352,70 @@ impl ToolApprovalBridge {
                 )),
             });
         }
-        if name != "bash" || !self.should_ask(name) {
+        if !self.should_ask(name) {
             return None;
         }
-
-        let command = ctx
-            .args
-            .get("command")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let cwd = ctx
-            .args
-            .get("cwd")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".")
-            .to_string();
-        let summary = truncate_cmd(&command, 72);
-        let detail = if cwd == "." {
-            command.clone()
-        } else {
-            format!("cwd: {cwd}\n{command}")
+        // Build the (kind, summary, detail, reject subject) tuple for the
+        // prompt; only tools with an interactive workflow get here
+        // (`should_ask` filters the rest).
+        let (kind, summary, detail, subject) = match name {
+            "bash" => {
+                let command = ctx
+                    .args
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let cwd = ctx
+                    .args
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".")
+                    .to_string();
+                let summary = truncate_cmd(&command, 72);
+                let detail = if cwd == "." {
+                    command.clone()
+                } else {
+                    format!("cwd: {cwd}\n{command}")
+                };
+                (
+                    ApprovalKind::Bash,
+                    summary,
+                    detail,
+                    "bash command".to_string(),
+                )
+            }
+            "web_fetch" => {
+                let url = ctx
+                    .args
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let summary = truncate_cmd(&url, 72);
+                (
+                    ApprovalKind::Web,
+                    summary,
+                    url.clone(),
+                    format!("fetch of {url}"),
+                )
+            }
+            "web_search" => {
+                let query = ctx
+                    .args
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let summary = truncate_cmd(&query, 72);
+                (
+                    ApprovalKind::Web,
+                    summary,
+                    query.clone(),
+                    format!("search for '{query}'"),
+                )
+            }
+            _ => return None,
         };
 
         let _lock = self.gate.lock().await;
@@ -373,24 +426,24 @@ impl ToolApprovalBridge {
         if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
             return Some(BeforeToolCallResult {
                 block: true,
-                reason: Some("Bash approval cancelled".into()),
+                reason: Some("Approval cancelled".into()),
             });
         }
 
         let decision = self
-            .ask_user(ApprovalKind::Bash, name, summary, detail, cancel.as_ref())
+            .ask_user(kind, name, summary, detail, cancel.as_ref())
             .await;
 
         match decision {
             ApprovalDecision::Accept => None,
             ApprovalDecision::AcceptSession => {
-                self.grant_and_persist(ApprovalKind::Bash.group()).await;
+                self.grant_and_persist(kind.group()).await;
                 None
             }
             ApprovalDecision::Reject { reason } => {
                 let msg = match reason.filter(|r| !r.trim().is_empty()) {
-                    Some(r) => format!("User rejected bash command. Reason: {r}"),
-                    None => "User rejected bash command.".into(),
+                    Some(r) => format!("User rejected {subject}. Reason: {r}"),
+                    None => format!("User rejected {subject}."),
                 };
                 Some(BeforeToolCallResult {
                     block: true,

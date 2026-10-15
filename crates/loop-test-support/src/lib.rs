@@ -13,6 +13,8 @@ pub struct FakeResponse {
     pub status: u16,
     /// `content-type` header.
     pub content_type: String,
+    /// Extra headers (e.g. `Location` for redirects).
+    pub headers: Vec<(String, String)>,
     /// Body bytes.
     pub body: Vec<u8>,
 }
@@ -28,8 +30,15 @@ impl FakeResponse {
         Self {
             status,
             content_type: content_type.into(),
+            headers: Vec::new(),
             body: body.into(),
         }
+    }
+
+    /// Add an extra header (e.g. `Location` for a redirect).
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
     }
 }
 
@@ -131,12 +140,16 @@ fn serve(stream: TcpStream, requests: &Mutex<Vec<RecordedRequest>>, route: &Rout
     let response = route(&request);
     requests.lock().unwrap().push(request);
     let mut stream = stream;
-    let head = format!(
-        "HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+    let mut head = format!(
+        "HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {}\r\n",
         response.status,
         response.content_type,
         response.body.len()
     );
+    for (name, value) in &response.headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("connection: close\r\n\r\n");
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(&response.body);
 }
