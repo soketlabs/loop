@@ -9,6 +9,8 @@ use loop_agent::harness::{create_web_fetch_tool, create_web_search_tool, verify_
 use loop_agent::types::AgentTool;
 use loop_test_support::{FakeHttpServer, FakeResponse};
 use serde_json::json;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// `AgentTool` is not `Debug`, so `expect_err` is unavailable.
 fn expect_creation_error(result: Result<AgentTool, String>, context: &str) -> String {
@@ -117,6 +119,33 @@ async fn fetch_reports_http_errors() {
         .await
         .expect_err("404 must be an error");
     assert!(err.contains("404"), "unexpected error: {err}");
+}
+
+#[tokio::test]
+async fn fetch_cancellation_interrupts_a_stalled_body_chunk() {
+    let server = FakeHttpServer::always(
+        FakeResponse::new(200, "text/plain", "body").with_body_delay(Duration::from_secs(30)),
+    );
+    let tool = fetch_tool_allowing_private_hosts();
+    let url = format!("{}/page", server.base_url());
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        (tool.execute)("test".into(), json!({"url": url}), Some(task_cancel), None).await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("request reaches fake server");
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("cancellation interrupts the pending body read")
+        .expect("fetch task joins");
+    assert!(result.unwrap_err().contains("cancelled"));
 }
 
 #[tokio::test]

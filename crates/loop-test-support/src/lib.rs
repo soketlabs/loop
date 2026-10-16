@@ -5,6 +5,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// A canned HTTP response.
 #[derive(Debug, Clone)]
@@ -17,6 +18,8 @@ pub struct FakeResponse {
     pub headers: Vec<(String, String)>,
     /// Body bytes.
     pub body: Vec<u8>,
+    /// Delay between the response headers and body.
+    pub body_delay: Option<Duration>,
 }
 
 impl FakeResponse {
@@ -32,12 +35,19 @@ impl FakeResponse {
             content_type: content_type.into(),
             headers: Vec::new(),
             body: body.into(),
+            body_delay: None,
         }
     }
 
     /// Add an extra header (e.g. `Location` for a redirect).
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Delay sending the body after response headers, for cancellation tests.
+    pub fn with_body_delay(mut self, delay: Duration) -> Self {
+        self.body_delay = Some(delay);
         self
     }
 }
@@ -151,6 +161,9 @@ fn serve(stream: TcpStream, requests: &Mutex<Vec<RecordedRequest>>, route: &Rout
     }
     head.push_str("connection: close\r\n\r\n");
     let _ = stream.write_all(head.as_bytes());
+    if let Some(delay) = response.body_delay {
+        std::thread::sleep(delay);
+    }
     let _ = stream.write_all(&response.body);
 }
 

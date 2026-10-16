@@ -429,14 +429,19 @@ pub(crate) async fn read_capped(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(8 * 1024);
     let mut body = Vec::with_capacity(expected.min(MAX_DOWNLOAD_BYTES));
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| format!("download interrupted: {e}"))?
-    {
-        if cancel.is_some_and(|c| c.is_cancelled()) {
-            return Err("web_fetch cancelled".into());
+    loop {
+        let next_chunk = match cancel {
+            Some(token) => tokio::select! {
+                biased;
+                () = token.cancelled() => return Err("web_fetch cancelled".into()),
+                chunk = response.chunk() => chunk,
+            },
+            None => response.chunk().await,
         }
+        .map_err(|e| format!("download interrupted: {e}"))?;
+        let Some(chunk) = next_chunk else {
+            break;
+        };
         let remaining = MAX_DOWNLOAD_BYTES.saturating_sub(body.len());
         if chunk.len() >= remaining {
             body.extend_from_slice(&chunk[..remaining]);
