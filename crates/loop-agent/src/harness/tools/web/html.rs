@@ -10,6 +10,9 @@ const SKIP_ELEMENTS: &[&str] = &[
     "script", "style", "noscript", "template", "head", "svg", "title", "iframe", "canvas",
 ];
 
+const MAX_TAG_SCAN_BYTES: usize = 1024;
+const MAX_ENTITY_BYTES: usize = 12;
+
 const BLOCK_ELEMENTS: &[&str] = &[
     "address",
     "article",
@@ -56,8 +59,17 @@ pub fn html_to_text(input: &str) -> String {
     let mut text = String::with_capacity(input.len() / 2);
     let mut rest = input;
     let mut at_line_start = true;
+    let mut next_tag_end = input.find('>');
 
-    'page: while let Some(mark) = rest.find(['<', '&']) {
+    'page: while let Some(mark) = {
+        let offset = input.len() - rest.len();
+        while let Some(end) = next_tag_end.filter(|end| *end < offset) {
+            next_tag_end = input[end + 1..]
+                .find('>')
+                .map(|relative| end + 1 + relative);
+        }
+        rest.find(['<', '&'])
+    } {
         let (chunk, tail) = rest.split_at(mark);
         // Bulk-copy the text run before the markup.
         if !chunk.is_empty() {
@@ -92,6 +104,13 @@ pub fn html_to_text(input: &str) -> String {
                     break;
                 }
             }
+            continue;
+        }
+
+        if next_tag_end.is_none() {
+            text.push('<');
+            at_line_start = false;
+            rest = &tail[1..];
             continue;
         }
 
@@ -181,8 +200,10 @@ impl<'a> ParsedTag<'a> {
         let is_closing = rest.starts_with('/');
         let body = rest.trim_start_matches('/');
         let name_len = body
-            .find(|c: char| c == '>' || c == '/' || c.is_whitespace())
-            .unwrap_or(body.len());
+            .bytes()
+            .take(MAX_TAG_SCAN_BYTES)
+            .position(|b| b == b'>' || b == b'/' || b.is_ascii_whitespace())
+            .or_else(|| (body.len() <= MAX_TAG_SCAN_BYTES).then_some(body.len()))?;
         let name = &body[..name_len];
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return None;
@@ -190,21 +211,24 @@ impl<'a> ParsedTag<'a> {
         // Find the end of the tag, tolerating quoted attribute values
         // containing `>`.
         let mut quote: Option<char> = None;
-        let end = rest.char_indices().find_map(|(j, c)| match quote {
-            Some(q) if c == q => {
-                quote = None;
-                None
-            }
-            Some(_) => None,
-            None => match c {
-                '"' | '\'' => {
-                    quote = Some(c);
+        let end = rest
+            .char_indices()
+            .take_while(|(j, _)| *j < MAX_TAG_SCAN_BYTES)
+            .find_map(|(j, c)| match quote {
+                Some(q) if c == q => {
+                    quote = None;
                     None
                 }
-                '>' => Some(j + 2), // past `>`, relative to the leading `<`
-                _ => None,
-            },
-        })?;
+                Some(_) => None,
+                None => match c {
+                    '"' | '\'' => {
+                        quote = Some(c);
+                        None
+                    }
+                    '>' => Some(j + 2), // past `>`, relative to the leading `<`
+                    _ => None,
+                },
+            })?;
         Some(Self {
             name,
             is_closing,
@@ -269,7 +293,11 @@ fn collapse_whitespace(text: &str) -> String {
 /// Numeric references that resolve to control characters are rejected (they
 /// would inject NULs / escape sequences into the output).
 fn decode_entity(s: &str) -> Option<(char, usize)> {
-    let end = s.find(';')?;
+    let end = s
+        .as_bytes()
+        .iter()
+        .take(MAX_ENTITY_BYTES + 1)
+        .position(|byte| *byte == b';')?;
     if end == 0 || end > 10 {
         return None;
     }
@@ -405,5 +433,22 @@ mod tests {
     fn double_line_breaks_keep_paragraph_gap() {
         assert_eq!(html_to_text("<p>a</p><br><br><p>b</p>"), "a\n\nb");
         assert_eq!(html_to_text("a<br><br>b"), "a\n\nb");
+    }
+
+    #[test]
+    fn hostile_unclosed_markup_and_entities_have_bounded_scans() {
+        let unclosed_tags = "<a ".repeat(100_000);
+        let unclosed_quotes = format!("<a \"{}>", "< ".repeat(100_000));
+        let entities = "&".repeat(100_000);
+        let started = std::time::Instant::now();
+
+        assert_eq!(html_to_text(&unclosed_tags), unclosed_tags.trim_end());
+        assert!(!html_to_text(&unclosed_quotes).is_empty());
+        assert_eq!(html_to_text(&entities), entities);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "hostile HTML scans took {:?}",
+            started.elapsed()
+        );
     }
 }
