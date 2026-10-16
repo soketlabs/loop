@@ -12,9 +12,9 @@ use async_trait::async_trait;
 use loop_ai::ImageContent;
 use loop_protocol::{
     AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, Compaction,
-    CompactionReport, ContentBlock, ErrorCategory, ErrorInfo, LocalShell, SessionKey, SessionRef,
-    SessionSpec, SessionStats, SessionUpdate, ShellResult, StatsSummary, StopReason, TurnHandle,
-    TurnOutcome, UpdateEnvelope,
+    CompactionReport, ContentBlock, ErrorCategory, ErrorInfo, LocalShell, NoticeLevel, Origin,
+    SessionKey, SessionRef, SessionSpec, SessionStats, SessionUpdate, ShellResult, StatsSummary,
+    StopReason, TurnHandle, TurnOutcome, UpdateEnvelope,
 };
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
@@ -22,7 +22,7 @@ use tokio::sync::broadcast;
 use crate::harness::agent_harness::AgentHarness;
 use crate::harness::session::format_session_stats;
 use crate::harness::types::{AgentHarnessError, AgentHarnessPhase, ShellExecOptions};
-use crate::protocol_events::{turn_outcome, NativeEventMapper};
+use crate::protocol_events::{replay, turn_outcome, NativeEventMapper};
 use crate::types::{AgentEvent, PromptInput};
 
 /// Instance id of Loop's own agent.
@@ -157,6 +157,78 @@ fn translate(
     envelopes
 }
 
+/// An error notice outside any turn.
+fn error_notice(
+    instance: &BackendInstanceId,
+    stream: &Mutex<StreamState>,
+    info: &ErrorInfo,
+) -> UpdateEnvelope {
+    let mut state = stream.lock();
+    state.seq += 1;
+    UpdateEnvelope::live(
+        instance.clone(),
+        0,
+        state.session.clone(),
+        None,
+        state.seq,
+        SessionUpdate::Notice {
+            level: NoticeLevel::Error,
+            text: info.message.clone(),
+        },
+    )
+}
+
+/// Keep the stream complete when the harness fails outside a normal run, so
+/// every prompt that ran produces exactly one `TurnEnded` (a prompt rejected
+/// as busy gets only an [`error_notice`]):
+/// - the run's turn is still open: end it as failed;
+/// - the run never started a turn (`turns_before` unchanged): report a
+///   started-and-failed turn;
+/// - the run's turn already ended (for example the failure was while saving
+///   it): report an error notice.
+fn close_failed_turn(
+    instance: &BackendInstanceId,
+    stream: &Mutex<StreamState>,
+    turns_before: u64,
+    info: &ErrorInfo,
+) -> Vec<UpdateEnvelope> {
+    let mut state = stream.lock();
+    let started = state.mapper.turns_started() > turns_before;
+    let mut updates = Vec::new();
+    if state.mapper.current_turn().is_some() {
+        updates.extend(state.mapper.end_turn_with_error(info.clone()));
+    } else if started {
+        updates.push(SessionUpdate::Notice {
+            level: NoticeLevel::Error,
+            text: info.message.clone(),
+        });
+    } else {
+        let turn_id = state.mapper.begin_turn();
+        updates.push(SessionUpdate::TurnStarted { turn_id });
+        updates.extend(state.mapper.end_turn_with_error(info.clone()));
+    }
+    let session = state.session.clone();
+    updates
+        .into_iter()
+        .map(|update| {
+            let turn = match &update {
+                SessionUpdate::TurnStarted { turn_id }
+                | SessionUpdate::TurnEnded { turn_id, .. } => Some(turn_id.clone()),
+                _ => None,
+            };
+            state.seq += 1;
+            UpdateEnvelope::live(
+                instance.clone(),
+                0,
+                session.clone(),
+                turn,
+                state.seq,
+                update,
+            )
+        })
+        .collect()
+}
+
 fn harness_error(err: AgentHarnessError) -> BackendError {
     match err {
         AgentHarnessError::Busy => BackendError::Busy,
@@ -242,7 +314,33 @@ impl AgentBackend for NativeBackend {
             .switch_session(&session.native_id)
             .await
             .map_err(harness_error)?;
-        Ok(self.adopt_session(&id))
+        let session = self.adopt_session(&id);
+        let history = self.transcript(&session).await?;
+        let mut stream = self.stream.lock();
+        for update in history {
+            stream.seq += 1;
+            let mut envelope = UpdateEnvelope::live(
+                self.instance.clone(),
+                0,
+                session.key.clone(),
+                None,
+                stream.seq,
+                update,
+            );
+            envelope.origin = Origin::Replay;
+            let _ = self.updates.send(envelope);
+        }
+        Ok(session)
+    }
+
+    async fn transcript(&self, session: &SessionRef) -> BackendResult<Vec<SessionUpdate>> {
+        self.check_session(session).await?;
+        let context = self
+            .harness
+            .session_context()
+            .await
+            .map_err(harness_error)?;
+        Ok(replay(&context.messages))
     }
 
     async fn prompt(
@@ -267,9 +365,17 @@ impl AgentBackend for NativeBackend {
         let input = prompt_input(input)?;
         let (done, handle) = TurnHandle::channel();
         let harness = Arc::clone(&self.harness);
+        let instance = self.instance.clone();
+        let stream = Arc::clone(&self.stream);
+        let updates = self.updates.clone();
+        let turns_before = self.stream.lock().mapper.turns_started();
         tokio::spawn(async move {
             let result = harness.prompt(input).await;
             drop(slot);
+            let rejected_busy = matches!(result, Err(AgentHarnessError::Busy));
+            // A run that returned a message already ended its turn on the
+            // stream, even when the message is an error.
+            let ran = result.is_ok();
             let outcome = match result {
                 Ok(message) => match message.as_assistant().map(turn_outcome) {
                     Some((StopReason::Cancelled, _)) => TurnOutcome::Cancelled,
@@ -290,6 +396,19 @@ impl AgentBackend for NativeBackend {
                     other => ErrorInfo::new(ErrorCategory::Internal, other.to_string()),
                 }),
             };
+            match &outcome {
+                // Another caller of the harness is running a turn; that
+                // turn is not this prompt's to close.
+                TurnOutcome::Failed(info) if rejected_busy => {
+                    let _ = updates.send(error_notice(&instance, &stream, info));
+                }
+                TurnOutcome::Failed(info) if !ran => {
+                    for envelope in close_failed_turn(&instance, &stream, turns_before, info) {
+                        let _ = updates.send(envelope);
+                    }
+                }
+                _ => {}
+            }
             let _ = done.send(outcome);
         });
         Ok(handle)
