@@ -29,7 +29,7 @@ use crate::model_selection::StartupModel;
 use crate::resources::{load_resources, LoadedResources};
 use crate::system_prompt::{
     build_system_prompt, default_tool_snippets, load_context_files, resolve_system_prompt_files,
-    BuildSystemPromptOptions,
+    BuildSystemPromptOptions, ContextFile,
 };
 use crate::theme::{theme_search_dirs, Theme};
 use loop_ai::CredentialStore;
@@ -40,6 +40,12 @@ pub struct Runtime {
     pub agent_dir: PathBuf,
     /// Cwd.
     pub cwd: PathBuf,
+    /// Custom system prompt loaded at startup, when configured.
+    pub custom_system_prompt: Option<String>,
+    /// Appended system prompt loaded at startup, when configured.
+    pub append_system_prompt: Option<String>,
+    /// Project and user context files loaded at startup.
+    pub context_files: Vec<ContextFile>,
     /// Settings.
     pub settings: Settings,
     /// Models collection.
@@ -597,7 +603,23 @@ impl Runtime {
             .set_tools(tools)
             .await
             .map_err(|e| anyhow::anyhow!("set tools: {e}"))?;
+        self.refresh_system_prompt().await;
         self.refresh_mcp_tools().await
+    }
+
+    async fn refresh_system_prompt(&self) {
+        let tools = self.harness.get_tools().await;
+        let selected: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        let snippets = default_tool_snippets();
+        let prompt = build_system_prompt(BuildSystemPromptOptions {
+            custom_prompt: self.custom_system_prompt.as_deref(),
+            append_system_prompt: self.append_system_prompt.as_deref(),
+            cwd: &self.cwd,
+            selected_tools: &selected,
+            tool_snippets: &snippets,
+            context_files: &self.context_files,
+        });
+        self.harness.set_system_prompt(prompt).await;
     }
 
     /// `/logout`: forget the provider's key; custom providers are removed entirely. A
@@ -1242,6 +1264,9 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     Ok(Runtime {
         agent_dir,
         cwd: opts.cwd,
+        custom_system_prompt: custom,
+        append_system_prompt: append,
+        context_files,
         settings,
         models,
         credentials,
