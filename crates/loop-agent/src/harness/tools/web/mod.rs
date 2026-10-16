@@ -155,6 +155,7 @@ fn shared_client(policy: FetchPolicy) -> Result<reqwest::Client, String> {
 
 fn build_client(policy: FetchPolicy) -> Option<reqwest::Client> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(REQUEST_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
         // Redirects are followed (and re-validated) by `fetch_url`.
