@@ -112,6 +112,13 @@ pub fn default_tool_permissions() -> BTreeMap<String, String> {
     ])
 }
 
+/// Fill in permissions added by Loop after a settings file was created.
+pub fn merge_default_tool_permissions(map: &mut BTreeMap<String, String>) {
+    for (tool, permission) in default_tool_permissions() {
+        map.entry(tool).or_insert(permission);
+    }
+}
+
 /// Tools that currently have an interactive approval workflow.
 pub fn interactive_tools() -> &'static [&'static str] {
     &["write", "edit", "bash", "web_fetch", "web_search"]
@@ -771,12 +778,11 @@ pub fn auto_approve_from_entries<'a>(
 pub fn permissions_from_settings(
     map: &BTreeMap<String, String>,
 ) -> BTreeMap<String, ToolPermission> {
+    let mut merged = map.clone();
+    merge_default_tool_permissions(&mut merged);
     let mut out = BTreeMap::new();
-    for (k, v) in default_tool_permissions() {
+    for (k, v) in merged {
         out.insert(k, ToolPermission::parse(&v));
-    }
-    for (k, v) in map {
-        out.insert(k.clone(), ToolPermission::parse(v));
     }
     out
 }
@@ -864,6 +870,15 @@ mod tests {
         assert_eq!(ToolPermission::parse("ASK"), ToolPermission::Ask);
         assert_eq!(approval_group("write"), Some(GROUP_FILE));
         assert_eq!(approval_group("bash"), Some(GROUP_BASH));
+    }
+
+    #[test]
+    fn legacy_permission_maps_get_new_web_defaults() {
+        let permissions =
+            permissions_from_settings(&BTreeMap::from([("bash".into(), "allow".into())]));
+        assert_eq!(permissions.get("bash"), Some(&ToolPermission::Allow));
+        assert_eq!(permissions.get("web_fetch"), Some(&ToolPermission::Ask));
+        assert_eq!(permissions.get("web_search"), Some(&ToolPermission::Ask));
     }
 
     #[test]

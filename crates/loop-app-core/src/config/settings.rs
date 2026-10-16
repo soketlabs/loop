@@ -411,6 +411,7 @@ pub fn load_settings(
     project_trusted: bool,
 ) -> anyhow::Result<Settings> {
     let mut settings = Settings::load_file(&settings_path(agent_dir))?;
+    crate::tool_approval::merge_default_tool_permissions(&mut settings.tool_permissions);
     if project_trusted {
         let project_settings = get_project_dir(cwd).join("settings.json");
         if project_settings.exists() {
@@ -498,6 +499,32 @@ mod tests {
         let on: Settings = serde_json::from_str(r#"{"webSearch": {"enabled": true}}"#).unwrap();
         global.merge_project(on);
         assert!(!global.web_search.unwrap().enabled);
+    }
+
+    #[test]
+    fn saved_partial_permissions_gain_new_defaults() {
+        let agent_dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let path = settings_path(agent_dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"toolPermissions":{"bash":"allow"}}"#).unwrap();
+
+        let loaded = load_settings(agent_dir.path(), cwd.path(), false).unwrap();
+        assert_eq!(
+            loaded.tool_permissions.get("bash").map(String::as_str),
+            Some("allow")
+        );
+        assert_eq!(
+            loaded.tool_permissions.get("web_fetch").map(String::as_str),
+            Some("ask")
+        );
+        assert_eq!(
+            loaded
+                .tool_permissions
+                .get("web_search")
+                .map(String::as_str),
+            Some("ask")
+        );
     }
 
     #[test]
