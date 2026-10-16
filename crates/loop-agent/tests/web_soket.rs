@@ -148,6 +148,28 @@ async fn non_json_auth_errors_are_reported_as_rejected_keys() {
 }
 
 #[tokio::test]
+async fn rate_limit_and_server_errors_are_not_classified_as_bad_keys() {
+    for status in [429, 503] {
+        let server = FakeHttpServer::always(FakeResponse::new(
+            status,
+            "text/plain",
+            "upstream unavailable",
+        ));
+        let err = verify_web_search_key(&search_config(&server, Some("tavily")), "tvly-key")
+            .await
+            .expect_err("non-authentication HTTP errors must fail verification");
+        assert!(
+            !err.contains("rejected the API key"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains(&format!("HTTP {status}")),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn tinyfish_search_backend() {
     let server = FakeHttpServer::always(FakeResponse::json(
         r#"{"query":"rust","results":[

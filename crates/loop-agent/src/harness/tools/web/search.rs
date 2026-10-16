@@ -5,9 +5,11 @@
 //! creation so a missing API key is reported once, not on every query.
 
 use loop_ai::providers::{SOKET_API_KEY_ENVS, SOKET_BASE_URL, SOKET_PROVIDER_ID};
+use reqwest::StatusCode;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::fmt;
 use tokio_util::sync::CancellationToken;
 
 use super::guard::{validate_request_url, FetchPolicy};
@@ -161,6 +163,54 @@ enum BackendKind {
     Brave,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchFailureKind {
+    Authentication,
+    RateLimited,
+    Upstream,
+    Other,
+}
+
+#[derive(Debug)]
+struct SearchFailure {
+    message: String,
+    kind: SearchFailureKind,
+}
+
+impl SearchFailure {
+    fn message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: SearchFailureKind::Other,
+        }
+    }
+
+    fn http(backend: &str, status: StatusCode) -> Self {
+        let kind = match status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => SearchFailureKind::Authentication,
+            StatusCode::TOO_MANY_REQUESTS => SearchFailureKind::RateLimited,
+            status if status.is_server_error() => SearchFailureKind::Upstream,
+            _ => SearchFailureKind::Other,
+        };
+        Self {
+            message: format!("{backend} search failed: HTTP {status}"),
+            kind,
+        }
+    }
+}
+
+impl fmt::Display for SearchFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for SearchFailure {
+    fn from(message: String) -> Self {
+        Self::message(message)
+    }
+}
+
 #[derive(Clone)]
 struct SearchBackend {
     kind: BackendKind,
@@ -232,7 +282,7 @@ impl SearchBackend {
         query: &str,
         max_results: usize,
         cancel: Option<&CancellationToken>,
-    ) -> Result<Vec<SearchHit>, String> {
+    ) -> Result<Vec<SearchHit>, SearchFailure> {
         let id = self.id;
         let request = match self.kind {
             BackendKind::Soket | BackendKind::Tavily => client
@@ -257,7 +307,7 @@ impl SearchBackend {
         };
         let response = super::send_cancellable(request, cancel)
             .await
-            .map_err(|e| format!("{id} search failed: {e}"))?;
+            .map_err(|e| SearchFailure::message(format!("{id} search failed: {e}")))?;
         let body = read_json(response, id, cancel).await?;
         let mut hits = match self.kind {
             BackendKind::Soket => parse_soket(&body)?,
@@ -285,20 +335,23 @@ pub(super) fn endpoint(base: &Url, path: &str) -> Url {
 
 /// Check the status first (error bodies are often not JSON), then read a
 /// capped body and parse it.
-pub(super) async fn read_json(
+async fn read_json(
     response: reqwest::Response,
     backend: &str,
     cancel: Option<&CancellationToken>,
-) -> Result<Value, String> {
+) -> Result<Value, SearchFailure> {
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("{backend} search failed: HTTP {status}"));
+        return Err(SearchFailure::http(backend, status));
     }
     let (bytes, truncated) = super::read_capped(response, cancel).await?;
     if truncated {
-        return Err(format!("{backend} response is too large"));
+        return Err(SearchFailure::message(format!(
+            "{backend} response is too large"
+        )));
     }
-    serde_json::from_slice(&bytes).map_err(|e| format!("{backend} returned invalid JSON: {e}"))
+    serde_json::from_slice(&bytes)
+        .map_err(|e| SearchFailure::message(format!("{backend} returned invalid JSON: {e}")))
 }
 
 /// API key resolution order: `apiKeyEnv` env vars → stored key → default envs.
@@ -434,7 +487,8 @@ pub fn create_web_search_tool(
                     .clamp(1, 10) as usize;
                 let hits = backend
                     .search(&client, &query, max_results, cancel.as_ref())
-                    .await?;
+                    .await
+                    .map_err(|error| error.to_string())?;
                 if hits.is_empty() {
                     return Ok(crate::types::AgentToolResult::text(format!(
                         "No results for '{query}'."
@@ -484,10 +538,10 @@ pub async fn verify_web_search_key(config: &WebSearchConfig, api_key: &str) -> R
         .await
     {
         Ok(_) => Ok(()),
-        Err(e) if e.contains("HTTP 401") || e.contains("HTTP 403") => {
+        Err(error) if error.kind == SearchFailureKind::Authentication => {
             Err(format!("{} rejected the API key", info.display_name))
         }
-        Err(e) => Err(e),
+        Err(error) => Err(error.to_string()),
     }
 }
 
