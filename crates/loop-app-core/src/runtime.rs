@@ -7,10 +7,9 @@ use anyhow::bail;
 
 use loop_agent::harness::{
     create_bash_tool, create_edit_tool, create_read_tool, create_session_repository,
-    create_sqlite_session_store, create_web_fetch_tool, create_web_search_tool, create_write_tool,
-    verify_web_search_key, AgentHarness, AgentHarnessOptions, AgentHarnessResources,
-    HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime, Sandbox, SandboxMode,
-    WebFetchConfig, WebSearchConfig,
+    create_sqlite_session_store, create_write_tool, verify_web_search_key, AgentHarness,
+    AgentHarnessOptions, AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox,
+    LocalSandboxRuntime, Sandbox, SandboxMode, WebSearchConfig,
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
 use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
@@ -75,6 +74,8 @@ pub struct Runtime {
     pub mcp_client: Arc<loop_mcp::McpClientManager>,
     /// Skills activated via `/skill:name` (not yet cleared; mirrored on the harness).
     pub active_skills: Vec<String>,
+    /// Started with `--no-web`: no web tools this run (until `/websearch on`).
+    pub web_disabled_for_run: bool,
     /// Process telemetry, when the host application installed it.
     #[cfg(feature = "telemetry")]
     pub telemetry: Option<loop_telemetry::TelemetryHandle>,
@@ -239,6 +240,12 @@ impl Runtime {
             self.save_settings()?;
         }
         self.needs_provider_setup = false;
+        if id == loop_ai::providers::SOKET_PROVIDER_ID {
+            // The Soket key also powers the default web search and fetch.
+            if let Err(e) = self.rebuild_tools().await {
+                tracing::warn!("web tools not refreshed after /login soket: {e:#}");
+            }
+        }
         Ok(ConnectedProvider {
             id,
             name,
@@ -265,13 +272,11 @@ impl Runtime {
         }
         // Keep a same-backend baseUrl / private-address opt-in when re-logging in.
         let mut config = match &self.settings.web_search {
-            Some(existing) if existing.provider.eq_ignore_ascii_case(&provider) => existing.clone(),
-            _ => WebSearchConfig {
-                provider: provider.clone(),
-                ..Default::default()
-            },
+            Some(existing) if existing.provider_id() == provider => existing.clone(),
+            _ => WebSearchConfig::default(),
         };
-        config.provider = provider.clone();
+        config.provider = Some(provider.clone());
+        config.enabled = true;
         verify_web_search_key(&config, api_key)
             .await
             .map_err(|e| anyhow::anyhow!("{name} rejected the key: {e}"))?;
@@ -285,7 +290,7 @@ impl Runtime {
     }
 
     /// `/logout tavily|brave`: forget the key; when it was the active backend,
-    /// disable `web_search` and drop the tool from the live harness.
+    /// `web_search` returns to the default backend (Soket).
     pub async fn disconnect_web_search(&mut self, provider: &str) -> anyhow::Result<String> {
         let provider = provider.trim().to_ascii_lowercase();
         let name = crate::config::web_search_display_name(&provider);
@@ -293,32 +298,48 @@ impl Runtime {
             .settings
             .web_search
             .as_ref()
-            .is_some_and(|c| c.provider.eq_ignore_ascii_case(&provider));
+            .is_some_and(|c| c.provider_id() == provider);
         if !active && self.credentials.get(&provider).is_none() {
             anyhow::bail!("{provider} is not connected");
         }
         self.credentials.remove(&provider);
-        if active {
-            self.settings.web_search = None;
+        if let Some(config) = self.settings.web_search.as_mut().filter(|_| active) {
+            config.provider = None;
             self.save_settings()?;
-            self.rebuild_tools().await?;
         }
+        self.rebuild_tools().await?;
         Ok(name)
     }
 
+    /// The web tools this runtime should register.
+    pub fn web_tools(&self) -> crate::web_tools::WebTools {
+        crate::web_tools::WebTools::from_settings(
+            &self.settings,
+            Some(Arc::clone(&self.credentials)),
+            self.web_disabled_for_run,
+        )
+    }
+
+    /// `/websearch on|off`: persist `webSearch.enabled` and add or drop the
+    /// web tools on the live harness. `on` also lifts `--no-web`.
+    pub async fn set_web_enabled(&mut self, enabled: bool) -> anyhow::Result<String> {
+        self.settings.web_search.get_or_insert_with(Default::default).enabled = enabled;
+        if enabled {
+            self.web_disabled_for_run = false;
+        }
+        self.save_settings()?;
+        self.rebuild_tools().await?;
+        Ok(self.web_tools().status())
+    }
+
     /// Swap the harness tool set for a freshly built one (keeps MCP tools).
-    async fn rebuild_tools(&self) -> anyhow::Result<()> {
+    pub async fn rebuild_tools(&self) -> anyhow::Result<()> {
         let env = self
             .harness
             .tool_env()
             .await
             .map_err(|e| anyhow::anyhow!("tool env: {e}"))?;
-        let tools = build_tools(
-            env,
-            self.settings.web_fetch,
-            self.settings.web_search.as_ref(),
-            Some(self.credentials.as_ref()),
-        );
+        let tools = build_tools(env, &self.web_tools());
         self.harness
             .set_tools(tools)
             .await
@@ -346,6 +367,12 @@ impl Runtime {
             }
             None => preset.map_or_else(|| id.clone(), |p| p.name.to_string()),
         };
+        if id == loop_ai::providers::SOKET_PROVIDER_ID {
+            // Drop the Soket-backed web tools (an env key may keep them).
+            if let Err(e) = self.rebuild_tools().await {
+                tracing::warn!("web tools not refreshed after /logout soket: {e:#}");
+            }
+        }
         if self
             .selected_model
             .as_ref()
@@ -482,18 +509,15 @@ pub struct BootstrapOpts {
     pub interactive: bool,
     /// Resume session id.
     pub session_id: Option<String>,
+    /// `--no-web`: register no web tools this run.
+    pub no_web: bool,
 }
 
-/// Build the standard tool set bound to an execution environment.
-///
-/// `web_fetch` is always included (subject to `web_fetch` settings); `web_search`
-/// is included only when a backend is configured and its API key resolves
-/// (`apiKeyEnv` env vars → saved `/login` key → backend default env var).
+/// Build the standard tool set bound to an execution environment, plus the
+/// web tools `web` asks for (see [`crate::web_tools`]).
 pub fn build_tools(
     env: Arc<dyn loop_agent::harness::ExecutionEnv>,
-    web_fetch: WebFetchConfig,
-    web_search: Option<&WebSearchConfig>,
-    credentials: Option<&FileCredentialStore>,
+    web: &crate::web_tools::WebTools,
 ) -> Vec<AgentTool> {
     let mut tools = vec![
         create_read_tool(Arc::clone(&env)),
@@ -501,25 +525,7 @@ pub fn build_tools(
         create_edit_tool(Arc::clone(&env)),
         create_bash_tool(env),
     ];
-    match create_web_fetch_tool(web_fetch) {
-        Ok(tool) => tools.push(tool),
-        Err(e) => tracing::warn!("web_fetch disabled: {e}"),
-    }
-    if let Some(config) = web_search {
-        let stored_key = credentials
-            .and_then(|store| store.get(&config.provider.trim().to_ascii_lowercase()))
-            .and_then(|credential| match credential {
-                loop_ai::Credential::ApiKey { key } => Some(key),
-                _ => None,
-            });
-        match create_web_search_tool(config.clone(), stored_key.as_deref()) {
-            Ok(tool) => tools.push(tool),
-            Err(e) => {
-                tracing::warn!("web_search disabled: {e}");
-                eprintln!("note: web_search not enabled: {e}");
-            }
-        }
-    }
+    tools.extend(web.build());
     tools
 }
 
@@ -854,12 +860,12 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
             }
         };
 
-    let tools = build_tools(
-        Arc::clone(&tool_env),
-        settings.web_fetch,
-        settings.web_search.as_ref(),
-        Some(credentials.as_ref()),
+    let web = crate::web_tools::WebTools::from_settings(
+        &settings,
+        Some(Arc::clone(&credentials)),
+        opts.no_web,
     );
+    let tools = build_tools(Arc::clone(&tool_env), &web);
 
     // The prompt lists the tools that were actually built (web_search may be
     // unconfigured), so it can never promise a tool the agent cannot call.
@@ -955,6 +961,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         tool_approval: None,
         mcp_client,
         active_skills: Vec::new(),
+        web_disabled_for_run: opts.no_web,
         #[cfg(feature = "telemetry")]
         telemetry: None,
     })
