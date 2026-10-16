@@ -168,8 +168,8 @@ pub struct Settings {
     #[serde(default)]
     pub sandbox: SandboxSettings,
     /// `web_fetch` tool (`webFetch` in settings.json).
-    #[serde(default)]
-    pub web_fetch: loop_agent::harness::WebFetchConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_fetch: Option<loop_agent::harness::WebFetchConfig>,
     /// Web tools switch and `web_search` backend (`webSearch` in
     /// settings.json). Absent means on, with the Soket backend; the search
     /// tool is only registered when the backend's API key resolves.
@@ -260,7 +260,7 @@ impl Default for Settings {
             double_escape_action: default_double_escape(),
             ui_mode: default_ui_mode(),
             sandbox: SandboxSettings::default(),
-            web_fetch: loop_agent::harness::WebFetchConfig::default(),
+            web_fetch: None,
             web_search: None,
             file_edit_review: default_file_edit_review(),
             diff_editor: None,
@@ -369,7 +369,13 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
     base.double_escape_action = project.double_escape_action;
     base.ui_mode = project.ui_mode;
     base.sandbox = project.sandbox;
-    base.web_fetch = project.web_fetch;
+    if let Some(project_fetch) = project.web_fetch {
+        let global = base.web_fetch.unwrap_or_default();
+        base.web_fetch = Some(loop_agent::harness::WebFetchConfig {
+            allow_private_addresses: global.allow_private_addresses,
+            provider: project_fetch.provider,
+        });
+    }
     if let Some(project_search) = project.web_search {
         // A project may pick the backend or turn the web tools off, but not
         // change where keys are sent or which env vars are read: `baseUrl`,
@@ -499,6 +505,43 @@ mod tests {
         let on: Settings = serde_json::from_str(r#"{"webSearch": {"enabled": true}}"#).unwrap();
         global.merge_project(on);
         assert!(!global.web_search.unwrap().enabled);
+    }
+
+    #[test]
+    fn project_web_fetch_cannot_enable_private_addresses_or_reset_global() {
+        use loop_agent::harness::{WebFetchConfig, WebFetchProvider};
+
+        let mut global = Settings {
+            web_fetch: Some(WebFetchConfig {
+                allow_private_addresses: false,
+                provider: WebFetchProvider::Soket,
+            }),
+            ..Default::default()
+        };
+        let project: Settings = serde_json::from_str(
+            r#"{"webFetch":{"allowPrivateAddresses":true,"provider":"direct"}}"#,
+        )
+        .unwrap();
+        global.merge_project(project);
+        let merged = global.web_fetch.unwrap();
+        assert!(!merged.allow_private_addresses);
+        assert_eq!(merged.provider, WebFetchProvider::Direct);
+
+        let mut global = Settings {
+            web_fetch: Some(WebFetchConfig {
+                allow_private_addresses: false,
+                provider: WebFetchProvider::Soket,
+            }),
+            ..Default::default()
+        };
+        global.merge_project(Settings::default());
+        assert_eq!(
+            global.web_fetch,
+            Some(WebFetchConfig {
+                allow_private_addresses: false,
+                provider: WebFetchProvider::Soket,
+            })
+        );
     }
 
     #[test]

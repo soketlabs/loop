@@ -40,7 +40,7 @@ impl WebTools {
         let search = settings.web_search.clone().unwrap_or_default();
         Self {
             enabled: search.enabled && !disabled_for_run,
-            fetch: settings.web_fetch,
+            fetch: settings.web_fetch.unwrap_or_default(),
             search,
             credentials,
         }
