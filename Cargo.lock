@@ -4536,6 +4536,7 @@ dependencies = [
  "loop-orchestration",
  "loop-protocol",
  "loop-telemetry",
+ "loop-test-support",
  "mime_guess",
  "opentelemetry_sdk",
  "parking_lot",
