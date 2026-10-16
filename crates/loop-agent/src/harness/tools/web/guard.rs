@@ -122,6 +122,44 @@ pub fn validate_request_url(url: &Url, policy: FetchPolicy) -> Result<(), String
     Ok(())
 }
 
+/// Resolve a hostname locally before forwarding the URL to Soket.
+pub(super) async fn validate_resolved_host(url: &Url, policy: FetchPolicy) -> Result<(), String> {
+    validate_request_url(url, policy)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| format!("could not resolve '{host}' before Soket fetch: {error}"))?
+        .map(|addr| addr.ip())
+        .collect::<Vec<_>>();
+    validate_resolved_addrs(host, &addrs, policy)
+}
+
+fn validate_resolved_addrs(
+    host: &str,
+    addrs: &[IpAddr],
+    policy: FetchPolicy,
+) -> Result<(), String> {
+    if addrs.is_empty() {
+        return Err(format!("host '{host}' did not resolve to any address"));
+    }
+    if let Some(addr) = addrs.iter().find(|addr| !policy.permits_addr(**addr)) {
+        return Err(format!(
+            "refusing to send '{host}' to Soket: resolves to forbidden {addr}"
+        ));
+    }
+    Ok(())
+}
+
 /// DNS resolver that enforces [`FetchPolicy`] at connect time.
 ///
 /// Resolution is rejected when any resolved address is non-public, so the
@@ -300,5 +338,21 @@ mod tests {
         // … but never weakens scheme/credential rules.
         assert!(validate_request_url(&url("ftp://example.com"), lenient).is_err());
         assert!(validate_request_url(&url("https://u:p@example.com"), lenient).is_err());
+    }
+
+    #[test]
+    fn resolved_host_validation_rejects_any_private_answer() {
+        let result = validate_resolved_addrs(
+            "internal.example",
+            &["8.8.8.8".parse().unwrap(), "192.168.1.20".parse().unwrap()],
+            FetchPolicy::default(),
+        );
+        assert!(result.unwrap_err().contains("192.168.1.20"));
+        assert!(validate_resolved_addrs(
+            "public.example",
+            &["8.8.8.8".parse().unwrap()],
+            FetchPolicy::default(),
+        )
+        .is_ok());
     }
 }

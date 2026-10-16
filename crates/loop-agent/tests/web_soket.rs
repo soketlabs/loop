@@ -252,6 +252,21 @@ async fn soket_fetch_never_forwards_private_targets() {
 }
 
 #[tokio::test]
+async fn soket_fetch_rejects_unresolvable_hostnames_before_forwarding() {
+    let server = FakeHttpServer::always(FakeResponse::json(SOKET_FETCH));
+    let tool = create_web_fetch_tool(soket_fetch_config(), Some(soket_api(&server)))
+        .expect("web_fetch tool");
+    let err = execute(&tool, json!({"url": "https://loop-internal-test.invalid/"}))
+        .await
+        .expect_err("unresolvable hostname must be rejected");
+    assert!(err.contains("resolve"), "unexpected error: {err}");
+    assert!(
+        server.requests().is_empty(),
+        "Soket must not receive the URL"
+    );
+}
+
+#[tokio::test]
 async fn fetch_path_selection() {
     let page = FakeHttpServer::always(FakeResponse::new(200, "text/plain", "direct page"));
     let page_url = format!("{}/page", page.base_url());

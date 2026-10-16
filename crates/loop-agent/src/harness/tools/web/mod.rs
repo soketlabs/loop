@@ -342,7 +342,7 @@ async fn fetch_via_soket(
     let url = Url::parse(raw_url).map_err(|e| format!("invalid URL '{raw_url}': {e}"))?;
     // Soket cannot reach this machine's network, and private URLs should not
     // leave it: apply the strict policy whatever `allowPrivateAddresses` says.
-    validate_request_url(&url, FetchPolicy::default())?;
+    guard::validate_resolved_host(&url, FetchPolicy::default()).await?;
     let request = client
         .post(endpoint.clone())
         .bearer_auth(api_key)
