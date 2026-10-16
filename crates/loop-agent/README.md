@@ -55,8 +55,15 @@ The default policy fails closed. `WebFetchConfig { allow_private_addresses: true
 opts a deployment into intranet mirrors (and the same field on
 `WebSearchConfig` allows private search-API base URLs).
 
-`web_search` is backend-driven: `tavily` and `brave` ship today; the backend
-registry in `harness::tools::web::search` is where an in-house API slots in.
+`web_search` is backend-driven. The registry in `harness::tools::web::search`
+lists `soket` (the default, using the Soket model-provider key), `tavily`,
+`tinyfish` and `brave`.
+
+`web_fetch` takes an optional `SoketWebApi`: with one (and
+`WebFetchProvider::Auto` or `Soket`), pages are fetched by Soket's fetch API
+and returned as markdown; the target URL still passes the strict guard before
+it is sent. Without one, or with `WebFetchProvider::Direct` or
+`allow_private_addresses`, the guarded direct client above is used.
 
 ## Sandbox
 

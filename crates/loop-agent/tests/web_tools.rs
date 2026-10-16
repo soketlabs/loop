@@ -21,9 +21,13 @@ fn expect_creation_error(result: Result<AgentTool, String>, context: &str) -> St
 /// A `web_fetch` tool that may talk to the fake server on 127.0.0.1
 /// (the documented intranet-mirror opt-in).
 fn fetch_tool_allowing_private_hosts() -> AgentTool {
-    create_web_fetch_tool(loop_agent::harness::WebFetchConfig {
-        allow_private_addresses: true,
-    })
+    create_web_fetch_tool(
+        loop_agent::harness::WebFetchConfig {
+            allow_private_addresses: true,
+            ..Default::default()
+        },
+        None,
+    )
     .expect("web_fetch tool")
 }
 
@@ -118,7 +122,7 @@ async fn fetch_reports_http_errors() {
 #[tokio::test]
 async fn fetch_rejects_private_addresses_by_default() {
     let server = FakeHttpServer::always(FakeResponse::new(200, "text/plain", "secret"));
-    let tool = create_web_fetch_tool(Default::default()).expect("web_fetch tool");
+    let tool = create_web_fetch_tool(Default::default(), None).expect("web_fetch tool");
     let err = execute_tool(&tool, json!({"url": server.base_url()}))
         .await
         .expect_err("strict policy must refuse loopback");
@@ -171,10 +175,11 @@ fn search_config(
     provider: &str,
 ) -> loop_agent::harness::WebSearchConfig {
     loop_agent::harness::WebSearchConfig {
-        provider: provider.into(),
+        provider: Some(provider.into()),
         api_key_env: vec![key_env.into()],
         base_url: Some(server.base_url().to_string()),
         allow_private_addresses: true,
+        ..Default::default()
     }
 }
 
@@ -244,7 +249,7 @@ async fn search_requires_an_api_key() {
     let err = expect_creation_error(
         create_web_search_tool(
             loop_agent::harness::WebSearchConfig {
-                provider: "tavily".into(),
+                provider: Some("tavily".into()),
                 api_key_env: vec!["LOOP_TEST_MISSING_KEY".into()],
                 ..Default::default()
             },
@@ -261,7 +266,7 @@ async fn search_rejects_unknown_provider() {
     let err = expect_creation_error(
         create_web_search_tool(
             loop_agent::harness::WebSearchConfig {
-                provider: "altavista".into(),
+                provider: Some("altavista".into()),
                 api_key_env: vec!["LOOP_TEST_ANY_KEY".into()],
                 ..Default::default()
             },
@@ -279,7 +284,7 @@ async fn search_rejects_private_base_urls_by_default() {
     let err = expect_creation_error(
         create_web_search_tool(
             loop_agent::harness::WebSearchConfig {
-                provider: "tavily".into(),
+                provider: Some("tavily".into()),
                 api_key_env: vec!["LOOP_TEST_STRICT_KEY".into()],
                 base_url: Some(server.base_url().to_string()),
                 ..Default::default()

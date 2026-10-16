@@ -7,11 +7,14 @@
 //! each hop is re-validated; downloads are capped and truncated before they
 //! reach the model context.
 //!
-//! - `web_fetch` is always available; `webFetch.allowPrivateAddresses` opts a
-//!   deployment into intranet mirrors (default: fail closed).
-//! - `web_search` needs a backend config (`webSearch` in settings.json); its
-//!   API key comes from `/login tavily|brave` (auth.json), `apiKeyEnv` env
-//!   vars, or the backend's default env var. See [`search`].
+//! - `web_fetch` goes through Soket's fetch API when a Soket key is available
+//!   (the page is fetched on Soket's side and returned as markdown) and
+//!   otherwise fetches directly. `webFetch.provider` pins either path;
+//!   `webFetch.allowPrivateAddresses` opts a deployment into intranet mirrors
+//!   (default: fail closed) and implies the direct path.
+//! - `web_search` uses the `webSearch.provider` backend (Soket by default);
+//!   its API key comes from `/login` (auth.json), `apiKeyEnv` env vars, or the
+//!   backend's default env vars. See [`search`].
 
 mod guard;
 mod html;
@@ -19,7 +22,7 @@ mod search;
 
 pub use search::{
     create_web_search_tool, verify_web_search_key, web_search_backend, WebSearchBackendInfo,
-    WebSearchConfig, WEB_SEARCH_BACKENDS,
+    WebSearchConfig, DEFAULT_WEB_SEARCH_PROVIDER, WEB_SEARCH_BACKENDS,
 };
 
 use std::sync::OnceLock;
@@ -34,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use crate::harness::utils::{truncate_head, DEFAULT_MAX_BYTES};
 use crate::types::{AgentTool, AgentToolResult};
 use guard::{validate_request_url, FetchPolicy};
+use loop_ai::providers::{SOKET_API_KEY_ENVS, SOKET_BASE_URL};
 use loop_ai::{TextContent, ToolResultContent};
 
 /// Hard cap on bytes downloaded per page (the model sees [`DEFAULT_MAX_BYTES`]).
@@ -45,14 +49,86 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Maximum followed redirects, each re-validated.
 const MAX_REDIRECTS: usize = 5;
 
+/// Where `web_fetch` sends its requests (`webFetch.provider`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WebFetchProvider {
+    /// Soket when a Soket key is available (and private addresses are not
+    /// allowed), otherwise direct.
+    #[default]
+    Auto,
+    /// Always Soket's fetch API; tool creation fails without a key.
+    Soket,
+    /// Always fetch from this machine.
+    Direct,
+}
+
 /// Configuration for the `web_fetch` tool (`webFetch` in settings.json).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WebFetchConfig {
     /// Allow loopback, private, link-local and reserved addresses. Intended
-    /// for intranet mirrors; the default fails closed.
+    /// for intranet mirrors; the default fails closed. Soket cannot reach an
+    /// intranet, so in `auto` mode this selects the direct path.
     #[serde(default)]
     pub allow_private_addresses: bool,
+    /// Soket fetch API or direct fetch.
+    #[serde(default, skip_serializing_if = "is_auto")]
+    pub provider: WebFetchProvider,
+}
+
+fn is_auto(provider: &WebFetchProvider) -> bool {
+    *provider == WebFetchProvider::Auto
+}
+
+/// Soket's search/fetch API access: the key stored for the Soket model
+/// provider and the API base URL.
+#[derive(Clone)]
+pub struct SoketWebApi {
+    /// API base URL, including the version path.
+    pub base_url: String,
+    /// Bearer token.
+    pub api_key: String,
+}
+
+impl std::fmt::Debug for SoketWebApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SoketWebApi")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SoketWebApi {
+    /// Access to the production Soket API with `api_key`.
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            base_url: SOKET_BASE_URL.into(),
+            api_key: api_key.into(),
+        }
+    }
+
+    /// Resolve the Soket key: the stored `/login soket` credential, then the
+    /// `SOKET_API_KEY` family of env vars. `None` when neither is set.
+    pub fn resolve(stored_key: Option<&str>) -> Option<Self> {
+        let non_empty = |v: &str| !v.trim().is_empty();
+        stored_key
+            .filter(|k| non_empty(k))
+            .map(str::to_string)
+            .or_else(|| {
+                SOKET_API_KEY_ENVS
+                    .iter()
+                    .find_map(|name| std::env::var(name).ok().filter(|v| non_empty(v)))
+            })
+            .map(Self::new)
+    }
+}
+
+/// How a built `web_fetch` tool reaches pages.
+#[derive(Clone)]
+enum FetchRoute {
+    Direct,
+    Soket { endpoint: Url, api_key: String },
 }
 
 impl WebFetchConfig {
@@ -92,14 +168,40 @@ fn build_client(policy: FetchPolicy) -> Option<reqwest::Client> {
     client.ok()
 }
 
-/// Build the `web_fetch` tool. `Err` only covers HTTP client init failure.
-pub fn create_web_fetch_tool(config: WebFetchConfig) -> Result<AgentTool, String> {
+/// Build the `web_fetch` tool. `soket` (when resolved) routes fetches through
+/// Soket's fetch API per [`WebFetchProvider`]. `Err` covers HTTP client init
+/// failure, a bad Soket base URL, and `provider: soket` without a key.
+pub fn create_web_fetch_tool(
+    config: WebFetchConfig,
+    soket: Option<SoketWebApi>,
+) -> Result<AgentTool, String> {
     let policy = config.policy();
     let client = shared_client(policy)?;
+    let soket = match (config.provider, soket) {
+        (WebFetchProvider::Direct, _) => None,
+        (WebFetchProvider::Auto, _) if config.allow_private_addresses => None,
+        (WebFetchProvider::Soket, None) => {
+            return Err(
+                "webFetch.provider is \"soket\" but no Soket API key: run /login soket or set SOKET_API_KEY"
+                    .into(),
+            )
+        }
+        (_, soket) => soket,
+    };
+    let route = match soket {
+        None => FetchRoute::Direct,
+        Some(api) => FetchRoute::Soket {
+            endpoint: search::endpoint(
+                &search::resolve_base_url(&api.base_url, policy)?,
+                "fetch",
+            ),
+            api_key: api.api_key,
+        },
+    };
     Ok(AgentTool::simple(
         "web_fetch",
         "Web fetch",
-        "Fetch an HTTP(S) URL and return its body as text (HTML pages are converted to plain text). Follows up to 5 redirects; only public internet hosts are reachable.",
+        "Fetch an HTTP(S) URL and return its content as text (HTML pages are converted to plain text or markdown). Only public internet hosts are reachable.",
         schema_object(
             json!({
                 "url": {"type": "string", "description": "Absolute http(s) URL to fetch"}
@@ -108,9 +210,16 @@ pub fn create_web_fetch_tool(config: WebFetchConfig) -> Result<AgentTool, String
         ),
         move |_id, args, cancel, _on_update| {
             let client = client.clone();
+            let route = route.clone();
             async move {
                 let raw_url = arg_str(&args, "url")?;
-                fetch_url(&client, &raw_url, policy, cancel.as_ref()).await
+                match &route {
+                    FetchRoute::Direct => fetch_url(&client, &raw_url, policy, cancel.as_ref()).await,
+                    FetchRoute::Soket { endpoint, api_key } => {
+                        fetch_via_soket(&client, endpoint, api_key, &raw_url, cancel.as_ref())
+                            .await
+                    }
+                }
             }
         },
     ))
@@ -130,13 +239,11 @@ async fn fetch_url(
 
     for _ in 0..=MAX_REDIRECTS {
         validate_request_url(&url, policy)?;
-        let response = client
-            .get(url.clone())
-            .header(
-                "accept",
-                "text/html, application/json, application/xml, text/plain;q=0.9, */*;q=0.5",
-            )
-            .send()
+        let request = client.get(url.clone()).header(
+            "accept",
+            "text/html, application/json, application/xml, text/plain;q=0.9, */*;q=0.5",
+        );
+        let response = send_cancellable(request, cancel)
             .await
             .map_err(|e| format!("request to {} failed: {e}", url.as_str()))?;
 
@@ -201,6 +308,7 @@ async fn fetch_url(
         let (text, truncated) = truncate_head(&text, DEFAULT_MAX_BYTES);
         let mut details = json!({
             "url": url.as_str(),
+            "via": "direct",
             "status": status.as_u16(),
             "contentType": content_type,
             "bytes": bytes.len(),
@@ -223,12 +331,94 @@ async fn fetch_url(
     Err(format!("too many redirects (more than {MAX_REDIRECTS})"))
 }
 
+/// Fetch through Soket's fetch API (`POST {base}/fetch {"url"}`), which
+/// returns the page as markdown. Failures are reported, not retried directly:
+/// a silent fallback would fetch the page twice and from a different origin.
+async fn fetch_via_soket(
+    client: &reqwest::Client,
+    endpoint: &Url,
+    api_key: &str,
+    raw_url: &str,
+    cancel: Option<&CancellationToken>,
+) -> Result<AgentToolResult, String> {
+    let url = Url::parse(raw_url).map_err(|e| format!("invalid URL '{raw_url}': {e}"))?;
+    // Soket cannot reach this machine's network, and private URLs should not
+    // leave it: apply the strict policy whatever `allowPrivateAddresses` says.
+    validate_request_url(&url, FetchPolicy::default())?;
+    let request = client
+        .post(endpoint.clone())
+        .bearer_auth(api_key)
+        .json(&json!({ "url": url.as_str() }));
+    let response = send_cancellable(request, cancel)
+        .await
+        .map_err(|e| format!("soket fetch of {} failed: {e}", url.as_str()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "soket fetch of {} failed: HTTP {status} (set webFetch.provider to \"direct\" to bypass Soket)",
+            url.as_str()
+        ));
+    }
+    let (bytes, too_large) = read_capped(response, cancel).await?;
+    if too_large {
+        return Err("soket fetch response is too large".into());
+    }
+    let body: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("soket fetch returned invalid JSON: {e}"))?;
+    search::check_soket_ok(&body, "fetch")
+        .map_err(|e| format!("{e} ({})", url.as_str()))?;
+    let field = |key: &str| body.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    let (markdown, title) = (field("markdown"), field("title"));
+    let page = if title.trim().is_empty() {
+        markdown.to_string()
+    } else {
+        format!("# {}\n\n{markdown}", title.trim())
+    };
+    let (text, truncated) = truncate_head(&page, DEFAULT_MAX_BYTES);
+    // Only page fields are kept: the response also names Soket's egress proxy.
+    let final_url = Some(field("url")).filter(|u| !u.is_empty()).unwrap_or(url.as_str());
+    let details = json!({
+        "url": final_url,
+        "via": "soket",
+        "title": title,
+        "contentType": "text/markdown",
+        "bytes": markdown.len(),
+        "truncated": truncated,
+    });
+    Ok(AgentToolResult {
+        content: vec![ToolResultContent::Text(TextContent {
+            text,
+            text_signature: None,
+        })],
+        details,
+        usage: None,
+        added_tool_names: None,
+        terminate: None,
+    })
+}
+
+/// Send `request`, giving up as soon as `cancel` fires.
+pub(crate) async fn send_cancellable(
+    request: reqwest::RequestBuilder,
+    cancel: Option<&CancellationToken>,
+) -> Result<reqwest::Response, String> {
+    let send = request.send();
+    match cancel {
+        Some(token) => tokio::select! {
+            biased;
+            () = token.cancelled() => Err("cancelled".into()),
+            result = send => result.map_err(|e| e.to_string()),
+        },
+        None => send.await.map_err(|e| e.to_string()),
+    }
+}
+
 fn is_redirect(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
 }
 
 /// Stream the body up to [`MAX_DOWNLOAD_BYTES`], honouring cancellation.
-async fn read_capped(
+pub(crate) async fn read_capped(
     mut response: reqwest::Response,
     cancel: Option<&CancellationToken>,
 ) -> Result<(Vec<u8>, bool), String> {
@@ -291,7 +481,8 @@ mod tests {
         );
         assert_eq!(
             WebFetchConfig {
-                allow_private_addresses: true
+                allow_private_addresses: true,
+                ..Default::default()
             }
             .policy(),
             FetchPolicy {

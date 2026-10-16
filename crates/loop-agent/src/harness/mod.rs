@@ -45,7 +45,8 @@ pub use session::{
 #[cfg(feature = "web")]
 pub use tools::web::{
     create_web_fetch_tool, create_web_search_tool, verify_web_search_key, web_search_backend,
-    WebFetchConfig, WebSearchBackendInfo, WebSearchConfig, WEB_SEARCH_BACKENDS,
+    SoketWebApi, WebFetchConfig, WebFetchProvider, WebSearchBackendInfo, WebSearchConfig,
+    DEFAULT_WEB_SEARCH_PROVIDER, WEB_SEARCH_BACKENDS,
 };
 pub use tools::{create_bash_tool, create_edit_tool, create_read_tool, create_write_tool};
 pub use types::{
