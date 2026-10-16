@@ -7,7 +7,7 @@
 //! operation the backend lacks.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use tokio::sync::{broadcast, oneshot};
@@ -175,6 +175,53 @@ pub trait AgentBackend: Send + Sync {
     fn local_shell(&self) -> Option<&dyn LocalShell> {
         None
     }
+
+    /// Choosing the model the backend uses for a session.
+    fn model_control(&self) -> Option<&dyn ModelControl> {
+        None
+    }
+}
+
+/// One model a backend offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    /// The backend's id for the model, passed back to [`ModelControl::set_model`].
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Short description, when the backend gives one.
+    pub description: Option<String>,
+}
+
+/// The models a session can use, and the one it uses now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelChoices {
+    /// The current model's id, when known.
+    pub current: Option<String>,
+    /// Every model on offer.
+    pub models: Vec<ModelChoice>,
+}
+
+/// Model selection for backends that choose their own models.
+#[async_trait]
+pub trait ModelControl: Send + Sync {
+    /// The models the session can use.
+    async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices>;
+    /// Switch the session to `model` (a [`ModelChoice::id`]).
+    async fn set_model(&self, session: &SessionRef, model: &str) -> BackendResult<()>;
+    /// The reasoning effort levels the session's model offers, as choices.
+    async fn efforts(&self, _session: &SessionRef) -> BackendResult<ModelChoices> {
+        Err(BackendError::Unsupported(
+            "choosing a reasoning effort".into(),
+        ))
+    }
+    /// Switch the session to reasoning effort `effort` (a [`ModelChoice::id`]
+    /// from [`Self::efforts`]).
+    async fn set_effort(&self, _session: &SessionRef, _effort: &str) -> BackendResult<()> {
+        Err(BackendError::Unsupported(
+            "choosing a reasoning effort".into(),
+        ))
+    }
 }
 
 /// What Loop provides to every backend. Implemented once by the host
@@ -185,6 +232,100 @@ pub trait HostServices: Send + Sync {
     /// request returns [`InteractionOutcome::Rejected`]. Callers that can be
     /// cancelled race this against their cancellation and drop it.
     async fn interact(&self, request: InteractionRequest) -> InteractionOutcome;
+
+    /// File access performed by Loop on the backend's behalf. When `None`,
+    /// backends must not offer agents file access through Loop.
+    fn file_system(&self) -> Option<&dyn HostFileSystem> {
+        None
+    }
+
+    /// Commands run by Loop on the backend's behalf. When `None`, backends
+    /// must not offer agents terminals through Loop.
+    fn terminals(&self) -> Option<&dyn HostTerminals> {
+        None
+    }
+}
+
+/// Text file access through Loop, so its approval policy, review and
+/// conflict checks apply to an agent's file changes.
+#[async_trait]
+pub trait HostFileSystem: Send + Sync {
+    /// Read a text file, optionally from a 1-based `line` for `limit` lines.
+    async fn read_text_file(
+        &self,
+        session: &SessionRef,
+        path: &Path,
+        line: Option<u32>,
+        limit: Option<u32>,
+    ) -> BackendResult<String>;
+
+    /// Write a text file, creating it if needed.
+    async fn write_text_file(
+        &self,
+        session: &SessionRef,
+        path: &Path,
+        content: &str,
+    ) -> BackendResult<()>;
+}
+
+/// A command to run in a terminal Loop manages.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalRequest {
+    /// Program to run.
+    pub command: String,
+    /// Arguments.
+    pub args: Vec<String>,
+    /// Extra environment variables.
+    pub env: Vec<(String, String)>,
+    /// Working directory. Defaults to the session's.
+    pub cwd: Option<PathBuf>,
+    /// Keep at most this many bytes of output (the most recent ones).
+    pub output_byte_limit: Option<u64>,
+}
+
+/// How a terminal's command ended.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalExit {
+    /// Exit code, when the process exited normally.
+    pub exit_code: Option<u32>,
+    /// Signal name, when the process was killed by one.
+    pub signal: Option<String>,
+}
+
+/// Output of a terminal so far.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalOutput {
+    /// Output text.
+    pub output: String,
+    /// Whether earlier output was dropped to respect the byte limit.
+    pub truncated: bool,
+    /// Set once the command has ended.
+    pub exit: Option<TerminalExit>,
+}
+
+/// Terminals run by Loop, so its sandbox and approval policy apply to an
+/// agent's commands. Ids are the host's own.
+#[async_trait]
+pub trait HostTerminals: Send + Sync {
+    /// Start a command. Returns the terminal id.
+    async fn create(&self, session: &SessionRef, request: TerminalRequest)
+        -> BackendResult<String>;
+    /// Output so far, without waiting.
+    async fn output(
+        &self,
+        session: &SessionRef,
+        terminal_id: &str,
+    ) -> BackendResult<TerminalOutput>;
+    /// Wait for the command to end.
+    async fn wait_for_exit(
+        &self,
+        session: &SessionRef,
+        terminal_id: &str,
+    ) -> BackendResult<TerminalExit>;
+    /// Kill the command; the terminal stays readable until released.
+    async fn kill(&self, session: &SessionRef, terminal_id: &str) -> BackendResult<()>;
+    /// Kill the command if still running and forget the terminal.
+    async fn release(&self, session: &SessionRef, terminal_id: &str) -> BackendResult<()>;
 }
 
 /// Result of compacting a conversation.
