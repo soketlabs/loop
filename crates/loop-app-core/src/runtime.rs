@@ -54,6 +54,14 @@ pub struct Runtime {
     /// Loop's own agent, for native-only features (sandbox, skills, MCP,
     /// forking, workflows). Same harness as `harness`.
     pub native: Arc<loop_agent::native_backend::NativeBackend>,
+    /// External ACP agents Loop can switch to.
+    pub agents: Arc<crate::agents::AgentManager>,
+    /// The external agent prompts go to, or `None` for Loop's own agent.
+    pub active_agent: Option<String>,
+    /// The model chosen for the active subscription, when one was chosen.
+    pub agent_model: Option<String>,
+    /// The active subscription's reasoning effort, when it has one.
+    pub agent_effort: Option<String>,
     /// Theme.
     pub theme: Theme,
     /// Resources.
@@ -86,6 +94,196 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Whether prompts go to Loop's own agent.
+    pub fn is_native(&self) -> bool {
+        self.active_agent.is_none()
+    }
+
+    /// Whether `provider` is a subscription served by an external agent.
+    pub fn is_subscription(&self, provider: &str) -> bool {
+        self.agents.entry(provider).is_some()
+    }
+
+    /// Make `backend`'s `session` the active one, for subscription `id`
+    /// running `model`.
+    pub fn adopt_agent(
+        &mut self,
+        id: &str,
+        backend: Arc<dyn loop_protocol::AgentBackend>,
+        session: loop_protocol::SessionRef,
+        model: Option<String>,
+    ) {
+        self.backend = backend;
+        self.session_id = session.native_id;
+        self.active_agent = Some(id.to_owned());
+        self.agent_model = model;
+        self.agent_effort = None;
+    }
+
+    /// Read the active subscription's current reasoning effort into
+    /// [`Self::agent_effort`].
+    pub async fn sync_agent_effort(&mut self) {
+        self.agent_effort = match self.backend.model_control() {
+            Some(control) if !self.is_native() => control
+                .efforts(&self.session_ref())
+                .await
+                .ok()
+                .and_then(|e| e.current),
+            _ => None,
+        };
+    }
+
+    /// The reasoning effort levels on offer, and the current one.
+    pub async fn efforts(&self) -> anyhow::Result<(Vec<String>, String)> {
+        if self.is_native() {
+            let levels = NATIVE_EFFORTS.iter().map(|l| (*l).to_owned()).collect();
+            let current = self.settings.default_thinking_level.to_lowercase();
+            return Ok((levels, current));
+        }
+        let control = self
+            .backend
+            .model_control()
+            .ok_or_else(|| anyhow::anyhow!("this subscription has no reasoning effort setting"))?;
+        let choices = control.efforts(&self.session_ref()).await?;
+        let levels = choices.models.into_iter().map(|m| m.id).collect();
+        Ok((levels, choices.current.unwrap_or_default()))
+    }
+
+    /// Set the reasoning effort to `level` and remember it for the next
+    /// session. Returns the level set.
+    pub async fn set_effort(&mut self, level: &str) -> anyhow::Result<String> {
+        let level = level.trim().to_lowercase();
+        let (levels, _) = self.efforts().await?;
+        if !levels.contains(&level) {
+            anyhow::bail!(
+                "unknown effort `{level}`; choose one of: {}",
+                levels.join(", ")
+            );
+        }
+        match self.active_agent.clone() {
+            None => {
+                self.harness
+                    .set_thinking_level(parse_thinking(&level))
+                    .await;
+                self.settings.default_thinking_level = level.clone();
+                self.save_settings()?;
+            }
+            Some(id) => {
+                if let Some(control) = self.backend.model_control() {
+                    control.set_effort(&self.session_ref(), &level).await?;
+                }
+                self.agents.remember_effort(&id, &level)?;
+                self.agent_effort = Some(level.clone());
+            }
+        }
+        Ok(level)
+    }
+
+    /// Step to the next reasoning effort (wrapping). Loop's own agent cycles
+    /// off → low → medium → high.
+    pub async fn cycle_effort(&mut self) -> anyhow::Result<String> {
+        let (levels, current) = if self.is_native() {
+            let levels: Vec<String> = ["off", "low", "medium", "high"]
+                .iter()
+                .map(|l| (*l).to_owned())
+                .collect();
+            (levels, self.settings.default_thinking_level.to_lowercase())
+        } else {
+            self.efforts().await?
+        };
+        let next = levels
+            .iter()
+            .position(|l| *l == current)
+            .map_or(0, |i| (i + 1) % levels.len());
+        let level = levels
+            .get(next)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no reasoning effort levels on offer"))?;
+        self.set_effort(&level).await
+    }
+
+    /// Start a new session with subscription `id` (on `model`, when given)
+    /// and make it active.
+    pub async fn use_agent(&mut self, id: &str, model: Option<&str>) -> anyhow::Result<()> {
+        let (backend, session) = self.agents.new_session(id, model).await?;
+        self.adopt_agent(id, backend, session, model.map(str::to_owned));
+        self.sync_agent_effort().await;
+        Ok(())
+    }
+
+    /// Save `provider/model` as the default for the next start.
+    pub fn remember_model(&mut self, provider: &str, model: &str) -> anyhow::Result<()> {
+        self.settings.set_selected_model(provider, model);
+        self.save_settings()
+    }
+
+    /// `provider/model` of what prompts go to, with the kind of access.
+    pub fn active_model_label(&self) -> Option<String> {
+        match (&self.active_agent, &self.agent_model) {
+            (Some(agent), model) => {
+                let mut label = agent.clone();
+                if let Some(model) = model {
+                    label = format!("{label}/{model}");
+                }
+                if let Some(effort) = &self.agent_effort {
+                    label = format!("{label} · {effort}");
+                }
+                Some(format!("{label} · subscription"))
+            }
+            (None, _) => self.selected_model_spec(),
+        }
+    }
+
+    /// Reopen a recorded external-agent session and make it active. The
+    /// session id is set first, so replayed history routes to it.
+    pub async fn resume_agent(
+        &mut self,
+        record: &crate::agents::AgentSessionRecord,
+    ) -> anyhow::Result<()> {
+        let previous = std::mem::replace(&mut self.session_id, record.id.clone());
+        match self.agents.resume(record).await {
+            Ok((backend, session)) => {
+                self.adopt_agent(&record.agent, backend, session, None);
+                self.sync_agent_effort().await;
+                Ok(())
+            }
+            Err(e) => {
+                self.session_id = previous;
+                Err(e)
+            }
+        }
+    }
+
+    /// Switch prompts back to Loop's own agent and its current session.
+    pub async fn use_native(&mut self) {
+        self.backend = self.native.clone();
+        self.session_id = self.harness.session_id().await;
+        self.active_agent = None;
+        self.agent_model = None;
+        self.agent_effort = None;
+    }
+
+    /// Start a new session with the active agent.
+    pub async fn new_session(&mut self) -> anyhow::Result<()> {
+        match self.active_agent.clone() {
+            Some(id) => {
+                let model = self.agent_model.clone();
+                self.use_agent(&id, model.as_deref()).await
+            }
+            None => {
+                let session = self
+                    .backend
+                    .new_session(loop_protocol::SessionSpec {
+                        cwd: Some(self.cwd.clone()),
+                        name: None,
+                    })
+                    .await?;
+                self.session_id = session.native_id;
+                Ok(())
+            }
+        }
+    }
+
     /// The active session as the backend interface names it.
     pub fn session_ref(&self) -> loop_protocol::SessionRef {
         loop_protocol::SessionRef {
@@ -416,6 +614,8 @@ pub struct BootstrapOpts {
     pub interactive: bool,
     /// Resume session id.
     pub session_id: Option<String>,
+    /// Start with this external agent. Loop's own provider is then optional.
+    pub agent: Option<String>,
 }
 
 /// Build the standard tool set bound to an execution environment.
@@ -561,6 +761,9 @@ pub fn resolve_trust(
     }
 }
 
+/// Reasoning effort levels of Loop's own agent, as `/effort` names them.
+const NATIVE_EFFORTS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 fn parse_thinking(s: &str) -> AgentThinkingLevel {
     match s.to_lowercase().as_str() {
         "minimal" => AgentThinkingLevel::Minimal,
@@ -605,8 +808,19 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     }
 
     let credentials = Arc::new(FileCredentialStore::open(auth_path(&agent_dir))?);
-    let needs_provider_setup =
-        ensure_provider_connected(&credentials, &settings.providers, opts.interactive)?;
+    let agents = Arc::new(crate::agents::AgentManager::new(
+        crate::agents::agent_entries(&settings.agents),
+        opts.cwd.clone(),
+        &agent_dir,
+    ));
+    // A signed-in subscription is a connected provider too.
+    let subscribed = agents
+        .entries()
+        .iter()
+        .any(|e| e.auth_method.is_some() && agents.is_signed_in(&e.id));
+    let needs_provider_setup = opts.agent.is_none()
+        && !subscribed
+        && ensure_provider_connected(&credentials, &settings.providers, opts.interactive)?;
 
     let models = build_models(&agent_dir, Arc::clone(&credentials), &settings.providers)?;
     // Hydrate every provider from models-store.json before resolving a model. Without
@@ -637,9 +851,13 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         });
     }
 
+    // A saved subscription model is started by the surface, not Loop's agent.
+    let saved = settings
+        .selected_model()
+        .filter(|(provider, _)| agents.entry(provider).is_none());
     let (mut model, mut model_note) = match crate::model_selection::resolve_startup_model(
         &models,
-        settings.selected_model(),
+        saved,
         opts.provider.as_deref(),
         opts.model.as_deref(),
     )? {
@@ -823,6 +1041,10 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         harness,
         backend,
         native,
+        agents,
+        active_agent: None,
+        agent_model: None,
+        agent_effort: None,
         theme,
         resources,
         project_trusted,

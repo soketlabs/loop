@@ -21,14 +21,13 @@ use loop_agent::harness::{
     format_prompt_template_invocation, KrunSandbox, Sandbox, SandboxMode, SessionForkPoint,
     SessionForkSelection,
 };
-use loop_agent::types::AgentThinkingLevel;
 use loop_ai::providers::SOKET_BASE_URL;
 use loop_ai::{calculate_context_tokens, ModelsRefreshOptions, Usage};
 use loop_app_core::interaction::{
     approval_kind, ApprovalReply, InteractionQueue, PendingInteraction,
 };
 use loop_protocol::{
-    ContentBlock, InteractionOutcome, InteractionRequest, NoticeLevel, Origin, Role, SessionSpec,
+    AgentBackend, ContentBlock, InteractionOutcome, InteractionRequest, NoticeLevel, Origin, Role,
     SessionUpdate, StopReason, ToolCallStatus, ToolContent, TurnOutcome, UpdateEnvelope,
 };
 
@@ -41,7 +40,7 @@ use crate::keybindings::{
     hotkey_help, multiline_paste_text, normalize_pasted_text, paste_burst_pending,
     pasted_single_line, Action,
 };
-use crate::provider_setup::ProviderSetup;
+use crate::provider_setup::{LoginChoice, ProviderSetup};
 use crate::setup_prompt::SetupPrompt;
 use crate::theme::Theme;
 use crate::tool_approval::{
@@ -59,7 +58,7 @@ use crate::tui::{
     CardStatus, ChatItem, CommandHistory, FileEntry, FooterOpts, InputBuffer, McpServerListing,
     PickerRow, PickerView, FOOTER_HEIGHT,
 };
-use crate::{build_tools, CliRuntime};
+use crate::{build_tools, CliRuntime, PendingAgent};
 
 enum UiEvent {
     UpdateAvailable(String),
@@ -67,6 +66,14 @@ enum UiEvent {
     Update(Box<UpdateEnvelope>),
     /// The backend refused to start a turn (no update was emitted for it).
     TurnFailed(String),
+    /// A subscription's agent started (or failed to).
+    AgentReady {
+        id: String,
+        model: Option<String>,
+        result: Result<(Arc<dyn AgentBackend>, loop_protocol::SessionRef), String>,
+    },
+    /// A message from background agent work (sign-in).
+    AgentNote(Result<String, String>),
     /// `/compact` finished (success message or error).
     CompactDone(Result<String, String>),
     /// `/sandbox` enable/disable finished.
@@ -360,11 +367,7 @@ async fn run_loop(
             }
         });
     }
-    forward_updates(
-        runtime.backend.subscribe(),
-        tx.clone(),
-        runtime.debug_log_path.clone(),
-    );
+    ensure_forwarding(runtime, runtime.backend.as_ref(), &tx);
 
     let review_policy = ApprovalPolicy::parse(&runtime.settings.file_edit_review);
     let policy_active = review_policy.asks_for_session(!runtime.resumed);
@@ -377,6 +380,9 @@ async fn run_loop(
         }
     };
     let (host, mut review_rx) = InteractionQueue::new();
+    // External agents ask the user through the same queue as Loop's own
+    // approvals.
+    runtime.agents.set_host(Arc::new(host.clone()));
     let bridge = Arc::new(ToolApprovalBridge::with_host(
         tool_env,
         runtime.settings.diff_editor.clone(),
@@ -411,6 +417,22 @@ async fn run_loop(
             Vec::new()
         }
     };
+    // An agent that needs a sign-in opens /login instead of failing.
+    let mut sign_in_first: Option<String> = None;
+    if let Some(pending) = runtime.pending_agent.take() {
+        let id = match &pending {
+            PendingAgent::New { id, .. } => id.clone(),
+            PendingAgent::Resume(record) => record.agent.clone(),
+        };
+        if runtime.agents.is_signed_in(&id) {
+            chat.push(sys(start_agent(runtime, pending, &tx)));
+        } else {
+            chat.push(sys(format!(
+                "sign in to {id} first, then pick its model with /model · login is open below"
+            )));
+            sign_in_first = Some(id);
+        }
+    }
     let mut flushed = 0usize;
     // Visual lines of `chat[flushed..]` already pushed into native scrollback.
     let mut live_frozen = 0usize;
@@ -446,7 +468,17 @@ async fn run_loop(
     let mut last_width = terminal.size()?.width;
     let mut hide_thinking = runtime.settings.hide_thinking_block;
     let mut pending_setup: Option<SetupPrompt> = if runtime.needs_provider_setup {
-        ProviderSetup::start(None).ok().map(SetupPrompt::Provider)
+        ProviderSetup::start(None, login_agents(runtime), runtime.connected_providers())
+            .ok()
+            .map(SetupPrompt::Provider)
+    } else if let Some(id) = &sign_in_first {
+        ProviderSetup::start(
+            Some(id),
+            login_agents(runtime),
+            runtime.connected_providers(),
+        )
+        .ok()
+        .map(SetupPrompt::Provider)
     } else {
         None
     };
@@ -512,7 +544,8 @@ async fn run_loop(
             redraw_request = true;
         }
 
-        let model_line = match runtime.selected_model_spec() {
+        let model_line = match runtime.active_model_label() {
+            Some(label) if !runtime.is_native() => label,
             Some(spec) => format!("{spec} · {}", runtime.settings.default_thinking_level),
             None => NO_MODEL_LABEL.to_string(),
         };
@@ -1130,6 +1163,10 @@ fn print_welcome(
         &runtime.theme,
         version,
         runtime.selected_model.as_ref(),
+        runtime
+            .active_agent
+            .as_deref()
+            .or(runtime.starting_agent.as_deref()),
         runtime.model_note.as_deref(),
         &endpoint,
         &runtime.session_id,
@@ -1343,6 +1380,48 @@ async fn drain_ui_events(
                     refresh_token_bar,
                 );
             }
+            UiEvent::AgentReady { id, model, result } => {
+                runtime.starting_agent = None;
+                match result {
+                    Ok((backend, session)) => {
+                        let resumed = runtime.session_id == session.native_id;
+                        runtime.adopt_agent(&id, backend, session, model.clone());
+                        runtime.sync_agent_effort().await;
+                        if let Some(model) = &model {
+                            if let Err(err) = runtime.remember_model(&id, model) {
+                                tracing::warn!("save model selection: {err:#}");
+                            }
+                        }
+                        let label = runtime.active_model_label().unwrap_or_else(|| id.clone());
+                        *status = format!("ready · {label}");
+                        if !resumed {
+                            push_before_queued(chat, sys(format!("model → {label} · new session")));
+                        }
+                    }
+                    Err(err) => {
+                        // A failed resume pointed the transcript at the agent's
+                        // session; return to Loop's own.
+                        if runtime.is_native() {
+                            runtime.use_native().await;
+                        }
+                        push_before_queued(chat, error_item(format!("{id}: {err}")));
+                        *status = "subscription failed to start".into();
+                    }
+                }
+            }
+            UiEvent::AgentNote(note) => {
+                let item = match note {
+                    Ok(text) => {
+                        *status = "ready · /help for commands".into();
+                        sys(text)
+                    }
+                    Err(err) => {
+                        *status = "login failed".into();
+                        error_item(err)
+                    }
+                };
+                push_before_queued(chat, item);
+            }
             UiEvent::TurnFailed(err) => {
                 *working = false;
                 turn_step.clear();
@@ -1524,6 +1603,112 @@ async fn drain_ui_events(
         message_queue,
         tx,
     );
+}
+
+/// Forward `backend`'s updates to the UI once per backend instance.
+fn ensure_forwarding(
+    runtime: &CliRuntime,
+    backend: &dyn AgentBackend,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+) {
+    let fresh = runtime
+        .forwarded
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(backend.instance().to_string());
+    if fresh {
+        forward_updates(
+            backend.subscribe(),
+            tx.clone(),
+            runtime.debug_log_path.clone(),
+        );
+    }
+}
+
+/// Start an external agent in the background; `UiEvent::AgentReady` reports
+/// the result. Returns a line to show meanwhile.
+fn start_agent(
+    runtime: &mut CliRuntime,
+    pending: PendingAgent,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+) -> String {
+    let (id, model) = match &pending {
+        PendingAgent::New { id, model } => (id.clone(), model.clone()),
+        PendingAgent::Resume(record) => {
+            // Replayed history must route to this session as it arrives.
+            runtime.session_id = record.id.clone();
+            (record.agent.clone(), None)
+        }
+    };
+    runtime.starting_agent = Some(match &model {
+        Some(model) => format!("{id}/{model}"),
+        None => id.clone(),
+    });
+    let agents = Arc::clone(&runtime.agents);
+    let forwarded = Arc::clone(&runtime.forwarded);
+    let debug_log = runtime.debug_log_path.clone();
+    let tx = tx.clone();
+    let task_id = id.clone();
+    tokio::spawn(async move {
+        let result = async {
+            // Subscribe before the session opens, so no update is missed.
+            let backend = agents.backend(&task_id).await?;
+            if forwarded
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(task_id.clone())
+            {
+                forward_updates(backend.subscribe(), tx.clone(), debug_log);
+            }
+            match pending {
+                PendingAgent::New { model, .. } => {
+                    agents.new_session(&task_id, model.as_deref()).await
+                }
+                PendingAgent::Resume(record) => agents.resume(&record).await,
+            }
+        }
+        .await
+        .map(|(backend, session)| (backend as Arc<dyn AgentBackend>, session))
+        .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(UiEvent::AgentReady {
+            id: task_id,
+            model,
+            result,
+        });
+    });
+    format!("starting {id}… (the first start can take a while)")
+}
+
+/// `provider/model` specs for every signed-in subscription's models.
+fn subscription_models(runtime: &CliRuntime) -> Vec<String> {
+    runtime
+        .agents
+        .entries()
+        .iter()
+        .filter(|entry| runtime.agents.is_signed_in(&entry.id))
+        .flat_map(|entry| {
+            runtime
+                .agents
+                .models(&entry.id)
+                .into_iter()
+                .map(move |model| format!("{}/{}", entry.id, model.id))
+        })
+        .collect()
+}
+
+/// Subscriptions offered in the `/login` wizard.
+fn login_agents(runtime: &CliRuntime) -> Vec<crate::provider_setup::AgentRow> {
+    runtime
+        .agents
+        .entries()
+        .iter()
+        .filter(|entry| entry.auth_method.is_some())
+        .map(|entry| crate::provider_setup::AgentRow {
+            id: entry.id.clone(),
+            label: entry.login_label().to_owned(),
+            configured: runtime.agents.is_signed_in(&entry.id),
+        })
+        .collect()
 }
 
 /// Forward the backend's updates into the UI loop, logging each when debug
@@ -1726,7 +1911,7 @@ fn submit_user_text(
     text: String,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
-    if runtime.selected_model.is_none() {
+    if runtime.is_native() && runtime.selected_model.is_none() {
         // Nothing can answer; don't queue or record the message.
         chat.push(error_item(
             loop_agent::harness::AgentHarnessError::NoModelSelected.to_string(),
@@ -2094,7 +2279,15 @@ async fn handle_key(
             KeyCode::Enter => {
                 if let Some(id) = picker.filtered.get(picker.selected).cloned() {
                     if let Some((provider, model)) = id.split_once('/') {
-                        choose_model(runtime, token_bar, provider, model, chat).await;
+                        if runtime.is_subscription(provider) {
+                            let pending = PendingAgent::New {
+                                id: provider.to_owned(),
+                                model: Some(model.to_owned()),
+                            };
+                            chat.push(sys(start_agent(runtime, pending, tx)));
+                        } else {
+                            choose_model(runtime, token_bar, provider, model, chat).await;
+                        }
                     }
                 }
                 *model_picker = None;
@@ -2357,6 +2550,7 @@ async fn handle_key(
                         input,
                         chat,
                         status,
+                        tx,
                     )
                     .await;
                 }
@@ -2437,7 +2631,9 @@ async fn handle_key(
                 if had_work || had_queue {
                     *working = false;
                     turn_step.clear();
-                    *streaming_assistant = None;
+                    // Keep the reply open: text the agent sends before it
+                    // acts on the cancel belongs to it, not to a new reply.
+                    // The turn's end (or the next prompt) closes it.
                     if let Some(idx) = streaming_thinking.take() {
                         if let Some(ChatItem::Thinking { done, .. }) = chat.get_mut(idx) {
                             *done = true;
@@ -2610,7 +2806,10 @@ async fn handle_key(
             }
             Action::ModelSelect => {
                 *fork_picker = None;
-                *model_picker = Some(ModelPickerState::new(runtime.available_models().await));
+                *model_picker = Some(ModelPickerState::new(
+                    runtime.available_models().await,
+                    subscription_models(runtime),
+                ));
                 return Ok(());
             }
             Action::SessionFork => {
@@ -2628,7 +2827,13 @@ async fn handle_key(
                 return Ok(());
             }
             Action::ThinkingCycle => {
-                cycle_thinking(runtime, chat).await;
+                match runtime.cycle_effort().await {
+                    Ok(level) => {
+                        chat.push(sys(format!("effort → {level}")));
+                        *status = effort_status(runtime);
+                    }
+                    Err(err) => chat.push(error_item(format!("{err:#}"))),
+                }
                 return Ok(());
             }
             Action::ThinkingToggle => {
@@ -2728,11 +2933,13 @@ struct ModelPickerState {
 }
 
 impl ModelPickerState {
-    /// `models` in picker order (see `Runtime::available_models`).
-    fn new(models: Vec<loop_ai::Model>) -> Self {
+    /// `models` in picker order (see `Runtime::available_models`), then
+    /// `subscriptions` (`provider/model` specs of signed-in subscriptions).
+    fn new(models: Vec<loop_ai::Model>, subscriptions: Vec<String>) -> Self {
         let all: Vec<String> = models
             .into_iter()
             .map(|m| format!("{}/{}", m.provider, m.id))
+            .chain(subscriptions)
             .collect();
         let filtered = all.clone();
         Self {
@@ -3186,6 +3393,14 @@ async fn open_fork_picker(
     status: &mut String,
 ) {
     *model_picker = None;
+    if !runtime.is_native() {
+        *fork_picker = None;
+        chat.push(sys(
+            "forking works with Loop's own models · pick one with /model first",
+        ));
+        *status = "ready".into();
+        return;
+    }
     match runtime.harness.fork_points().await {
         Ok(points) if points.is_empty() => {
             *fork_picker = None;
@@ -3737,7 +3952,12 @@ fn advance_tracing_setup(
     *status = "ready".into();
 }
 
-/// Feed one answer to the `/login` wizard; on the last step, connect the provider.
+/// Feed one answer to the `/login` wizard; on the last step, connect the
+/// provider or start the agent sign-in.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pre-existing signature; refactor tracked separately"
+)]
 async fn advance_provider_setup(
     step: ProviderSetup,
     value: &str,
@@ -3746,8 +3966,9 @@ async fn advance_provider_setup(
     input: &mut InputBuffer,
     chat: &mut Vec<ChatItem>,
     status: &mut String,
+    tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
-    let Some(request) = step_wizard(
+    let Some(choice) = step_wizard(
         step.submit(value),
         SetupPrompt::Provider,
         value,
@@ -3756,6 +3977,29 @@ async fn advance_provider_setup(
         chat,
     ) else {
         return;
+    };
+    let request = match choice {
+        LoginChoice::Provider(request) => request,
+        LoginChoice::Subscription(agent) => {
+            *status = format!("login · signing in to {}…", agent.label);
+            chat.push(sys(format!(
+                "signing in to {} · finish in the browser that opens (the first start can take a while)",
+                agent.label
+            )));
+            let agents = Arc::clone(&runtime.agents);
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let note = match agents.sign_in(&agent.id).await {
+                    Ok(count) => Ok(format!(
+                        "✓ Connected {} · {count} models — /model to choose one",
+                        agent.label
+                    )),
+                    Err(e) => Err(format!("{}: sign-in failed: {e:#}", agent.label)),
+                };
+                let _ = tx.send(UiEvent::AgentNote(note));
+            });
+            return;
+        }
     };
     *status = format!("login · connecting {}…", request.display_name());
     match runtime.connect_provider(&request).await {
@@ -3788,6 +4032,15 @@ async fn apply_logout(provider: Option<String>, runtime: &mut CliRuntime) -> Str
             )
         };
     };
+    if runtime.is_subscription(&provider) {
+        if runtime.active_agent.as_deref() == Some(provider.as_str()) {
+            runtime.use_native().await;
+        }
+        return match runtime.agents.sign_out(&provider).await {
+            Ok(()) => format!("logged out: {provider}"),
+            Err(err) => format!("logout: {err:#}"),
+        };
+    }
     match runtime.disconnect_provider(&provider).await {
         Ok(name) => format!("logged out: {name}"),
         Err(err) => format!("logout: {err:#}"),
@@ -3887,7 +4140,23 @@ async fn apply_effect(
         }
         CommandEffect::SelectModel(None) => {
             *fork_picker = None;
-            *model_picker = Some(ModelPickerState::new(runtime.available_models().await));
+            *model_picker = Some(ModelPickerState::new(
+                runtime.available_models().await,
+                subscription_models(runtime),
+            ));
+        }
+        CommandEffect::SelectModel(Some(spec))
+            if spec
+                .split_once('/')
+                .is_some_and(|(provider, _)| runtime.is_subscription(provider)) =>
+        {
+            if let Some((provider, model)) = spec.split_once('/') {
+                let pending = PendingAgent::New {
+                    id: provider.to_owned(),
+                    model: Some(model.to_owned()),
+                };
+                chat.push(sys(start_agent(runtime, pending, tx)));
+            }
         }
         CommandEffect::SelectModel(Some(spec)) => {
             match loop_app_core::model_selection::resolve_model_spec(&runtime.models, &spec) {
@@ -3897,6 +4166,26 @@ async fn apply_effect(
                 Err(err) => chat.push(error_item(format!("{err:#}"))),
             }
         }
+        CommandEffect::Effort(None) => match runtime.efforts().await {
+            Ok((levels, current)) => {
+                let levels: Vec<String> = levels
+                    .into_iter()
+                    .map(|l| if l == current { format!("[{l}]") } else { l })
+                    .collect();
+                chat.push(sys(format!(
+                    "reasoning effort: {} — /effort <level> or shift+tab",
+                    levels.join(" ")
+                )));
+            }
+            Err(err) => chat.push(error_item(format!("{err:#}"))),
+        },
+        CommandEffect::Effort(Some(level)) => match runtime.set_effort(&level).await {
+            Ok(level) => {
+                chat.push(sys(format!("effort → {level}")));
+                *status = effort_status(runtime);
+            }
+            Err(err) => chat.push(error_item(format!("{err:#}"))),
+        },
         CommandEffect::SetSandbox(mode) => {
             if mode.is_empty() || mode.trim() == "status" {
                 let info = runtime.harness.sandbox_info().await;
@@ -4002,14 +4291,20 @@ async fn apply_effect(
                 input,
             )));
         }
-        CommandEffect::Login(provider) => match ProviderSetup::start(provider.as_deref()) {
-            Ok(step) => {
-                *pending_setup = Some(SetupPrompt::Provider(step));
-                input.clear();
-                chat.push(sys("login — follow the prompts below · esc cancels"));
+        CommandEffect::Login(provider) => {
+            match ProviderSetup::start(
+                provider.as_deref(),
+                login_agents(runtime),
+                runtime.connected_providers(),
+            ) {
+                Ok(step) => {
+                    *pending_setup = Some(SetupPrompt::Provider(step));
+                    input.clear();
+                    chat.push(sys("login — follow the prompts below · esc cancels"));
+                }
+                Err(usage) => chat.push(sys(usage)),
             }
-            Err(usage) => chat.push(sys(usage)),
-        },
+        }
         CommandEffect::Logout(provider) => {
             chat.push(sys(apply_logout(provider, runtime).await));
         }
@@ -4019,13 +4314,8 @@ async fn apply_effect(
             *streaming_assistant = None;
             *streaming_thinking = None;
             *working = false;
-            let spec = SessionSpec {
-                cwd: Some(runtime.cwd.clone()),
-                name: None,
-            };
-            match runtime.backend.new_session(spec).await {
-                Ok(session) => {
-                    runtime.session_id = session.native_id;
+            match runtime.new_session().await {
+                Ok(()) => {
                     runtime.resumed = false;
                     runtime.active_skills.clear();
                     chat.clear();
@@ -4647,6 +4937,10 @@ async fn choose_model(
 ) {
     match runtime.select_model(provider, id).await {
         Ok(model) => {
+            if !runtime.is_native() {
+                runtime.use_native().await;
+                chat.push(sys("back to Loop's own agent"));
+            }
             token_bar.sync_window(runtime);
             chat.push(sys(format!("model → {}/{}", model.provider, model.id)));
         }
@@ -4654,31 +4948,16 @@ async fn choose_model(
     }
 }
 
-async fn cycle_thinking(runtime: &mut CliRuntime, chat: &mut Vec<ChatItem>) {
-    let order = [
-        AgentThinkingLevel::Off,
-        AgentThinkingLevel::Low,
-        AgentThinkingLevel::Medium,
-        AgentThinkingLevel::High,
-    ];
-    let cur = runtime.settings.default_thinking_level.to_lowercase();
-    let idx = match cur.as_str() {
-        "low" => 1,
-        "medium" => 2,
-        "high" => 3,
-        _ => 0,
-    };
-    let next = order[(idx + 1) % order.len()];
-    let label = match next {
-        AgentThinkingLevel::Off => "off",
-        AgentThinkingLevel::Low => "low",
-        AgentThinkingLevel::Medium => "medium",
-        AgentThinkingLevel::High => "high",
-        _ => "off",
-    };
-    runtime.harness.set_thinking_level(next).await;
-    runtime.settings.default_thinking_level = label.into();
-    chat.push(sys(format!("thinking → {label}")));
+/// Status line after the reasoning effort changes.
+fn effort_status(runtime: &CliRuntime) -> String {
+    match runtime.active_model_label() {
+        Some(label) if !runtime.is_native() => format!("ready · {label}"),
+        Some(spec) => format!(
+            "ready · {spec} · {}",
+            runtime.settings.default_thinking_level
+        ),
+        None => "ready".into(),
+    }
 }
 
 fn copy_last_assistant(chat: &[ChatItem], status: &mut String) {

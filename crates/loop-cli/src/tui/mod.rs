@@ -220,6 +220,7 @@ pub fn welcome_lines(
     theme: &Theme,
     version: &str,
     model: Option<&loop_ai::Model>,
+    agent: Option<&str>,
     model_note: Option<&str>,
     endpoint: &str,
     session_id: &str,
@@ -261,19 +262,31 @@ pub fn welcome_lines(
 
     // Info card
     let border = theme.style("border");
-    let rows: Vec<(&str, String)> = match model {
-        Some(model) => vec![
+    let rows: Vec<(&str, String)> = match (agent, model) {
+        (Some(agent), _) => vec![
+            ("Model", format!("{agent} · subscription")),
+            (
+                "Session",
+                "opens when the subscription is ready".to_string(),
+            ),
+        ],
+        (None, Some(model)) => vec![
             ("Provider", model.provider.clone()),
             ("Model", model.id.clone()),
             ("Endpoint", endpoint.to_string()),
             ("Session", session_id.to_string()),
         ],
-        None => vec![
+        (None, None) => vec![
             ("Model", "none — run /model".to_string()),
             ("Session", session_id.to_string()),
         ],
     };
-    let (dot_style, status_text) = if needs_setup {
+    let (dot_style, status_text) = if let Some(agent) = agent {
+        (
+            theme.style("success"),
+            format!("starting {agent} — /model switches models or providers"),
+        )
+    } else if needs_setup {
         (
             theme.style("warning"),
             "setup — connect a model provider to begin (/login)".to_string(),
@@ -1107,6 +1120,13 @@ fn setup_lines(
         )),
     ];
     if let Some((rows, selected)) = prompt.options() {
+        let width = rows
+            .iter()
+            .map(|(label, _)| label.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(14)
+            + 2;
         for (i, (label, description)) in rows.into_iter().enumerate() {
             let (marker, label_style) = if i == selected {
                 ("  ▸ ", theme.accent().add_modifier(Modifier::BOLD))
@@ -1115,7 +1135,7 @@ fn setup_lines(
             };
             lines.push(Line::from(vec![
                 Span::styled(marker.to_string(), theme.accent()),
-                Span::styled(format!("{label:<16}"), label_style),
+                Span::styled(format!("{label:<width$}"), label_style),
                 Span::styled(description.to_string(), theme.dim()),
             ]));
         }
@@ -1881,6 +1901,7 @@ mod tests {
             &Theme::dark(),
             "v",
             model,
+            None,
             note,
             "http://e",
             "sess",
@@ -1977,9 +1998,12 @@ mod tests {
         let host = TracingSetup::LangfuseHost;
         let otlp = TracingSetup::OtlpEndpoint;
         for prompt in [
-            SetupPrompt::Provider(crate::provider_setup::ProviderSetup::start(None).unwrap()),
             SetupPrompt::Provider(
-                crate::provider_setup::ProviderSetup::start(Some("soket")).unwrap(),
+                crate::provider_setup::ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap(),
+            ),
+            SetupPrompt::Provider(
+                crate::provider_setup::ProviderSetup::start(Some("soket"), Vec::new(), Vec::new())
+                    .unwrap(),
             ),
             SetupPrompt::Tracing(picker),
             SetupPrompt::Tracing(host),
@@ -2038,9 +2062,13 @@ mod tests {
             public_key: "p".into(),
         };
         assert!(last_line(SetupPrompt::Tracing(secret)).contains("enter save"));
-        let key = crate::provider_setup::ProviderSetup::start(Some("soket")).unwrap();
+        let key =
+            crate::provider_setup::ProviderSetup::start(Some("soket"), Vec::new(), Vec::new())
+                .unwrap();
         assert!(last_line(SetupPrompt::Provider(key)).contains("enter save"));
-        let name = crate::provider_setup::ProviderSetup::start(Some("custom")).unwrap();
+        let name =
+            crate::provider_setup::ProviderSetup::start(Some("custom"), Vec::new(), Vec::new())
+                .unwrap();
         assert!(last_line(SetupPrompt::Provider(name)).contains("enter next"));
     }
 
