@@ -1,6 +1,7 @@
-//! `/login` wizard: pick a provider, then enter its details and API key.
+//! `/login` wizard: pick an API-key provider and enter its key, or pick a
+//! subscription (such as ChatGPT Plus/Pro) and sign in to it.
 //!
-//! Pure state machine; the app connects the resulting [`ProviderLoginRequest`].
+//! Pure state machine; the app acts on the resulting [`LoginChoice`].
 
 use loop_agent::harness::{web_search_backend, WebSearchBackendInfo, WEB_SEARCH_BACKENDS};
 use loop_ai::providers::{provider_preset, ProviderPreset, PROVIDER_PRESETS};
@@ -15,11 +16,25 @@ const CUSTOM_LABEL: &str = "Custom";
 const CUSTOM_DESCRIPTION: &str =
     "Any OpenAI-compatible API · Together, Groq, DeepSeek, vLLM, Ollama, LM Studio";
 
+/// Web search backends that get their own `/login` row. Soket search uses
+/// the Soket model key, so it has no row of its own.
+fn login_web_backends() -> impl Iterator<Item = &'static WebSearchBackendInfo> {
+    WEB_SEARCH_BACKENDS
+        .iter()
+        .filter(|info| info.id != loop_ai::providers::SOKET_PROVIDER_ID)
+}
+
+/// A web search backend `/login <id>` can set up.
+fn login_web_backend(id: &str) -> Option<&'static WebSearchBackendInfo> {
+    web_search_backend(id).filter(|info| info.id != loop_ai::providers::SOKET_PROVIDER_ID)
+}
+
 /// Picker-row copy for a web-search backend. Ids and names come from
 /// loop-agent's `WEB_SEARCH_BACKENDS` registry; only presentation lives here.
 fn backend_description(info: &WebSearchBackendInfo) -> &'static str {
     match info.id {
         "brave" => "Web search for the web_search tool · brave.com/search-api",
+        "tinyfish" => "Web search for the web_search tool · tinyfish.ai",
         _ => "Web search for the web_search tool · free tier available",
     }
 }
@@ -68,13 +83,37 @@ impl PartialEq for LoginTarget {
 
 impl Eq for LoginTarget {}
 
+/// A subscription offered in `/login`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRow {
+    /// Subscription id (the provider id in `provider/model`).
+    pub id: String,
+    /// Row label, such as "ChatGPT Plus/Pro (Codex subscription)".
+    pub label: String,
+    /// Already signed in.
+    pub configured: bool,
+}
+
+/// What the finished wizard asks the app to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginChoice {
+    /// Connect an API-key provider.
+    Provider(ProviderLoginRequest),
+    /// Sign in to a subscription.
+    Subscription(AgentRow),
+}
+
 /// Current step of the wizard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderSetup {
-    /// Choose a preset or Custom.
+    /// Choose a provider, a subscription or Custom.
     Choose {
         /// Highlighted row.
         selected: usize,
+        /// Subscriptions listed after the API-key presets.
+        agents: Vec<AgentRow>,
+        /// Preset ids that already have a key.
+        connected: Vec<String>,
     },
     /// Custom provider name.
     CustomName,
@@ -91,14 +130,24 @@ pub enum ProviderSetup {
 }
 
 /// Result of submitting an answer to the login wizard.
-pub type Transition = crate::wizard::Transition<ProviderSetup, ProviderLoginRequest>;
+pub type Transition = crate::wizard::Transition<ProviderSetup, LoginChoice>;
 
 impl ProviderSetup {
     /// Start the wizard; `provider` (`/login openrouter`, `/login tavily`,
-    /// `/login custom`) skips the picker.
-    pub fn start(provider: Option<&str>) -> Result<Self, String> {
+    /// `/login custom`) skips the picker, and a subscription id
+    /// (`/login chatgpt`) highlights it. `connected` lists preset and web
+    /// search ids that already have a key.
+    pub fn start(
+        provider: Option<&str>,
+        agents: Vec<AgentRow>,
+        connected: Vec<String>,
+    ) -> Result<Self, String> {
         match provider.map(str::trim).filter(|p| !p.is_empty()) {
-            None => Ok(Self::Choose { selected: 0 }),
+            None => Ok(Self::Choose {
+                selected: 0,
+                agents,
+                connected,
+            }),
             Some(p) if p.eq_ignore_ascii_case(CUSTOM_PROVIDER) => Ok(Self::CustomName),
             Some(p) => {
                 if let Some(preset) = provider_preset(p) {
@@ -106,12 +155,19 @@ impl ProviderSetup {
                         target: LoginTarget::Preset(preset),
                     });
                 }
-                if let Some(info) = web_search_backend(p) {
+                if let Some(info) = login_web_backend(p) {
                     return Ok(Self::ApiKey {
                         target: LoginTarget::WebSearch(info),
                     });
                 }
-                Err(format!("unknown provider `{p}`. {}", login_usage()))
+                match agents.iter().position(|a| a.id.eq_ignore_ascii_case(p)) {
+                    Some(i) => Ok(Self::Choose {
+                        selected: PROVIDER_PRESETS.len() + i,
+                        agents,
+                        connected,
+                    }),
+                    None => Err(format!("unknown provider `{p}`. {}", login_usage(&agents))),
+                }
             }
         }
     }
@@ -121,11 +177,23 @@ impl ProviderSetup {
         let target = match request {
             ProviderLoginRequest::Preset { id, .. } => match provider_preset(id) {
                 Some(preset) => LoginTarget::Preset(preset),
-                None => return Self::Choose { selected: 0 },
+                None => {
+                    return Self::Choose {
+                        selected: 0,
+                        agents: Vec::new(),
+                        connected: Vec::new(),
+                    }
+                }
             },
             ProviderLoginRequest::WebSearch { id, .. } => match web_search_backend(id) {
                 Some(info) => LoginTarget::WebSearch(info),
-                None => return Self::Choose { selected: 0 },
+                None => {
+                    return Self::Choose {
+                        selected: 0,
+                        agents: Vec::new(),
+                        connected: Vec::new(),
+                    }
+                }
             },
             ProviderLoginRequest::Custom { name, base_url, .. } => LoginTarget::Custom {
                 name: name.clone(),
@@ -135,24 +203,33 @@ impl ProviderSetup {
         Self::ApiKey { target }
     }
 
-    fn row_count() -> usize {
-        PROVIDER_PRESETS.len() + WEB_SEARCH_BACKENDS.len() + 1
+    fn row_count(agents: &[AgentRow]) -> usize {
+        PROVIDER_PRESETS.len() + agents.len() + login_web_backends().count() + 1
     }
 
     /// Submit the input line at the current step.
     pub fn submit(self, input: &str) -> Transition {
         let value = input.trim().to_string();
         match self {
-            Self::Choose { selected } => {
+            Self::Choose {
+                selected, agents, ..
+            } => {
                 let step = match PROVIDER_PRESETS.get(selected) {
                     Some(preset) => Self::ApiKey {
                         target: LoginTarget::Preset(preset),
                     },
-                    None => match WEB_SEARCH_BACKENDS.get(selected - PROVIDER_PRESETS.len()) {
-                        Some(info) => Self::ApiKey {
-                            target: LoginTarget::WebSearch(info),
+                    None => match agents.get(selected - PROVIDER_PRESETS.len()) {
+                        Some(agent) => {
+                            return Transition::Done(LoginChoice::Subscription(agent.clone()))
+                        }
+                        None => match login_web_backends()
+                            .nth(selected - PROVIDER_PRESETS.len() - agents.len())
+                        {
+                            Some(info) => Self::ApiKey {
+                                target: LoginTarget::WebSearch(info),
+                            },
+                            None => Self::CustomName,
                         },
-                        None => Self::CustomName,
                     },
                 };
                 Transition::Next {
@@ -195,10 +272,10 @@ impl ProviderSetup {
             .retry(&format!("{} needs an API key", preset.name)),
             Self::ApiKey {
                 target: LoginTarget::Preset(preset),
-            } => Transition::Done(ProviderLoginRequest::Preset {
+            } => Transition::Done(LoginChoice::Provider(ProviderLoginRequest::Preset {
                 id: preset.id.into(),
                 api_key: value,
-            }),
+            })),
             Self::ApiKey {
                 target: LoginTarget::WebSearch(info),
             } if value.is_empty() => Self::ApiKey {
@@ -207,17 +284,17 @@ impl ProviderSetup {
             .retry(&format!("{} needs an API key", info.display_name)),
             Self::ApiKey {
                 target: LoginTarget::WebSearch(info),
-            } => Transition::Done(ProviderLoginRequest::WebSearch {
+            } => Transition::Done(LoginChoice::Provider(ProviderLoginRequest::WebSearch {
                 id: info.id.into(),
                 api_key: value,
-            }),
+            })),
             Self::ApiKey {
                 target: LoginTarget::Custom { name, base_url },
-            } => Transition::Done(ProviderLoginRequest::Custom {
+            } => Transition::Done(LoginChoice::Provider(ProviderLoginRequest::Custom {
                 name,
                 base_url,
                 api_key: (!value.is_empty()).then_some(value),
-            }),
+            })),
         }
     }
 
@@ -230,11 +307,12 @@ impl ProviderSetup {
 }
 
 /// Usage line for `/login`.
-pub fn login_usage() -> String {
+pub fn login_usage(agents: &[AgentRow]) -> String {
     let ids: Vec<&str> = PROVIDER_PRESETS
         .iter()
         .map(|p| p.id)
-        .chain(WEB_SEARCH_BACKENDS.iter().map(|info| info.id))
+        .chain(agents.iter().map(|a| a.id.as_str()))
+        .chain(login_web_backends().map(|info| info.id))
         .chain([CUSTOM_PROVIDER])
         .collect();
     format!("Usage: /login [{}]", ids.join("|"))
@@ -243,7 +321,7 @@ pub fn login_usage() -> String {
 impl WizardView for ProviderSetup {
     fn title(&self) -> String {
         match self {
-            Self::Choose { .. } => "Connect a model or search provider".into(),
+            Self::Choose { .. } => "Connect a model provider, subscription or web search".into(),
             Self::CustomName => "Connect a custom provider · step 1 of 3".into(),
             Self::CustomBaseUrl { .. } => "Connect a custom provider · step 2 of 3".into(),
             Self::ApiKey {
@@ -302,18 +380,43 @@ impl WizardView for ProviderSetup {
         }
     }
 
-    fn options(&self) -> Option<(Vec<(&'static str, &'static str)>, usize)> {
+    fn options(&self) -> Option<(Vec<(String, String)>, usize)> {
+        let state = |configured: bool| {
+            if configured {
+                "configured"
+            } else {
+                "not configured"
+            }
+        };
         match self {
-            Self::Choose { selected } => Some((
+            Self::Choose {
+                selected,
+                agents,
+                connected,
+            } => Some((
                 PROVIDER_PRESETS
                     .iter()
-                    .map(|p| (p.name, p.description))
-                    .chain(
-                        WEB_SEARCH_BACKENDS
-                            .iter()
-                            .map(|info| (info.display_name, backend_description(info))),
-                    )
-                    .chain([(CUSTOM_LABEL, CUSTOM_DESCRIPTION)])
+                    .map(|p| {
+                        let configured = connected.iter().any(|c| c == p.id);
+                        (
+                            format!("{} · api key", p.name),
+                            format!("{} · {}", state(configured), p.description),
+                        )
+                    })
+                    .chain(agents.iter().map(|a| {
+                        (
+                            format!("{} · subscription", a.label),
+                            state(a.configured).to_owned(),
+                        )
+                    }))
+                    .chain(login_web_backends().map(|info| {
+                        let configured = connected.iter().any(|c| c == info.id);
+                        (
+                            format!("{} · web search", info.display_name),
+                            format!("{} · {}", state(configured), backend_description(info)),
+                        )
+                    }))
+                    .chain([(CUSTOM_LABEL.to_owned(), CUSTOM_DESCRIPTION.to_owned())])
                     .collect(),
                 *selected,
             )),
@@ -331,8 +434,11 @@ impl WizardView for ProviderSetup {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if let Self::Choose { selected } = self {
-            *selected = wrap_selection(*selected, delta, Self::row_count());
+        if let Self::Choose {
+            selected, agents, ..
+        } = self
+        {
+            *selected = wrap_selection(*selected, delta, Self::row_count(agents));
         }
     }
 }
@@ -357,17 +463,18 @@ mod tests {
 
     #[test]
     fn picker_lists_presets_then_web_search_then_custom() {
-        let step = ProviderSetup::start(None).unwrap();
+        let step = ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap();
         let (rows, selected) = step.options().unwrap();
-        let labels: Vec<_> = rows.iter().map(|r| r.0).collect();
+        let labels: Vec<_> = rows.iter().map(|r| r.0.as_str()).collect();
         assert_eq!(
             labels,
             [
-                "Soket",
-                "OpenRouter",
-                "OpenAI",
-                "Tavily",
-                "Brave Search",
+                "Soket · api key",
+                "OpenRouter · api key",
+                "OpenAI · api key",
+                "Tavily · web search",
+                "TinyFish · web search",
+                "Brave Search · web search",
                 "Custom"
             ]
         );
@@ -377,15 +484,26 @@ mod tests {
 
     #[test]
     fn selection_wraps_over_all_rows() {
-        let mut step = ProviderSetup::Choose { selected: 0 };
+        let mut step = ProviderSetup::Choose {
+            selected: 0,
+            agents: Vec::new(),
+            connected: Vec::new(),
+        };
         step.move_selection(-1);
-        assert_eq!(step, ProviderSetup::Choose { selected: 5 });
+        assert_eq!(
+            step,
+            ProviderSetup::Choose {
+                selected: 6,
+                agents: Vec::new(),
+                connected: Vec::new(),
+            }
+        );
     }
 
     #[test]
     fn tavily_flow_from_picker_and_argument() {
         // From the picker (row 3).
-        let mut step = ProviderSetup::start(None).unwrap();
+        let mut step = ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap();
         step.move_selection(3);
         let key = next(step.submit(""));
         assert!(key.masked());
@@ -394,20 +512,20 @@ mod tests {
         assert!(retry_error(key.clone().submit("  ")).contains("needs an API key"));
         assert_eq!(
             key.submit(" tvly-1 "),
-            Transition::Done(ProviderLoginRequest::WebSearch {
+            Transition::Done(LoginChoice::Provider(ProviderLoginRequest::WebSearch {
                 id: "tavily".into(),
                 api_key: "tvly-1".into(),
-            })
+            }))
         );
 
         // Direct: /login tavily skips the picker.
-        let direct = ProviderSetup::start(Some("Tavily")).unwrap();
+        let direct = ProviderSetup::start(Some("Tavily"), Vec::new(), Vec::new()).unwrap();
         assert_eq!(direct.title(), "Connect Tavily");
     }
 
     #[test]
     fn openrouter_flow() {
-        let mut step = ProviderSetup::start(None).unwrap();
+        let mut step = ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap();
         step.move_selection(1);
         let key = next(step.submit(""));
         assert!(key.masked());
@@ -417,16 +535,16 @@ mod tests {
         assert!(retry_error(key.clone().submit("  ")).contains("needs an API key"));
         assert_eq!(
             key.submit(" sk-or-1 "),
-            Transition::Done(ProviderLoginRequest::Preset {
+            Transition::Done(LoginChoice::Provider(ProviderLoginRequest::Preset {
                 id: "openrouter".into(),
                 api_key: "sk-or-1".into(),
-            })
+            }))
         );
     }
 
     #[test]
     fn custom_flow_allows_empty_key_and_validates() {
-        let step = ProviderSetup::start(Some("custom")).unwrap();
+        let step = ProviderSetup::start(Some("custom"), Vec::new(), Vec::new()).unwrap();
         assert_eq!(step, ProviderSetup::CustomName);
         assert!(retry_error(ProviderSetup::CustomName.submit("!!")).contains("letters"));
         assert!(retry_error(ProviderSetup::CustomName.submit("OpenAI")).contains("built-in"));
@@ -437,21 +555,21 @@ mod tests {
         assert_eq!(key.title(), "Connect LM Studio · step 3 of 3");
         assert_eq!(
             key.submit(""),
-            Transition::Done(ProviderLoginRequest::Custom {
+            Transition::Done(LoginChoice::Provider(ProviderLoginRequest::Custom {
                 name: "LM Studio".into(),
                 base_url: "http://localhost:1234/v1".into(),
                 api_key: None,
-            })
+            }))
         );
     }
 
     #[test]
     fn start_with_argument_skips_the_picker() {
-        let step = ProviderSetup::start(Some("OpenAI")).unwrap();
+        let step = ProviderSetup::start(Some("OpenAI"), Vec::new(), Vec::new()).unwrap();
         assert_eq!(step.title(), "Connect OpenAI");
-        let err = ProviderSetup::start(Some("groq")).unwrap_err();
+        let err = ProviderSetup::start(Some("groq"), Vec::new(), Vec::new()).unwrap_err();
         assert!(
-            err.contains("Usage: /login [soket|openrouter|openai|tavily|brave|custom]"),
+            err.contains("Usage: /login [soket|openrouter|openai|tavily|tinyfish|brave|custom]"),
             "{err}"
         );
     }
@@ -482,5 +600,48 @@ mod tests {
             ProviderSetup::retry_key(&web).title(),
             "Connect Brave Search"
         );
+    }
+
+    fn chatgpt(configured: bool) -> AgentRow {
+        AgentRow {
+            id: "chatgpt".into(),
+            label: "ChatGPT Plus/Pro (Codex subscription)".into(),
+            configured,
+        }
+    }
+
+    #[test]
+    fn subscriptions_are_rows_with_their_state_and_sign_in_directly() {
+        let step = ProviderSetup::start(None, vec![chatgpt(false)], vec!["openai".into()]).unwrap();
+        let (rows, _) = step.options().unwrap();
+        assert_eq!(rows[2].0, "OpenAI · api key");
+        assert!(rows[2].1.starts_with("configured"));
+        assert_eq!(
+            rows[3].0,
+            "ChatGPT Plus/Pro (Codex subscription) · subscription"
+        );
+        assert_eq!(rows[3].1, "not configured");
+        assert_eq!(rows[4].0, "Tavily · web search");
+        assert_eq!(rows.last().unwrap().0, "Custom");
+
+        let step = ProviderSetup::start(Some("chatgpt"), vec![chatgpt(false)], Vec::new()).unwrap();
+        assert_eq!(
+            step.submit(""),
+            Transition::Done(LoginChoice::Subscription(chatgpt(false)))
+        );
+        let err = ProviderSetup::start(Some("nope"), vec![chatgpt(true)], Vec::new()).unwrap_err();
+        assert!(err.contains("openai|chatgpt|tavily"), "{err}");
+    }
+
+    #[test]
+    fn soket_is_one_row_and_web_rows_show_their_state() {
+        let step = ProviderSetup::start(None, Vec::new(), vec!["tavily".into()]).unwrap();
+        let (rows, _) = step.options().unwrap();
+        assert_eq!(rows.iter().filter(|r| r.0.starts_with("Soket")).count(), 1);
+        let tavily = rows.iter().find(|r| r.0 == "Tavily · web search").unwrap();
+        assert!(tavily.1.starts_with("configured"));
+        // `/login soket` is the model provider; its key also serves web search.
+        let soket = ProviderSetup::start(Some("soket"), Vec::new(), Vec::new()).unwrap();
+        assert_eq!(soket.title(), "Connect Soket");
     }
 }

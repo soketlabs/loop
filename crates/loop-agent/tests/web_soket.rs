@@ -118,7 +118,10 @@ async fn soket_search_reports_body_level_failures() {
     let err = execute(&tool, json!({"query": "q"}))
         .await
         .expect_err("ok:false must fail");
-    assert!(err.contains("upstream timed out"), "unexpected error: {err}");
+    assert!(
+        err.contains("upstream timed out"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test]
@@ -131,7 +134,10 @@ async fn non_json_auth_errors_are_reported_as_rejected_keys() {
     let err = verify_web_search_key(&search_config(&server, Some("tavily")), "tvly-bad")
         .await
         .expect_err("401 must fail verification");
-    assert!(err.contains("rejected the API key"), "unexpected error: {err}");
+    assert!(
+        err.contains("rejected the API key"),
+        "unexpected error: {err}"
+    );
 
     let tool = create_web_search_tool(search_config(&server, None), Some("sk-bad"))
         .expect("web_search tool");
@@ -162,7 +168,10 @@ async fn tinyfish_search_backend() {
     assert_eq!(requests[0].header("x-api-key"), Some("tf-test"));
     let text = text(&result);
     assert!(text.contains("1. Rust\n   https://rust-lang.org\n   A language"));
-    assert!(!text.contains("Docs"), "no count parameter, so the list is cut");
+    assert!(
+        !text.contains("Docs"),
+        "no count parameter, so the list is cut"
+    );
     assert_eq!(result.details["provider"], "tinyfish");
 }
 
@@ -200,8 +209,14 @@ async fn soket_fetch_reports_failures() {
     let err = execute(&tool, json!({"url": "https://example.com/slow"}))
         .await
         .expect_err("ok:false must fail");
-    assert!(err.contains("upstream timed out"), "unexpected error: {err}");
-    assert!(err.contains("https://example.com/slow"), "unexpected error: {err}");
+    assert!(
+        err.contains("upstream timed out"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        err.contains("https://example.com/slow"),
+        "unexpected error: {err}"
+    );
 
     let down = FakeHttpServer::always(FakeResponse::new(502, "text/html", "<h1>Bad gateway</h1>"));
     let tool = create_web_fetch_tool(soket_fetch_config(), Some(soket_api(&down)))
@@ -277,7 +292,10 @@ fn soket_key_prefers_the_stored_credential() {
     let api = SoketWebApi::resolve(Some("sk-stored")).expect("stored key");
     assert_eq!(api.api_key, "sk-stored");
     assert_eq!(api.base_url, loop_ai::providers::SOKET_BASE_URL);
-    assert!(!format!("{api:?}").contains("sk-stored"), "Debug hides the key");
+    assert!(
+        !format!("{api:?}").contains("sk-stored"),
+        "Debug hides the key"
+    );
 }
 
 #[tokio::test]

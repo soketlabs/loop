@@ -209,6 +209,10 @@ pub struct Settings {
     /// Custom OpenAI-compatible providers added with `/login` (global only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<CustomProviderEntry>,
+    /// External ACP agents (global only: a project file must not add
+    /// commands Loop runs). Entries replace built-in presets with the same id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<crate::agents::AgentEntry>,
 }
 
 fn default_thinking() -> String {
@@ -267,6 +271,7 @@ impl Default for Settings {
             response_header_timeout_ms: default_response_header_timeout_ms(),
             tracing: TracingSettings::default(),
             providers: Vec::new(),
+            agents: Vec::new(),
         }
     }
 }

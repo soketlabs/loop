@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use loop_agent::harness::{
-    create_web_fetch_tool, create_web_search_tool, web_search_backend, SoketWebApi,
-    WebFetchConfig, WebFetchProvider, WebSearchConfig,
+    create_web_fetch_tool, create_web_search_tool, web_search_backend, SoketWebApi, WebFetchConfig,
+    WebFetchProvider, WebSearchConfig,
 };
 use loop_agent::types::AgentTool;
 use loop_ai::providers::SOKET_PROVIDER_ID;
@@ -157,7 +157,10 @@ mod tests {
             ..Default::default()
         });
         let web = WebTools::from_settings(&settings, Some(store), false);
-        assert!(web.build().is_empty(), "webSearch.enabled=false registers nothing");
+        assert!(
+            web.build().is_empty(),
+            "webSearch.enabled=false registers nothing"
+        );
     }
 
     #[test]

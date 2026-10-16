@@ -176,10 +176,13 @@ impl SearchBackend {
     fn resolve(config: &WebSearchConfig, stored_key: Option<&str>) -> Result<Self, String> {
         let provider = config.provider_id();
         let info = web_search_backend(&provider).ok_or_else(|| {
-            format!("unknown provider '{provider}' (expected one of {})", backend_ids())
+            format!(
+                "unknown provider '{provider}' (expected one of {})",
+                backend_ids()
+            )
         })?;
-        let api_key = resolve_api_key(config, stored_key, info.default_api_key_envs)
-            .ok_or_else(|| {
+        let api_key =
+            resolve_api_key(config, stored_key, info.default_api_key_envs).ok_or_else(|| {
                 format!(
                     "no API key: run /login {}, or set {}",
                     info.id,
@@ -247,7 +250,9 @@ impl SearchBackend {
                 url.query_pairs_mut()
                     .append_pair("q", query)
                     .append_pair("count", &max_results.to_string());
-                client.get(url).header("X-Subscription-Token", &self.api_key)
+                client
+                    .get(url)
+                    .header("X-Subscription-Token", &self.api_key)
             }
         };
         let response = super::send_cancellable(request, cancel)
@@ -464,7 +469,10 @@ pub fn create_web_search_tool(
 pub async fn verify_web_search_key(config: &WebSearchConfig, api_key: &str) -> Result<(), String> {
     let provider = config.provider_id();
     let info = web_search_backend(&provider).ok_or_else(|| {
-        format!("unknown provider '{provider}' (expected one of {})", backend_ids())
+        format!(
+            "unknown provider '{provider}' (expected one of {})",
+            backend_ids()
+        )
     })?;
     let backend = SearchBackend::new(info, api_key.to_string(), config)?;
     let policy = FetchPolicy {
@@ -597,7 +605,9 @@ mod tests {
         let err = parse_soket(&body).unwrap_err();
         assert!(err.contains("quota exceeded"), "{err}");
         let body = json!({"ok": false, "error_kind": "blocked"});
-        assert!(check_soket_ok(&body, "fetch").unwrap_err().contains("blocked"));
+        assert!(check_soket_ok(&body, "fetch")
+            .unwrap_err()
+            .contains("blocked"));
         // Responses without `ok` are judged by their payload alone.
         let body = json!({"results": [{"title": "t", "url": "https://t", "description": "d"}]});
         assert_eq!(parse_soket(&body).unwrap()[0].snippet, "d");

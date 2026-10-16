@@ -191,10 +191,7 @@ pub fn create_web_fetch_tool(
     let route = match soket {
         None => FetchRoute::Direct,
         Some(api) => FetchRoute::Soket {
-            endpoint: search::endpoint(
-                &search::resolve_base_url(&api.base_url, policy)?,
-                "fetch",
-            ),
+            endpoint: search::endpoint(&search::resolve_base_url(&api.base_url, policy)?, "fetch"),
             api_key: api.api_key,
         },
     };
@@ -365,8 +362,7 @@ async fn fetch_via_soket(
     }
     let body: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("soket fetch returned invalid JSON: {e}"))?;
-    search::check_soket_ok(&body, "fetch")
-        .map_err(|e| format!("{e} ({})", url.as_str()))?;
+    search::check_soket_ok(&body, "fetch").map_err(|e| format!("{e} ({})", url.as_str()))?;
     let field = |key: &str| body.get(key).and_then(|v| v.as_str()).unwrap_or("");
     let (markdown, title) = (field("markdown"), field("title"));
     let page = if title.trim().is_empty() {
@@ -376,7 +372,9 @@ async fn fetch_via_soket(
     };
     let (text, truncated) = truncate_head(&page, DEFAULT_MAX_BYTES);
     // Only page fields are kept: the response also names Soket's egress proxy.
-    let final_url = Some(field("url")).filter(|u| !u.is_empty()).unwrap_or(url.as_str());
+    let final_url = Some(field("url"))
+        .filter(|u| !u.is_empty())
+        .unwrap_or(url.as_str());
     let details = json!({
         "url": final_url,
         "via": "soket",

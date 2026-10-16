@@ -32,8 +32,10 @@ async fn tracing_commands_persist_to_settings_and_auth() {
         system_prompt: None,
         append_system_prompt: None,
         no_context_files: true,
+        no_web: false,
         interactive: false,
         session_id: None,
+        agent: None,
     })
     .await
     .unwrap();
@@ -82,8 +84,10 @@ async fn tracing_commands_persist_to_settings_and_auth() {
         system_prompt: None,
         append_system_prompt: None,
         no_context_files: true,
+        no_web: false,
         interactive: false,
         session_id: None,
+        agent: None,
     })
     .await
     .unwrap();
