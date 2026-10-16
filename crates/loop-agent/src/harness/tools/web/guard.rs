@@ -72,6 +72,13 @@ fn is_private_ipv6(v: Ipv6Addr) -> bool {
         || v.is_multicast()
         || (s[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
         || (s[0] & 0xffc0) == 0xfe80 // link-local
+        || (s[0] == 0x0064
+            && s[1] == 0xff9b
+            && s[2..6].iter().all(|segment| *segment == 0)) // NAT64 well-known prefix
+        || s[0] == 0x2002 // 6to4
+        || s[..6].iter().all(|segment| *segment == 0) // IPv4-compatible
+        || (s[0] & 0xffc0) == 0xfec0 // site-local
+        || (s[0] == 0x2001 && s[1] == 0) // Teredo
         || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
         || v.to_ipv4_mapped().is_some_and(is_private_ipv4)
 }
@@ -226,6 +233,11 @@ mod tests {
             "fe80::1",
             "ff02::1",
             "2001:db8::1",
+            "64:ff9b::808:808",
+            "2002:808:808::",
+            "::808:808",
+            "fec0::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
         ] {
             assert!(is_private(blocked), "{blocked} should be private");
         }
