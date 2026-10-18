@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -135,6 +136,7 @@ pub struct AgentHarness {
     follow_up_mode: Mutex<QueueMode>,
     #[cfg(feature = "mcp")]
     mcp_client: Arc<loop_mcp::McpClientManager>,
+    max_model_requests: RwLock<Option<NonZeroU64>>,
 }
 
 impl AgentHarness {
@@ -176,6 +178,7 @@ impl AgentHarness {
             follow_up_mode: Mutex::new(QueueMode::OneAtATime),
             #[cfg(feature = "mcp")]
             mcp_client: Arc::new(loop_mcp::McpClientManager::new()),
+            max_model_requests: RwLock::new(None),
         }
     }
 
@@ -529,6 +532,11 @@ impl AgentHarness {
     /// Set resources.
     pub async fn set_resources(&self, resources: AgentHarnessResources) {
         *self.resources.write().await = resources;
+    }
+
+    /// Set the maximum number of model requests per run; `None` disables the limit.
+    pub async fn set_max_model_requests(&self, max: Option<NonZeroU64>) {
+        *self.max_model_requests.write().await = max;
     }
 
     /// Get resources (clone).
@@ -1204,6 +1212,7 @@ impl AgentHarness {
         config.stream_options.reasoning = snapshot.thinking_level.to_reasoning();
         config.before_tool_call = self.before_tool_call.lock().clone();
         config.after_tool_call = self.after_tool_call.lock().clone();
+        config.max_model_requests = *self.max_model_requests.read().await;
 
         let steer_q = Arc::clone(&self.steering);
         let follow_q = Arc::clone(&self.follow_up);

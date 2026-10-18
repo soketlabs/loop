@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -424,6 +425,8 @@ pub enum AgentEvent {
     AgentEnd {
         /// Messages produced by this run.
         messages: Vec<AgentMessage>,
+        /// Whether maximum no. of requests reached.
+        max_requests_reached: bool,
     },
     /// Lightweight status for UI (prep phases, waiting on model, etc.).
     Progress {
@@ -603,6 +606,8 @@ pub struct AgentLoopConfig {
     pub stream_options: SimpleStreamOptions,
     /// Thinking budgets.
     pub thinking_budgets: Option<ThinkingBudgets>,
+    /// Maximum no. of requests.
+    pub max_model_requests: Option<NonZeroU64>,
 }
 
 impl AgentLoopConfig {
@@ -624,6 +629,7 @@ impl AgentLoopConfig {
             after_tool_call: None,
             stream_options: SimpleStreamOptions::default(),
             thinking_budgets: None,
+            max_model_requests: None,
         }
     }
 }

@@ -217,7 +217,10 @@ async fn failed_turn_has_category() {
 async fn turn_ids_increase_per_run() {
     let mut mapper = NativeEventMapper::new();
     let first = mapper.map(&AgentEvent::AgentStart);
-    mapper.map(&AgentEvent::AgentEnd { messages: vec![] });
+    mapper.map(&AgentEvent::AgentEnd {
+        messages: vec![],
+        max_requests_reached: false,
+    });
     let second = mapper.map(&AgentEvent::AgentStart);
     let id = |u: &[SessionUpdate]| match &u[0] {
         SessionUpdate::TurnStarted { turn_id } => turn_id.clone(),

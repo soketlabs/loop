@@ -3776,6 +3776,8 @@ fn handle_update(
                 push_before_queued(chat, error_item(format!("error: {}", error.message)));
             } else if live && stop == StopReason::Cancelled {
                 push_before_queued(chat, sys("interrupted"));
+            } else if live && stop == StopReason::MaxTurnRequests {
+                push_before_queued(chat, sys("model request limit reached"));
             } else if live && !answered_since_last_prompt(chat) {
                 push_before_queued(chat, sys("(no reply)"));
             }

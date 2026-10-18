@@ -1,5 +1,6 @@
 //! NativeBackend: Loop's own agent behind the AgentBackend interface.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -97,6 +98,69 @@ async fn prompt_streams_envelopes_and_resolves_once() {
     {
         assert_eq!(envelope.turn.as_ref(), Some(&turn_id), "{envelope:?}");
     }
+}
+
+#[tokio::test]
+async fn model_request_limit_stops_tool_loop() {
+    let ping = AgentTool::simple(
+        "ping",
+        "Ping",
+        "Ping",
+        json!({"type": "object", "properties": {}}),
+        |_id, _args, _cancel, _update| async move { Ok(AgentToolResult::text("pong")) },
+    );
+    let call = |id: &str| ToolCall {
+        id: id.into(),
+        name: "ping".into(),
+        arguments: json!({}),
+        thought_signature: None,
+    };
+    let harness = harness(
+        vec![
+            FauxResponse::ToolCalls(vec![call("1")]),
+            FauxResponse::ToolCalls(vec![call("2")]),
+            FauxResponse::Text("third response".into()),
+        ],
+        vec![ping],
+    )
+    .await;
+    harness
+        .set_max_model_requests(Some(NonZeroU64::new(2).unwrap()))
+        .await;
+    let backend = NativeBackend::new(Arc::clone(&harness)).await;
+    let session = backend.current_session().await;
+    let mut rx = backend.subscribe();
+
+    let handle = backend.prompt(&session, text("go")).await.unwrap();
+    let envelopes = collect_turn(&mut rx).await;
+    assert_eq!(
+        handle.outcome().await,
+        TurnOutcome::Completed(StopReason::MaxTurnRequests)
+    );
+    assert!(matches!(
+        envelopes.last().map(|e| &e.update),
+        Some(SessionUpdate::TurnEnded {
+            stop: StopReason::MaxTurnRequests,
+            ..
+        })
+    ));
+    let context = harness.session_context().await.unwrap();
+    assert_eq!(
+        context
+            .messages
+            .iter()
+            .filter(|message| message.role() == "assistant")
+            .count(),
+        2
+    );
+    assert_eq!(
+        context
+            .messages
+            .iter()
+            .filter(|message| message.role() == "toolResult")
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]

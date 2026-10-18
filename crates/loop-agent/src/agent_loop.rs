@@ -226,6 +226,20 @@ async fn run_loop(
         let mut has_more_tool_calls = true;
 
         while has_more_tool_calls || !pending_messages.is_empty() {
+            if config
+                .max_model_requests
+                .is_some_and(|max| turn_index >= max.get())
+            {
+                emit_ev(
+                    emit,
+                    AgentEvent::AgentEnd {
+                        messages: new_messages.clone(),
+                        max_requests_reached: true,
+                    },
+                )
+                .await;
+                return Ok(());
+            }
             turn_index += 1;
             let turn = turn_span(turn_index);
             if !first_turn {
@@ -274,6 +288,7 @@ async fn run_loop(
                     emit,
                     AgentEvent::AgentEnd {
                         messages: new_messages.clone(),
+                        max_requests_reached: false,
                     },
                 )
                 .await;
@@ -352,6 +367,7 @@ async fn run_loop(
                         emit,
                         AgentEvent::AgentEnd {
                             messages: new_messages.clone(),
+                            max_requests_reached: false,
                         },
                     )
                     .await;
@@ -382,6 +398,7 @@ async fn run_loop(
         emit,
         AgentEvent::AgentEnd {
             messages: new_messages.clone(),
+            max_requests_reached: false,
         },
     )
     .await;

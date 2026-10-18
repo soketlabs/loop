@@ -1,5 +1,6 @@
 //! Loop — interactive coding agent CLI by Soket AI.
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -53,6 +54,10 @@ struct Cli {
     /// Print mode: send one prompt and exit (non-interactive).
     #[arg(long, global = true)]
     print: Option<String>,
+
+    /// Maximum model requests per prompt for Loop's native agent.
+    #[arg(long, global = true)]
+    max_model_requests: Option<NonZeroU64>,
 
     /// Write verbose session logs to `target/debug/logs/` (also: `LOOP_DEBUG=1`).
     #[arg(long, global = true)]
@@ -279,6 +284,10 @@ async fn real_main() -> anyhow::Result<()> {
         }),
     })
     .await?;
+    runtime
+        .harness
+        .set_max_model_requests(cli.max_model_requests)
+        .await;
     // With no model asked for, a saved subscription model starts as before.
     let saved_subscription = (pending_agent.is_none() && !explicit_model)
         .then(|| {
