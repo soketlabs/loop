@@ -273,6 +273,18 @@ impl AgentHarness {
         Ok(sid)
     }
 
+    /// The sessions with messages in this harness's store, most recently
+    /// used first; only those opened in `cwd`, when given.
+    pub async fn session_summaries(
+        &self,
+        cwd: Option<&str>,
+    ) -> Result<Vec<crate::harness::session::SessionSummary>, AgentHarnessError> {
+        let store = self.session.lock().await.store();
+        crate::harness::session::list_session_summaries(store.as_ref(), cwd)
+            .await
+            .map_err(AgentHarnessError::Session)
+    }
+
     /// Set the display name for the active session.
     pub async fn set_session_name(&self, name: impl Into<String>) -> Result<(), AgentHarnessError> {
         let name = name.into();
