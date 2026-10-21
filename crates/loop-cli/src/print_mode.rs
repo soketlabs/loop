@@ -161,6 +161,7 @@ pub async fn run_print(
         Some(PendingAgent::Resume(record)) => runtime.resume_agent(&record).await?,
         None => {}
     }
+    runtime.note_prompt(&prompt);
     let backend = runtime.backend.clone();
     let session = runtime.session_ref();
     let input = prompt.clone();

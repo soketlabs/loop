@@ -129,6 +129,12 @@ pub enum PickerView {
         selected: usize,
         hint: String,
     },
+    /// `/sessions`: like `Models`, with room for a conversation title.
+    Sessions {
+        rows: Vec<PickerRow>,
+        selected: usize,
+        hint: String,
+    },
     Setup {
         prompt: crate::setup_prompt::SetupPrompt,
         /// First-run provider setup: esc quits instead of cancelling.
@@ -1041,7 +1047,9 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
     let lines = match picker {
         PickerView::None => Vec::new(),
         PickerView::Setup { prompt, first_run } => setup_lines(prompt, *first_run, theme),
-        PickerView::Commands { rows, selected } => picker_lines(rows, *selected, theme, false),
+        PickerView::Commands { rows, selected } => {
+            picker_lines(rows, *selected, theme, false, LABEL_MAX)
+        }
         PickerView::Models {
             rows,
             selected,
@@ -1051,7 +1059,19 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
                 hint.clone(),
                 theme.style("warning"),
             ))];
-            out.extend(picker_lines(rows, *selected, theme, true));
+            out.extend(picker_lines(rows, *selected, theme, true, LABEL_MAX));
+            out
+        }
+        PickerView::Sessions {
+            rows,
+            selected,
+            hint,
+        } => {
+            let mut out = vec![Line::from(Span::styled(
+                hint.clone(),
+                theme.style("warning"),
+            ))];
+            out.extend(picker_lines(rows, *selected, theme, true, TITLE_MAX));
             out
         }
         PickerView::FileReview {
@@ -1172,11 +1192,17 @@ fn setup_line_count(prompt: &crate::setup_prompt::SetupPrompt, _first_run: bool)
     (3 + rows + usize::from(prompt.env_hint().is_some())) as u16
 }
 
+/// Widest label column in most pickers.
+const LABEL_MAX: usize = 28;
+/// Widest title column in the session picker.
+const TITLE_MAX: usize = 60;
+
 fn picker_lines(
     rows: &[PickerRow],
     selected: usize,
     theme: &Theme,
     _show_mark: bool,
+    label_max: usize,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     if rows.is_empty() {
@@ -1198,7 +1224,7 @@ fn picker_lines(
         .map(|r| UnicodeWidthStr::width(r.label.as_str()))
         .max()
         .unwrap_or(16)
-        .clamp(16, 28);
+        .clamp(16, label_max);
     for (i, row) in rows.iter().enumerate().take(end).skip(start) {
         let active = i == selected;
         let arrow = if active { "❯" } else { " " };
@@ -1351,7 +1377,7 @@ fn picker_height(picker: &PickerView) -> u16 {
             let n = rows.len().min(PICKER_PAGE) as u16;
             n + 1 // page indicator
         }
-        PickerView::Models { rows, .. } => {
+        PickerView::Models { rows, .. } | PickerView::Sessions { rows, .. } => {
             let n = rows.len().min(PICKER_PAGE) as u16;
             n + 2 // hint + page
         }
