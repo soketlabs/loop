@@ -59,7 +59,7 @@ use crate::tui::{
     CardStatus, ChatItem, CommandHistory, FileEntry, FooterOpts, InputBuffer, McpServerListing,
     PickerRow, PickerView, FOOTER_HEIGHT,
 };
-use crate::{build_tools, CliRuntime, PendingAgent};
+use crate::{build_tools, CliRuntime, PendingAgent, StartupSessions};
 use loop_app_core::permissions::PermissionMode;
 
 enum UiEvent {
@@ -480,6 +480,7 @@ async fn run_loop(
     let mut fork_picker: Option<ForkPickerState> = None;
     let mut skill_picker: Option<SkillPickerState> = None;
     let mut mcp_picker: Option<McpPickerState> = None;
+    let mut session_picker: Option<SessionPickerState> = None;
     let mut active_approval: Option<ActiveApproval> = None;
     let mut ac_selected: usize = 0;
     let mut last_ac_filter = String::new();
@@ -505,6 +506,41 @@ async fn run_loop(
             ));
             render_lines_to_buffer(&[line], buf, &runtime.theme);
         })?;
+    }
+
+    // `loop --resume` with no id opens the picker; `--continue` resumes the
+    // most recent session.
+    if let Some(start) = runtime.startup_sessions.take() {
+        match runtime.list_sessions().await {
+            Ok(choices) if choices.is_empty() => {
+                chat.push(sys("no earlier sessions in this folder"));
+            }
+            Ok(choices) => match start {
+                StartupSessions::Pick => {
+                    session_picker = Some(SessionPickerState::new(choices));
+                    status = "sessions · pick one to resume".into();
+                }
+                StartupSessions::Latest => {
+                    resume_session(
+                        choices[0].clone(),
+                        runtime,
+                        &mut chat,
+                        &mut status,
+                        &mut working,
+                        &mut message_queue,
+                        &mut streaming_assistant,
+                        &mut streaming_thinking,
+                        &mut redraw_request,
+                        &mut purge_ui_events,
+                        &tx,
+                        &mut token_bar,
+                        &mut refresh_token_bar,
+                    )
+                    .await;
+                }
+            },
+            Err(e) => chat.push(error_item(format!("could not list sessions: {e:#}"))),
+        }
     }
 
     let tick = Duration::from_millis(33);
@@ -552,6 +588,7 @@ async fn run_loop(
             && fork_picker.is_none()
             && skill_picker.is_none()
             && mcp_picker.is_none()
+            && session_picker.is_none()
             && active_approval.is_none()
         {
             let extra = dynamic_command_entries(runtime);
@@ -565,6 +602,7 @@ async fn run_loop(
             && fork_picker.is_none()
             && skill_picker.is_none()
             && mcp_picker.is_none()
+            && session_picker.is_none()
             && active_approval.is_none()
         {
             find_at_mention(input.as_str(), input.cursor())
@@ -679,6 +717,27 @@ async fn run_loop(
                 selected: p.selected,
                 hint: "MCP: [x] enabled · [ ] disabled. Changes are saved to settings.json.".into(),
             }
+        } else if let Some(p) = &session_picker {
+            let now = now_ms();
+            PickerView::Sessions {
+                rows: p
+                    .filtered
+                    .iter()
+                    .filter_map(|&i| p.choices.get(i))
+                    .map(|c| PickerRow {
+                        label: c.title.clone(),
+                        description: session_row_details(c, now),
+                        mark: (c.id == runtime.session_id).then(|| "✓".into()),
+                    })
+                    .collect(),
+                selected: p.selected,
+                hint: if p.query.is_empty() {
+                    "Sessions in this folder, most recent first. Type to filter by title or id."
+                        .into()
+                } else {
+                    format!("Sessions matching \"{}\"", p.query)
+                },
+            }
         } else if let Some(prompt) = &pending_setup {
             PickerView::Setup {
                 prompt: prompt.clone(),
@@ -718,6 +777,8 @@ async fn run_loop(
             "↑↓ select · enter confirm · esc cancel".into()
         } else if fork_picker.is_some() {
             "↑↓ select · enter edit · esc cancel".into()
+        } else if session_picker.is_some() {
+            "↑↓ select · enter resume · type to filter · esc cancel".into()
         } else if skill_picker.is_some() || mcp_picker.is_some() {
             "↑↓ select · space/enter toggle · type to filter · esc close".into()
         } else if let Some(prompt) = &pending_setup {
@@ -860,6 +921,7 @@ async fn run_loop(
                         &mut fork_picker,
                         &mut skill_picker,
                         &mut mcp_picker,
+                        &mut session_picker,
                         &mut active_approval,
                     );
                     for ev in &batch {
@@ -891,6 +953,7 @@ async fn run_loop(
                             &mut fork_picker,
                             &mut skill_picker,
                             &mut mcp_picker,
+                            &mut session_picker,
                             &mut active_approval,
                         );
                         token_bar.sync_window(runtime);
@@ -918,6 +981,7 @@ async fn run_loop(
                             &mut fork_picker,
                             &mut skill_picker,
                             &mut mcp_picker,
+                            &mut session_picker,
                             &mut active_approval,
                             &mut working,
                             &mut message_queue,
@@ -1897,6 +1961,8 @@ fn start_user_turn(
     prompt: String,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
+    // The first prompt titles a subscription session in /sessions.
+    runtime.note_prompt(&display);
     // Keep prior turn output above this user message.
     settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
 
@@ -2158,6 +2224,7 @@ fn insert_pasted_text(
     fork_picker: &mut Option<ForkPickerState>,
     skill_picker: &mut Option<SkillPickerState>,
     mcp_picker: &mut Option<McpPickerState>,
+    session_picker: &mut Option<SessionPickerState>,
     active_approval: &mut Option<ActiveApproval>,
 ) {
     if let Some(review) = active_approval.as_mut() {
@@ -2186,6 +2253,14 @@ fn insert_pasted_text(
         return;
     }
     if let Some(picker) = skill_picker.as_mut() {
+        let line = pasted_single_line(text);
+        if !line.is_empty() {
+            picker.query.push_str(&line);
+            picker.refilter();
+        }
+        return;
+    }
+    if let Some(picker) = session_picker.as_mut() {
         let line = pasted_single_line(text);
         if !line.is_empty() {
             picker.query.push_str(&line);
@@ -2243,6 +2318,7 @@ async fn handle_key(
     fork_picker: &mut Option<ForkPickerState>,
     skill_picker: &mut Option<SkillPickerState>,
     mcp_picker: &mut Option<McpPickerState>,
+    session_picker: &mut Option<SessionPickerState>,
     active_approval: &mut Option<ActiveApproval>,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
@@ -2460,6 +2536,55 @@ async fn handle_key(
                 if let Some(name) = picker.selected_name().map(str::to_string) {
                     let enabled = !runtime.resources.skills.iter().any(|s| s.name == name);
                     set_skill_enabled(runtime, &name, enabled, chat, status).await;
+                }
+            }
+            KeyCode::Char(c) => {
+                picker.query.push(c);
+                picker.refilter();
+            }
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.refilter();
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if let Some(picker) = session_picker.as_mut() {
+        match key.code {
+            KeyCode::Esc => {
+                *session_picker = None;
+                *status = "ready".into();
+            }
+            KeyCode::Up => {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if picker.selected + 1 < picker.filtered.len() {
+                    picker.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let choice = picker.selected_choice().cloned();
+                *session_picker = None;
+                if let Some(choice) = choice {
+                    resume_session(
+                        choice,
+                        runtime,
+                        chat,
+                        status,
+                        working,
+                        message_queue,
+                        streaming_assistant,
+                        streaming_thinking,
+                        redraw_request,
+                        purge_ui_events,
+                        tx,
+                        token_bar,
+                        refresh_token_bar,
+                    )
+                    .await;
                 }
             }
             KeyCode::Char(c) => {
@@ -2800,6 +2925,7 @@ async fn handle_key(
                             fork_picker,
                             skill_picker,
                             mcp_picker,
+                            session_picker,
                             hide_thinking,
                             working,
                             message_queue,
@@ -3059,6 +3185,137 @@ impl ModelPickerState {
         if self.selected >= self.filtered.len() {
             self.selected = self.filtered.len().saturating_sub(1);
         }
+    }
+}
+
+/// `/sessions`: earlier sessions in this folder, newest first.
+struct SessionPickerState {
+    choices: Vec<loop_app_core::sessions::SessionChoice>,
+    /// Indices into `choices` after filter.
+    filtered: Vec<usize>,
+    selected: usize,
+    query: String,
+}
+
+impl SessionPickerState {
+    fn new(choices: Vec<loop_app_core::sessions::SessionChoice>) -> Self {
+        let filtered = (0..choices.len()).collect();
+        Self {
+            choices,
+            filtered,
+            selected: 0,
+            query: String::new(),
+        }
+    }
+
+    fn refilter(&mut self) {
+        let q = self.query.to_lowercase();
+        self.filtered = self
+            .choices
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.title.to_lowercase().contains(&q) || c.id.contains(&q))
+            .map(|(i, _)| i)
+            .collect();
+        self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+    }
+
+    fn selected_choice(&self) -> Option<&loop_app_core::sessions::SessionChoice> {
+        self.filtered
+            .get(self.selected)
+            .and_then(|&i| self.choices.get(i))
+    }
+}
+
+/// The picker's second column: id, what ran it, size and age.
+fn session_row_details(choice: &loop_app_core::sessions::SessionChoice, now: i64) -> String {
+    let mut parts = vec![choice.id.clone()];
+    if let Some(source) = &choice.source {
+        parts.push(source.clone());
+    }
+    if let Some(n) = choice.message_count {
+        parts.push(format!("{n} messages"));
+    }
+    parts.push(loop_app_core::sessions::ago(now, choice.updated_at));
+    parts.join(" · ")
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+/// Switch to `choice`: Loop's own sessions in place, with their transcript;
+/// subscription sessions by restarting the agent on them, which replays it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "follows the other session switches in this file"
+)]
+async fn resume_session(
+    choice: loop_app_core::sessions::SessionChoice,
+    runtime: &mut CliRuntime,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    working: &mut bool,
+    message_queue: &mut VecDeque<QueuedMessage>,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
+    redraw_request: &mut bool,
+    purge_ui_events: &mut bool,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+    token_bar: &mut TokenBarState,
+    refresh_token_bar: &mut bool,
+) {
+    if *working {
+        chat.push(sys("stop the current turn first (esc), then resume"));
+        return;
+    }
+    if let Some(agent) = &runtime.starting_agent {
+        chat.push(sys(format!(
+            "{agent} is still starting; resume once it is ready"
+        )));
+        return;
+    }
+    if choice.id == runtime.session_id {
+        chat.push(sys(format!("already in session {}", choice.id)));
+        return;
+    }
+    message_queue.clear();
+    *streaming_assistant = None;
+    *streaming_thinking = None;
+    match choice.agent {
+        Some(record) => {
+            // Approvals accepted in the previous session don't carry over.
+            if let Some(bridge) = &runtime.tool_approval {
+                bridge.clear_session_grants();
+            }
+            chat.clear();
+            *redraw_request = true;
+            *purge_ui_events = true;
+            let note = start_agent(runtime, PendingAgent::Resume(record), tx);
+            chat.push(sys(note));
+            *status = format!("resuming · {}", choice.title);
+        }
+        None => match runtime.open_native_session(&choice.id).await {
+            Ok(()) => {
+                *chat = match runtime.backend.transcript(&runtime.session_ref()).await {
+                    Ok(updates) => chat_from_transcript(updates),
+                    Err(e) => {
+                        tracing::warn!("failed to load the session transcript: {e}");
+                        Vec::new()
+                    }
+                };
+                chat.push(sys(format!("resumed {} · {}", choice.id, choice.title)));
+                *status = "ready · resumed".into();
+                *redraw_request = true;
+                *purge_ui_events = true;
+                *refresh_token_bar = true;
+                token_bar.sync_window(runtime);
+            }
+            Err(e) => chat.push(error_item(format!("could not resume {}: {e:#}", choice.id))),
+        },
     }
 }
 
@@ -4252,6 +4509,7 @@ async fn apply_effect(
     fork_picker: &mut Option<ForkPickerState>,
     skill_picker: &mut Option<SkillPickerState>,
     mcp_picker: &mut Option<McpPickerState>,
+    session_picker: &mut Option<SessionPickerState>,
     hide_thinking: &mut bool,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
@@ -4830,12 +5088,67 @@ async fn apply_effect(
                 chat.push(sys(text));
             }
         }
-        CommandEffect::Resume => {
-            chat.push(sys(
-                "resume: restart with `loop --resume <session-id>` (picker UI forthcoming)",
-            ));
-            if !runtime.session_id.is_empty() {
-                chat.push(sys(format!("current session id: {}", runtime.session_id)));
+        CommandEffect::Resume(id) => {
+            let choices = match runtime.list_sessions().await {
+                Ok(choices) => choices,
+                Err(e) => {
+                    chat.push(error_item(format!("could not list sessions: {e:#}")));
+                    return Ok(false);
+                }
+            };
+            match id {
+                Some(id) => {
+                    // Ids start with a timestamp, so a short prefix can match
+                    // several sessions: resume only an exact or unique match.
+                    let matching: Vec<_> = match choices.iter().find(|c| c.id == id) {
+                        Some(exact) => vec![exact.clone()],
+                        None => choices
+                            .iter()
+                            .filter(|c| c.id.starts_with(&id))
+                            .cloned()
+                            .collect(),
+                    };
+                    match <[_; 1]>::try_from(matching) {
+                        Ok([choice]) => {
+                            resume_session(
+                                choice,
+                                runtime,
+                                chat,
+                                status,
+                                working,
+                                message_queue,
+                                streaming_assistant,
+                                streaming_thinking,
+                                redraw_request,
+                                purge_ui_events,
+                                tx,
+                                token_bar,
+                                refresh_token_bar,
+                            )
+                            .await
+                        }
+                        Err(matching) if matching.is_empty() => chat.push(sys(format!(
+                            "no session `{id}` in this folder; /sessions lists them"
+                        ))),
+                        Err(matching) => {
+                            let mut picker = SessionPickerState::new(matching);
+                            picker.query = id;
+                            *session_picker = Some(picker);
+                            *status = "several sessions match · pick one".into();
+                        }
+                    }
+                }
+                None if choices.is_empty() => {
+                    chat.push(sys("no earlier sessions in this folder"));
+                }
+                None => {
+                    *model_picker = None;
+                    *fork_picker = None;
+                    *skill_picker = None;
+                    *mcp_picker = None;
+                    *session_picker = Some(SessionPickerState::new(choices));
+                    *status = "sessions · pick one to resume".into();
+                }
             }
         }
         CommandEffect::Tree => {
@@ -4843,9 +5156,13 @@ async fn apply_effect(
                 "session tree stored in SQLite — use /fork /clone; full tree UI forthcoming",
             ));
         }
-        CommandEffect::SetName(name) => {
-            chat.push(sys(format!("session name → {name}")));
+        CommandEffect::SetName(name) if name.trim().is_empty() => {
+            chat.push(sys("Usage: /name <name>"));
         }
+        CommandEffect::SetName(name) => match runtime.rename_session(name.trim()).await {
+            Ok(()) => chat.push(sys(format!("session name → {}", name.trim()))),
+            Err(e) => chat.push(error_item(format!("could not name the session: {e:#}"))),
+        },
         CommandEffect::Export(path) => {
             chat.push(sys(format!("export: path {:?}", path)));
         }
@@ -5491,6 +5808,50 @@ mod reasoning_notice_tests {
         assert!(
             take_reasoning_notice(&model, &mut reported).is_none(),
             "one notice per model"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_picker_tests {
+    use super::*;
+    use loop_app_core::sessions::SessionChoice;
+
+    fn choice(id: &str, title: &str, source: Option<&str>) -> SessionChoice {
+        SessionChoice {
+            id: id.into(),
+            title: title.into(),
+            source: source.map(str::to_owned),
+            message_count: source.is_some().then_some(6),
+            updated_at: 0,
+            agent: None,
+        }
+    }
+
+    #[test]
+    fn typing_filters_by_title_or_id() {
+        let mut picker = SessionPickerState::new(vec![
+            choice("aaa-111", "Fix the login bug", Some("soket/qwen")),
+            choice("bbb-222", "Write release notes", None),
+        ]);
+        picker.query = "LOGIN".into();
+        picker.refilter();
+        assert_eq!(picker.selected_choice().unwrap().id, "aaa-111");
+        picker.query = "bbb".into();
+        picker.refilter();
+        assert_eq!(picker.selected_choice().unwrap().id, "bbb-222");
+        picker.query = "nothing".into();
+        picker.refilter();
+        assert!(picker.selected_choice().is_none());
+    }
+
+    #[test]
+    fn rows_show_id_source_size_and_age() {
+        let row = session_row_details(&choice("aaa-111", "t", Some("soket/qwen")), 3_600_000);
+        assert_eq!(row, "aaa-111 · soket/qwen · 6 messages · 1h ago");
+        assert_eq!(
+            session_row_details(&choice("b", "t", None), 0),
+            "b · just now"
         );
     }
 }

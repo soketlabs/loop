@@ -188,6 +188,22 @@ impl SessionTreeEntry {
         }
     }
 
+    /// When the entry was written (unix ms).
+    pub fn timestamp(&self) -> i64 {
+        match self {
+            Self::Message { timestamp, .. }
+            | Self::ThinkingLevelChange { timestamp, .. }
+            | Self::ModelChange { timestamp, .. }
+            | Self::ActiveToolsChange { timestamp, .. }
+            | Self::Compaction { timestamp, .. }
+            | Self::BranchSummary { timestamp, .. }
+            | Self::Custom { timestamp, .. }
+            | Self::Label { timestamp, .. }
+            | Self::SessionInfo { timestamp, .. }
+            | Self::Leaf { timestamp, .. } => *timestamp,
+        }
+    }
+
     /// Parent id.
     pub fn parent_id(&self) -> Option<&str> {
         match self {
