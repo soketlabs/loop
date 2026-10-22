@@ -253,14 +253,22 @@ pub fn welcome_lines(
         )));
     }
     out.push(Line::from(""));
-    out.push(Line::from(vec![
-        Span::styled("✦ ".to_string(), theme.accent()),
-        Span::styled(
-            "Interactive Coding Agent Harness".to_string(),
+    // Tagline
+    if w >= 36 {
+        out.push(Line::from(vec![
+            Span::styled("✦ ".to_string(), theme.accent()),
+            Span::styled(
+                "Interactive Coding Agent Harness".to_string(),
+                theme.style("text"),
+            ),
+            Span::styled(" ✦".to_string(), theme.accent()),
+        ]));
+    } else {
+        out.push(Line::from(Span::styled(
+            "Agent Harness".to_string(),
             theme.style("text"),
-        ),
-        Span::styled(" ✦".to_string(), theme.accent()),
-    ]));
+        )));
+    }
     out.push(Line::from(""));
 
     // Info card
@@ -352,15 +360,14 @@ pub fn welcome_lines(
     ]));
     out.push(hline('╰', '╯'));
 
-    out.push(Line::from(Span::styled(
-        format!("loop v{version} · {skills} skills · {prompts} prompts"),
-        theme.muted(),
-    )));
-    out.push(Line::from(Span::styled(
-        "enter send · queues while busy · esc interrupt · shift+enter newline · / commands · ctrl+o expand details · ctrl+c quit"
-            .to_string(),
-        theme.dim(),
-    )));
+    let summary = format!("loop v{version} · {skills} skills · {prompts} prompts");
+    for part in soft_wrap(&summary, w) {
+        out.push(Line::from(Span::styled(part, theme.muted())));
+    }
+    let hints = "enter send · queues while busy · esc interrupt · shift+enter newline · / commands · ctrl+o expand details · ctrl+c quit";
+    for part in soft_wrap(hints, w) {
+        out.push(Line::from(Span::styled(part, theme.dim())));
+    }
     out.push(Line::from(""));
     out
 }
@@ -853,7 +860,6 @@ fn format_shell_box(
 pub fn render_lines_to_buffer(lines: &[Line<'static>], buf: &mut Buffer, theme: &Theme) {
     Paragraph::new(lines.to_vec())
         .style(theme.page())
-        .wrap(Wrap { trim: false })
         .render(buf.area, buf);
 }
 
@@ -1359,7 +1365,7 @@ fn picker_height(picker: &PickerView) -> u16 {
 }
 
 fn input_content_width(term_width: usize) -> usize {
-    term_width.saturating_sub(INPUT_PREFIX_WIDTH).max(1)
+    term_width.saturating_sub(INPUT_PREFIX_WIDTH + 1).max(1)
 }
 
 fn count_input_visual_lines(input: &str, term_width: usize) -> usize {
@@ -2129,5 +2135,39 @@ mod tests {
         let h = footer_live_height(FOOTER_HEIGHT, 80, "", &PickerView::None);
         assert!(h > 0);
         assert!(h < FOOTER_HEIGHT);
+    }
+
+    #[test]
+    fn welcome_lines_wraps_cleanly_on_narrow_terminals() {
+        let theme = Theme::dark();
+        for width in [40u16, 60, 80, 120] {
+            let lines = welcome_lines(
+                &theme,
+                "0.4.0",
+                None,
+                None,
+                None,
+                "http://localhost:8080",
+                "session-1",
+                2,
+                3,
+                false,
+                width,
+            );
+            for line in lines {
+                assert!(
+                    line.width() <= width.max(20) as usize,
+                    "line exceeded width {}: (width {})",
+                    width,
+                    line.width()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn input_content_width_reserves_space_for_caret() {
+        assert_eq!(input_content_width(80), 80 - INPUT_PREFIX_WIDTH - 1);
+        assert_eq!(input_content_width(2), 1);
     }
 }
