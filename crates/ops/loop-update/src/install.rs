@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{sha256_file, Error, Result};
 
+/// `LOOP_INSTALL_DIR` if set, otherwise `~/.loop/bin`.
 pub fn default_install_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("LOOP_INSTALL_DIR") {
         return Ok(PathBuf::from(dir));
@@ -64,6 +65,7 @@ impl Installation {
         Self::managed_executable().is_ok()
     }
 
+    /// The running executable, if the installer owns it.
     pub fn managed_executable() -> Result<PathBuf> {
         let executable = std::env::current_exe()?;
         let dir = default_install_dir()?;
@@ -77,10 +79,13 @@ impl Installation {
         Ok(executable)
     }
 
+    /// The installation of the running executable.
     pub fn current() -> Result<Self> {
         Self::at(Self::managed_executable()?)
     }
 
+    /// Where the last update check is cached, creating the state directory
+    /// if needed.
     pub fn notification_cache_path() -> Result<PathBuf> {
         let executable = Self::managed_executable()?;
         let state = executable
@@ -131,12 +136,14 @@ impl Installation {
         Ok(installation)
     }
 
+    /// A temporary directory for downloads, removed on drop.
     pub fn staging(&self) -> Result<tempfile::TempDir> {
         Ok(tempfile::Builder::new()
             .prefix("stage-")
             .tempdir_in(&self.state_dir)?)
     }
 
+    /// Path of the installed executable.
     pub fn executable(&self) -> &Path {
         &self.executable
     }
@@ -306,6 +313,8 @@ impl Installation {
         Ok(())
     }
 
+    /// Restore the binary saved by the last update. Returns the restored
+    /// version.
     pub async fn rollback(&self) -> Result<String> {
         let record_path = self.state_dir.join("rollback.json");
         regular(&record_path).map_err(|_| Error::Invalid("No rollback record found".into()))?;
@@ -332,6 +341,7 @@ impl Installation {
         Ok(record.previous_version)
     }
 
+    /// Remove the installed executable and its update state.
     pub fn uninstall(mut self) -> Result<()> {
         regular(&self.executable)?;
         if fs::canonicalize(std::env::current_exe()?)? == fs::canonicalize(&self.executable)? {

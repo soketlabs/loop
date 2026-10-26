@@ -40,12 +40,14 @@ impl FakeResponse {
     }
 
     /// Add an extra header (e.g. `Location` for a redirect).
+    #[must_use]
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.into(), value.into()));
         self
     }
 
     /// Delay sending the body after response headers, for cancellation tests.
+    #[must_use]
     pub fn with_body_delay(mut self, delay: Duration) -> Self {
         self.body_delay = Some(delay);
         self

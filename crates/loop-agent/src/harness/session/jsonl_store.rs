@@ -388,7 +388,7 @@ impl SessionReader for JsonlReader {
                             return Err(SessionError::Invalid(format!("Entry {leaf} not found")));
                         }
                     }
-                    return Ok(c.leaf_id.clone());
+                    return Ok(c.leaf_id);
                 }
                 Err(SessionError::NotFound(path.clone()))
             })
@@ -731,12 +731,7 @@ impl SessionStore for JsonlSessionStore {
                     through.as_deref(),
                 )?;
                 let cwd_encoded = doc.meta.cwd.clone().unwrap_or_else(|| ".".into());
-                Ok((
-                    cwd_encoded,
-                    doc.meta.cwd.clone(),
-                    source_path.clone(),
-                    selected,
-                ))
+                Ok((cwd_encoded, doc.meta.cwd, source_path.clone(), selected))
             })
             .await?;
 

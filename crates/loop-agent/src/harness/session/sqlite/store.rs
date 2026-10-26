@@ -574,7 +574,7 @@ impl SessionStore for SqliteSessionStore {
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
             let id = loop_ai::new_id();
             let ts = now_ms();
-            let entry = pending_to_entry(pending, id.clone(), leaf.clone(), ts);
+            let entry = pending_to_entry(pending, id, leaf, ts);
             let new_leaf = if let SessionTreeEntry::Leaf { target_id, .. } = &entry {
                 target_id.clone()
             } else {

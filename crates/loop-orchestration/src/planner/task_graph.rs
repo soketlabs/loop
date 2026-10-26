@@ -238,6 +238,7 @@ impl TaskNode {
     }
 
     /// Set the task configuration.
+    #[must_use]
     pub fn with_config(mut self, config: TaskConfig) -> Self {
         self.config = config;
         self

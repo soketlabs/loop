@@ -27,6 +27,7 @@ impl LlmPlanner {
     }
 
     /// Set custom stream options (e.g., API key).
+    #[must_use]
     pub fn with_options(mut self, options: SimpleStreamOptions) -> Self {
         self.options = options;
         self

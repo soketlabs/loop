@@ -20,13 +20,18 @@ pub use crate::oauth::OAuthLoginOutcome;
 pub enum McpTransport {
     /// Spawn a local child process and communicate over stdin/stdout.
     Stdio {
+        /// Program to run.
         command: String,
+        /// Program arguments.
         args: Vec<String>,
+        /// Extra environment variables for the process.
         env: HashMap<String, String>,
     },
     /// Connect to a remote MCP server over streamable HTTP.
     Http {
+        /// Server endpoint.
         url: String,
+        /// Headers sent with every request.
         headers: HashMap<String, String>,
     },
 }

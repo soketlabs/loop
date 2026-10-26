@@ -33,6 +33,7 @@ impl LoopToolProvider {
     }
 
     /// Run the host's tool checks around every call, as the agent loop does.
+    #[must_use]
     pub fn with_tool_hooks(
         mut self,
         before: Option<BeforeToolCallFn>,

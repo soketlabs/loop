@@ -47,7 +47,9 @@ pub fn truncate_line(line: &str, max_chars: usize) -> String {
     if line.chars().count() <= max_chars {
         return line.to_string();
     }
-    line.chars().take(max_chars).collect::<String>() + "…"
+    let mut out: String = line.chars().take(max_chars).collect();
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -56,7 +58,7 @@ mod tests {
 
     #[test]
     fn truncates_utf8_safely() {
-        let s = "hello 🦀 world";
+        let s = "hello ð¦ world";
         let (head, truncated) = truncate_head(s, 8);
         assert!(truncated);
         assert!(s.starts_with(&head) || head.len() <= 8);

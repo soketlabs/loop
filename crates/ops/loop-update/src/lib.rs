@@ -1,6 +1,8 @@
 //! Distribution operations. This crate depends on no runtime or surface crate.
 //! User configuration and sessions are deliberately outside its ownership.
 
+#![deny(missing_docs)]
+
 mod control;
 mod install;
 mod release;
@@ -9,18 +11,25 @@ pub use control::{cancellable, plan, update_check_disabled, UpdatePlan};
 pub use install::{default_install_dir, Installation};
 pub use release::{is_newer, platform_target, ReleaseClient, ReleaseVersion};
 
+/// Errors from release lookup, download, install, rollback and uninstall.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A failed check, with a message for the user.
     #[error("{0}")]
     Invalid(String),
+    /// A filesystem operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// A release request failed.
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+    /// Release metadata or a state file did not parse.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// A version string is not valid SemVer.
     #[error(transparent)]
     Version(#[from] semver::Error),
+    /// A termination signal stopped the operation.
     #[error("Update cancelled; current binary kept")]
     Cancelled,
     #[cfg(windows)]
@@ -28,8 +37,10 @@ pub enum Error {
     Zip(#[from] zip::result::ZipError),
 }
 
+/// Result type for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Lowercase hex SHA-256 of the file at `path`.
 pub fn sha256_file(path: &std::path::Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut file = std::fs::File::open(path)?;

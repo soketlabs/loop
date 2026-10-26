@@ -34,6 +34,7 @@ impl WorkflowEngine {
     }
 
     /// Set the signal router (for sharing across scheduler and engine).
+    #[must_use]
     pub fn with_signal_router(mut self, router: Arc<SignalRouter>) -> Self {
         self.signal_router = router;
         self

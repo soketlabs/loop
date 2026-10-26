@@ -6,6 +6,8 @@
 //!
 //! Other crates use only this API and never depend on `opentelemetry` directly.
 
+#![deny(missing_docs)]
+
 mod credentials;
 mod exporter;
 mod handle;

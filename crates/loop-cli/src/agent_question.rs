@@ -208,7 +208,7 @@ impl AgentQuestion {
             if let Err(error) = check(&field.input, &raw) {
                 return Transition::Retry { step: self, error };
             }
-            answers.push((field.name.clone(), raw));
+            answers.push((field.name, raw));
         }
         *index += 1;
         let next = fields

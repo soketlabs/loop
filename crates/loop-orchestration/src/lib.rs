@@ -5,6 +5,8 @@
 //! boundaries so that the host crate can provide concrete implementations
 //! without creating circular dependencies.
 
+#![deny(missing_docs)]
+
 pub mod memory;
 pub mod planner;
 pub mod scheduler;
@@ -43,6 +45,8 @@ pub struct AgentRunResult {
 /// wire `run_agent_loop` into the orchestration scheduler.
 #[async_trait]
 pub trait AgentRunner: Send + Sync {
+    /// Run one agent turn. `dependency_context` carries the named outputs of
+    /// upstream tasks.
     async fn run(
         &self,
         prompt: String,
@@ -54,8 +58,11 @@ pub trait AgentRunner: Send + Sync {
 
 /// Result from a shell command execution.
 pub struct ShellRunResult {
+    /// Captured standard output.
     pub stdout: String,
+    /// Captured standard error.
     pub stderr: String,
+    /// Process exit code.
     pub exit_code: i32,
 }
 
@@ -63,6 +70,7 @@ pub struct ShellRunResult {
 /// wire `ExecutionEnv` into the orchestration scheduler.
 #[async_trait]
 pub trait ShellRunner: Send + Sync {
+    /// Run `command` until it exits or `cancel` fires.
     async fn exec(
         &self,
         command: &str,
