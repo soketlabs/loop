@@ -1,6 +1,7 @@
 //! Prompt template loading and argument substitution.
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::Deserialize;
@@ -112,13 +113,17 @@ pub fn parse_command_args(input: &str) -> Vec<String> {
     args
 }
 
+/// Matches `${@:N}` and `${@:N:L}` argument slices.
+static ARG_SLICE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$\{@:(\d+)(?::(\d+))?\}").expect("argument slice pattern is valid")
+});
+
 /// Substitute `$1`, `$@`, `$ARGUMENTS`, `${@:N}`, `${@:N:L}`.
 pub fn substitute_args(template: &str, args: &[String]) -> String {
     let mut out = template.to_string();
     out = out.replace("$ARGUMENTS", &args.join(" "));
     out = out.replace("$@", &args.join(" "));
-    let re_slice = Regex::new(r"\$\{@:(\d+)(?::(\d+))?\}").unwrap();
-    out = re_slice
+    out = ARG_SLICE_RE
         .replace_all(&out, |caps: &regex::Captures| {
             let start: usize = caps[1].parse().unwrap_or(1);
             let start_idx = start.saturating_sub(1);

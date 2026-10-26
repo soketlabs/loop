@@ -383,14 +383,11 @@ impl Agent {
                             s.streaming_message = None;
                             match message.role() {
                                 "assistant" => {
-                                    if s.messages()
-                                        .last()
-                                        .map(|m| m.role() == "assistant")
-                                        .unwrap_or(false)
-                                    {
-                                        *s.messages_mut().last_mut().unwrap() = message.clone();
-                                    } else {
-                                        s.messages_mut().push(message.clone());
+                                    match s.messages_mut().last_mut() {
+                                        Some(last) if last.role() == "assistant" => {
+                                            *last = message.clone();
+                                        }
+                                        _ => s.messages_mut().push(message.clone()),
                                     }
                                     if let Some(a) = message.as_assistant() {
                                         if matches!(
