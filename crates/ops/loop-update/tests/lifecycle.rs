@@ -1,5 +1,8 @@
 //! A self-contained executable so tests exercise replacement/deletion of a
 //! running program, including the Windows helper, rather than just file copies.
+
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use loop_update::{Installation, ReleaseClient, ReleaseVersion};
 use std::{
     collections::HashMap,

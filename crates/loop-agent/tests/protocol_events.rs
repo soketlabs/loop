@@ -1,6 +1,8 @@
 //! Loop's own agent, driven by the faux provider, translated into protocol
 //! updates. These pin the update sequence surfaces will render.
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use std::sync::Arc;
 
 use loop_agent::harness::{

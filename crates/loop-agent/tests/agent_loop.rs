@@ -1,5 +1,7 @@
 //! Agent loop tests with faux provider.
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use std::sync::Arc;
 
 use futures::StreamExt;

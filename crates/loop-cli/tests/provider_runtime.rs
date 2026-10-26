@@ -1,6 +1,8 @@
 //! `/login` / `/logout` persistence against local fake providers (separate test binary:
 //! it mutates process env).
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use loop_cli::config::paths::{auth_path, settings_path, ENV_AGENT_DIR, ENV_SESSION_DIR};
 use loop_cli::config::ProviderLoginRequest;
 use loop_cli::{bootstrap_cli, BootstrapOpts, CliRuntime};

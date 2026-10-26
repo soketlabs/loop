@@ -5,6 +5,8 @@
 //! every assertion here passing. A deliberate behavior change updates the
 //! expectation in the same PR and says so.
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -1,4 +1,7 @@
 //! Isolated process: environment credentials must not bypass explicit logout.
+
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use loop_ai::{Credential, CredentialStore};
 use loop_cli::config::paths::{ENV_AGENT_DIR, ENV_SESSION_DIR};
 use loop_cli::config::ProviderLoginRequest;

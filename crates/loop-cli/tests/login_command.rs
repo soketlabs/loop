@@ -1,5 +1,7 @@
 //! `/login` and `/logout` parsing.
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use loop_cli::commands::{self, CommandEffect};
 
 fn dispatch(line: &str) -> CommandEffect {

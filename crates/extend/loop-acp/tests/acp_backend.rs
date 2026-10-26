@@ -1,6 +1,8 @@
 //! AcpBackend against a scripted fake agent that speaks raw ACP JSON-RPC
 //! (written by hand, not with an SDK, so it pins the wire format).
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

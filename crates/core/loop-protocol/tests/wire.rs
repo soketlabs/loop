@@ -2,6 +2,8 @@
 //! stream (surfaces, `--print` consumers), so a failing assertion means a
 //! breaking change unless `PROTOCOL_VERSION` is bumped.
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use loop_protocol::{
     ContentBlock, ErrorCategory, ErrorInfo, InteractionOutcome, InteractionRequest, PermissionKind,
     PermissionOption, Role, SessionUpdate, StopReason, ToolCall, ToolCallStatus, ToolCallUpdate,

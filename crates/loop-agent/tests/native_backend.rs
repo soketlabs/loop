@@ -1,5 +1,7 @@
 //! NativeBackend: Loop's own agent behind the AgentBackend interface.
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use std::sync::Arc;
 use std::time::Duration;
 

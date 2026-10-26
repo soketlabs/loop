@@ -1,5 +1,7 @@
 //! AgentHarness extended API tests.
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

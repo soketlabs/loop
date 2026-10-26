@@ -116,6 +116,17 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-kit", rev = 
 async-channel = "2"
 portable-pty = "0.9"
 
+# Mechanical rules adopted from the Google Rust style guide; see
+# docs/design/rust-style-adoption.md. CI runs clippy with -D warnings.
+[workspace.lints.clippy]
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "warn"
+return_self_not_must_use = "warn"
+redundant_clone = "warn"
+string_add = "warn"
+ref_option = "warn"
+missing_panics_doc = "warn"
+
 [profile.release]
 lto = true
 codegen-units = 1

@@ -8,3 +8,6 @@ description = "Test helpers shared across Loop crates (dev-dependency only)"
 publish = false
 
 [dependencies]
+
+[lints]
+workspace = true

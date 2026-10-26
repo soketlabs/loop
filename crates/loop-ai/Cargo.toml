@@ -31,3 +31,6 @@ loop-test-support = { workspace = true }
 
 [features]
 default = []
+
+[lints]
+workspace = true

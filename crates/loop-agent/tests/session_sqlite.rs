@@ -1,5 +1,6 @@
 //! SQLite session store integration tests.
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
 #![cfg(feature = "sqlite")]
 
 use std::sync::Arc;

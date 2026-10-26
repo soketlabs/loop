@@ -61,3 +61,6 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rusqlite = { workspace = true, features = ["bundled"] }
+
+[lints]
+workspace = true
