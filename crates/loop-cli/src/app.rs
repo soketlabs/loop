@@ -1701,7 +1701,6 @@ fn ensure_forwarding(
     let fresh = runtime
         .forwarded
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
         .insert(backend.instance().to_string());
     if fresh {
         forward_updates(
@@ -1740,11 +1739,7 @@ fn start_agent(
         let result = async {
             // Subscribe before the session opens, so no update is missed.
             let backend = agents.backend(&task_id).await?;
-            if forwarded
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(task_id.clone())
-            {
+            if forwarded.lock().insert(task_id.clone()) {
                 forward_updates(backend.subscribe(), tx.clone(), debug_log);
             }
             match pending {

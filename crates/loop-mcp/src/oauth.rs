@@ -81,7 +81,7 @@ where
 
     let (tx, rx) = oneshot::channel();
     let state = CallbackState {
-        tx: Arc::new(std::sync::Mutex::new(Some(tx))),
+        tx: Arc::new(parking_lot::Mutex::new(Some(tx))),
     };
     let app = Router::new()
         .route("/callback", get(callback))
@@ -188,7 +188,7 @@ async fn finish_callback(
 
 #[derive(Clone)]
 struct CallbackState {
-    tx: Arc<std::sync::Mutex<Option<oneshot::Sender<CallbackQuery>>>>,
+    tx: Arc<parking_lot::Mutex<Option<oneshot::Sender<CallbackQuery>>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,10 +205,8 @@ async fn callback(
     Query(query): Query<CallbackQuery>,
 ) -> Html<&'static str> {
     let denied = query.error.is_some();
-    if let Ok(mut slot) = state.tx.lock() {
-        if let Some(tx) = slot.take() {
-            let _ = tx.send(query);
-        }
+    if let Some(tx) = state.tx.lock().take() {
+        let _ = tx.send(query);
     }
     Html(if denied { CALLBACK_DENIED } else { CALLBACK_OK })
 }

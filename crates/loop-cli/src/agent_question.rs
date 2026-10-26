@@ -5,9 +5,10 @@
 //! request's reply channel, which lives in the wizard: closing it without an
 //! answer (esc, or the request being withdrawn) cancels the request.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use loop_protocol::{InteractionId, InteractionOutcome, InteractionRequest, DECLINE_CHOICE};
+use parking_lot::Mutex;
 use serde_json::{Map, Value};
 use tokio::sync::oneshot;
 
@@ -233,7 +234,7 @@ impl AgentQuestion {
     }
 
     fn answer(&self, outcome: InteractionOutcome) {
-        if let Some(reply) = self.reply.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        if let Some(reply) = self.reply.lock().take() {
             let _ = reply.send(outcome);
         }
     }

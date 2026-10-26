@@ -927,14 +927,14 @@ fn apply_reasoning(
 
 /// Models whose server rejected reasoning parameters in this process, as
 /// `provider/id`.
-static REASONING_REJECTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static REASONING_REJECTED: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
 
 fn model_key(model: &Model) -> String {
     format!("{}/{}", model.provider, model.id)
 }
 
 fn mark_reasoning_rejected(model: &Model) {
-    let mut rejected = REASONING_REJECTED.lock().unwrap_or_else(|p| p.into_inner());
+    let mut rejected = REASONING_REJECTED.lock();
     let key = model_key(model);
     if !rejected.contains(&key) {
         rejected.push(key);
@@ -944,10 +944,7 @@ fn mark_reasoning_rejected(model: &Model) {
 /// Whether `model`'s server rejected reasoning parameters earlier in this
 /// process. Requests for it are then sent without them.
 pub fn reasoning_rejected(model: &Model) -> bool {
-    REASONING_REJECTED
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .contains(&model_key(model))
+    REASONING_REJECTED.lock().contains(&model_key(model))
 }
 
 /// Whether an error body says a reasoning parameter is not supported.

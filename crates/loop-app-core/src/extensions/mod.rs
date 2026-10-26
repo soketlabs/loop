@@ -1,8 +1,9 @@
 //! Rhai extension host.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use rhai::{Engine, Scope};
 
 /// Commands registered by extensions.
@@ -31,20 +32,16 @@ pub fn load_extensions(paths: &[std::path::PathBuf]) -> ExtensionState {
     {
         let state_cmd = Arc::clone(&state);
         engine.register_fn("register_command", move |name: &str, description: &str| {
-            if let Ok(mut s) = state_cmd.lock() {
-                s.commands.push(ExtensionCommand {
-                    name: name.to_string(),
-                    description: description.to_string(),
-                });
-            }
+            state_cmd.lock().commands.push(ExtensionCommand {
+                name: name.to_string(),
+                description: description.to_string(),
+            });
         });
     }
     {
         let state_n = Arc::clone(&state);
         engine.register_fn("notify", move |msg: &str| {
-            if let Ok(mut s) = state_n.lock() {
-                s.notices.push(msg.to_string());
-            }
+            state_n.lock().notices.push(msg.to_string());
         });
     }
 
@@ -62,8 +59,8 @@ pub fn load_extensions(paths: &[std::path::PathBuf]) -> ExtensionState {
     }
 
     Arc::try_unwrap(state)
-        .map(|m| m.into_inner().unwrap_or_default())
-        .unwrap_or_else(|arc| arc.lock().unwrap().clone_state())
+        .map(Mutex::into_inner)
+        .unwrap_or_else(|arc| arc.lock().clone_state())
 }
 
 trait CloneState {

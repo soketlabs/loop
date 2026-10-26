@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
@@ -21,6 +21,7 @@ use loop_protocol::{
     AgentBackend, HostServices, InteractionOutcome, InteractionRequest, ModelChoice, SessionKey,
     SessionRef, SessionSpec,
 };
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 /// A subscription provider and the ACP agent that serves it.
@@ -212,13 +213,13 @@ impl AgentManager {
 
     /// Where agents ask the user. Applies to agents started afterwards.
     pub fn set_host(&self, host: Arc<dyn HostServices>) {
-        *self.host.lock().unwrap_or_else(|p| p.into_inner()) = host;
+        *self.host.lock() = host;
     }
 
     /// Run agents' permission requests and finished tool calls through
     /// `gate`'s hooks. Applies to agents started afterwards.
     pub fn set_gate(&self, gate: Arc<crate::tool_gate::ToolGate>) {
-        *self.gate.lock().unwrap_or_else(|p| p.into_inner()) = Some(gate);
+        *self.gate.lock() = Some(gate);
     }
 
     /// Every subscription Loop knows.
@@ -313,8 +314,8 @@ impl AgentManager {
         if let Some(backend) = started.get(id) {
             return Ok(Arc::clone(backend));
         }
-        let mut host = Arc::clone(&self.host.lock().unwrap_or_else(|p| p.into_inner()));
-        let gate = self.gate.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let mut host = Arc::clone(&self.host.lock());
+        let gate = self.gate.lock().clone();
         if let Some(gate) = &gate {
             host = Arc::new(crate::agent_gate::GatedHost::new(
                 host,
