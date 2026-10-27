@@ -145,7 +145,7 @@ Implemented on `chore/rust-style-guide`, one commit per item. Notes:
   helper crate doesn't need a new dependency.
 - `task_graph.rs` uses `if let` instead of `expect`. The edges are validated
   just above, so the entry always exists.
-- clippy's `allow-unwrap-in-tests` covers only `#[test]` functions, so 17
+- clippy's `allow-unwrap-in-tests` covers only `#[test]` functions, so 18
   integration-test files allow `unwrap_used` at file level for their
   helpers.
 - The `keys` constants in `loop-telemetry` allow `missing_docs`, because each
