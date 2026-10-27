@@ -32,6 +32,7 @@ pub enum Error {
     /// A termination signal stopped the operation.
     #[error("Update cancelled; current binary kept")]
     Cancelled,
+    /// The Windows release archive could not be read.
     #[cfg(windows)]
     #[error(transparent)]
     Zip(#[from] zip::result::ZipError),

@@ -1,5 +1,7 @@
 //! `/tracing` slash command parsing and dispatch.
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use loop_app_core::config::TracingBackend;
 use loop_cli::commands::{self, CommandEffect, TracingCommand};
 
