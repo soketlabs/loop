@@ -819,6 +819,33 @@ impl Runtime {
         Ok(status)
     }
 
+    /// Hand queued spans to their exporters. Blocking: call from a blocking context.
+    pub fn flush_tracing(&self) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.flush();
+        }
+    }
+
+    /// `/tracing local on|off`, persisted to global settings.
+    pub fn set_tracing_local_log(
+        &mut self,
+        on: bool,
+    ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
+        let status = self.tracing_control()?.set_local_log(on);
+        self.save_settings()?;
+        Ok(status)
+    }
+
+    /// `/tracing anonymous on|off`, persisted to global settings.
+    pub fn set_tracing_anonymous(
+        &mut self,
+        anonymous: bool,
+    ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
+        let status = self.tracing_control()?.set_anonymous(anonymous);
+        self.save_settings()?;
+        Ok(status)
+    }
+
     /// `/tracing setup`, persisted to global settings and the credential store.
     pub fn setup_tracing(
         &mut self,

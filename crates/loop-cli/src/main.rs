@@ -111,6 +111,9 @@ enum Commands {
     Rollback,
     /// Remove the installed program; keep settings, credentials and sessions.
     Uninstall,
+    /// Show the usage dashboard (tokens, models, tools, agents, sessions) in the terminal.
+    #[cfg(feature = "dashboard")]
+    Dashboard,
 }
 
 #[tokio::main]
@@ -187,6 +190,20 @@ async fn real_main() -> anyhow::Result<()> {
             Commands::Uninstall => {
                 loop_update::Installation::current()?.uninstall()?;
                 println!("Loop program files removed. User settings, credentials, skills and sessions kept.");
+                return Ok(());
+            }
+            #[cfg(feature = "dashboard")]
+            Commands::Dashboard => {
+                use loop_app_core::theme::{self, Theme};
+                let agent_dir = config::paths::get_agent_dir();
+                let settings =
+                    config::Settings::load_file(&config::paths::settings_path(&agent_dir))
+                        .unwrap_or_default();
+                let theme =
+                    Theme::load(&settings.theme, &theme::theme_search_dirs(&agent_dir, None))
+                        .unwrap_or_else(|_| Theme::dark());
+                let options = loop_cli::app::dashboard::options(&theme, settings.tracing.local_log);
+                tokio::task::block_in_place(|| loop_dashboard::run(options))?;
                 return Ok(());
             }
             _ => (),

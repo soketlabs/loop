@@ -31,6 +31,9 @@ use loop_protocol::{
     SessionUpdate, StopReason, ToolCallStatus, ToolContent, TurnOutcome, UpdateEnvelope,
 };
 
+#[cfg(feature = "dashboard")]
+pub mod dashboard;
+
 #[cfg(feature = "telemetry")]
 use crate::commands::TracingCommand;
 use crate::commands::{self, AutocompleteEntry, CommandEffect, McpCommand, SkillsCommand};
@@ -509,8 +512,70 @@ async fn run_loop(
 
     let tick = Duration::from_millis(33);
     let mut should_quit = false;
+    // `/dashboard` while open (see `dashboard.rs`): this loop keeps draining agent events.
+    #[cfg(feature = "dashboard")]
+    let mut dashboard: Option<dashboard::Screen> = None;
 
     while !should_quit {
+        #[cfg(feature = "dashboard")]
+        {
+            if std::mem::take(&mut runtime.dashboard_requested) && dashboard.is_none() {
+                let state = dashboard::ChatState {
+                    items: &chat,
+                    working,
+                    turn_step: &turn_step,
+                    token_bar: &token_bar,
+                };
+                match dashboard::Screen::open(runtime, state).await {
+                    Ok(screen) => dashboard = Some(screen),
+                    Err(err) => chat.push(sys(format!("dashboard: {err}"))),
+                }
+            }
+            if let Some(screen) = dashboard.as_mut() {
+                // A tool waiting for approval closes it, so the turn is not stuck.
+                let closed = active_approval.is_some() || screen.handle_input(tick)?;
+                drain_ui_events(
+                    runtime,
+                    &mut rx,
+                    &mut review_rx,
+                    &mut active_approval,
+                    &mut pending_setup,
+                    &mut input,
+                    &mut chat,
+                    &mut status,
+                    &mut turn_step,
+                    &mut streaming_assistant,
+                    &mut streaming_thinking,
+                    &mut working,
+                    &mut message_queue,
+                    &mut token_bar,
+                    &mut refresh_token_bar,
+                    &tx,
+                )
+                .await;
+                if std::mem::take(&mut refresh_token_bar) {
+                    token_bar.refresh(runtime).await;
+                }
+                if closed || active_approval.is_some() {
+                    let resized = dashboard.take().map(dashboard::Screen::close);
+                    if let Some(width) = resized.transpose()?.flatten() {
+                        let _ = terminal.autoresize();
+                        last_width = width;
+                        redraw_request = true;
+                    }
+                    continue;
+                }
+                let state = dashboard::ChatState {
+                    items: &chat,
+                    working,
+                    turn_step: &turn_step,
+                    token_bar: &token_bar,
+                };
+                screen.refresh(runtime, state).await?;
+                continue;
+            }
+        }
+
         if working && last_spin.elapsed() >= Duration::from_millis(80) {
             spinner_frame = spinner_frame.wrapping_add(1);
             last_spin = Instant::now();
@@ -4224,6 +4289,11 @@ fn apply_tracing_command(
             .ok_or_else(|| anyhow::anyhow!("tracing is not available in this mode")),
         TracingCommand::Enable => runtime.set_tracing_enabled(true),
         TracingCommand::Disable => runtime.set_tracing_enabled(false),
+        TracingCommand::Anonymous(None) | TracingCommand::Local(None) => runtime
+            .tracing_status()
+            .ok_or_else(|| anyhow::anyhow!("tracing is not available in this mode")),
+        TracingCommand::Local(Some(on)) => runtime.set_tracing_local_log(on),
+        TracingCommand::Anonymous(Some(anonymous)) => runtime.set_tracing_anonymous(anonymous),
         TracingCommand::Setup { backend } => {
             let (step, prefill) = TracingSetup::start(backend, &runtime.settings.tracing);
             input.set(prefill);
@@ -4506,6 +4576,8 @@ async fn apply_effect(
                 }
             }
         }
+        #[cfg(feature = "dashboard")]
+        CommandEffect::Dashboard => runtime.dashboard_requested = true,
         #[cfg(feature = "telemetry")]
         CommandEffect::Tracing(command) => {
             chat.push(sys(apply_tracing_command(

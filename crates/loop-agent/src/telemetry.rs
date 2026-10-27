@@ -13,7 +13,7 @@ use loop_telemetry::{ObservationExt, TraceAttrs};
 use serde::Serialize;
 use tracing::Span;
 
-use crate::types::{AgentMessage, AgentToolResult};
+use crate::types::{AgentMessage, AgentToolResult, RunLabels};
 
 /// Name of the agent observation for one run of the loop.
 pub(crate) const RUN_SPAN_NAME: &str = "loop.run";
@@ -30,7 +30,12 @@ pub(crate) struct RunObserver {
 impl RunObserver {
     /// `session_id` becomes the Langfuse session when this run is the trace root;
     /// an enclosing span (e.g. print mode's root) owns trace attributes otherwise.
-    pub(crate) fn start(model: &Model, prompts: &[AgentMessage], session_id: Option<&str>) -> Self {
+    pub(crate) fn start(
+        model: &Model,
+        prompts: &[AgentMessage],
+        session_id: Option<&str>,
+        labels: &RunLabels,
+    ) -> Self {
         let is_root = !Span::current().is_recording();
         let span = obs::agent(RUN_SPAN_NAME);
         if is_root {
@@ -41,6 +46,12 @@ impl RunObserver {
         }
         span.record_metadata("model", &model.id);
         span.record_metadata("provider", &model.provider);
+        if let Some(agent) = labels.agent {
+            span.record_metadata("agent", agent);
+        }
+        if !labels.skills.is_empty() {
+            span.record_metadata("skills", &labels.skills);
+        }
         span.record_input(prompts);
         Self { span }
     }
@@ -206,7 +217,23 @@ pub(crate) fn preflight_span(tool_call: &ToolCall) -> Span {
 pub(crate) fn tool_span(tool_call: &ToolCall, args: &serde_json::Value) -> Span {
     let span = obs::tool(&tool_call.name, &tool_call.id);
     span.record_input(args);
+    if let Some(skill) = skill_loaded_by(&tool_call.name, args) {
+        span.record_metadata("skill", skill);
+    }
     span
+}
+
+/// The skill whose `SKILL.md` a `read` call loads: its folder name. Recorded as metadata
+/// (kept in anonymous traces) so skill use can be counted without the path.
+fn skill_loaded_by<'a>(tool: &str, args: &'a serde_json::Value) -> Option<&'a str> {
+    if tool != "read" {
+        return None;
+    }
+    let path = std::path::Path::new(args.get("path")?.as_str()?);
+    if path.file_name()? != "SKILL.md" {
+        return None;
+    }
+    path.parent()?.file_name()?.to_str()
 }
 
 /// Record a tool (or preflight) outcome on its span.
@@ -293,6 +320,25 @@ mod tests {
             summary.last_assistant.unwrap().stop_reason,
             StopReason::Stop
         );
+    }
+
+    #[test]
+    fn reading_a_skill_file_names_the_skill() {
+        let read = |path: &str| serde_json::json!({ "path": path });
+        assert_eq!(
+            skill_loaded_by(
+                "read",
+                &read("/home/u/.loop/agent/skills/pdf-tools/SKILL.md")
+            ),
+            Some("pdf-tools")
+        );
+        assert_eq!(
+            skill_loaded_by("read", &read(r"C:\loop\skills\review\SKILL.md").clone()),
+            if cfg!(windows) { Some("review") } else { None }
+        );
+        assert_eq!(skill_loaded_by("read", &read("src/main.rs")), None);
+        assert_eq!(skill_loaded_by("bash", &read("skills/x/SKILL.md")), None);
+        assert_eq!(skill_loaded_by("read", &serde_json::json!({})), None);
     }
 
     #[test]

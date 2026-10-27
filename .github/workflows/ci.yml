@@ -51,8 +51,11 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --exclude loop-desktop --all-targets --locked -- -D warnings
 
-      - name: clippy (telemetry)
-        run: cargo clippy --workspace --exclude loop-desktop --all-targets --features loop-agent/telemetry,loop-app-core/telemetry,loop-cli/telemetry --locked -- -D warnings
+      - name: clippy (without telemetry)
+        run: cargo clippy -p loop-cli --no-default-features --all-targets --locked -- -D warnings
+
+      - name: clippy (without dashboard)
+        run: cargo clippy -p loop-cli --no-default-features --features telemetry --all-targets --locked -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -95,13 +98,8 @@ jobs:
           LOOP_TEST_POWERSHELL: powershell.exe
         run: cargo test -p loop-update --test lifecycle --locked
 
-      # Build with telemetry on every OS, which reuses the artifacts from the
-      # Build step. Telemetry code has no OS-specific parts, so its tests
-      # only run on Linux. (cargo check would be slower here: it cannot reuse
-      # build artifacts and recompiles every dependency.)
-      - name: Build (telemetry)
-        run: cargo build -p loop-cli --features telemetry --locked
-
-      - name: Test (telemetry)
+      # Telemetry is a default feature of loop-cli, so the steps above cover it.
+      # The build without it has no OS-specific parts, so it is only tested on Linux.
+      - name: Test (without telemetry)
         if: runner.os == 'Linux'
-        run: cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli --features loop-agent/telemetry,loop-app-core/telemetry,loop-cli/telemetry --locked
+        run: cargo test -p loop-cli --no-default-features --locked

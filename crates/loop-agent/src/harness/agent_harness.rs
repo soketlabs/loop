@@ -30,7 +30,7 @@ use crate::stream_fn::{stream_fn_from_models, StreamFn};
 use crate::types::{
     AfterToolCallContext, AfterToolCallResult, AgentContext, AgentEvent, AgentEventSink,
     AgentLoopConfig, AgentMessage, AgentThinkingLevel, AgentTool, BeforeToolCallContext,
-    BeforeToolCallResult, PromptInput, QueueMode, ToolExecutionMode,
+    BeforeToolCallResult, PromptInput, QueueMode, RunLabels, ToolExecutionMode,
 };
 
 type BeforeToolHook = Arc<
@@ -1222,6 +1222,10 @@ impl AgentHarness {
         config.stream_options.reasoning = snapshot.thinking_level.to_reasoning();
         config.before_tool_call = self.before_tool_call.lock().clone();
         config.after_tool_call = self.after_tool_call.lock().clone();
+        config.run_labels = RunLabels {
+            agent: Some(RunLabels::MAIN),
+            skills: self.active_skill_names.read().await.clone(),
+        };
 
         let steer_q = Arc::clone(&self.steering);
         let follow_q = Arc::clone(&self.follow_up);

@@ -1,8 +1,11 @@
 //! Tracing setup, destination resolution and live control (`telemetry` feature).
 
+use std::path::PathBuf;
+
 use loop_ai::auth::{Credential, CredentialStore};
 use loop_telemetry::{
-    CredentialSource, TelemetryCredentials, TelemetryDestination, TelemetryHandle, TelemetryStatus,
+    default_trace_dir, CredentialSource, TelemetryCredentials, TelemetryDestination,
+    TelemetryHandle, TelemetryStatus,
 };
 
 use super::*;
@@ -26,6 +29,11 @@ pub enum TracingSetupRequest {
         /// Optional `Authorization` header value.
         authorization: Option<String>,
     },
+    /// JSON-lines files in a local folder.
+    File {
+        /// Folder; blank means the default under the OS temp folder.
+        dir: String,
+    },
 }
 
 impl std::fmt::Debug for TracingSetupRequest {
@@ -42,6 +50,7 @@ impl std::fmt::Debug for TracingSetupRequest {
                 .debug_struct("Otlp")
                 .field("endpoint", endpoint)
                 .finish_non_exhaustive(),
+            Self::File { dir } => f.debug_struct("File").field("dir", dir).finish(),
         }
     }
 }
@@ -52,6 +61,7 @@ impl TracingSetupRequest {
         match self {
             Self::Langfuse { .. } => TracingBackend::Langfuse,
             Self::Otlp { .. } => TracingBackend::Otlp,
+            Self::File { .. } => TracingBackend::File,
         }
     }
 
@@ -85,6 +95,10 @@ impl TracingSetupRequest {
                 )
                 .ok_or_else(|| anyhow::anyhow!("OTLP endpoint is required"))
             }
+            Self::File { dir } => Ok(file_destination(
+                Some(dir.as_str()),
+                CredentialSource::Config,
+            )),
         }
     }
 
@@ -108,6 +122,9 @@ impl TracingSetupRequest {
                 settings.otlp_endpoint = Some(endpoint.trim().to_string());
                 store_secret(store, OTLP_CREDENTIAL_ID, authorization.as_deref());
             }
+            Self::File { dir } => {
+                settings.file_dir = Some(dir.trim().to_string()).filter(|d| !d.is_empty());
+            }
         }
     }
 }
@@ -117,6 +134,21 @@ fn store_secret(store: &dyn CredentialStore, id: &str, secret: Option<&str>) {
         Some(key) => store.set(id, Credential::ApiKey { key: key.into() }),
         None => store.remove(id),
     }
+}
+
+/// Default folder of the `file` backend: beside the usage log, not in it, so
+/// `loop dashboard` does not count those spans twice.
+pub fn default_file_backend_dir() -> PathBuf {
+    default_trace_dir().join("full")
+}
+
+/// Trace file destination in `dir`, or the default folder when blank or unset.
+fn file_destination(dir: Option<&str>, source: CredentialSource) -> TelemetryDestination {
+    let dir = dir
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map_or_else(default_file_backend_dir, PathBuf::from);
+    TelemetryDestination::file(&dir, source)
 }
 
 fn stored_secret(store: &dyn CredentialStore, id: &str) -> Option<String> {
@@ -163,6 +195,10 @@ pub fn resolve_with_env(
                 CredentialSource::Config,
             )
         }),
+        TracingBackend::File => Some(file_destination(
+            settings.file_dir.as_deref(),
+            CredentialSource::Config,
+        )),
     }
 }
 
@@ -189,9 +225,13 @@ impl TracingControl<'_> {
         &mut self,
         destination: Option<&TelemetryDestination>,
     ) -> anyhow::Result<TelemetryStatus> {
+        if self.settings.local_log {
+            self.handle.install_local(&default_trace_dir());
+        }
         if let Some(destination) = destination {
             self.handle.install(destination)?;
         }
+        self.handle.set_anonymous(self.settings.anonymous);
         Ok(self.handle.set_enabled(self.settings.enabled))
     }
 
@@ -199,6 +239,28 @@ impl TracingControl<'_> {
     pub fn set_enabled(&mut self, enabled: bool) -> TelemetryStatus {
         self.settings.enabled = enabled;
         self.handle.set_enabled(enabled)
+    }
+
+    /// `/tracing local on|off`: the anonymous usage log behind `loop dashboard`.
+    pub fn set_local_log(&mut self, on: bool) -> TelemetryStatus {
+        self.settings.local_log = on;
+        let running = self.handle.status().local_log.is_some();
+        match (on, running) {
+            (true, false) => {
+                self.handle.install_local(&default_trace_dir());
+            }
+            (false, true) => {
+                self.handle.remove_local();
+            }
+            _ => {}
+        }
+        self.handle.status()
+    }
+
+    /// `/tracing anonymous on|off`.
+    pub fn set_anonymous(&mut self, anonymous: bool) -> TelemetryStatus {
+        self.settings.anonymous = anonymous;
+        self.handle.set_anonymous(anonymous)
     }
 
     /// `/tracing setup`: save the configuration and start exporting with it now.
@@ -212,8 +274,17 @@ impl TracingControl<'_> {
 
 /// One-line summary for `/tracing status` and startup messages.
 pub fn describe_tracing_status(status: &TelemetryStatus) -> String {
+    let usage = match &status.local_log {
+        Some(path) => format!("usage log: on · anonymous, local only · {path} · loop dashboard"),
+        None => "usage log: off (/tracing local on)".into(),
+    };
+    format!("{}\n{usage}", describe_destination(status))
+}
+
+fn describe_destination(status: &TelemetryStatus) -> String {
     let Some(destination) = &status.destination else {
-        return "tracing: not configured · run /tracing setup (Langfuse or any OTLP endpoint), \
+        return "tracing: not configured · run /tracing setup (Langfuse, any OTLP endpoint \
+                or a local file), \
                 or set LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY"
             .into();
     };
@@ -227,6 +298,9 @@ pub fn describe_tracing_status(status: &TelemetryStatus) -> String {
         .map(CredentialSource::as_str)
         .unwrap_or("unknown");
     let mut line = format!("tracing: {state} · {destination} · configured from {source}");
+    if status.anonymous {
+        line.push_str(" · anonymous (no prompts, outputs or tool data)");
+    }
     if let Some(err) = &status.last_error {
         line.push_str(&format!(" · last export failed: {err}"));
     }
@@ -349,6 +423,84 @@ mod tests {
     }
 
     #[test]
+    fn local_log_starts_by_default_and_toggles() {
+        let (mut settings, store, handle) = fresh();
+        let mut control = TracingControl {
+            settings: &mut settings,
+            store: &store,
+            handle: &handle,
+        };
+        let status = control.apply_destination(None).unwrap();
+        let path = status.local_log.clone().expect("usage log on by default");
+        assert!(std::path::Path::new(&path).starts_with(default_trace_dir()));
+        assert!(!status.active());
+        let text = describe_tracing_status(&status);
+        assert!(
+            text.contains("not configured") && text.contains("usage log: on"),
+            "{text}"
+        );
+
+        let status = control.set_local_log(false);
+        assert_eq!(status.local_log, None);
+        assert!(describe_tracing_status(&status).contains("usage log: off"));
+        assert!(!settings.local_log);
+
+        let (mut settings, store, handle) = fresh();
+        settings.local_log = false;
+        let status = TracingControl {
+            settings: &mut settings,
+            store: &store,
+            handle: &handle,
+        }
+        .apply_destination(None)
+        .unwrap();
+        assert_eq!(status.local_log, None, "saved opt-out is honoured");
+    }
+
+    #[test]
+    fn apply_honours_saved_anonymous_preference() {
+        let (mut settings, store, handle) = fresh();
+        settings.anonymous = true;
+        let status = TracingControl {
+            settings: &mut settings,
+            store: &store,
+            handle: &handle,
+        }
+        .apply_destination(None)
+        .unwrap();
+        assert!(status.anonymous);
+        assert!(handle.status().anonymous);
+    }
+
+    #[test]
+    fn set_anonymous_updates_settings_handle_and_status_line() {
+        let (mut settings, store) = saved(&langfuse("https://lf.example", "sk-1"));
+        let handle = TelemetryHandle::new("t", true);
+        let destination = resolve_with_env(&settings, &store, env_of(&[]));
+        let mut control = TracingControl {
+            settings: &mut settings,
+            store: &store,
+            handle: &handle,
+        };
+        control.apply_destination(destination.as_ref()).unwrap();
+        let status = control.set_anonymous(true);
+        assert!(status.anonymous && status.active());
+        // First line describes the destination; the second is the always-anonymous usage log.
+        let destination_line = |s: &TelemetryStatus| {
+            describe_tracing_status(s)
+                .lines()
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        assert!(destination_line(&status).contains("anonymous"));
+        let status = control.set_anonymous(false);
+        assert!(!status.anonymous);
+        assert!(!destination_line(&status).contains("anonymous"));
+        assert!(!settings.anonymous);
+    }
+
+    #[test]
     fn langfuse_setup_stores_keys_and_activates() {
         let (mut settings, store, handle) = fresh();
         settings.enabled = false;
@@ -447,6 +599,25 @@ mod tests {
             otlp("http://c", Some("Bearer tok"))
         );
         assert!(!text.contains("sk-secret") && !text.contains("tok"));
+    }
+
+    #[test]
+    fn file_setup_defaults_to_temp_folder_and_saves_custom_dir() {
+        let (settings, store) = saved(&TracingSetupRequest::File { dir: "  ".into() });
+        assert_eq!(settings.backend, TracingBackend::File);
+        assert_eq!(settings.file_dir, None);
+        let destination = resolve_with_env(&settings, &store, env_of(&[])).unwrap();
+        assert!(std::path::Path::new(&destination.endpoint).starts_with(default_file_backend_dir()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().display().to_string();
+        let (settings, store) = saved(&TracingSetupRequest::File {
+            dir: custom.clone(),
+        });
+        assert_eq!(settings.file_dir.as_deref(), Some(custom.as_str()));
+        let destination = resolve_with_env(&settings, &store, env_of(&[])).unwrap();
+        assert!(std::path::Path::new(&destination.endpoint).starts_with(dir.path()));
+        assert!(destination.label.starts_with("file · "));
     }
 
     #[test]

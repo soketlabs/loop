@@ -191,6 +191,7 @@ async fn run_loop_observed(
         &config.model,
         input,
         config.stream_options.base.session_id.as_deref(),
+        &config.run_labels,
     );
     let result = run_loop(
         current_context,

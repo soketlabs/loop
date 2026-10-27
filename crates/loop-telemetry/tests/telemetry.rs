@@ -229,6 +229,99 @@ fn recorders_write_langfuse_attributes() {
     ));
 }
 
+/// A failed generation with a tool child, a warning and full trace attributes.
+fn record_sensitive_run() {
+    let run = obs::agent("loop.run");
+    run.record_trace(&TraceAttrs {
+        session_id: Some("sess-1".into()),
+        user_id: Some("alice@example.com".into()),
+        ..Default::default()
+    });
+    run.record_input("secret prompt");
+    let _run = run.enter();
+    let generation = obs::generation("llm.generate");
+    generation.record_model("gpt-x", "openai", &serde_json::json!({"temperature": 0.2}));
+    generation.record_input(&serde_json::json!([{"role": "user", "content": "secret prompt"}]));
+    generation.record_output("secret answer");
+    generation.record_metadata("stop_reason", "error");
+    generation.record_usage(&loop_ai::Usage {
+        input: 10,
+        output: 5,
+        total_tokens: 15,
+        ..Default::default()
+    });
+    generation.record_error("provider echoed secret prompt");
+    drop(generation);
+    let tool = obs::tool("read", "call_1");
+    tool.record_input(&serde_json::json!({"path": "/home/alice/secret.txt"}));
+    tool.record_output("secret file contents");
+    tool.in_scope(|| tracing::warn!(target: "loop_agent", "could not read /home/alice/secret.txt"));
+}
+
+fn assert_no_secrets(spans: &[SpanData]) {
+    for span in spans {
+        let dump = format!("{:?} {:?} {:?}", span.attributes, span.events, span.status);
+        assert!(!dump.contains("secret"), "{}: {dump}", span.name);
+        assert!(!dump.contains("alice"), "{}: {dump}", span.name);
+    }
+}
+
+#[test]
+fn anonymous_mode_strips_content_but_keeps_shape_and_usage() {
+    let f = Fixture::installed(true);
+    assert!(f.handle.set_anonymous(true).anonymous);
+    f.run(record_sensitive_run);
+    let spans = f.spans();
+    assert_eq!(spans.len(), 3);
+    assert_no_secrets(&spans);
+
+    let by_name = |n: &str| spans.iter().find(|s| s.name == n).unwrap();
+    let (run, generation, tool) = (
+        by_name("loop.run"),
+        by_name("llm.generate"),
+        by_name("tool read"),
+    );
+    assert_eq!(tool.parent_span_id, run.span_context.span_id());
+    assert_eq!(attr(run, keys::SESSION_ID).as_deref(), Some("sess-1"));
+    assert_eq!(attr(generation, keys::MODEL_NAME).as_deref(), Some("gpt-x"));
+    assert!(attr(generation, keys::USAGE_DETAILS).is_some());
+    assert_eq!(
+        attr(generation, &format!("{}stop_reason", keys::METADATA_PREFIX)).as_deref(),
+        Some("error")
+    );
+    assert_eq!(attr(generation, keys::LEVEL).as_deref(), Some("ERROR"));
+    assert!(matches!(
+        generation.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
+    assert_eq!(attr(tool, keys::GEN_AI_TOOL_NAME).as_deref(), Some("read"));
+    assert!(tool.events.is_empty());
+}
+
+#[test]
+fn anonymous_mode_is_off_by_default_and_toggles() {
+    let f = Fixture::installed(true);
+    assert!(!f.handle.status().anonymous);
+    f.run(|| obs::span("full").record_input("secret prompt"));
+    f.handle.set_anonymous(true);
+    f.run(|| obs::span("anonymous").record_input("secret prompt"));
+    assert!(!f.handle.set_anonymous(false).anonymous);
+    f.run(|| obs::span("full again").record_input("secret prompt"));
+    let inputs: Vec<_> = f
+        .spans()
+        .iter()
+        .map(|s| (s.name.to_string(), attr(s, keys::INPUT)))
+        .collect();
+    assert_eq!(
+        inputs,
+        vec![
+            ("full".into(), Some("secret prompt".into())),
+            ("anonymous".into(), None),
+            ("full again".into(), Some("secret prompt".into())),
+        ]
+    );
+}
+
 #[test]
 fn trace_attrs_are_recorded() {
     let f = Fixture::installed(true);
@@ -359,6 +452,94 @@ fn otlp_exporter_posts_to_collector_with_optional_auth() {
     assert_eq!(request.path, "/v1/traces");
     assert_eq!(request.header("authorization"), Some("Bearer tok"));
     assert!(request.header("x-langfuse-ingestion-version").is_none());
+}
+
+/// Local file: one JSON object per span, nested by parent id, anonymous mode applied.
+#[test]
+fn file_destination_writes_jsonl_spans() {
+    let dir = tempfile::tempdir().unwrap();
+    let destination = TelemetryDestination::file(dir.path(), CredentialSource::Config);
+    let handle = TelemetryHandle::new("test-release", true);
+    handle.install(&destination).unwrap();
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+        "file is created on first export"
+    );
+    let dispatch = Dispatch::new(tracing_subscriber::registry().with(handle.layer()));
+    tracing::dispatcher::with_default(&dispatch, || {
+        let run = obs::agent("loop.run");
+        run.record_input("visible prompt");
+        let _run = run.enter();
+        let generation = obs::generation("llm.generate");
+        generation.record_usage(&loop_ai::Usage {
+            input: 10,
+            total_tokens: 10,
+            ..Default::default()
+        });
+    });
+    handle.set_anonymous(true);
+    tracing::dispatcher::with_default(&dispatch, record_sensitive_run);
+    handle.flush();
+    assert_eq!(handle.status().last_error, None);
+
+    let text = std::fs::read_to_string(&destination.endpoint).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 5);
+    let span = |name: &str| lines.iter().find(|l| l["name"] == name).unwrap();
+    let (run, generation) = (span("loop.run"), span("llm.generate"));
+    assert_eq!(generation["parent_span_id"], run["span_id"]);
+    assert_eq!(generation["trace_id"], run["trace_id"]);
+    assert!(run["parent_span_id"].is_null());
+    assert_eq!(run["attributes"][keys::INPUT], "visible prompt");
+    assert_eq!(generation["attributes"][keys::USAGE_DETAILS]["input"], 10);
+    assert!(generation["duration_ms"].as_f64().unwrap() >= 0.0);
+    assert!(!lines[2..].iter().any(|l| l.to_string().contains("secret")));
+}
+
+/// The usage log works without a destination and is always anonymous, while the
+/// destination keeps full content.
+#[test]
+fn local_usage_log_is_independent_and_always_anonymous() {
+    let f = Fixture::uninstalled(true);
+    let local = InMemorySpanExporter::default();
+    f.handle
+        .install_local_exporter(local.clone(), "memory-log".into());
+    let status = f.handle.status();
+    assert!(!status.active(), "no destination configured");
+    assert_eq!(status.local_log.as_deref(), Some("memory-log"));
+
+    f.run(record_sensitive_run);
+    f.install();
+    f.run(|| obs::span("both").record_input("secret prompt"));
+    f.handle.set_enabled(false);
+    f.run(|| obs::span("local only").record_input("secret prompt"));
+    f.handle.flush();
+
+    let local_spans = local.get_finished_spans().unwrap();
+    assert_eq!(local_spans.len(), 5);
+    assert_no_secrets(&local_spans);
+    let remote = f.spans();
+    assert_eq!(
+        remote
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect::<Vec<_>>(),
+        ["both"]
+    );
+    assert_eq!(
+        attr(&remote[0], keys::INPUT).as_deref(),
+        Some("secret prompt")
+    );
+
+    let status = f.handle.remove_local();
+    assert_eq!(status.local_log, None);
+    f.run(|| {
+        let span = obs::span("after removal");
+        assert!(!span.is_recording(), "nothing left to export to");
+    });
 }
 
 #[test]

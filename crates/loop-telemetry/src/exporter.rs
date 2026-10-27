@@ -92,6 +92,13 @@ impl ExporterSlot {
         state.last_error = None;
     }
 
+    /// Remove the destination, shutting it down; later batches are dropped.
+    pub(crate) fn clear(&self) {
+        if let Some(previous) = self.inner.write().exporter.take() {
+            let _ = previous.shutdown();
+        }
+    }
+
     /// Error from the most recent failed export, cleared by the next success.
     pub(crate) fn last_error(&self) -> Option<String> {
         self.inner.read().last_error.clone()

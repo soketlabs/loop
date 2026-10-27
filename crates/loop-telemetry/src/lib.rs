@@ -6,11 +6,16 @@
 //!
 //! Other crates use only this API and never depend on `opentelemetry` directly.
 
+mod anonymize;
 mod credentials;
 mod exporter;
+mod file_exporter;
 mod handle;
 pub mod obs;
 
-pub use credentials::{CredentialSource, TelemetryCredentials, TelemetryDestination};
+pub use credentials::{
+    CredentialSource, DestinationKind, TelemetryCredentials, TelemetryDestination,
+};
+pub use file_exporter::{default_trace_dir, is_trace_file, TRACE_RETENTION};
 pub use handle::{TelemetryHandle, TelemetryStatus};
 pub use obs::{ObservationExt, TraceAttrs};
