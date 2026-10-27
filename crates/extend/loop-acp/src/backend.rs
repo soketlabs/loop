@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Weak};
 
 use agent_client_protocol_schema::v1 as acp;
 use agent_client_protocol_schema::ProtocolVersion;
@@ -25,6 +25,7 @@ use loop_protocol::{
     SessionUpdate, StopReason, TerminalRequest, TurnHandle, TurnId, TurnOutcome, UpdateEnvelope,
     DECLINE_CHOICE, PROTOCOL_VERSION,
 };
+use parking_lot::{Mutex, MutexGuard};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -163,10 +164,7 @@ impl AcpBackend {
     }
 
     fn lock_state(&self) -> MutexGuard<'_, State> {
-        // A panic while holding the lock leaves plain data; keep going.
-        self.state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+        self.state.lock()
     }
 
     /// The live connection, starting the agent if needed.

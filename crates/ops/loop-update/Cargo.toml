@@ -32,3 +32,6 @@ tar.workspace = true
 name = "lifecycle"
 path = "tests/lifecycle.rs"
 harness = false
+
+[lints]
+workspace = true

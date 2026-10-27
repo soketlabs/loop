@@ -855,7 +855,7 @@ async fn run_loop(
                         &text,
                         runtime,
                         &mut input,
-                        &pending_setup,
+                        pending_setup.as_ref(),
                         &mut model_picker,
                         &mut fork_picker,
                         &mut skill_picker,
@@ -886,7 +886,7 @@ async fn run_loop(
                             &text,
                             runtime,
                             &mut input,
-                            &pending_setup,
+                            pending_setup.as_ref(),
                             &mut model_picker,
                             &mut fork_picker,
                             &mut skill_picker,
@@ -1701,7 +1701,6 @@ fn ensure_forwarding(
     let fresh = runtime
         .forwarded
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
         .insert(backend.instance().to_string());
     if fresh {
         forward_updates(
@@ -1740,11 +1739,7 @@ fn start_agent(
         let result = async {
             // Subscribe before the session opens, so no update is missed.
             let backend = agents.backend(&task_id).await?;
-            if forwarded
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(task_id.clone())
-            {
+            if forwarded.lock().insert(task_id.clone()) {
                 forward_updates(backend.subscribe(), tx.clone(), debug_log);
             }
             match pending {
@@ -2153,7 +2148,7 @@ fn insert_pasted_text(
     text: &str,
     runtime: &CliRuntime,
     input: &mut InputBuffer,
-    pending_setup: &Option<SetupPrompt>,
+    pending_setup: Option<&SetupPrompt>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
     skill_picker: &mut Option<SkillPickerState>,
@@ -2201,7 +2196,7 @@ fn insert_pasted_text(
         }
         return;
     }
-    if let Some(prompt) = pending_setup.as_ref() {
+    if let Some(prompt) = pending_setup {
         if prompt.options().is_some() {
             return;
         }

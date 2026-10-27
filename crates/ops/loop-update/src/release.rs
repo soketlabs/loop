@@ -13,13 +13,17 @@ use crate::{checksum, sha256_file, Error, Result};
 const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 const MAX_BINARY: u64 = 256 * 1024 * 1024;
 
+/// A release version and its Git tag.
 #[derive(Debug, Clone)]
 pub struct ReleaseVersion {
+    /// Tag name, such as `v0.5.0`.
     pub tag: String,
+    /// Parsed version.
     pub version: Version,
 }
 
 impl ReleaseVersion {
+    /// Parse a version with or without a leading `v`.
     pub fn parse(value: &str) -> Result<Self> {
         let version = Version::parse(value.strip_prefix('v').unwrap_or(value))?;
         Ok(Self {
@@ -29,12 +33,14 @@ impl ReleaseVersion {
     }
 }
 
+/// Whether `available` takes SemVer precedence over `current`.
 pub fn is_newer(current: &str, available: &ReleaseVersion) -> Result<bool> {
     Ok(Version::parse(current.trim_start_matches('v'))?
         .cmp_precedence(&available.version)
         .is_lt())
 }
 
+/// The release target triple for this platform.
 pub fn platform_target() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") if cfg!(target_env = "gnu") => Ok("x86_64-unknown-linux-gnu"),
@@ -48,6 +54,7 @@ pub fn platform_target() -> Result<&'static str> {
     }
 }
 
+/// Looks up and downloads releases.
 #[derive(Clone)]
 pub struct ReleaseClient {
     client: reqwest::Client,
@@ -71,6 +78,7 @@ struct CachedRelease {
 }
 
 impl ReleaseClient {
+    /// A client for the `soketlabs/loop` GitHub releases.
     pub fn github(timeout: Duration) -> Result<Self> {
         Self::new(
             "https://api.github.com/repos/soketlabs/loop/releases/",
@@ -107,6 +115,7 @@ impl ReleaseClient {
         })
     }
 
+    /// Resolve the latest release from this redirect URL instead of the API.
     pub fn with_latest_redirect(mut self, url: &str) -> Result<Self> {
         let url = Url::parse(url).map_err(|e| Error::Invalid(e.to_string()))?;
         let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
@@ -119,6 +128,7 @@ impl ReleaseClient {
         Ok(self)
     }
 
+    /// The latest published release.
     pub async fn latest(&self) -> Result<ReleaseVersion> {
         if let Some(url) = &self.latest_redirect {
             let response = self
@@ -229,6 +239,8 @@ impl ReleaseClient {
         self.download_with_progress(release, dir, |_, _| {}).await
     }
 
+    /// Like [`Self::download`], calling `progress` with bytes received and
+    /// the total size when known.
     pub async fn download_with_progress(
         &self,
         release: &ReleaseVersion,

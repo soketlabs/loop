@@ -40,7 +40,7 @@ pub struct CliRuntime {
     /// Subscription being signed in to from `/login`, until it finishes.
     pub signing_in: Option<String>,
     /// Backend instances whose updates are already forwarded to the surface.
-    pub forwarded: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    pub forwarded: std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Recoverable reasoning warnings already shown in this CLI process.
     pub(crate) reasoning_notices: std::collections::HashSet<String>,
     /// `/permissions full-access` was asked for once and needs repeating to

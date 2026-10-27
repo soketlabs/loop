@@ -1,5 +1,6 @@
 //! MCP integration tests: bridge, server tool logic, and command policy.
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
 #![cfg(feature = "mcp")]
 
 use std::sync::Arc;

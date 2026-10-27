@@ -1,11 +1,16 @@
-use std::{cmp::Ordering, future::Future};
+use std::cmp::Ordering;
+use std::future::Future;
 
 use crate::{Error, ReleaseVersion, Result};
 
+/// What an update should do, from [`plan`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpdatePlan {
+    /// The release is newer, or the update is forced.
     Install,
+    /// The release is the installed version.
     UpToDate,
+    /// The release is older; installing it needs `force`.
     DowngradeBlocked,
 }
 
@@ -23,6 +28,8 @@ pub fn plan(current: &str, release: &ReleaseVersion, force: bool) -> Result<Upda
     })
 }
 
+/// Whether a `LOOP_NO_UPDATE_CHECK` value turns the update check off:
+/// `1`, `true`, `yes` or `on`, in any case.
 pub fn update_check_disabled(value: Option<&str>) -> bool {
     value.is_some_and(|s| {
         matches!(

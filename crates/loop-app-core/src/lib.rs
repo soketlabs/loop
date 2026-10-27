@@ -1,5 +1,7 @@
 //! Shared bootstrap, configuration, and runtime wiring for Loop CLI and desktop.
 
+#![deny(missing_docs)]
+
 pub mod agent_gate;
 pub mod agents;
 pub mod config;

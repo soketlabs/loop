@@ -35,6 +35,10 @@ pub fn soket_seed_models() -> Vec<Model> {
 }
 
 /// Build the built-in Soket provider (dynamic catalog via `/v1/models`).
+///
+/// # Panics
+///
+/// If the Soket preset is missing from the built-in presets, which is a build bug.
 pub fn soket_provider() -> Provider {
     super::presets::provider_preset(SOKET_PROVIDER_ID)
         .expect("Soket preset")

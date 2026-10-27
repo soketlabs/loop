@@ -43,30 +43,35 @@ impl CustomModelSpec {
     }
 
     /// Enable reasoning.
+    #[must_use]
     pub fn with_reasoning(mut self, reasoning: bool) -> Self {
         self.reasoning = reasoning;
         self
     }
 
     /// Set the display name.
+    #[must_use]
     pub fn with_name(mut self, name: Option<&str>) -> Self {
         self.name = name.map(String::from);
         self
     }
 
     /// Set the context window (tokens).
+    #[must_use]
     pub fn with_context_window(mut self, context_window: Option<u64>) -> Self {
         self.context_window = context_window;
         self
     }
 
     /// Set the max output tokens.
+    #[must_use]
     pub fn with_max_tokens(mut self, max_tokens: Option<u64>) -> Self {
         self.max_tokens = max_tokens;
         self
     }
 
     /// Set compat overrides.
+    #[must_use]
     pub fn with_compat(mut self, compat: OpenAICompletionsCompat) -> Self {
         self.compat = Some(compat);
         self

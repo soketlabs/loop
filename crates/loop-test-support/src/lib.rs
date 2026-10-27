@@ -40,12 +40,14 @@ impl FakeResponse {
     }
 
     /// Add an extra header (e.g. `Location` for a redirect).
+    #[must_use]
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.into(), value.into()));
         self
     }
 
     /// Delay sending the body after response headers, for cancellation tests.
+    #[must_use]
     pub fn with_body_delay(mut self, delay: Duration) -> Self {
         self.body_delay = Some(delay);
         self
@@ -89,9 +91,16 @@ pub struct FakeHttpServer {
 
 impl FakeHttpServer {
     /// Start serving; `route` builds the response for each request.
+    ///
+    /// # Panics
+    ///
+    /// If no local port can be bound.
     pub fn start(route: impl Fn(&RecordedRequest) -> FakeResponse + Send + Sync + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake server");
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("fake server address")
+        );
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let route: Arc<Router> = Arc::new(route);
@@ -127,8 +136,12 @@ impl FakeHttpServer {
     }
 
     /// Requests received so far.
+    ///
+    /// # Panics
+    ///
+    /// If a serving thread panicked while recording a request.
     pub fn requests(&self) -> Vec<RecordedRequest> {
-        self.requests.lock().unwrap().clone()
+        self.requests.lock().expect("request log lock").clone()
     }
 }
 
@@ -148,7 +161,7 @@ fn serve(stream: TcpStream, requests: &Mutex<Vec<RecordedRequest>>, route: &Rout
         return;
     };
     let response = route(&request);
-    requests.lock().unwrap().push(request);
+    requests.lock().expect("request log lock").push(request);
     let mut stream = stream;
     let mut head = format!(
         "HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {}\r\n",

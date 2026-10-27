@@ -164,12 +164,12 @@ impl ApprovalReply {
 
     /// Label for the "accept" row.
     pub fn accept_label(&self) -> String {
-        label(&self.accept, "Accept (not offered)")
+        label(self.accept.as_ref(), "Accept (not offered)")
     }
 
     /// Label for the "accept for this session" row.
     pub fn accept_session_label(&self) -> String {
-        label(&self.accept_session, "Accept always (not offered)")
+        label(self.accept_session.as_ref(), "Accept always (not offered)")
     }
 
     /// Send the user's decision. A choice the backend did not offer cancels
@@ -191,9 +191,8 @@ impl ApprovalReply {
     }
 }
 
-fn label(option: &Option<PermissionOption>, missing: &str) -> String {
+fn label(option: Option<&PermissionOption>, missing: &str) -> String {
     option
-        .as_ref()
         .map(|o| o.label.clone())
         .unwrap_or_else(|| missing.to_owned())
 }

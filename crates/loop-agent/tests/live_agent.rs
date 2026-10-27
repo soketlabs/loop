@@ -7,6 +7,8 @@
 //! cargo test -p loop-agent --test live_agent -- --ignored --nocapture
 //! ```
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use std::sync::Arc;
 
 use loop_agent::harness::{

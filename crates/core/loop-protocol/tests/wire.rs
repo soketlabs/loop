@@ -2,6 +2,8 @@
 //! stream (surfaces, `--print` consumers), so a failing assertion means a
 //! breaking change unless `PROTOCOL_VERSION` is bumped.
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use loop_protocol::{
     ContentBlock, ErrorCategory, ErrorInfo, InteractionOutcome, InteractionRequest, PermissionKind,
     PermissionOption, Role, SessionUpdate, StopReason, ToolCall, ToolCallStatus, ToolCallUpdate,
@@ -178,7 +180,7 @@ fn unknown_update_type_is_kept() {
 fn unknown_content_and_tool_content_are_kept() {
     let raw = json!({"type": "audio", "data": "AAA"});
     let block: ContentBlock = serde_json::from_value(raw.clone()).unwrap();
-    assert_eq!(block, ContentBlock::Unknown(raw.clone()));
+    assert_eq!(block, ContentBlock::Unknown(raw));
 
     let raw = json!({"type": "hologram", "id": 1});
     let content: ToolContent = serde_json::from_value(raw.clone()).unwrap();

@@ -128,7 +128,7 @@ mod tests {
                 .unwrap();
         assert_eq!(old.selected_model(), Some(("soket", "qwen3-8-27b")));
 
-        let mut global = old.clone();
+        let mut global = old;
         global.merge_project(fresh);
         assert_eq!(
             global.selected_model(),

@@ -7,6 +7,8 @@
 //! The `ToolProvider` trait decouples the MCP server from concrete tool types,
 //! allowing the host crate (`loop-agent`) to provide its own implementation.
 
+#![deny(missing_docs)]
+
 pub mod client;
 mod oauth;
 pub mod server;

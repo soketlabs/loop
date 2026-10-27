@@ -1,5 +1,7 @@
 //! `--print` reads its answer from the backend's update stream.
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use std::sync::Arc;
 
 use loop_agent::harness::{

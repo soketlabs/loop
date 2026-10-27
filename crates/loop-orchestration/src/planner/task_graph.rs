@@ -119,10 +119,12 @@ impl TaskGraph {
                     TaskEdge::DataFlow { from, to, .. } => (from.as_str(), to.as_str()),
                 };
                 if dep == node {
-                    let deg = in_degree.get_mut(dependent).unwrap();
-                    *deg -= 1;
-                    if *deg == 0 {
-                        queue.push(dependent);
+                    // Edges were validated above, so every endpoint has an entry.
+                    if let Some(deg) = in_degree.get_mut(dependent) {
+                        *deg -= 1;
+                        if *deg == 0 {
+                            queue.push(dependent);
+                        }
                     }
                 }
             }
@@ -236,6 +238,7 @@ impl TaskNode {
     }
 
     /// Set the task configuration.
+    #[must_use]
     pub fn with_config(mut self, config: TaskConfig) -> Self {
         self.config = config;
         self

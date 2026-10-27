@@ -72,7 +72,7 @@ pub async fn execute_shell_with_capture(
         );
         spill_path = Some(path);
         return Ok(ShellCaptureResult {
-            text: text + &note,
+            text: format!("{text}{note}"),
             exit_code: output.exit_code,
             spill_path,
             truncated: true,

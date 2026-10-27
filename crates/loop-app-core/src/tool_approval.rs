@@ -135,7 +135,10 @@ pub enum ApprovalDecision {
     /// Accept this and all further calls in the same group for this session.
     AcceptSession,
     /// Reject; optional reason guides the model.
-    Reject { reason: Option<String> },
+    Reject {
+        /// Why the call was rejected.
+        reason: Option<String>,
+    },
 }
 
 /// Kind of approval prompt.
@@ -386,7 +389,7 @@ impl ToolApprovalBridge {
                     .to_string();
                 let summary = truncate_cmd(&command, 72);
                 let detail = if cwd == "." {
-                    command.clone()
+                    command
                 } else {
                     format!("cwd: {cwd}\n{command}")
                 };

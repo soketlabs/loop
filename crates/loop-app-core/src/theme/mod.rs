@@ -27,11 +27,19 @@ pub struct Theme {
 
 impl Theme {
     /// Built-in dark theme.
+    ///
+    /// # Panics
+    ///
+    /// If the bundled theme JSON does not parse, which is a build bug.
     pub fn dark() -> Self {
         Self::from_json(BUILTIN_DARK).expect("builtin dark theme")
     }
 
     /// Built-in light theme.
+    ///
+    /// # Panics
+    ///
+    /// If the bundled theme JSON does not parse, which is a build bug.
     pub fn light() -> Self {
         Self::from_json(BUILTIN_LIGHT).expect("builtin light theme")
     }

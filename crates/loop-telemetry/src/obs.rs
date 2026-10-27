@@ -19,6 +19,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 pub const SPAN_TARGET: &str = "loop_telemetry";
 
 /// Langfuse / OTel attribute keys.
+#[allow(missing_docs, reason = "each key's value is its documentation")]
 pub mod keys {
     pub const OBSERVATION_TYPE: &str = "langfuse.observation.type";
     pub const INPUT: &str = "langfuse.observation.input";
@@ -46,9 +47,13 @@ pub mod keys {
 /// Langfuse observation types used by Loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObservationType {
+    /// An agent run.
     Agent,
+    /// One model call.
     Generation,
+    /// One tool call.
     Tool,
+    /// Any other unit of work.
     Span,
 }
 
@@ -99,12 +104,19 @@ pub fn span(name: &str) -> Span {
 /// Trace-level attributes; set once, usually on the root span.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TraceAttrs {
+    /// Trace name.
     pub name: Option<String>,
+    /// Groups traces into a Langfuse session.
     pub session_id: Option<String>,
+    /// User the trace belongs to.
     pub user_id: Option<String>,
+    /// Trace tags.
     pub tags: Vec<String>,
+    /// Trace metadata, one attribute per key.
     pub metadata: BTreeMap<String, String>,
+    /// Deployment environment, such as `production`.
     pub environment: Option<String>,
+    /// Loop release version.
     pub release: Option<String>,
 }
 

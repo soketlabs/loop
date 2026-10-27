@@ -40,7 +40,12 @@ pub enum ToolOutputContent {
     /// Text content.
     Text(String),
     /// Image content (base64 data + MIME type).
-    Image { data: String, mime_type: String },
+    Image {
+        /// Base64-encoded image bytes.
+        data: String,
+        /// MIME type, such as `image/png`.
+        mime_type: String,
+    },
 }
 
 /// Trait for providing tools to the MCP server, decoupled from concrete tool types.

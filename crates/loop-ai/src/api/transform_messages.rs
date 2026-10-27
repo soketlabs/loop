@@ -275,7 +275,7 @@ mod tests {
             ],
             api: source.api.clone(),
             provider: source.provider.clone(),
-            model: source.id.clone(),
+            model: source.id,
             response_model: None,
             response_id: None,
             usage: Usage::empty(),

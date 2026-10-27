@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use std::collections::BTreeMap;
 
 use loop_telemetry::obs::{self, keys};

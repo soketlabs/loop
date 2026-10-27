@@ -1,6 +1,8 @@
 //! Subscriptions with a fake ACP agent: explicit sign-in through the declared
 //! method, cached models, sessions on a chosen model, resume and sign-out.
 
+#![allow(clippy::unwrap_used, reason = "test helpers outside #[test] functions")]
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

@@ -16,12 +16,9 @@ static STATES: Mutex<Option<QueueState>> = Mutex::new(None);
 fn lock_for(path: &Path) -> Arc<AsyncMutex<()>> {
     let key = path.to_string_lossy().into_owned();
     let mut guard = STATES.lock();
-    if guard.is_none() {
-        *guard = Some(QueueState {
-            locks: HashMap::new(),
-        });
-    }
-    let st = guard.as_mut().unwrap();
+    let st = guard.get_or_insert_with(|| QueueState {
+        locks: HashMap::new(),
+    });
     st.locks
         .entry(key)
         .or_insert_with(|| Arc::new(AsyncMutex::new(())))

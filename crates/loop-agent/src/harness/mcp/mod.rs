@@ -4,10 +4,9 @@ pub mod bridge;
 
 pub use bridge::mcp_tools_to_agent_tools;
 
-use std::sync::RwLock;
-
 use async_trait::async_trait;
 use loop_mcp::server::{ToolDef, ToolOutput, ToolOutputContent, ToolProvider};
+use parking_lot::RwLock;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -34,6 +33,7 @@ impl LoopToolProvider {
     }
 
     /// Run the host's tool checks around every call, as the agent loop does.
+    #[must_use]
     pub fn with_tool_hooks(
         mut self,
         before: Option<BeforeToolCallFn>,
@@ -46,14 +46,14 @@ impl LoopToolProvider {
 
     /// Update the tool set at runtime.
     pub async fn set_tools(&self, tools: Vec<AgentTool>) {
-        *self.tools.write().expect("tool lock poisoned") = tools;
+        *self.tools.write() = tools;
     }
 }
 
 #[async_trait]
 impl ToolProvider for LoopToolProvider {
     fn list_tools(&self) -> Vec<ToolDef> {
-        let tools = self.tools.read().expect("tool lock poisoned");
+        let tools = self.tools.read();
         tools
             .iter()
             .map(|t| ToolDef {
@@ -66,7 +66,7 @@ impl ToolProvider for LoopToolProvider {
 
     async fn call_tool(&self, name: &str, args: Value) -> Result<ToolOutput, String> {
         let tool = {
-            let tools = self.tools.read().expect("tool lock poisoned");
+            let tools = self.tools.read();
             tools
                 .iter()
                 .find(|t| t.name == name)
