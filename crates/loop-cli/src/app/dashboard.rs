@@ -41,6 +41,9 @@ pub fn options(theme: &Theme, dir: PathBuf, notice: Option<String>) -> Options {
     }
 }
 
+/// Finished Subagents shown in the Now view; running ones are always shown.
+const FINISHED_SHOWN: usize = 5;
+
 /// What the chat is doing right now.
 pub(super) struct ChatState<'a> {
     pub items: &'a [ChatItem],
@@ -211,6 +214,7 @@ fn live_status(runtime: &CliRuntime, chat: &ChatState<'_>, slow: &Slow) -> LiveS
             _ => None,
         })
         .collect();
+    let sub_agents = recent_sub_agents(sub_agents);
     LiveStatus {
         taken_at: chrono::Local::now(),
         model,
@@ -245,5 +249,44 @@ fn live_status(runtime: &CliRuntime, chat: &ChatState<'_>, slow: &Slow) -> LiveS
         usage_log: runtime
             .usage_log()
             .map(|log| log.path.display().to_string()),
+    }
+}
+
+/// Running Subagents plus the last [`FINISHED_SHOWN`] finished ones, in transcript order.
+fn recent_sub_agents(all: Vec<SubAgent>) -> Vec<SubAgent> {
+    let finished = all
+        .iter()
+        .filter(|agent| agent.state == SubAgentState::Finished)
+        .count();
+    let mut skip = finished.saturating_sub(FINISHED_SHOWN);
+    all.into_iter()
+        .filter(|agent| {
+            let drop = agent.state == SubAgentState::Finished && skip > 0;
+            skip -= usize::from(drop);
+            !drop
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn now_view_keeps_running_and_the_last_finished_subagents() {
+        let agent = |id: usize, state| SubAgent {
+            id: id.to_string(),
+            description: String::new(),
+            state,
+        };
+        let mut all: Vec<_> = (0..8)
+            .map(|id| agent(id, SubAgentState::Finished))
+            .collect();
+        all.insert(1, agent(100, SubAgentState::Running));
+        let ids: Vec<_> = recent_sub_agents(all)
+            .into_iter()
+            .map(|agent| agent.id)
+            .collect();
+        assert_eq!(ids, ["100", "3", "4", "5", "6", "7"]);
     }
 }

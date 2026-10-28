@@ -162,18 +162,29 @@ pub struct Options {
     pub live: Option<LiveStatus>,
 }
 
-/// Run the dashboard standalone: takes over the terminal until the user quits.
+/// Run the usage view standalone: takes over the terminal until the user quits.
 pub fn run(options: Options) -> io::Result<()> {
     terminal::enable_raw_mode()?;
-    let result = Dashboard::open(options).and_then(|mut dashboard| loop {
+    let _raw_mode = RawModeGuard;
+    let mut dashboard = Dashboard::open(options)?;
+    loop {
         dashboard.tick()?;
         if event::poll(Duration::from_millis(500))? && dashboard.handle_event(&event::read()?)? {
             return dashboard.close();
         }
-    });
-    let _ = execute!(io::stdout(), crossterm::cursor::Show);
-    terminal::disable_raw_mode()?;
-    result
+    }
+}
+
+/// Leaves raw mode and shows the cursor when dropped, so an error or a panic in
+/// [`run`] never leaves the shell unusable. (Leaving the alternate screen is
+/// [`Dashboard`]'s job.)
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), crossterm::cursor::Show);
+        let _ = terminal::disable_raw_mode();
+    }
 }
 
 /// The dashboard open on the alternate screen, driven by a host that keeps running its
@@ -2191,13 +2202,13 @@ mod tests {
             ],
             extensions: 1,
             hooks: 2,
-            usage_log: Some("/tmp/loop-traces/loop-1.jsonl".into()),
+            usage_log: Some("/home/u/.loop/agent/usage/loop-1.jsonl".into()),
         }
     }
 
     fn app(summary: Summary, live: Option<LiveStatus>) -> App {
         let mut app = App::new(Options {
-            dir: PathBuf::from("/nonexistent/loop-traces"),
+            dir: PathBuf::from("/nonexistent/usage"),
             palette: Palette::default(),
             notice: None,
             live,
