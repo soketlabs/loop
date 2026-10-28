@@ -15,6 +15,7 @@ pub mod setup_prompt;
 #[cfg(feature = "telemetry")]
 pub mod tracing_setup;
 pub mod tui;
+pub mod uninstall;
 pub mod wizard;
 
 pub use loop_app_core::{

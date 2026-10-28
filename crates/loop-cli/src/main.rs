@@ -1,10 +1,10 @@
 //! Loop — interactive coding agent CLI by Soket AI.
 
-use std::path::PathBuf;
+use std::{io::IsTerminal, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use loop_cli::print_mode::{self, TraceArgs};
-use loop_cli::{bootstrap_cli, config, debug_log, BootstrapOpts};
+use loop_cli::{bootstrap_cli, config, debug_log, uninstall, BootstrapOpts};
 #[cfg(feature = "telemetry")]
 use loop_telemetry::TelemetryHandle;
 #[cfg(feature = "telemetry")]
@@ -110,7 +110,15 @@ enum Commands {
     /// Restore the previous installed binary.
     Rollback,
     /// Remove the installed program; keep settings, credentials and sessions.
-    Uninstall,
+    Uninstall {
+        /// Also remove the agent data directory: settings, credentials,
+        /// skills, sessions and usage data.
+        #[arg(long)]
+        purge: bool,
+        /// Answer the `--purge` confirmation with yes.
+        #[arg(long, requires = "purge")]
+        yes: bool,
+    },
     /// Show usage (tokens, models, tools, agents, sessions) in the terminal.
     #[cfg(feature = "usage")]
     Usage,
@@ -187,9 +195,38 @@ async fn real_main() -> anyhow::Result<()> {
                 println!("Restored Loop {version}. Run `loop` to start it.");
                 return Ok(());
             }
-            Commands::Uninstall => {
+            Commands::Uninstall { purge, yes } => {
+                let agent_dir = config::paths::get_agent_dir();
+                if *purge && !*yes {
+                    if !std::io::stdin().is_terminal() {
+                        return Err(anyhow::anyhow!(
+                            "--purge needs a terminal to confirm; pass --yes to remove {} without asking",
+                            agent_dir.display()
+                        ));
+                    }
+                    let mut input = std::io::stdin().lock();
+                    let mut output = std::io::stdout();
+                    if !uninstall::confirm(&agent_dir, &mut input, &mut output)? {
+                        println!("Aborted. Nothing was removed.");
+                        return Ok(());
+                    }
+                }
                 loop_update::Installation::current()?.uninstall()?;
-                println!("Loop program files removed. User settings, credentials, skills and sessions kept.");
+                if *purge {
+                    if uninstall::remove_agent_data(&agent_dir)? {
+                        println!("Loop program files and agent data removed.");
+                    } else {
+                        println!(
+                            "Loop program files removed. No agent data found in {}.",
+                            agent_dir.display()
+                        );
+                    }
+                } else {
+                    println!(
+                        "Loop program files removed. User settings, credentials, skills, sessions and usage data kept in {}.",
+                        agent_dir.display()
+                    );
+                }
                 return Ok(());
             }
             #[cfg(feature = "usage")]
