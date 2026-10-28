@@ -3,6 +3,8 @@
 //! All span creation and attribute recording for `agent_loop.rs` lives here so the
 //! loop itself only starts and finishes observers.
 
+use std::path::{Path, PathBuf};
+
 use chrono::Utc;
 use loop_ai::{
     AssistantMessage, AssistantMessageEvent, Context, Message, Model, SimpleStreamOptions,
@@ -171,6 +173,11 @@ impl GenerationObserver {
             },
         );
         span.record_input(context);
+        // The run's root span, which carries the trace's session, is written last; this
+        // lets usage views attribute calls of a run that is still going.
+        if let Some(session) = &options.base.session_id {
+            span.record_metadata("session", session);
+        }
         Self {
             span,
             first_token_seen: false,
@@ -214,26 +221,43 @@ pub(crate) fn preflight_span(tool_call: &ToolCall) -> Span {
 }
 
 /// `tool <name>`: one tool execution.
-pub(crate) fn tool_span(tool_call: &ToolCall, args: &serde_json::Value) -> Span {
+pub(crate) fn tool_span(
+    tool_call: &ToolCall,
+    args: &serde_json::Value,
+    session_id: Option<&str>,
+    labels: &RunLabels,
+) -> Span {
     let span = obs::tool(&tool_call.name, &tool_call.id);
     span.record_input(args);
-    if let Some(skill) = skill_loaded_by(&tool_call.name, args) {
+    if let Some(session) = session_id {
+        span.record_metadata("session", session);
+    }
+    if let Some(skill) = skill_loaded_by(&tool_call.name, args, &labels.skill_files) {
         span.record_metadata("skill", skill);
     }
     span
 }
 
-/// The skill whose `SKILL.md` a `read` call loads: its folder name. Recorded as metadata
-/// (kept in anonymous traces) so skill use can be counted without the path.
-fn skill_loaded_by<'a>(tool: &str, args: &'a serde_json::Value) -> Option<&'a str> {
+/// The registered skill whose `SKILL.md` a `read` call loads. Recorded as metadata (kept
+/// in the usage log) so skill use can be counted without the path.
+fn skill_loaded_by<'a>(
+    tool: &str,
+    args: &serde_json::Value,
+    skill_files: &'a [(PathBuf, String)],
+) -> Option<&'a str> {
     if tool != "read" {
         return None;
     }
-    let path = std::path::Path::new(args.get("path")?.as_str()?);
+    let raw = args.get("path")?.as_str()?;
+    let path = Path::new(raw.strip_prefix("~/").unwrap_or(raw));
     if path.file_name()? != "SKILL.md" {
         return None;
     }
-    path.parent()?.file_name()?.to_str()
+    // `read` paths may be relative to the working directory or to `~`.
+    skill_files
+        .iter()
+        .find(|(file, _)| file == path || file.ends_with(path))
+        .map(|(_, name)| name.as_str())
 }
 
 /// Record a tool (or preflight) outcome on its span.
@@ -323,22 +347,43 @@ mod tests {
     }
 
     #[test]
-    fn reading_a_skill_file_names_the_skill() {
+    fn reading_a_registered_skill_file_names_the_skill() {
         let read = |path: &str| serde_json::json!({ "path": path });
-        assert_eq!(
-            skill_loaded_by(
-                "read",
-                &read("/home/u/.loop/agent/skills/pdf-tools/SKILL.md")
+        let skills = [
+            (
+                PathBuf::from("/home/u/.loop/agent/skills/pdf-tools/SKILL.md"),
+                "pdf".to_string(),
             ),
-            Some("pdf-tools")
+            (
+                PathBuf::from("/repo/.loop/skills/nested/review/SKILL.md"),
+                "review".to_string(),
+            ),
+        ];
+        let loaded = |tool: &str, path: &str| skill_loaded_by(tool, &read(path), &skills);
+        // The registered name is used, not the folder name.
+        assert_eq!(
+            loaded("read", "/home/u/.loop/agent/skills/pdf-tools/SKILL.md"),
+            Some("pdf")
         );
         assert_eq!(
-            skill_loaded_by("read", &read(r"C:\loop\skills\review\SKILL.md").clone()),
-            if cfg!(windows) { Some("review") } else { None }
+            loaded("read", "~/.loop/agent/skills/pdf-tools/SKILL.md"),
+            Some("pdf")
         );
-        assert_eq!(skill_loaded_by("read", &read("src/main.rs")), None);
-        assert_eq!(skill_loaded_by("bash", &read("skills/x/SKILL.md")), None);
-        assert_eq!(skill_loaded_by("read", &serde_json::json!({})), None);
+        assert_eq!(
+            loaded("read", ".loop/skills/nested/review/SKILL.md"),
+            Some("review")
+        );
+        // A SKILL.md that is not a registered skill, e.g. in a repo being browsed.
+        assert_eq!(loaded("read", "/tmp/other/skills/x/SKILL.md"), None);
+        assert_eq!(loaded("read", "src/main.rs"), None);
+        assert_eq!(
+            loaded("bash", "/home/u/.loop/agent/skills/pdf-tools/SKILL.md"),
+            None
+        );
+        assert_eq!(
+            skill_loaded_by("read", &serde_json::json!({}), &skills),
+            None
+        );
     }
 
     #[test]

@@ -4,8 +4,8 @@
 //! leaves the transcript untouched, and `loop usage` uses the same view standalone.
 //!
 //! Views: **Now** (live status of the running loop, like Codex's `/status`: session,
-//! context window, agents and sub-agents, skills, MCP servers, extensions), **Usage**
-//! (tokens and activity over time), **Models**, **Tools**, **Agents** (main and sub-agent
+//! context window, agents and subagents, skills, MCP servers, extensions), **Usage**
+//! (tokens and activity over time), **Models**, **Tools**, **Agents** (main and subagent
 //! runs, skills, MCP servers) and **Sessions**. History reloads every few seconds.
 
 use std::io::{self, Stdout};
@@ -23,7 +23,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
 
-use crate::aggregate::{self, DayRow, LogFile, ModelRow, Summary, ToolRow, BUILT_IN};
+use crate::aggregate::{DayRow, LogCache, ModelRow, Summary, ToolRow, BUILT_IN};
 
 /// How often the open dashboard re-reads the usage log.
 const RELOAD_EVERY: Duration = Duration::from_secs(5);
@@ -45,7 +45,7 @@ pub struct Palette {
     pub accent: Color,
     /// First data series (input tokens, single-series charts).
     pub series_1: Color,
-    /// Second data series (output tokens, sub-agents).
+    /// Second data series (output tokens, subagents).
     pub series_2: Color,
     /// Things that are running or connected.
     pub good: Color,
@@ -100,7 +100,7 @@ pub struct LiveStatus {
     pub main_agent_step: String,
     /// Subscription agent serving the model (e.g. ChatGPT through `codex-acp`).
     pub external_agent: Option<String>,
-    /// Workflow sub-agents of this session.
+    /// Workflow subagents of this session.
     pub sub_agents: Vec<SubAgent>,
     /// Skills available to the agent.
     pub skills_loaded: Vec<String>,
@@ -118,7 +118,7 @@ pub struct LiveStatus {
     pub usage_log: Option<String>,
 }
 
-/// One workflow sub-agent.
+/// One workflow subagent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubAgent {
     /// Task id.
@@ -129,7 +129,7 @@ pub struct SubAgent {
     pub state: SubAgentState,
 }
 
-/// Progress of a sub-agent.
+/// Progress of a subagent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubAgentState {
     /// Still working.
@@ -238,7 +238,7 @@ impl Dashboard {
     /// Re-read the usage log when due, and redraw if anything changed.
     pub fn tick(&mut self) -> io::Result<()> {
         if self.app.loaded_at.elapsed() >= RELOAD_EVERY {
-            self.dirty |= self.app.reload_if_written();
+            self.dirty |= self.app.reload();
         }
         if self.dirty {
             self.terminal.draw(|frame| self.app.render(frame))?;
@@ -352,8 +352,8 @@ struct App {
     range: Range,
     summary: Summary,
     loaded_at: Instant,
-    /// Log files as of the last load, to skip re-reading an unchanged log.
-    seen: Vec<LogFile>,
+    /// Parsed log files, re-read only when they change.
+    cache: LogCache,
     table: TableState,
 }
 
@@ -370,24 +370,21 @@ impl App {
             range: Range::Month,
             summary: Summary::default(),
             loaded_at: Instant::now(),
-            seen: Vec::new(),
+            cache: LogCache::default(),
             table: TableState::default().with_selected(Some(0)),
         }
     }
 
-    /// Re-read the usage log if it was written to since the last load.
-    fn reload_if_written(&mut self) -> bool {
-        if aggregate::log_fingerprint(&self.options.dir) == self.seen {
-            self.loaded_at = Instant::now();
-            return false;
-        }
-        self.reload()
+    /// Re-read the log files that changed and summarize again, so rolling periods move
+    /// forward even when nothing new was written. Returns whether anything changed.
+    fn reload(&mut self) -> bool {
+        self.cache.refresh(&self.options.dir);
+        self.resummarize()
     }
 
-    /// Re-read the usage log; returns whether anything changed.
-    fn reload(&mut self) -> bool {
-        self.seen = aggregate::log_fingerprint(&self.options.dir);
-        let mut summary = aggregate::summarize_dir(&self.options.dir, self.range.days());
+    /// Summarize the cached log for the current period; returns whether anything changed.
+    fn resummarize(&mut self) -> bool {
+        let mut summary = self.cache.summarize(self.range.days(), Utc::now());
         self.loaded_at = Instant::now();
         // `generated_at` always moves; compare the data only.
         summary.generated_at = self.summary.generated_at;
@@ -434,7 +431,7 @@ impl App {
         if range != self.range {
             self.range = range;
             self.table.select(Some(0));
-            self.reload();
+            self.resummarize();
         }
     }
 
@@ -657,7 +654,7 @@ impl App {
                     Span::from("/usage").fg(p.accent),
                     Span::from(" inside loop to see the session, context window,").fg(p.muted),
                 ]),
-                Line::from("agents and sub-agents, skills and MCP servers.").fg(p.muted),
+                Line::from("agents and subagents, skills and MCP servers.").fg(p.muted),
                 Line::from(""),
                 Line::from(vec![
                     Span::from("2").fg(p.accent).bold(),
@@ -819,7 +816,7 @@ impl App {
             ]));
         }
         lines.push(Line::from(vec![
-            Span::from(format!("{:<13}", "Sub-agents")).fg(p.muted),
+            Span::from(format!("{:<13}", "Subagents")).fg(p.muted),
             Span::from(format!("{running} running")).fg(if running > 0 { p.good } else { p.text }),
             Span::from(format!(" · {finished} finished")).fg(p.muted),
         ]));
@@ -1040,7 +1037,7 @@ impl App {
             Tile::new(
                 "Agent runs",
                 thousands(t.runs + t.sub_agent_runs),
-                format!("{} sub-agents", thousands(t.sub_agent_runs)),
+                format!("{} subagents", thousands(t.sub_agent_runs)),
             ),
             Tile::new(
                 "Sessions",
@@ -1631,7 +1628,7 @@ impl App {
                 format!("runs in {} sessions", thousands(t.sessions)),
             ),
             Tile::new(
-                "Sub-agents",
+                "Subagents",
                 thousands(t.sub_agent_runs),
                 format!("{} spawned", thousands(t.sub_agents_spawned)),
             ),
@@ -1673,7 +1670,7 @@ impl App {
                     value: |d| d.runs as f64,
                 },
                 Series {
-                    name: "sub-agents",
+                    name: "subagents",
                     value: |d| d.sub_agent_runs as f64,
                 },
             ],
@@ -1727,7 +1724,7 @@ impl App {
             ),
             Column::new("Last active", 11, 9),
             Column::new(">Runs", 4, 5),
-            Column::new(">Sub-agents", 10, 4),
+            Column::new(">Subagents", 10, 4),
             Column::new(">Calls", 5, 7),
             Column::new(">Tools", 5, 6),
             Column::new(">Tokens", 7, 8),
@@ -2283,7 +2280,7 @@ mod tests {
                 "1.3M",
                 "Cached",
                 "Agent runs",
-                "2 sub-agents",
+                "2 subagents",
                 "Tokens per day",
                 "Calls per day",
                 "Model calls by hour",
@@ -2311,10 +2308,10 @@ mod tests {
             &screen,
             &[
                 "Main agent",
-                "Sub-agents",
+                "Subagents",
                 "2 spawned",
                 "Agent runs per day",
-                "Runs  ■ main   ■ sub-agents",
+                "Runs  ■ main   ■ subagents",
                 "Skills used",
                 "pdf-tools",
                 "2 sessions",
@@ -2358,7 +2355,7 @@ mod tests {
         );
         app.set_view(View::Sessions);
         let screen = draw(&mut app, 140, 30);
-        assert_shows(&screen, &["0192aaaa-bbbb", "just now", "Sub-agents"]);
+        assert_shows(&screen, &["0192aaaa-bbbb", "just now", "Subagents"]);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -641,13 +642,16 @@ pub struct RunLabels {
     pub agent: Option<&'static str>,
     /// Skills the user activated for this run.
     pub skills: Vec<String>,
+    /// The `SKILL.md` file of each registered skill, with the skill's name, so a `read`
+    /// of one is counted as that skill being loaded.
+    pub skill_files: Vec<(PathBuf, String)>,
 }
 
 impl RunLabels {
     /// The chat's own agent.
     pub const MAIN: &'static str = "main";
     /// An agent started for a workflow task.
-    pub const SUB_AGENT: &'static str = "sub-agent";
+    pub const SUB_AGENT: &'static str = "subagent";
 }
 
 impl AgentLoopConfig {

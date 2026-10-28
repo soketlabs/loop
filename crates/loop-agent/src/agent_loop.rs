@@ -651,8 +651,15 @@ async fn execute_tool_calls_sequential(
                 tool,
                 args,
             } => {
-                let executed =
-                    execute_prepared_tool_call(&tool_call, &tool, args.clone(), cancel, emit).await;
+                let executed = execute_prepared_tool_call(
+                    &tool_call,
+                    &tool,
+                    args.clone(),
+                    cancel,
+                    emit,
+                    config,
+                )
+                .await;
                 finalize_executed_tool_call(
                     current_context,
                     assistant_message,
@@ -775,6 +782,7 @@ async fn execute_tool_calls_parallel(
                     args.clone(),
                     cancel.as_ref(),
                     &emit,
+                    &config,
                 )
                 .await;
                 let finalized = finalize_executed_tool_call(
@@ -948,6 +956,7 @@ async fn execute_prepared_tool_call(
     args: serde_json::Value,
     cancel: Option<&CancellationToken>,
     emit: &AgentEventSink,
+    config: &AgentLoopConfig,
 ) -> ExecutedOutcome {
     let accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let accepting_cb = Arc::clone(&accepting);
@@ -975,7 +984,12 @@ async fn execute_prepared_tool_call(
         });
     });
 
-    let span = tool_span(tool_call, &args);
+    let span = tool_span(
+        tool_call,
+        &args,
+        config.stream_options.base.session_id.as_deref(),
+        &config.run_labels,
+    );
     let result = (tool.execute)(tool_call.id.clone(), args, cancel.cloned(), Some(on_update))
         .instrument(span.clone())
         .await;

@@ -1225,6 +1225,14 @@ impl AgentHarness {
         config.run_labels = RunLabels {
             agent: Some(RunLabels::MAIN),
             skills: self.active_skill_names.read().await.clone(),
+            skill_files: self
+                .resources
+                .read()
+                .await
+                .skills
+                .iter()
+                .map(|skill| (skill.path.clone(), skill.name.clone()))
+                .collect(),
         };
 
         let steer_q = Arc::clone(&self.steering);

@@ -243,41 +243,115 @@ pub fn log_fingerprint(dir: &Path) -> Vec<LogFile> {
     files
 }
 
+/// Read every trace file in `dir` and summarize spans that started within `days`
+/// (all of them when `None`). A missing folder yields an empty summary.
 #[must_use]
 pub fn summarize_dir(dir: &Path, days: Option<u32>) -> Summary {
-    let now = Utc::now();
-    let since = days.map(|d| now - Duration::days(i64::from(d)));
-    let mut spans = Vec::new();
-    let (mut files, mut skipped) = (0, 0);
-    let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
-    for path in entries
-        .map(|e| e.path())
-        .filter(|p| loop_telemetry::is_trace_file(p))
-    {
-        let Ok(file) = std::fs::File::open(&path) else {
-            continue;
-        };
-        files += 1;
-        for line in BufReader::new(file).lines() {
-            let Ok(line) = line else {
-                skipped += 1;
-                break;
-            };
-            if line.trim().is_empty() {
+    let mut cache = LogCache::default();
+    cache.refresh(dir);
+    cache.summarize(days, Utc::now())
+}
+
+/// Parsed spans of every trace file in a folder. [`refresh`](Self::refresh) re-reads only
+/// the files whose size or modification time changed.
+#[derive(Debug, Default)]
+pub struct LogCache {
+    files: BTreeMap<PathBuf, CachedFile>,
+}
+
+#[derive(Debug)]
+struct CachedFile {
+    seen: LogFile,
+    spans: Vec<SpanRecord>,
+    skipped: u64,
+}
+
+impl LogCache {
+    /// Bring the cache up to date with `dir`; returns how many files were read.
+    pub fn refresh(&mut self, dir: &Path) -> usize {
+        let current = log_fingerprint(dir);
+        self.files
+            .retain(|path, _| current.iter().any(|file| &file.path == path));
+        let mut read = 0;
+        for file in current {
+            if self
+                .files
+                .get(&file.path)
+                .is_some_and(|cached| cached.seen == file)
+            {
                 continue;
             }
-            match serde_json::from_str::<SpanRecord>(&line) {
-                Ok(span) if since.is_none_or(|s| span.start_time >= s) => spans.push(span),
-                Ok(_) => {}
-                Err(_) => skipped += 1,
-            }
+            let Some((spans, skipped)) = read_trace_file(&file.path) else {
+                self.files.remove(&file.path);
+                continue;
+            };
+            read += 1;
+            self.files.insert(
+                file.path.clone(),
+                CachedFile {
+                    seen: file,
+                    spans,
+                    skipped,
+                },
+            );
+        }
+        read
+    }
+
+    /// Summarize the cached spans that started within `days` of `now` (all of them when
+    /// `None`).
+    #[must_use]
+    pub fn summarize(&self, days: Option<u32>, now: DateTime<Utc>) -> Summary {
+        let since = days.map(|d| now - Duration::days(i64::from(d)));
+        let spans: Vec<&SpanRecord> = self.files.values().flat_map(|f| &f.spans).collect();
+        let mut summary = summarize_since(&spans, since, now);
+        summary.since = since;
+        summary.files = self.files.len() as u64;
+        summary.skipped_lines = self.files.values().map(|f| f.skipped).sum();
+        summary
+    }
+}
+
+#[cfg(test)]
+impl LogCache {
+    /// A cache holding `spans` as if read from one file.
+    fn from_spans(spans: Vec<SpanRecord>) -> Self {
+        let path = PathBuf::from("loop-test-1.jsonl");
+        let seen = LogFile {
+            path: path.clone(),
+            len: 0,
+            modified: None,
+        };
+        let file = CachedFile {
+            seen,
+            spans,
+            skipped: 0,
+        };
+        Self {
+            files: BTreeMap::from([(path, file)]),
         }
     }
-    let mut summary = summarize(&spans, now);
-    summary.since = since;
-    summary.files = files;
-    summary.skipped_lines = skipped;
-    summary
+}
+
+/// Spans in one trace file and the number of lines that could not be parsed; `None` when
+/// the file can't be opened.
+fn read_trace_file(path: &Path) -> Option<(Vec<SpanRecord>, u64)> {
+    let file = std::fs::File::open(path).ok()?;
+    let (mut spans, mut skipped) = (Vec::new(), 0);
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            skipped += 1;
+            break;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<SpanRecord>(&line) {
+            Ok(span) => spans.push(span),
+            Err(_) => skipped += 1,
+        }
+    }
+    Some((spans, skipped))
 }
 
 #[derive(Default)]
@@ -307,7 +381,18 @@ struct SkillAcc {
 
 /// Summarize already-loaded spans.
 pub fn summarize(spans: &[SpanRecord], now: DateTime<Utc>) -> Summary {
-    // Session ids are recorded on the root span; every span of a trace shares them.
+    let spans: Vec<&SpanRecord> = spans.iter().collect();
+    summarize_since(&spans, None, now)
+}
+
+/// Summarize the spans that started at or after `since`. Sessions are resolved from all
+/// of `spans`, so a run whose root started before `since` still names its session.
+fn summarize_since(
+    spans: &[&SpanRecord],
+    since: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Summary {
+    // The trace's session is recorded on its root span; every span of a trace shares it.
     let session_of: HashMap<&str, &str> = spans
         .iter()
         .filter_map(|s| Some((s.trace_id.as_str(), s.attr_str(keys::SESSION_ID)?)))
@@ -322,17 +407,26 @@ pub fn summarize(spans: &[SpanRecord], now: DateTime<Utc>) -> Summary {
     let mut skills: BTreeMap<String, SkillAcc> = BTreeMap::new();
     let mut sessions: HashMap<String, SessionRow> = HashMap::new();
 
-    for span in spans {
+    for span in spans
+        .iter()
+        .filter(|s| since.is_none_or(|t| s.start_time >= t))
+    {
         let local = span.start_time.with_timezone(&Local);
         let date = local.format("%Y-%m-%d").to_string();
         let day = days.entry(date.clone()).or_insert_with(|| DayRow {
             date,
             ..Default::default()
         });
-        let session_id = session_of.get(span.trace_id.as_str()).map_or_else(
-            || format!("trace {}", short(&span.trace_id)),
-            |s| s.to_string(),
-        );
+        // Calls and tools carry their own session: the root span of a run that is still
+        // going has not been written yet.
+        let session_id = span
+            .metadata("session")
+            .and_then(Value::as_str)
+            .or_else(|| session_of.get(span.trace_id.as_str()).copied())
+            .map_or_else(
+                || format!("trace {}", short(&span.trace_id)),
+                str::to_string,
+            );
         let is_sub_agent_session = session_id.starts_with(SUB_AGENT_SESSION_PREFIX);
         // Sub-agent sessions are not chat sessions; their work still counts in totals.
         let mut scratch = SessionRow::default();
@@ -364,7 +458,8 @@ pub fn summarize(spans: &[SpanRecord], now: DateTime<Utc>) -> Summary {
         match span.observation_type() {
             "agent" => {
                 let sub_agent = match span.metadata("agent").and_then(Value::as_str) {
-                    Some(agent) => agent == "sub-agent",
+                    // Logs written by earlier builds spell it `sub-agent`.
+                    Some(agent) => matches!(agent, "subagent" | "sub-agent"),
                     // Traces from before agent labels: tell by the session id.
                     None => is_sub_agent_session,
                 };
@@ -770,5 +865,99 @@ mod tests {
         )
         .unwrap();
         assert_ne!(log_fingerprint(dir.path()), before);
+    }
+
+    #[test]
+    fn calls_of_a_running_run_count_for_their_own_session() {
+        // The root `loop.run` span is written when the run ends, so mid-run only its
+        // calls and tools are in the log.
+        let with_session = |mut span: SpanRecord, session: &str| {
+            span.attributes.insert(meta("session"), json!(session));
+            span
+        };
+        let spans = vec![
+            with_session(generation("live", "m-large", 10, 100.0), "s-live"),
+            with_session(tool("live", "read", 5.0), "s-live"),
+            with_session(generation("sub", "m-small", 10, 100.0), "wf-task-9"),
+        ];
+        let summary = summarize(&spans, Utc::now());
+        let ids: Vec<_> = summary
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        assert_eq!(ids, ["s-live"], "no `trace …` sessions, Subagents excluded");
+        assert_eq!(summary.sessions[0].llm_calls, 1);
+        assert_eq!(summary.totals.llm_calls, 2);
+    }
+
+    #[test]
+    fn a_root_that_started_before_the_period_still_names_the_session() {
+        let mut old_root = run("t", "s-old", json!({ meta("agent"): "main" }));
+        old_root.start_time = "2026-10-01T00:00:00Z".parse().unwrap();
+        let spans = vec![old_root, generation("t", "m-large", 10, 100.0)];
+        let cache = LogCache::from_spans(spans);
+        let now: DateTime<Utc> = "2026-10-20T12:00:00Z".parse().unwrap();
+        let day = cache.summarize(Some(1), now);
+        assert_eq!(day.totals.runs, 0, "the run itself started earlier");
+        assert_eq!(day.totals.llm_calls, 1);
+        let ids: Vec<_> = day.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["s-old"]);
+    }
+
+    #[test]
+    fn both_subagent_spellings_count_as_subagent_runs() {
+        let spans = vec![
+            run("a", "s1", json!({ meta("agent"): "subagent" })),
+            run("b", "s2", json!({ meta("agent"): "sub-agent" })),
+            run("c", "s3", json!({ meta("agent"): "main" })),
+        ];
+        let totals = summarize(&spans, Utc::now()).totals;
+        assert_eq!((totals.runs, totals.sub_agent_runs), (1, 2));
+    }
+
+    #[test]
+    fn rolling_periods_move_forward_without_new_writes() {
+        let cache = LogCache::from_spans(vec![generation("t", "m-large", 10, 100.0)]);
+        let at = |t: &str| t.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            cache
+                .summarize(Some(1), at("2026-10-20T12:00:00Z"))
+                .totals
+                .llm_calls,
+            1
+        );
+        assert_eq!(
+            cache
+                .summarize(Some(1), at("2026-10-21T12:00:00Z"))
+                .totals
+                .llm_calls,
+            0
+        );
+    }
+
+    #[test]
+    fn cache_rereads_only_changed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = json!({
+            "trace_id": "t", "name": "llm.generate", "start_time": Utc::now().to_rfc3339(),
+            "attributes": { keys::OBSERVATION_TYPE: "generation" },
+        })
+        .to_string();
+        let (a, b) = (
+            dir.path().join("loop-a-1.jsonl"),
+            dir.path().join("loop-b-2.jsonl"),
+        );
+        std::fs::write(&a, format!("{line}\n")).unwrap();
+        std::fs::write(&b, format!("{line}\n")).unwrap();
+        let mut cache = LogCache::default();
+        assert_eq!(cache.refresh(dir.path()), 2);
+        assert_eq!(cache.refresh(dir.path()), 0);
+        std::fs::write(&b, format!("{line}\n{line}\n")).unwrap();
+        assert_eq!(cache.refresh(dir.path()), 1);
+        assert_eq!(cache.summarize(None, Utc::now()).totals.llm_calls, 3);
+        std::fs::remove_file(&a).unwrap();
+        assert_eq!(cache.refresh(dir.path()), 0);
+        assert_eq!(cache.summarize(None, Utc::now()).totals.llm_calls, 2);
     }
 }
