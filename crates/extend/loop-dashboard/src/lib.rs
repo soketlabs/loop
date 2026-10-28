@@ -6,10 +6,12 @@
 //! tokens and calls over time, models, tools, agent runs, skills, MCP servers and sessions.
 //! Nothing is sent anywhere.
 //!
-//! * [`aggregate`] turns trace files into a [`Summary`](aggregate::Summary).
+//! * [`spans`] reads the usage log's files.
+//! * [`aggregate`] turns their spans into a [`Summary`](aggregate::Summary).
 //! * [`tui`] draws it; [`tui::run`] standalone, [`tui::Dashboard`] driven from inside the chat.
 
 pub mod aggregate;
+pub mod spans;
 pub mod tui;
 
 pub use aggregate::{summarize_dir, Summary};
