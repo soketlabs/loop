@@ -1,0 +1,3 @@
+# The Runtime is event-sourced
+
+Every Runtime keeps one append-only Event Log, and live Surface views, audit, replay and crash recovery are all projections of it. Session messages, tool calls, Swarm coordination (Task Board changes, Mailbox messages, Leases), human steering and Policy decisions are all events. We chose this over separate stores for transcripts, audit and orchestration state because a long-running Swarm has to be watchable, resumable and auditable at once, and one log gives all three without them drifting apart. `loop-orchestration`'s workflow event log and checkpoints are the seed.
