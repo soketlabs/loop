@@ -1,7 +1,8 @@
-//! Local destination: spans appended as JSON lines to a file, no collector needed.
+//! The usage log on disk: spans appended as JSON lines to a file, no collector needed.
 //!
 //! Each process writes its own `loop-<start time>-<pid>.jsonl`, created on the first
-//! export so runs that trace nothing leave no file behind.
+//! export so runs that trace nothing leave no file behind. On Unix the folder is
+//! private to the user (0700) and each file is 0600.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -16,10 +17,9 @@ use opentelemetry_sdk::trace::{SpanData, SpanExporter};
 use parking_lot::Mutex;
 use serde_json::{json, Map};
 
-/// Folder of the always-on anonymous usage log: `<OS temp dir>/loop-traces`.
-pub fn default_trace_dir() -> PathBuf {
-    std::env::temp_dir().join("loop-traces")
-}
+/// Format version written as `"v"` on every line, so later readers can tell formats
+/// apart.
+pub const USAGE_LOG_VERSION: u32 = 1;
 
 /// How long usage log files are kept.
 pub const TRACE_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -79,13 +79,9 @@ impl FileSpanExporter {
         let mut writer = self.writer.lock();
         if writer.is_none() {
             if let Some(dir) = self.path.parent() {
-                std::fs::create_dir_all(dir)?;
+                create_private_dir(dir)?;
             }
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)?;
-            *writer = Some(BufWriter::new(file));
+            *writer = Some(BufWriter::new(open_private_append(&self.path)?));
         }
         let out = writer.as_mut().expect("opened above");
         for span in batch {
@@ -102,6 +98,29 @@ impl SpanExporter for FileSpanExporter {
         self.write_batch(&batch)
             .map_err(|err| OTelSdkError::InternalFailure(format!("{}: {err}", self.path.display())))
     }
+}
+
+/// Create `dir` (and its parents); on Unix the folder itself is made 0700.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Open `path` for appending; on Unix a new file is created 0600.
+fn open_private_append(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 /// One span as a self-contained JSON object.
@@ -131,6 +150,7 @@ fn span_json(span: &SpanData) -> serde_json::Value {
         })
         .collect();
     json!({
+        "v": USAGE_LOG_VERSION,
         "trace_id": context.trace_id().to_string(),
         "span_id": context.span_id().to_string(),
         "parent_span_id": (span.parent_span_id != SpanId::INVALID)
@@ -211,6 +231,23 @@ mod tests {
         assert!(!old.exists() && other.exists());
         assert!(is_trace_file(Path::new("x/loop-a-1.jsonl")));
         assert!(!is_trace_file(Path::new("x/loop-a-1.json")));
+    }
+
+    #[test]
+    fn files_are_private_to_the_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = trace_file_path(&dir.path().join("usage"));
+        FileSpanExporter::new(path.clone())
+            .write_batch(&[])
+            .unwrap();
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(path.parent().unwrap()), 0o700);
+            assert_eq!(mode(&path), 0o600);
+        }
     }
 
     #[test]

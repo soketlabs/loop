@@ -26,19 +26,17 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             description: "Show or change sandbox mode",
             args_hint: Some("[status|off|local [--full|--partial] [--crun|--runc|--runsc|--krun]]"),
         },
-        #[cfg(feature = "dashboard")]
+        #[cfg(feature = "usage")]
         SlashCommand {
-            name: "dashboard",
-            description: "Usage dashboard: live agents, tokens, models, tools, sessions",
+            name: "usage",
+            description: "Usage: live agents, tokens, models, tools, sessions",
             args_hint: None,
         },
         #[cfg(feature = "telemetry")]
         SlashCommand {
             name: "tracing",
-            description: "Langfuse tracing status, on/off, anonymous mode, or setup",
-            args_hint: Some(
-                "[status|enable|disable|local [on|off]|anonymous [on|off]|setup [langfuse|otlp|file]]",
-            ),
+            description: "Langfuse tracing status, on/off, or setup",
+            args_hint: Some("[status|enable|disable|setup [langfuse|otlp]]"),
         },
         SlashCommand {
             name: "settings",
@@ -349,9 +347,9 @@ pub enum CommandEffect {
     /// Langfuse tracing control.
     #[cfg(feature = "telemetry")]
     Tracing(TracingCommand),
-    /// Open the local usage dashboard.
-    #[cfg(feature = "dashboard")]
-    Dashboard,
+    /// Open the local usage view.
+    #[cfg(feature = "usage")]
+    Usage,
     /// Login flow.
     Login(Option<String>),
     /// Logout.
@@ -504,10 +502,6 @@ pub enum TracingCommand {
     Enable,
     /// Turn exporting off (persisted).
     Disable,
-    /// Show (`None`) or set anonymous mode: no user content in exported spans (persisted).
-    Anonymous(Option<bool>),
-    /// Show (`None`) or switch the local anonymous usage log (persisted).
-    Local(Option<bool>),
     /// Open the setup wizard, optionally skipping the backend picker.
     Setup {
         /// Backend chosen on the command line.
@@ -517,7 +511,7 @@ pub enum TracingCommand {
 
 #[cfg(feature = "telemetry")]
 const TRACING_USAGE: &str =
-    "Usage: /tracing [status|enable|disable|local [on|off]|anonymous [on|off]|setup [langfuse|otlp|file]] — setup opens a guided wizard";
+    "Usage: /tracing [status|enable|disable|setup [langfuse|otlp]] — setup opens a guided wizard";
 
 /// Parse `/tracing` arguments; `Err` carries the usage text.
 #[cfg(feature = "telemetry")]
@@ -526,12 +520,6 @@ pub fn parse_tracing(args: &str) -> Result<TracingCommand, String> {
         [] | ["status"] => Ok(TracingCommand::Status),
         ["enable" | "on"] => Ok(TracingCommand::Enable),
         ["disable" | "off"] => Ok(TracingCommand::Disable),
-        ["anonymous"] => Ok(TracingCommand::Anonymous(None)),
-        ["anonymous", "on" | "enable"] => Ok(TracingCommand::Anonymous(Some(true))),
-        ["anonymous", "off" | "disable"] => Ok(TracingCommand::Anonymous(Some(false))),
-        ["local"] => Ok(TracingCommand::Local(None)),
-        ["local", "on" | "enable"] => Ok(TracingCommand::Local(Some(true))),
-        ["local", "off" | "disable"] => Ok(TracingCommand::Local(Some(false))),
         ["setup"] => Ok(TracingCommand::Setup { backend: None }),
         ["setup", backend] => TracingBackend::parse(backend)
             .map(|backend| TracingCommand::Setup {
@@ -558,8 +546,8 @@ pub fn dispatch(
             }
         }
         "sandbox" => CommandEffect::SetSandbox(cmd.args.clone()),
-        #[cfg(feature = "dashboard")]
-        "dashboard" => CommandEffect::Dashboard,
+        #[cfg(feature = "usage")]
+        "usage" => CommandEffect::Usage,
         #[cfg(feature = "telemetry")]
         "tracing" => match parse_tracing(&cmd.args) {
             Ok(command) => CommandEffect::Tracing(command),

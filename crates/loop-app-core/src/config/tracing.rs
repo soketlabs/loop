@@ -40,20 +40,17 @@ pub enum TracingBackend {
     Langfuse,
     /// Any OTLP/HTTP collector (Jaeger, Phoenix, Tempo, OTel Collector, …).
     Otlp,
-    /// JSON-lines files on this machine (default: the OS temp folder).
-    File,
 }
 
 impl TracingBackend {
     /// All backends, in picker order.
-    pub const ALL: [Self; 3] = [Self::Langfuse, Self::Otlp, Self::File];
+    pub const ALL: [Self; 2] = [Self::Langfuse, Self::Otlp];
 
     /// Display name.
     pub fn label(self) -> &'static str {
         match self {
             Self::Langfuse => "Langfuse",
             Self::Otlp => "OTLP endpoint",
-            Self::File => "Local file",
         }
     }
 
@@ -62,7 +59,6 @@ impl TracingBackend {
         match self {
             Self::Langfuse => "Langfuse cloud or self-hosted · host + public/secret keys",
             Self::Otlp => "Any OTLP/HTTP collector · Jaeger, Phoenix, Tempo, OTel Collector",
-            Self::File => "JSON lines on this machine · no server needed",
         }
     }
 
@@ -71,7 +67,6 @@ impl TracingBackend {
         match raw.trim().to_ascii_lowercase().as_str() {
             "langfuse" => Some(Self::Langfuse),
             "otlp" | "otel" => Some(Self::Otlp),
-            "file" | "local" => Some(Self::File),
             _ => None,
         }
     }
@@ -85,13 +80,6 @@ pub struct TracingSettings {
     /// User preference toggled by `/tracing enable|disable`.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// Export spans without user content, toggled by `/tracing anonymous on|off`.
-    #[serde(default)]
-    pub anonymous: bool,
-    /// Always-anonymous local usage log read by `loop dashboard`, toggled by
-    /// `/tracing local on|off`. Independent of the configured backend.
-    #[serde(default = "default_enabled")]
-    pub local_log: bool,
     /// Backend chosen in `/tracing setup`.
     #[serde(default)]
     pub backend: TracingBackend,
@@ -104,9 +92,6 @@ pub struct TracingSettings {
     /// OTLP collector URL saved by `/tracing setup`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otlp_endpoint: Option<String>,
-    /// Trace file folder saved by `/tracing setup`; the OS temp folder when unset.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_dir: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -117,13 +102,10 @@ impl Default for TracingSettings {
     fn default() -> Self {
         Self {
             enabled: default_enabled(),
-            anonymous: false,
-            local_log: default_enabled(),
             backend: TracingBackend::default(),
             langfuse_host: None,
             langfuse_public_key: None,
             otlp_endpoint: None,
-            file_dir: None,
         }
     }
 }
@@ -163,9 +145,8 @@ mod tests {
             Some(TracingBackend::Langfuse)
         );
         assert_eq!(TracingBackend::parse("otel"), Some(TracingBackend::Otlp));
-        assert_eq!(TracingBackend::parse("local"), Some(TracingBackend::File));
         assert_eq!(TracingBackend::parse("jaeger"), None);
-        assert_eq!(TracingBackend::ALL.len(), 3);
+        assert_eq!(TracingBackend::ALL.len(), 2);
     }
 
     #[test]
@@ -173,8 +154,6 @@ mod tests {
         let settings: crate::config::Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.tracing, TracingSettings::default());
         assert!(settings.tracing.enabled);
-        assert!(!settings.tracing.anonymous);
-        assert!(settings.tracing.local_log, "usage log is on by default");
         assert_eq!(settings.tracing.backend, TracingBackend::Langfuse);
     }
 
@@ -185,23 +164,19 @@ mod tests {
         let settings = crate::config::Settings {
             tracing: TracingSettings {
                 enabled: false,
-                anonymous: true,
-                local_log: false,
                 backend: TracingBackend::Otlp,
                 langfuse_host: Some("https://h".into()),
                 langfuse_public_key: Some("pk".into()),
                 otlp_endpoint: Some("http://c:4318".into()),
-                file_dir: Some("/tmp/traces".into()),
             },
             ..Default::default()
         };
         settings.save_file(&path).unwrap();
         let loaded = crate::config::Settings::load_file(&path).unwrap();
         assert_eq!(loaded.tracing, settings.tracing);
-        let json = std::fs::read_to_string(&path).unwrap();
-        assert!(json.contains(r#""backend": "otlp""#));
-        assert!(json.contains(r#""anonymous": true"#));
-        assert!(json.contains(r#""localLog": false"#));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(r#""backend": "otlp""#));
     }
 
     #[test]
@@ -212,8 +187,6 @@ mod tests {
         project.tracing.langfuse_host = Some("https://attacker".into());
         project.tracing.backend = TracingBackend::Otlp;
         project.tracing.enabled = false;
-        project.tracing.anonymous = true;
-        project.tracing.local_log = false;
         global.merge_project(project);
         assert_eq!(
             global.tracing.langfuse_host.as_deref(),
@@ -221,7 +194,5 @@ mod tests {
         );
         assert_eq!(global.tracing.backend, TracingBackend::Langfuse);
         assert!(global.tracing.enabled);
-        assert!(!global.tracing.anonymous);
-        assert!(global.tracing.local_log);
     }
 }

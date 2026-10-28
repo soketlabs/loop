@@ -1,8 +1,6 @@
 //! Export destinations: a generic OTLP/HTTP endpoint, and Langfuse credentials that
 //! resolve to one.
 
-use std::path::Path;
-
 use base64::Engine;
 
 /// Path of Langfuse's OTLP/HTTP trace ingestion endpoint, relative to the host.
@@ -93,7 +91,6 @@ impl TelemetryCredentials {
     /// The OTLP destination for this Langfuse project.
     pub fn destination(&self) -> TelemetryDestination {
         TelemetryDestination {
-            kind: DestinationKind::OtlpHttp,
             endpoint: self.traces_endpoint(),
             headers: vec![
                 ("Authorization".into(), self.authorization()),
@@ -108,22 +105,10 @@ impl TelemetryCredentials {
     }
 }
 
-/// How a destination receives spans.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DestinationKind {
-    /// OTLP/HTTP (protobuf) POSTs to `endpoint`.
-    OtlpHttp,
-    /// JSON lines appended to the file at `endpoint`.
-    JsonlFile,
-}
-
-/// Where spans are exported: an OTLP/HTTP traces endpoint plus request headers, or a
-/// local file.
+/// Where spans are exported: an OTLP/HTTP traces endpoint plus request headers.
 #[derive(Clone, PartialEq, Eq)]
 pub struct TelemetryDestination {
-    /// Transport.
-    pub kind: DestinationKind,
-    /// Full traces URL, or the trace file path for [`DestinationKind::JsonlFile`].
+    /// Full traces URL.
     pub endpoint: String,
     /// Request headers (may carry credentials).
     pub headers: Vec<(String, String)>,
@@ -137,7 +122,6 @@ impl std::fmt::Debug for TelemetryDestination {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let header_names: Vec<&str> = self.headers.iter().map(|(k, _)| k.as_str()).collect();
         f.debug_struct("TelemetryDestination")
-            .field("kind", &self.kind)
             .field("endpoint", &self.endpoint)
             .field("headers", &header_names)
             .field("label", &self.label)
@@ -171,24 +155,11 @@ impl TelemetryDestination {
             .map(|v| vec![("Authorization".to_string(), v.to_string())])
             .unwrap_or_default();
         Some(Self {
-            kind: DestinationKind::OtlpHttp,
             label: format!("OTLP · {endpoint}"),
             endpoint,
             headers,
             source,
         })
-    }
-
-    /// JSON-lines file for this process inside `dir`.
-    pub fn file(dir: &Path, source: CredentialSource) -> Self {
-        let path = crate::file_exporter::trace_file_path(dir);
-        Self {
-            kind: DestinationKind::JsonlFile,
-            label: format!("file · {}", path.display()),
-            endpoint: path.display().to_string(),
-            headers: Vec::new(),
-            source,
-        }
     }
 }
 
@@ -282,15 +253,6 @@ mod tests {
             vec![("Authorization".into(), "Bearer tok".into())]
         );
         assert!(!format!("{dest:?}").contains("tok"));
-    }
-
-    #[test]
-    fn file_destination_points_into_dir() {
-        let dest = TelemetryDestination::file(Path::new("traces"), CredentialSource::Config);
-        assert_eq!(dest.kind, DestinationKind::JsonlFile);
-        assert!(dest.headers.is_empty());
-        assert!(Path::new(&dest.endpoint).starts_with("traces"));
-        assert!(dest.label.starts_with("file · "));
     }
 
     #[test]

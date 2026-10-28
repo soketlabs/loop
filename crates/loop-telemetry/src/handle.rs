@@ -1,9 +1,9 @@
 //! Process-wide telemetry state: tracer provider, export gate and the two sinks.
 //!
-//! * The **local usage log** is an always-anonymous JSON-lines file per process, read by
-//!   `loop dashboard`. It is on unless the user turns it off.
-//! * The **destination** is what `/tracing setup` configured (Langfuse, OTLP or a file),
-//!   with its own on/off and anonymous switches.
+//! * The **usage log** is an always-on, always-anonymous JSON-lines file per process,
+//!   read by `/usage` and `loop usage`. It never leaves the machine.
+//! * The **destination** is what `/tracing setup` configured (Langfuse or OTLP), with
+//!   its own on/off switch.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,9 +11,11 @@ use std::sync::Arc;
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
+use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{
     BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider, SpanExporter,
 };
+use opentelemetry_sdk::trace::{SpanData, SpanProcessor};
 use opentelemetry_sdk::Resource;
 use parking_lot::Mutex;
 use tracing::metadata::LevelFilter;
@@ -24,7 +26,7 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
 use crate::anonymize::SinkProcessor;
-use crate::credentials::{CredentialSource, DestinationKind, TelemetryDestination};
+use crate::credentials::{CredentialSource, TelemetryDestination};
 use crate::exporter::{otlp_exporter, ExporterSlot};
 use crate::file_exporter::{self, FileSpanExporter, TRACE_RETENTION};
 use crate::obs::SPAN_TARGET;
@@ -46,20 +48,25 @@ pub struct TelemetryStatus {
     pub destination: Option<String>,
     /// Where the installed credentials came from.
     pub source: Option<CredentialSource>,
-    /// User content is stripped from spans before export.
-    pub anonymous: bool,
     /// Error from the most recent failed export, if the last export failed.
     pub last_error: Option<String>,
-    /// File the anonymous usage log is written to, while it is on.
-    pub local_log: Option<String>,
 }
 
 impl TelemetryStatus {
     /// Spans go to the configured destination only when one exists and the user has
-    /// not disabled it. The local usage log is independent of this.
+    /// not disabled it. The usage log is independent of this.
     pub fn active(&self) -> bool {
         self.enabled && self.destination.is_some()
     }
+}
+
+/// Where the usage log is written, shown by `/usage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageLog {
+    /// This process's usage log file.
+    pub path: PathBuf,
+    /// Error from the most recent failed write, cleared by the next success.
+    pub last_error: Option<String>,
 }
 
 /// Cheap to clone; all clones share state.
@@ -71,11 +78,12 @@ pub struct TelemetryHandle {
     enabled: Arc<AtomicBool>,
     /// Destination installed and enabled.
     remote_active: Arc<AtomicBool>,
-    anonymous: Arc<AtomicBool>,
     destination: Arc<Mutex<Option<(String, CredentialSource)>>>,
     local_slot: ExporterSlot,
+    /// The usage log's batch processor, kept so it can be flushed on its own.
+    local_processor: Arc<BatchSpanProcessor>,
     local_active: Arc<AtomicBool>,
-    local_log: Arc<Mutex<Option<String>>>,
+    local_log: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl std::fmt::Debug for TelemetryHandle {
@@ -87,7 +95,7 @@ impl std::fmt::Debug for TelemetryHandle {
 }
 
 impl TelemetryHandle {
-    /// Create the provider with no destination and no local log. `release` becomes
+    /// Create the provider with no destination and no usage log. `release` becomes
     /// `service.version`.
     ///
     /// Nothing is exported until [`install`](Self::install) or
@@ -97,7 +105,7 @@ impl TelemetryHandle {
         let local_slot = ExporterSlot::default();
         let remote_active = Arc::new(AtomicBool::new(false));
         let local_active = Arc::new(AtomicBool::new(false));
-        let anonymous = Arc::new(AtomicBool::new(false));
+        let local_processor = Arc::new(batch_processor(&local_slot));
         let provider = SdkTracerProvider::builder()
             .with_resource(
                 Resource::builder()
@@ -108,12 +116,12 @@ impl TelemetryHandle {
             .with_span_processor(SinkProcessor::new(
                 batch_processor(&slot),
                 remote_active.clone(),
-                anonymous.clone(),
+                false,
             ))
             .with_span_processor(SinkProcessor::new(
-                batch_processor(&local_slot),
+                SharedProcessor(local_processor.clone(), local_slot.clone()),
                 local_active.clone(),
-                Arc::new(AtomicBool::new(true)),
+                true,
             ))
             .build();
         Self {
@@ -122,9 +130,9 @@ impl TelemetryHandle {
             gate: ExportGate::default(),
             enabled: Arc::new(AtomicBool::new(enabled)),
             remote_active,
-            anonymous,
             destination: Arc::new(Mutex::new(None)),
             local_slot,
+            local_processor,
             local_active,
             local_log: Arc::new(Mutex::new(None)),
         }
@@ -143,16 +151,8 @@ impl TelemetryHandle {
 
     /// Start exporting to `destination`.
     pub fn install(&self, destination: &TelemetryDestination) -> anyhow::Result<()> {
-        let (label, source) = (destination.label.clone(), destination.source);
-        match destination.kind {
-            DestinationKind::OtlpHttp => {
-                self.install_exporter(otlp_exporter(destination)?, label, source);
-            }
-            DestinationKind::JsonlFile => {
-                let path = destination.endpoint.clone().into();
-                self.install_exporter(FileSpanExporter::new(path), label, source);
-            }
-        }
+        let exporter = otlp_exporter(destination)?;
+        self.install_exporter(exporter, destination.label.clone(), destination.source);
         Ok(())
     }
 
@@ -173,29 +173,26 @@ impl TelemetryHandle {
     pub fn install_local(&self, dir: &Path) -> PathBuf {
         file_exporter::prune_old_traces(dir, TRACE_RETENTION);
         let path = file_exporter::trace_file_path(dir);
-        self.install_local_exporter(
-            FileSpanExporter::new(path.clone()),
-            path.display().to_string(),
-        );
+        self.install_local_exporter(FileSpanExporter::new(path.clone()), path.clone());
         path
     }
 
-    /// Usage log to an arbitrary exporter (tests use the in-memory exporter).
-    pub fn install_local_exporter<E: SpanExporter + 'static>(&self, exporter: E, label: String) {
+    /// Usage log to an arbitrary exporter (tests use the in-memory exporter); `path` is
+    /// what [`usage_log`](Self::usage_log) reports.
+    pub fn install_local_exporter<E: SpanExporter + 'static>(&self, exporter: E, path: PathBuf) {
         self.local_slot.install(exporter);
-        *self.local_log.lock() = Some(label);
+        *self.local_log.lock() = Some(path);
         self.local_active.store(true, Ordering::Release);
         self.refresh_gate();
     }
 
-    /// Stop the usage log; spans still queued for it are dropped. Returns the resulting
-    /// status.
-    pub fn remove_local(&self) -> TelemetryStatus {
-        self.local_active.store(false, Ordering::Release);
-        self.local_slot.clear();
-        *self.local_log.lock() = None;
-        self.refresh_gate();
-        self.status()
+    /// The usage log, once installed.
+    pub fn usage_log(&self) -> Option<UsageLog> {
+        let path = self.local_log.lock().clone()?;
+        Some(UsageLog {
+            path,
+            last_error: self.local_slot.last_error(),
+        })
     }
 
     /// Set the user preference; returns the resulting status.
@@ -205,23 +202,14 @@ impl TelemetryHandle {
         self.status()
     }
 
-    /// Strip prompts, outputs, tool arguments/results, error text and user ids from
-    /// spans that end from now on; returns the resulting status.
-    pub fn set_anonymous(&self, anonymous: bool) -> TelemetryStatus {
-        self.anonymous.store(anonymous, Ordering::Release);
-        self.status()
-    }
-
     /// Current state.
     pub fn status(&self) -> TelemetryStatus {
         let destination = self.destination.lock().clone();
         TelemetryStatus {
             enabled: self.enabled.load(Ordering::Acquire),
             source: destination.as_ref().map(|(_, s)| *s),
-            anonymous: self.anonymous.load(Ordering::Acquire),
             destination: destination.map(|(label, _)| label),
             last_error: self.slot.last_error(),
-            local_log: self.local_log.lock().clone(),
         }
     }
 
@@ -231,6 +219,16 @@ impl TelemetryHandle {
     pub fn flush(&self) {
         if let Err(err) = self.provider.force_flush() {
             tracing::warn!(target: "loop_telemetry", error = %err, "trace flush failed");
+        }
+    }
+
+    /// Block until spans queued for the usage log are written. Unlike
+    /// [`flush`](Self::flush) it never waits on the network.
+    ///
+    /// Blocking: call from `spawn_blocking` / a plain thread inside async code.
+    pub fn flush_local(&self) {
+        if let Err(err) = self.local_processor.force_flush() {
+            tracing::warn!(target: "loop_telemetry", error = %err, "usage log flush failed");
         }
     }
 
@@ -247,6 +245,34 @@ impl TelemetryHandle {
         self.remote_active.store(remote, Ordering::Release);
         self.gate
             .set(remote || self.local_active.load(Ordering::Acquire));
+    }
+}
+
+/// A batch processor shared with the handle, so the usage log can be flushed without
+/// flushing the configured destination.
+#[derive(Debug)]
+struct SharedProcessor(Arc<BatchSpanProcessor>, ExporterSlot);
+
+impl SpanProcessor for SharedProcessor {
+    fn on_start(&self, span: &mut opentelemetry_sdk::trace::Span, cx: &opentelemetry::Context) {
+        self.0.on_start(span, cx);
+    }
+
+    fn on_end(&self, span: SpanData) {
+        self.0.on_end(span);
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.0.force_flush()
+    }
+
+    fn shutdown_with_timeout(&self, timeout: std::time::Duration) -> OTelSdkResult {
+        self.0.shutdown_with_timeout(timeout)
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        // The processor is shared, so hand the resource to its exporter's slot directly.
+        self.1.set_resource(resource);
     }
 }
 

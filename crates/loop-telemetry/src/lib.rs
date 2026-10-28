@@ -13,9 +13,7 @@ mod file_exporter;
 mod handle;
 pub mod obs;
 
-pub use credentials::{
-    CredentialSource, DestinationKind, TelemetryCredentials, TelemetryDestination,
-};
-pub use file_exporter::{default_trace_dir, is_trace_file, TRACE_RETENTION};
-pub use handle::{TelemetryHandle, TelemetryStatus};
+pub use credentials::{CredentialSource, TelemetryCredentials, TelemetryDestination};
+pub use file_exporter::{is_trace_file, TRACE_RETENTION, USAGE_LOG_VERSION};
+pub use handle::{TelemetryHandle, TelemetryStatus, UsageLog};
 pub use obs::{ObservationExt, TraceAttrs};

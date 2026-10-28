@@ -54,7 +54,7 @@ jobs:
       - name: clippy (without telemetry)
         run: cargo clippy -p loop-cli --no-default-features --all-targets --locked -- -D warnings
 
-      - name: clippy (without dashboard)
+      - name: clippy (without the usage view)
         run: cargo clippy -p loop-cli --no-default-features --features telemetry --all-targets --locked -- -D warnings
 
   test:
@@ -99,7 +99,7 @@ jobs:
         run: cargo test -p loop-update --test lifecycle --locked
 
       # Telemetry is a default feature of loop-cli, so the steps above cover it.
-      # The build without it has no OS-specific parts, so it is only tested on Linux.
+      # The builds without it have no OS-specific parts, so they are only tested on Linux.
       - name: Test (without telemetry)
         if: runner.os == 'Linux'
-        run: cargo test -p loop-cli --no-default-features --locked
+        run: cargo test -p loop-agent -p loop-app-core -p loop-cli --no-default-features --locked

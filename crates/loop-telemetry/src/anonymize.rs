@@ -1,13 +1,10 @@
-//! Anonymous mode: strip user content from spans before they are queued for export.
+//! Anonymous usage log: strip everything but names and measurements from spans before
+//! they are written to the local usage log.
 //!
-//! The local usage log is always anonymous; the configured destination is anonymous
-//! while `/tracing anonymous on` is set.
-//!
-//! Applied once per span as it ends, so the span tree, timings, model, token usage, cost,
-//! tool names and error levels are still exported while prompts, completions, tool
-//! arguments and results, error text and log events never leave the process. Whether a
-//! span is redacted is decided when it ends; switching anonymous mode off later does not
-//! release content from spans that were already redacted.
+//! Applied once per span as it ends. Only the attributes in [`KEPT_KEYS`] and
+//! [`KEPT_METADATA`] survive, so the span tree, timings, model, token usage, tool and
+//! skill names and run labels are kept, while prompts, completions, tool arguments and
+//! results, error text, log events and any attribute added later are dropped.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,18 +18,46 @@ use opentelemetry_sdk::Resource;
 
 use crate::obs::keys;
 
-/// Attributes that can carry user content or identity.
-const REDACTED_KEYS: [&str; 4] = [
-    keys::INPUT,
-    keys::OUTPUT,
-    keys::STATUS_MESSAGE,
-    keys::USER_ID,
+/// Attributes kept in the usage log: names and measurements, never user content.
+const KEPT_KEYS: [&str; 9] = [
+    keys::OBSERVATION_TYPE,
+    keys::MODEL_NAME,
+    keys::GEN_AI_SYSTEM,
+    keys::USAGE_DETAILS,
+    keys::COMPLETION_START_TIME,
+    keys::LEVEL,
+    keys::SESSION_ID,
+    keys::RELEASE,
+    keys::GEN_AI_TOOL_NAME,
 ];
+
+/// `langfuse.observation.metadata.<key>` entries kept in the usage log.
+const KEPT_METADATA: [&str; 13] = [
+    "model",
+    "provider",
+    "agent",
+    "skills",
+    "skill",
+    "session",
+    "tool",
+    "turn",
+    "turns",
+    "tool_calls",
+    "tool_errors",
+    "total_tokens",
+    "stop_reason",
+];
+
+fn is_kept(key: &str) -> bool {
+    KEPT_KEYS.contains(&key)
+        || key
+            .strip_prefix(keys::METADATA_PREFIX)
+            .is_some_and(|name| KEPT_METADATA.contains(&name))
+}
 
 /// Remove user content from a finished span, keeping its shape and measurements.
 pub(crate) fn anonymize(span: &mut SpanData) {
-    span.attributes
-        .retain(|kv| !REDACTED_KEYS.contains(&kv.key.as_str()));
+    span.attributes.retain(|kv| is_kept(kv.key.as_str()));
     // Events are forwarded `loop_*` warnings, which can quote paths and messages.
     span.events = Default::default();
     if let Status::Error { .. } = span.status {
@@ -41,16 +66,16 @@ pub(crate) fn anonymize(span: &mut SpanData) {
 }
 
 /// One export sink: forwards finished spans to `inner` while the sink is active,
-/// anonymizing them first while its anonymous switch is on.
+/// anonymizing them first when it is the usage log.
 #[derive(Debug)]
 pub(crate) struct SinkProcessor<P> {
     inner: P,
     active: Arc<AtomicBool>,
-    anonymous: Arc<AtomicBool>,
+    anonymous: bool,
 }
 
 impl<P> SinkProcessor<P> {
-    pub(crate) fn new(inner: P, active: Arc<AtomicBool>, anonymous: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(inner: P, active: Arc<AtomicBool>, anonymous: bool) -> Self {
         Self {
             inner,
             active,
@@ -68,7 +93,7 @@ impl<P: SpanProcessor> SpanProcessor for SinkProcessor<P> {
         if !self.active.load(Ordering::Acquire) {
             return;
         }
-        if self.anonymous.load(Ordering::Acquire) {
+        if self.anonymous {
             anonymize(&mut span);
         }
         self.inner.on_end(span);
@@ -84,5 +109,23 @@ impl<P: SpanProcessor> SpanProcessor for SinkProcessor<P> {
 
     fn set_resource(&mut self, resource: &Resource) {
         self.inner.set_resource(resource);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_only_listed_keys() {
+        assert!(is_kept(keys::MODEL_NAME));
+        assert!(is_kept("langfuse.observation.metadata.skill"));
+        assert!(!is_kept(keys::INPUT));
+        assert!(!is_kept(keys::TRACE_NAME));
+        assert!(!is_kept(keys::GEN_AI_TOOL_CALL_ID));
+        assert!(!is_kept("langfuse.observation.metadata.response_id"));
+        assert!(!is_kept("langfuse.trace.metadata.ticket"));
+        assert!(!is_kept("code.filepath"));
+        assert!(!is_kept("some.future.attribute"));
     }
 }

@@ -12,14 +12,14 @@ name = "loop"
 path = "src/main.rs"
 
 [features]
-default = ["telemetry", "dashboard"]
+default = ["telemetry", "usage"]
 orchestration = ["loop-agent/orchestration", "dep:loop-orchestration"]
-# Anonymous local usage log, and optional Langfuse / OTLP / file export (`/tracing`,
+# Anonymous local usage log, and optional Langfuse / OTLP export (`/tracing`,
 # `--trace-*` flags). Build with `--no-default-features` to leave out.
 telemetry = ["loop-agent/telemetry", "loop-app-core/telemetry", "dep:loop-telemetry"]
-# `/dashboard` and `loop dashboard` over the usage log. Leave out with
+# `/usage` and `loop usage` over the usage log. Leave out with
 # `--no-default-features --features telemetry`.
-dashboard = ["telemetry", "dep:loop-dashboard"]
+usage = ["telemetry", "dep:loop-dashboard"]
 
 [dependencies]
 loop-app-core = { workspace = true }

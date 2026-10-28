@@ -46,8 +46,8 @@ pub struct CliRuntime {
     /// `/permissions full-access` was asked for once and needs repeating to
     /// confirm.
     pub confirm_full_access: bool,
-    /// `/dashboard` asked for the usage dashboard; the chat loop opens it.
-    pub dashboard_requested: bool,
+    /// `/usage` asked for the usage view; the chat loop opens it.
+    pub usage_requested: bool,
 }
 
 /// An external agent to start when the surface is ready.
@@ -94,6 +94,6 @@ pub async fn bootstrap_cli(opts: BootstrapOpts) -> anyhow::Result<CliRuntime> {
         forwarded: Default::default(),
         reasoning_notices: Default::default(),
         confirm_full_access: false,
-        dashboard_requested: false,
+        usage_requested: false,
     })
 }

@@ -1,7 +1,7 @@
 //! Full-screen terminal dashboard over the usage summary.
 //!
-//! Runs on the terminal's alternate screen, so opening it from inside the chat (`/dashboard`)
-//! leaves the transcript untouched, and `loop dashboard` uses the same view standalone.
+//! Runs on the terminal's alternate screen, so opening it from inside the chat (`/usage`)
+//! leaves the transcript untouched, and `loop usage` uses the same view standalone.
 //!
 //! Views: **Now** (live status of the running loop, like Codex's `/status`: session,
 //! context window, agents and sub-agents, skills, MCP servers, extensions), **Usage**
@@ -463,7 +463,7 @@ impl App {
         let area = frame.area();
         if area.width < MIN_SIZE.0 || area.height < MIN_SIZE.1 {
             let msg = Paragraph::new(vec![
-                Line::from("Terminal too small for the dashboard".bold()),
+                Line::from("Terminal too small for the usage view".bold()),
                 Line::from(format!(
                     "Resize to at least {}×{} · q to close",
                     MIN_SIZE.0, MIN_SIZE.1
@@ -635,9 +635,7 @@ impl App {
             Line::from(""),
             Line::from(vec![
                 Span::from("←→").fg(p.accent).bold(),
-                Span::from(" try a longer period · ").fg(p.dim),
-                Span::from("/tracing status").fg(p.accent),
-                Span::from(" checks the log is on").fg(p.dim),
+                Span::from(" try a longer period").fg(p.dim),
             ]),
         ];
         frame.render_widget(
@@ -655,8 +653,8 @@ impl App {
                 Line::from("Live status needs a running loop".bold().fg(p.text)),
                 Line::from(""),
                 Line::from(vec![
-                    Span::from("Open the dashboard with ").fg(p.muted),
-                    Span::from("/dashboard").fg(p.accent),
+                    Span::from("Open it with ").fg(p.muted),
+                    Span::from("/usage").fg(p.accent),
                     Span::from(" inside loop to see the session, context window,").fg(p.muted),
                 ]),
                 Line::from("agents and sub-agents, skills and MCP servers.").fg(p.muted),
@@ -704,8 +702,8 @@ impl App {
                 "Usage log",
                 live.usage_log
                     .as_ref()
-                    .map_or("off · /tracing local on".into(), |_| {
-                        "on · anonymous, local only".into()
+                    .map_or("not available in this build".into(), |path| {
+                        format!("anonymous, local only · {path}")
                     }),
             ),
         ];

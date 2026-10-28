@@ -2,7 +2,6 @@
 //!
 //! Pure state machine; the TUI renders [`TracingSetup`] and feeds it the input line.
 
-use loop_app_core::config::tracing as tracing_config;
 use loop_app_core::config::tracing::{
     DEFAULT_LANGFUSE_HOST, DEFAULT_OTLP_ENDPOINT, ENV_LANGFUSE_HOST, ENV_LANGFUSE_PUBLIC_KEY,
     ENV_LANGFUSE_SECRET_KEY,
@@ -42,8 +41,6 @@ pub enum TracingSetup {
         /// Entered endpoint.
         endpoint: String,
     },
-    /// Folder for local trace files.
-    FileDir,
 }
 
 impl std::fmt::Debug for TracingSetup {
@@ -56,7 +53,6 @@ impl std::fmt::Debug for TracingSetup {
             Self::LangfuseSecret { .. } => "LangfuseSecret",
             Self::OtlpEndpoint => "OtlpEndpoint",
             Self::OtlpAuth { .. } => "OtlpAuth",
-            Self::FileDir => "FileDir",
         })
     }
 }
@@ -94,14 +90,6 @@ impl TracingSetup {
                     .otlp_endpoint
                     .clone()
                     .unwrap_or_else(|| DEFAULT_OTLP_ENDPOINT.into()),
-            ),
-            TracingBackend::File => (
-                Self::FileDir,
-                saved.file_dir.clone().unwrap_or_else(|| {
-                    tracing_config::default_file_backend_dir()
-                        .display()
-                        .to_string()
-                }),
             ),
         }
     }
@@ -152,7 +140,6 @@ impl TracingSetup {
                 endpoint,
                 authorization: (!value.is_empty()).then_some(value),
             }),
-            Self::FileDir => Transition::Done(TracingSetupRequest::File { dir: value }),
         }
     }
 
@@ -176,7 +163,6 @@ impl WizardView for TracingSetup {
             Self::LangfuseSecret { .. } => ("Langfuse", 3, 3),
             Self::OtlpEndpoint => ("OTLP endpoint", 1, 2),
             Self::OtlpAuth { .. } => ("OTLP endpoint", 2, 2),
-            Self::FileDir => ("Local file", 1, 1),
         };
         format!("Set up tracing · {backend} · step {step} of {of}")
     }
@@ -198,10 +184,6 @@ impl WizardView for TracingSetup {
             Self::OtlpAuth { .. } => {
                 "Authorization header value, e.g. `Bearer <token>` — optional, enter to skip".into()
             }
-            Self::FileDir => {
-                "Folder for trace files — one .jsonl per loop process, blank for the temp folder"
-                    .into()
-            }
         }
     }
 
@@ -214,7 +196,6 @@ impl WizardView for TracingSetup {
             Self::LangfuseSecret { .. } => " sk-lf-…",
             Self::OtlpEndpoint => " http://localhost:4318",
             Self::OtlpAuth { .. } => " Bearer <token> (optional)",
-            Self::FileDir => " temp folder",
         }
     }
 
@@ -268,7 +249,7 @@ mod tests {
         let (rows, selected) = step.options().unwrap();
         assert_eq!(
             rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
-            ["Langfuse", "OTLP endpoint", "Local file"]
+            ["Langfuse", "OTLP endpoint"]
         );
         assert_eq!(selected, 0);
         assert!(prefill.is_empty());
@@ -285,7 +266,7 @@ mod tests {
     fn selection_wraps() {
         let mut step = TracingSetup::Choose { selected: 0 };
         step.move_selection(-1);
-        assert_eq!(step, TracingSetup::Choose { selected: 2 });
+        assert_eq!(step, TracingSetup::Choose { selected: 1 });
         step.move_selection(1);
         assert_eq!(step, TracingSetup::Choose { selected: 0 });
     }
@@ -354,26 +335,6 @@ mod tests {
             TracingSetup::OtlpEndpoint.submit("localhost:4318", &saved),
             Transition::Retry { .. }
         ));
-    }
-
-    #[test]
-    fn file_flow_prefills_temp_folder_and_finishes_in_one_step() {
-        let saved = TracingSettings::default();
-        let (step, prefill) = TracingSetup::start(Some(TracingBackend::File), &saved);
-        assert_eq!(step, TracingSetup::FileDir);
-        assert_eq!(
-            prefill,
-            tracing_config::default_file_backend_dir()
-                .display()
-                .to_string()
-        );
-        assert!(!step.masked());
-        assert_eq!(
-            step.submit(" /tmp/traces ", &saved),
-            Transition::Done(TracingSetupRequest::File {
-                dir: "/tmp/traces".into()
-            })
-        );
     }
 
     #[test]

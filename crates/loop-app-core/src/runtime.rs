@@ -795,13 +795,28 @@ impl Runtime {
 
 #[cfg(feature = "telemetry")]
 impl Runtime {
-    /// Take ownership of the process telemetry and apply saved tracing settings.
+    /// Take ownership of the process telemetry, start the usage log and apply saved
+    /// tracing settings.
     pub fn attach_telemetry(
         &mut self,
         handle: loop_telemetry::TelemetryHandle,
     ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
+        handle.install_local(&crate::config::paths::usage_dir(&self.agent_dir));
         self.telemetry = Some(handle);
         self.tracing_control()?.apply()
+    }
+
+    /// The usage log behind `/usage`, once telemetry is attached.
+    pub fn usage_log(&self) -> Option<loop_telemetry::UsageLog> {
+        self.telemetry.as_ref().and_then(|t| t.usage_log())
+    }
+
+    /// Write spans queued for the usage log, on a blocking thread so the caller never
+    /// waits for it.
+    pub fn flush_usage_log(&self) {
+        if let Some(telemetry) = self.telemetry.clone() {
+            tokio::task::spawn_blocking(move || telemetry.flush_local());
+        }
     }
 
     /// Current tracing state, if telemetry is attached.
@@ -815,33 +830,6 @@ impl Runtime {
         enabled: bool,
     ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
         let status = self.tracing_control()?.set_enabled(enabled);
-        self.save_settings()?;
-        Ok(status)
-    }
-
-    /// Hand queued spans to their exporters. Blocking: call from a blocking context.
-    pub fn flush_tracing(&self) {
-        if let Some(telemetry) = &self.telemetry {
-            telemetry.flush();
-        }
-    }
-
-    /// `/tracing local on|off`, persisted to global settings.
-    pub fn set_tracing_local_log(
-        &mut self,
-        on: bool,
-    ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
-        let status = self.tracing_control()?.set_local_log(on);
-        self.save_settings()?;
-        Ok(status)
-    }
-
-    /// `/tracing anonymous on|off`, persisted to global settings.
-    pub fn set_tracing_anonymous(
-        &mut self,
-        anonymous: bool,
-    ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
-        let status = self.tracing_control()?.set_anonymous(anonymous);
         self.save_settings()?;
         Ok(status)
     }

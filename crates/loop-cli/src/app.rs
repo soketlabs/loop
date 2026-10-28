@@ -31,7 +31,7 @@ use loop_protocol::{
     SessionUpdate, StopReason, ToolCallStatus, ToolContent, TurnOutcome, UpdateEnvelope,
 };
 
-#[cfg(feature = "dashboard")]
+#[cfg(feature = "usage")]
 pub mod dashboard;
 
 #[cfg(feature = "telemetry")]
@@ -512,14 +512,14 @@ async fn run_loop(
 
     let tick = Duration::from_millis(33);
     let mut should_quit = false;
-    // `/dashboard` while open (see `dashboard.rs`): this loop keeps draining agent events.
-    #[cfg(feature = "dashboard")]
+    // `/usage` while open (see `dashboard.rs`): this loop keeps draining agent events.
+    #[cfg(feature = "usage")]
     let mut dashboard: Option<dashboard::Screen> = None;
 
     while !should_quit {
-        #[cfg(feature = "dashboard")]
+        #[cfg(feature = "usage")]
         {
-            if std::mem::take(&mut runtime.dashboard_requested) && dashboard.is_none() {
+            if std::mem::take(&mut runtime.usage_requested) && dashboard.is_none() {
                 let state = dashboard::ChatState {
                     items: &chat,
                     working,
@@ -528,7 +528,7 @@ async fn run_loop(
                 };
                 match dashboard::Screen::open(runtime, state).await {
                     Ok(screen) => dashboard = Some(screen),
-                    Err(err) => chat.push(sys(format!("dashboard: {err}"))),
+                    Err(err) => chat.push(sys(format!("usage: {err}"))),
                 }
             }
             if let Some(screen) = dashboard.as_mut() {
@@ -4289,11 +4289,6 @@ fn apply_tracing_command(
             .ok_or_else(|| anyhow::anyhow!("tracing is not available in this mode")),
         TracingCommand::Enable => runtime.set_tracing_enabled(true),
         TracingCommand::Disable => runtime.set_tracing_enabled(false),
-        TracingCommand::Anonymous(None) | TracingCommand::Local(None) => runtime
-            .tracing_status()
-            .ok_or_else(|| anyhow::anyhow!("tracing is not available in this mode")),
-        TracingCommand::Local(Some(on)) => runtime.set_tracing_local_log(on),
-        TracingCommand::Anonymous(Some(anonymous)) => runtime.set_tracing_anonymous(anonymous),
         TracingCommand::Setup { backend } => {
             let (step, prefill) = TracingSetup::start(backend, &runtime.settings.tracing);
             input.set(prefill);
@@ -4576,8 +4571,8 @@ async fn apply_effect(
                 }
             }
         }
-        #[cfg(feature = "dashboard")]
-        CommandEffect::Dashboard => runtime.dashboard_requested = true,
+        #[cfg(feature = "usage")]
+        CommandEffect::Usage => runtime.usage_requested = true,
         #[cfg(feature = "telemetry")]
         CommandEffect::Tracing(command) => {
             chat.push(sys(apply_tracing_command(

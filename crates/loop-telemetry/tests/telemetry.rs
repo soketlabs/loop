@@ -233,8 +233,11 @@ fn recorders_write_langfuse_attributes() {
 fn record_sensitive_run() {
     let run = obs::agent("loop.run");
     run.record_trace(&TraceAttrs {
+        name: Some("secret ticket".into()),
         session_id: Some("sess-1".into()),
         user_id: Some("alice@example.com".into()),
+        tags: vec!["secret-tag".into()],
+        metadata: BTreeMap::from([("ticket".into(), "secret-123".into())]),
         ..Default::default()
     });
     run.record_input("secret prompt");
@@ -266,12 +269,20 @@ fn assert_no_secrets(spans: &[SpanData]) {
     }
 }
 
+/// Spans written to the usage log by `f`'s handle.
+fn usage_log_spans(f: &Fixture, local: &InMemorySpanExporter) -> Vec<SpanData> {
+    f.handle.flush_local();
+    local.get_finished_spans().unwrap()
+}
+
 #[test]
-fn anonymous_mode_strips_content_but_keeps_shape_and_usage() {
-    let f = Fixture::installed(true);
-    assert!(f.handle.set_anonymous(true).anonymous);
+fn usage_log_strips_content_but_keeps_shape_and_usage() {
+    let f = Fixture::uninstalled(true);
+    let local = InMemorySpanExporter::default();
+    f.handle
+        .install_local_exporter(local.clone(), "memory-log".into());
     f.run(record_sensitive_run);
-    let spans = f.spans();
+    let spans = usage_log_spans(&f, &local);
     assert_eq!(spans.len(), 3);
     assert_no_secrets(&spans);
 
@@ -283,7 +294,9 @@ fn anonymous_mode_strips_content_but_keeps_shape_and_usage() {
     );
     assert_eq!(tool.parent_span_id, run.span_context.span_id());
     assert_eq!(attr(run, keys::SESSION_ID).as_deref(), Some("sess-1"));
+    assert_eq!(attr(run, keys::TRACE_NAME), None);
     assert_eq!(attr(generation, keys::MODEL_NAME).as_deref(), Some("gpt-x"));
+    assert_eq!(attr(generation, keys::MODEL_PARAMETERS), None);
     assert!(attr(generation, keys::USAGE_DETAILS).is_some());
     assert_eq!(
         attr(generation, &format!("{}stop_reason", keys::METADATA_PREFIX)).as_deref(),
@@ -295,31 +308,8 @@ fn anonymous_mode_strips_content_but_keeps_shape_and_usage() {
         opentelemetry::trace::Status::Error { .. }
     ));
     assert_eq!(attr(tool, keys::GEN_AI_TOOL_NAME).as_deref(), Some("read"));
+    assert_eq!(attr(tool, keys::GEN_AI_TOOL_CALL_ID), None);
     assert!(tool.events.is_empty());
-}
-
-#[test]
-fn anonymous_mode_is_off_by_default_and_toggles() {
-    let f = Fixture::installed(true);
-    assert!(!f.handle.status().anonymous);
-    f.run(|| obs::span("full").record_input("secret prompt"));
-    f.handle.set_anonymous(true);
-    f.run(|| obs::span("anonymous").record_input("secret prompt"));
-    assert!(!f.handle.set_anonymous(false).anonymous);
-    f.run(|| obs::span("full again").record_input("secret prompt"));
-    let inputs: Vec<_> = f
-        .spans()
-        .iter()
-        .map(|s| (s.name.to_string(), attr(s, keys::INPUT)))
-        .collect();
-    assert_eq!(
-        inputs,
-        vec![
-            ("full".into(), Some("secret prompt".into())),
-            ("anonymous".into(), None),
-            ("full again".into(), Some("secret prompt".into())),
-        ]
-    );
 }
 
 #[test]
@@ -454,49 +444,38 @@ fn otlp_exporter_posts_to_collector_with_optional_auth() {
     assert!(request.header("x-langfuse-ingestion-version").is_none());
 }
 
-/// Local file: one JSON object per span, nested by parent id, anonymous mode applied.
+/// The usage log on disk: one versioned JSON object per span, nested by parent id.
 #[test]
-fn file_destination_writes_jsonl_spans() {
+fn usage_log_file_writes_versioned_jsonl_spans() {
     let dir = tempfile::tempdir().unwrap();
-    let destination = TelemetryDestination::file(dir.path(), CredentialSource::Config);
     let handle = TelemetryHandle::new("test-release", true);
-    handle.install(&destination).unwrap();
-    assert!(
-        std::fs::read_dir(dir.path()).unwrap().next().is_none(),
-        "file is created on first export"
-    );
+    let path = handle.install_local(&dir.path().join("usage"));
+    assert_eq!(handle.usage_log().map(|log| log.path), Some(path.clone()));
+    assert!(!path.exists(), "file is created on first write");
     let dispatch = Dispatch::new(tracing_subscriber::registry().with(handle.layer()));
-    tracing::dispatcher::with_default(&dispatch, || {
-        let run = obs::agent("loop.run");
-        run.record_input("visible prompt");
-        let _run = run.enter();
-        let generation = obs::generation("llm.generate");
-        generation.record_usage(&loop_ai::Usage {
-            input: 10,
-            total_tokens: 10,
-            ..Default::default()
-        });
-    });
-    handle.set_anonymous(true);
     tracing::dispatcher::with_default(&dispatch, record_sensitive_run);
-    handle.flush();
-    assert_eq!(handle.status().last_error, None);
+    handle.flush_local();
+    assert_eq!(handle.usage_log().and_then(|log| log.last_error), None);
 
-    let text = std::fs::read_to_string(&destination.endpoint).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("secret") && !text.contains("alice"),
+        "{text}"
+    );
     let lines: Vec<serde_json::Value> = text
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(lines.len(), 5);
+    assert_eq!(lines.len(), 3);
+    assert!(lines
+        .iter()
+        .all(|l| l["v"] == loop_telemetry::USAGE_LOG_VERSION));
     let span = |name: &str| lines.iter().find(|l| l["name"] == name).unwrap();
     let (run, generation) = (span("loop.run"), span("llm.generate"));
     assert_eq!(generation["parent_span_id"], run["span_id"]);
     assert_eq!(generation["trace_id"], run["trace_id"]);
     assert!(run["parent_span_id"].is_null());
-    assert_eq!(run["attributes"][keys::INPUT], "visible prompt");
     assert_eq!(generation["attributes"][keys::USAGE_DETAILS]["input"], 10);
-    assert!(generation["duration_ms"].as_f64().unwrap() >= 0.0);
-    assert!(!lines[2..].iter().any(|l| l.to_string().contains("secret")));
 }
 
 /// The usage log works without a destination and is always anonymous, while the
@@ -507,13 +486,16 @@ fn local_usage_log_is_independent_and_always_anonymous() {
     let local = InMemorySpanExporter::default();
     f.handle
         .install_local_exporter(local.clone(), "memory-log".into());
-    let status = f.handle.status();
-    assert!(!status.active(), "no destination configured");
-    assert_eq!(status.local_log.as_deref(), Some("memory-log"));
+    assert!(!f.handle.status().active(), "no destination configured");
+    assert_eq!(
+        f.handle.usage_log().map(|log| log.path),
+        Some("memory-log".into())
+    );
 
     f.run(record_sensitive_run);
     f.install();
     f.run(|| obs::span("both").record_input("secret prompt"));
+    // `/tracing disable` stops the export, never the usage log.
     f.handle.set_enabled(false);
     f.run(|| obs::span("local only").record_input("secret prompt"));
     f.handle.flush();
@@ -533,13 +515,40 @@ fn local_usage_log_is_independent_and_always_anonymous() {
         attr(&remote[0], keys::INPUT).as_deref(),
         Some("secret prompt")
     );
+}
 
-    let status = f.handle.remove_local();
-    assert_eq!(status.local_log, None);
+#[test]
+fn flushing_the_usage_log_leaves_the_destination_alone() {
+    let f = Fixture::installed(true);
+    let local = InMemorySpanExporter::default();
+    f.handle
+        .install_local_exporter(local.clone(), "memory-log".into());
     f.run(|| {
-        let span = obs::span("after removal");
-        assert!(!span.is_recording(), "nothing left to export to");
+        let _ = obs::span("one").entered();
     });
+    f.handle.flush_local();
+    assert_eq!(local.get_finished_spans().unwrap().len(), 1);
+    assert!(
+        f.exporter.get_finished_spans().unwrap().is_empty(),
+        "the destination's queue was not flushed"
+    );
+}
+
+#[test]
+fn failed_usage_log_write_is_reported() {
+    let f = Fixture::uninstalled(true);
+    f.handle
+        .install_local_exporter(FailingExporter, "broken-log".into());
+    f.run(|| {
+        let _ = obs::span("one").entered();
+    });
+    f.handle.flush_local();
+    let log = f.handle.usage_log().unwrap();
+    assert!(log.last_error.is_some());
+    assert!(
+        f.handle.status().last_error.is_none(),
+        "destination unaffected"
+    );
 }
 
 #[test]

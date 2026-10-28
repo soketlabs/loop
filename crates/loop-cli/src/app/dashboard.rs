@@ -1,9 +1,10 @@
-//! `/dashboard` inside the chat. While open, the dashboard owns the screen and the keys;
+//! `/usage` inside the chat. While open, the usage view owns the screen and the keys;
 //! the chat loop keeps draining agent events and hands it a fresh live status, so turns
 //! and sub-agents carry on and the **Now** view stays current. Nothing runs while closed.
 
 use std::collections::HashMap;
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event;
@@ -15,13 +16,15 @@ use super::{CardStatus, ChatItem, CliRuntime, Theme, TokenBarState};
 
 /// How often the Now view is rebuilt from the chat's in-memory state.
 const LIVE_EVERY: Duration = Duration::from_millis(500);
-/// How often sandbox and MCP state are queried again and this session's spans flushed.
+/// How often sandbox and MCP state are queried again and this session's spans written to
+/// the usage log.
 const SLOW_EVERY: Duration = Duration::from_secs(5);
 
-/// Usage dashboard settings in the colors of the chat theme.
-pub fn options(theme: &Theme, usage_log_on: bool) -> Options {
+/// Usage view settings for the log in `dir`, in the colors of the chat theme. `notice`
+/// is shown above the views.
+pub fn options(theme: &Theme, dir: PathBuf, notice: Option<String>) -> Options {
     Options {
-        dir: loop_telemetry::default_trace_dir(),
+        dir,
         palette: Palette {
             text: theme.get("text"),
             muted: theme.get("muted"),
@@ -33,9 +36,7 @@ pub fn options(theme: &Theme, usage_log_on: bool) -> Options {
             good: theme.get("success"),
             selected_bg: theme.get("selectedBg"),
         },
-        notice: (!usage_log_on).then(|| {
-            "Usage log is off, so new activity is not recorded · /tracing local on".into()
-        }),
+        notice,
         live: None,
     }
 }
@@ -60,13 +61,18 @@ pub(super) struct Screen {
 impl Screen {
     pub async fn open(runtime: &CliRuntime, chat: ChatState<'_>) -> io::Result<Self> {
         let slow = Slow::query(runtime).await;
-        let usage_log_on = runtime
-            .tracing_status()
-            .is_some_and(|status| status.local_log.is_some());
-        let mut options = options(&runtime.theme, usage_log_on);
+        let usage_log = runtime.usage_log();
+        let dir = usage_log
+            .as_ref()
+            .and_then(|log| log.path.parent().map(PathBuf::from))
+            .unwrap_or_else(|| loop_app_core::config::paths::usage_dir(&runtime.agent_dir));
+        let notice = usage_log
+            .and_then(|log| log.last_error)
+            .map(|err| format!("The usage log could not be written: {err}"));
+        let mut options = options(&runtime.theme, dir, notice);
         options.live = Some(live_status(runtime, &chat, &slow));
-        // Include this session's latest spans.
-        tokio::task::block_in_place(|| runtime.flush_tracing());
+        // Include this session's latest spans; they show up on the next reload.
+        runtime.flush_usage_log();
         Ok(Self {
             board: Dashboard::open(options)?,
             size: crossterm::terminal::size().ok(),
@@ -92,7 +98,7 @@ impl Screen {
     pub async fn refresh(&mut self, runtime: &CliRuntime, chat: ChatState<'_>) -> io::Result<()> {
         if self.slow_at.elapsed() >= SLOW_EVERY {
             self.slow = Slow::query(runtime).await;
-            tokio::task::block_in_place(|| runtime.flush_tracing());
+            runtime.flush_usage_log();
             self.slow_at = Instant::now();
         }
         if self.live_at.elapsed() >= LIVE_EVERY {
@@ -236,6 +242,8 @@ fn live_status(runtime: &CliRuntime, chat: &ChatState<'_>, slow: &Slow) -> LiveS
         mcp_servers: slow.mcp_servers.clone(),
         extensions: runtime.resources.extension_paths.len(),
         hooks: runtime.resources.hook_paths.len(),
-        usage_log: runtime.tracing_status().and_then(|status| status.local_log),
+        usage_log: runtime
+            .usage_log()
+            .map(|log| log.path.display().to_string()),
     }
 }

@@ -1,11 +1,11 @@
 # loop-dashboard
 
-The terminal usage dashboard for Loop. It has two sources:
+The terminal usage view for Loop (`/usage`, `loop usage`). It has two sources:
 
 - The **live status** of the running loop: its session, context window, agents, skills and
-  MCP servers. Only `/dashboard` inside the chat has this.
-- The **history** in the anonymous usage log that Loop writes to
-  `<OS temp folder>/loop-traces`, one JSON-lines file per process.
+  MCP servers. Only `/usage` inside the chat has this.
+- The **history** in the anonymous usage log that Loop always writes to
+  `~/.loop/agent/usage`, one JSON-lines file per process.
 
 | View | Shows |
 |------|-------|
@@ -16,10 +16,10 @@ The terminal usage dashboard for Loop. It has two sources:
 | **Agents** | main agent and sub-agent runs, sub-agents spawned, agent runs per day, skills used, and calls to each MCP server |
 | **Sessions** | recent sessions: last active, runs, sub-agents, calls, tokens and models |
 
-Open it with `/dashboard` inside the chat, or with `loop dashboard` on its own, which has
-history only. It uses the terminal's alternate screen, so the transcript is untouched when
-you close it. While it is open the chat is paused, so **Now** is a snapshot from when you
-opened it. History reloads every 5 seconds.
+Open it with `/usage` inside the chat, or with `loop usage` on its own, which has history
+only. It uses the terminal's alternate screen, so the transcript is untouched when you
+close it. While it is open, turns and Subagents keep running and **Now** stays current.
+History reloads every 5 seconds.
 
 | Key | Action |
 |------|--------|

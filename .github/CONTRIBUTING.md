@@ -71,7 +71,7 @@ Loop is a Cargo workspace. Put changes in the narrowest crate that fits.
 | `loop-cli` | The `loop` binary and its ratatui TUI |
 | `loop-desktop` | GPUI desktop app (experimental, nightly toolchain) |
 | `loop-telemetry` | Optional OpenTelemetry tracing and the anonymous local usage log (`telemetry` feature) |
-| `loop-dashboard` | Terminal usage dashboard over the usage log (`dashboard` feature of `loop-cli`) |
+| `loop-dashboard` | Terminal usage view over the usage log (`/usage`; `usage` feature of `loop-cli`) |
 | `loop-test-support` | Shared test fixtures and helpers |
 
 Dependencies flow one way:
