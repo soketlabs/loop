@@ -40,6 +40,7 @@ pub struct NativeBackend {
     /// Set while a prompt sent through this backend runs, so two callers
     /// cannot both start one.
     prompting: Arc<AtomicBool>,
+    max_requests_reached: Arc<AtomicBool>,
 }
 
 /// Clears [`NativeBackend::prompting`] when the prompt is over.
@@ -71,15 +72,24 @@ impl NativeBackend {
             seq: 0,
             mapper: NativeEventMapper::new(),
         }));
+        let max_requests_reached = Arc::new(AtomicBool::new(false));
         let backend = Arc::new(Self {
             instance: BackendInstanceId::from(NATIVE_INSTANCE),
             harness: Arc::clone(&harness),
             updates: updates.clone(),
             stream: Arc::clone(&stream),
             prompting: Arc::new(AtomicBool::new(false)),
+            max_requests_reached: Arc::clone(&max_requests_reached),
         });
         let instance = backend.instance.clone();
         harness.subscribe(move |event: AgentEvent| {
+            if let AgentEvent::AgentEnd {
+                max_requests_reached: reached,
+                ..
+            } = &event
+            {
+                max_requests_reached.store(*reached, Ordering::Release);
+            }
             let envelopes = translate(&instance, &stream, &event);
             for envelope in envelopes {
                 // No receivers is fine: nobody is listening yet.
@@ -368,15 +378,18 @@ impl AgentBackend for NativeBackend {
         let instance = self.instance.clone();
         let stream = Arc::clone(&self.stream);
         let updates = self.updates.clone();
+        let max_requests_reached = Arc::clone(&self.max_requests_reached);
         let turns_before = self.stream.lock().mapper.turns_started();
         tokio::spawn(async move {
             let result = harness.prompt(input).await;
+            let reached = max_requests_reached.swap(false, Ordering::AcqRel);
             drop(slot);
             let rejected_busy = matches!(result, Err(AgentHarnessError::Busy));
             // A run that returned a message already ended its turn on the
             // stream, even when the message is an error.
             let ran = result.is_ok();
             let outcome = match result {
+                Ok(_) if reached => TurnOutcome::Completed(StopReason::MaxTurnRequests),
                 Ok(message) => match message.as_assistant().map(turn_outcome) {
                     Some((StopReason::Cancelled, _)) => TurnOutcome::Cancelled,
                     Some((StopReason::Error, error)) => {

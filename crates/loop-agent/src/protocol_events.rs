@@ -79,7 +79,10 @@ impl NativeEventMapper {
     pub fn map(&mut self, event: &AgentEvent) -> Vec<SessionUpdate> {
         match event {
             AgentEvent::AgentStart => self.start_turn(),
-            AgentEvent::AgentEnd { messages } => self.end_turn(messages),
+            AgentEvent::AgentEnd {
+                messages,
+                max_requests_reached,
+            } => self.end_turn(messages, *max_requests_reached),
             AgentEvent::Progress { message } => vec![SessionUpdate::Notice {
                 level: NoticeLevel::Info,
                 text: message.clone(),
@@ -137,7 +140,11 @@ impl NativeEventMapper {
         turn_id
     }
 
-    fn end_turn(&mut self, messages: &[AgentMessage]) -> Vec<SessionUpdate> {
+    fn end_turn(
+        &mut self,
+        messages: &[AgentMessage],
+        max_requests_reached: bool,
+    ) -> Vec<SessionUpdate> {
         let mut updates = self.close_open_message();
         let Some(turn_id) = self.turn.take() else {
             return updates;
@@ -147,9 +154,14 @@ impl NativeEventMapper {
             .rev()
             .find_map(AgentMessage::as_assistant)
             .or(self.last_assistant.as_ref());
-        let (stop, error) = match last {
-            Some(message) => turn_outcome(message),
-            None => (StopReason::EndTurn, None),
+
+        let (stop, error) = if max_requests_reached {
+            (StopReason::MaxTurnRequests, None)
+        } else {
+            match last {
+                Some(message) => turn_outcome(message),
+                None => (StopReason::EndTurn, None),
+            }
         };
         self.last_assistant = None;
         updates.push(SessionUpdate::TurnEnded {

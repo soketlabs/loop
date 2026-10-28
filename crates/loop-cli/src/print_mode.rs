@@ -228,6 +228,9 @@ pub async fn print_turn(
                 if stop == StopReason::Cancelled {
                     anyhow::bail!("the turn was cancelled");
                 }
+                if stop == StopReason::MaxTurnRequests {
+                    anyhow::bail!("model request limit reached");
+                }
                 return Ok(last_text);
             }
             _ => {}
@@ -235,6 +238,9 @@ pub async fn print_turn(
     }
     // The stream closed without a turn end; the turn's outcome decides.
     match turn.outcome().await {
+        TurnOutcome::Completed(StopReason::MaxTurnRequests) => {
+            anyhow::bail!("model request limit reached")
+        }
         TurnOutcome::Completed(_) => Ok(last_text),
         TurnOutcome::Cancelled => anyhow::bail!("the turn was cancelled"),
         TurnOutcome::Failed(error) => anyhow::bail!("{}", error.message),
