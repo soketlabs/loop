@@ -167,8 +167,6 @@ pub struct ApprovalPrompt {
 /// Shared bridge between agent hooks and the TUI.
 #[derive(Clone)]
 pub struct ToolApprovalBridge {
-    /// Per-tool permission overrides from settings.
-    permissions: Arc<SyncMutex<BTreeMap<String, ToolPermission>>>,
     /// Session auto-approve groups (`file`, `bash`, …).
     auto_approve: Arc<SyncMutex<HashSet<String>>>,
     prompts: PromptSink,
@@ -201,7 +199,6 @@ impl ToolApprovalBridge {
     pub fn new(
         env: Arc<dyn ExecutionEnv>,
         diff_editor: Option<String>,
-        permissions: BTreeMap<String, ToolPermission>,
         session_auto_approve: HashSet<String>,
     ) -> (Self, mpsc::UnboundedReceiver<ApprovalPrompt>) {
         let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
@@ -209,7 +206,6 @@ impl ToolApprovalBridge {
             Self::with_sink(
                 env,
                 diff_editor,
-                permissions,
                 session_auto_approve,
                 PromptSink::Prompts(prompt_tx),
             ),
@@ -223,14 +219,12 @@ impl ToolApprovalBridge {
     pub fn with_host(
         env: Arc<dyn ExecutionEnv>,
         diff_editor: Option<String>,
-        permissions: BTreeMap<String, ToolPermission>,
         session_auto_approve: HashSet<String>,
         host: Arc<dyn HostServices>,
     ) -> Self {
         Self::with_sink(
             env,
             diff_editor,
-            permissions,
             session_auto_approve,
             PromptSink::Host(host),
         )
@@ -239,12 +233,10 @@ impl ToolApprovalBridge {
     fn with_sink(
         env: Arc<dyn ExecutionEnv>,
         diff_editor: Option<String>,
-        permissions: BTreeMap<String, ToolPermission>,
         session_auto_approve: HashSet<String>,
         prompts: PromptSink,
     ) -> Self {
         Self {
-            permissions: Arc::new(SyncMutex::new(permissions)),
             auto_approve: Arc::new(SyncMutex::new(session_auto_approve)),
             prompts,
             env,
@@ -264,11 +256,6 @@ impl ToolApprovalBridge {
     /// Install a persistence callback for Accept-all labels.
     pub fn set_persist(&self, persist: PersistAutoApprove) {
         *self.persist.lock() = Some(persist);
-    }
-
-    /// Replace per-tool permissions from settings.
-    pub fn set_permissions(&self, permissions: BTreeMap<String, ToolPermission>) {
-        *self.permissions.lock() = permissions;
     }
 
     /// Snapshot of session auto-approve groups.
@@ -291,15 +278,6 @@ impl ToolApprovalBridge {
         *self.diff_editor.lock().await = editor;
     }
 
-    /// Resolve permission for a tool (defaults to allow for unknown tools).
-    pub fn permission_for(&self, tool: &str) -> ToolPermission {
-        self.permissions
-            .lock()
-            .get(tool)
-            .copied()
-            .unwrap_or(ToolPermission::Allow)
-    }
-
     /// Whether to prompt for a call the gate routed here as "ask": not when
     /// the session already accepted its group.
     pub fn should_ask(&self, tool: &str) -> bool {
@@ -312,22 +290,14 @@ impl ToolApprovalBridge {
         if !interactive_tools().contains(&tool) {
             return false;
         }
-        // The tool gate decides allow / ask / deny (modes, pattern rules)
-        // and only hands "ask" calls here; a deny never reaches the prompt.
-        if self.permission_for(tool) == ToolPermission::Deny {
-            return false;
-        }
+        // The tool gate decides allow / ask / deny (modes, rules, Policy)
+        // and only hands "ask" calls here.
         ignore_grants
             || approval_group(tool).is_none_or(|group| !self.auto_approve.lock().contains(group))
     }
 
-    /// Whether the tool is hard-denied by config.
-    pub fn is_denied(&self, tool: &str) -> bool {
-        self.permission_for(tool) == ToolPermission::Deny
-    }
-
     /// The prompt step of [`crate::tool_gate::ToolGate`] before a call
-    /// (bash, web, deny).
+    /// (bash, web).
     pub(crate) async fn review_before_tool(
         &self,
         ctx: BeforeToolCallContext,
@@ -335,14 +305,6 @@ impl ToolApprovalBridge {
         ignore_grants: bool,
     ) -> Option<BeforeToolCallResult> {
         let name = ctx.tool_call.name.as_str();
-        if self.is_denied(name) {
-            return Some(BeforeToolCallResult {
-                block: true,
-                reason: Some(format!(
-                    "Tool `{name}` is denied by settings.toolPermissions"
-                )),
-            });
-        }
         if !self.asks(name, ignore_grants) {
             return None;
         }
@@ -458,12 +420,6 @@ impl ToolApprovalBridge {
         if name != "write" && name != "edit" {
             return None;
         }
-        if self.is_denied(name) {
-            // Should have been blocked before; if we got here, revert.
-            return self
-                .reject_file_result(&ctx, "Tool denied by settings.toolPermissions")
-                .await;
-        }
         if !self.asks(name, ignore_grants) {
             // Still clean up review snapshots when not asking.
             if let Some(prev) = ctx
@@ -567,35 +523,6 @@ impl ToolApprovalBridge {
                 Some(reject_file_patch(&msg, &path, None))
             }
         }
-    }
-
-    async fn reject_file_result(
-        &self,
-        ctx: &AfterToolCallContext,
-        message: &str,
-    ) -> Option<AfterToolCallResult> {
-        let path = ctx
-            .result
-            .details
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from)?;
-        let previous_path = ctx
-            .result
-            .details
-            .get("previousPath")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from);
-        let created = ctx
-            .result
-            .details
-            .get("created")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let _ = self
-            .revert_change(&path, previous_path.as_deref(), created)
-            .await;
-        Some(reject_file_patch(message, &path, previous_path.as_deref()))
     }
 
     async fn ask_user(

@@ -11,9 +11,7 @@ use loop_agent::harness::{
 };
 use loop_agent::types::{AgentEvent, AgentMessage, AgentThinkingLevel, AgentToolResult};
 use loop_ai::AssistantMessageEvent;
-use loop_app_core::tool_approval::{
-    permissions_from_settings, ApprovalDecision, ToolApprovalBridge,
-};
+use loop_app_core::tool_approval::{ApprovalDecision, ToolApprovalBridge};
 use loop_app_core::{bootstrap, settings_path, BootstrapOpts, Runtime, Settings};
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -171,7 +169,6 @@ impl DesktopController {
         let (bridge, approval_rx) = ToolApprovalBridge::new(
             tool_env,
             runtime.settings.diff_editor.clone(),
-            permissions_from_settings(&runtime.settings.tool_permissions),
             Default::default(),
         );
         // Review file edits in the desktop diff panel; do not spawn Cursor/VS Code on each write.

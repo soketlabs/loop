@@ -45,8 +45,8 @@ use crate::provider_setup::{LoginChoice, ProviderSetup};
 use crate::setup_prompt::SetupPrompt;
 use crate::theme::Theme;
 use crate::tool_approval::{
-    auto_approve_from_entries, permissions_from_settings, ApprovalDecision, ApprovalKind,
-    ToolApprovalBridge, GROUP_BASH, GROUP_FILE, GROUP_WEB,
+    auto_approve_from_entries, ApprovalDecision, ApprovalKind, ToolApprovalBridge, GROUP_BASH,
+    GROUP_FILE, GROUP_WEB,
 };
 #[cfg(feature = "telemetry")]
 use crate::tracing_setup::TracingSetup;
@@ -388,7 +388,6 @@ async fn run_loop(
     let bridge = Arc::new(ToolApprovalBridge::with_host(
         tool_env,
         runtime.settings.diff_editor.clone(),
-        permissions_from_settings(&runtime.settings.tool_permissions),
         session_grants,
         Arc::new(host),
     ));
