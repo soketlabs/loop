@@ -2,6 +2,7 @@
 //!
 //! - [`transport`]: whole messages over a byte stream ([`transport::lines`])
 //!   or in one process ([`transport::memory`]).
+//! - [`socket`]: Unix sockets and WebSockets as transports.
 //! - [`connection`]: JSON-RPC 2.0 over a transport, with responses kept in
 //!   order with the notifications sent before them.
 //! - [`server`]: [`serve`] an `AgentBackend` to one client.
@@ -14,6 +15,7 @@
 pub mod client;
 pub mod connection;
 pub mod server;
+pub mod socket;
 pub mod transport;
 
 pub use client::RemoteBackend;

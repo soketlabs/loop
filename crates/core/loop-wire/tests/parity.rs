@@ -69,9 +69,54 @@ impl HostServices for FirstOption {
     }
 }
 
+/// Which transport a test runs over.
+#[derive(Debug, Clone, Copy)]
+enum Wire {
+    Memory,
+    #[cfg(unix)]
+    Unix,
+    WebSocket,
+}
+
 /// `backend` served over an in-memory transport, and the client for it.
 async fn over_the_wire(backend: Arc<NativeBackend>) -> (Arc<RemoteBackend>, loop_wire::Served) {
-    let (server_end, client_end) = memory();
+    over(backend, Wire::Memory).await
+}
+
+/// `backend` served over `wire`, and the client for it.
+async fn over(backend: Arc<NativeBackend>, wire: Wire) -> (Arc<RemoteBackend>, loop_wire::Served) {
+    let (server_end, client_end) = match wire {
+        Wire::Memory => memory(),
+        #[cfg(unix)]
+        Wire::Unix => {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("loop.sock");
+            let listener = loop_wire::socket::unix_listen(&path).unwrap();
+            let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            // Keep the directory until the connection is up; the open
+            // sockets outlive it.
+            drop(dir);
+            (
+                loop_wire::socket::unix(server),
+                loop_wire::socket::unix(client),
+            )
+        }
+        Wire::WebSocket => {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let accept = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                loop_wire::socket::websocket_accept(stream, "t0ken")
+                    .await
+                    .unwrap()
+            });
+            let client = loop_wire::socket::websocket_connect(&format!("ws://{addr}/"), "t0ken")
+                .await
+                .unwrap();
+            (accept.await.unwrap(), client)
+        }
+    };
     let served = serve(backend, server_end, info("server"));
     let remote = RemoteBackend::connect(client_end, info("client"), Arc::new(FirstOption))
         .await
@@ -152,7 +197,37 @@ async fn turn_to_end(
 }
 
 #[tokio::test]
-async fn a_turn_is_the_same_over_the_wire() {
+async fn a_turn_is_the_same_over_memory() {
+    a_turn_is_the_same_over(Wire::Memory).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_turn_is_the_same_over_a_unix_socket() {
+    a_turn_is_the_same_over(Wire::Unix).await;
+}
+
+#[tokio::test]
+async fn a_turn_is_the_same_over_a_websocket() {
+    a_turn_is_the_same_over(Wire::WebSocket).await;
+}
+
+#[tokio::test]
+async fn the_server_asks_the_client_over_a_websocket() {
+    let backend = native(vec![], vec![]).await;
+    let (_remote, served) = over(backend, Wire::WebSocket).await;
+    let request = InteractionRequest::Question {
+        id: "q1".into(),
+        prompt: "?".into(),
+        choices: None,
+    };
+    assert_eq!(
+        served.host.interact(request).await,
+        InteractionOutcome::Cancelled
+    );
+}
+
+async fn a_turn_is_the_same_over(wire: Wire) {
     let script = || {
         vec![
             FauxResponse::ToolCalls(vec![ToolCall {
@@ -171,7 +246,7 @@ async fn a_turn_is_the_same_over_the_wire() {
 
     let served = native(script(), vec![]).await;
     let session = served.current_session().await;
-    let (remote, _server) = over_the_wire(Arc::clone(&served)).await;
+    let (remote, _server) = over(Arc::clone(&served), wire).await;
     assert_eq!(remote.instance(), served.instance());
     assert_eq!(remote.capabilities(), served.capabilities());
     let (remote_updates, remote_outcome) = turn(remote.as_ref(), &session, "go").await;
@@ -182,7 +257,7 @@ async fn a_turn_is_the_same_over_the_wire() {
             remote_updates.last().map(|e| &e.update),
             Some(SessionUpdate::TurnEnded { .. })
         ),
-        "over the wire the outcome resolves only after turn_ended arrived: {:?}",
+        "over {wire:?} the outcome resolves only after turn_ended arrived: {:?}",
         shape(&remote_updates)
     );
     assert_eq!(shape(&remote_updates), shape(&direct_updates));
