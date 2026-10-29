@@ -11,6 +11,7 @@ members = [
     "crates/loop-cli",
     "crates/ops/loop-update",
     "crates/core/loop-protocol",
+    "crates/core/loop-wire",
     "crates/extend/loop-acp",
     "crates/loop-desktop"
 ]
@@ -26,6 +27,7 @@ default-members = [
     "crates/loop-cli",
     "crates/ops/loop-update",
     "crates/core/loop-protocol",
+    "crates/core/loop-wire",
     "crates/extend/loop-acp",
 ]
 
@@ -46,6 +48,7 @@ loop-telemetry = { path = "crates/loop-telemetry" }
 loop-test-support = { path = "crates/loop-test-support" }
 loop-update = { path = "crates/ops/loop-update" }
 loop-protocol = { path = "crates/core/loop-protocol" }
+loop-wire = { path = "crates/core/loop-wire" }
 loop-acp = { path = "crates/extend/loop-acp" }
 agent-client-protocol-schema = { version = "1.11", default-features = false }
 sha2 = "0.10"
