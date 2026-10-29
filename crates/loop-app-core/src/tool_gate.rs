@@ -248,29 +248,17 @@ impl ToolGate {
 
     /// Ask the user through `approver` (TUI, desktop); `None` runs headless.
     pub fn set_approver(&self, approver: Option<Arc<ToolApprovalBridge>>) {
-        if let Some(approver) = &approver {
-            approver.set_permissions(self.permissions.lock().clone());
-        }
         *self.approver.lock() = approver;
     }
 
     /// Replace the per-tool permissions (settings changed).
     pub fn set_permissions(&self, permissions: BTreeMap<String, ToolPermission>) {
-        if let Some(approver) = self.approver() {
-            approver.set_permissions(permissions.clone());
-        }
         *self.permissions.lock() = permissions;
         self.allowed.lock().clear();
     }
 
     fn approver(&self) -> Option<Arc<ToolApprovalBridge>> {
         self.approver.lock().clone()
-    }
-
-    /// Why `tool` may not run at all, by its plain `toolPermissions` rule.
-    pub fn denied(&self, tool: &str) -> Option<String> {
-        (self.permissions.lock().get(tool) == Some(&ToolPermission::Deny))
-            .then(|| format!("Tool `{tool}` is denied by settings.toolPermissions"))
     }
 
     fn mark_allowed(&self, call: &ToolCall, args: &serde_json::Value) {
@@ -530,11 +518,11 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         );
-        let gate = ToolGate::new(permissions.clone());
+        let gate = ToolGate::new(permissions);
         let env: Arc<dyn loop_agent::harness::ExecutionEnv> = Arc::new(
             loop_agent::harness::HostExecutionEnv::new(std::env::temp_dir()),
         );
-        let (bridge, prompts) = ToolApprovalBridge::new(env, None, permissions, Default::default());
+        let (bridge, prompts) = ToolApprovalBridge::new(env, None, Default::default());
         gate.set_approver(Some(Arc::new(bridge)));
         (gate, prompts)
     }
