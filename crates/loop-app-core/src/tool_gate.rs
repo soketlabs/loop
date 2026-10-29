@@ -90,6 +90,46 @@ impl ToolGate {
         *self.harness.lock() = Arc::downgrade(harness);
         harness.set_before_tool_call(Some(self.before_hook()));
         harness.set_after_tool_call(Some(self.after_hook()));
+        let gate = Arc::clone(self);
+        harness.set_tool_filter(Some(Arc::new(move |tool| gate.available(tool))));
+    }
+
+    /// Whether `tool` is offered to the model: a tool whose Capability is
+    /// off is taken out of the toolset, not just refused.
+    pub fn available(&self, tool: &str) -> bool {
+        let call = Call {
+            kind: self.kind_now(tool),
+            ..Call::new(tool, serde_json::Value::Null, self.workspace())
+        };
+        crate::permissions::available(self.mode(), &call)
+    }
+
+    /// [`Self::kind`] without waiting. While the MCP server list is being
+    /// changed, an MCP tool counts as a read, so it stays listed; the gate
+    /// still checks each call.
+    fn kind_now(&self, tool: &str) -> ToolKind {
+        let kind = loop_agent::protocol_events::tool_kind(tool);
+        let mcp = self.mcp.lock().clone();
+        let (Some(mcp), Some((server, name))) = (
+            mcp,
+            loop_agent::harness::mcp::bridge::parse_mcp_tool_name(tool),
+        ) else {
+            return kind;
+        };
+        let read_only = match mcp.connections().try_read() {
+            Ok(connections) => connections.get(server).is_some_and(|conn| {
+                conn.tools.iter().any(|t| {
+                    t.name == name
+                        && t.annotations.as_ref().and_then(|a| a.read_only_hint) == Some(true)
+                })
+            }),
+            Err(_) => true,
+        };
+        if read_only {
+            ToolKind::Read
+        } else {
+            kind
+        }
     }
 
     /// The active permission mode.
@@ -643,6 +683,26 @@ mod tests {
             !gate.take_allowed(&inside.tool_call, &inside.args),
             "changing mode forgets earlier allows"
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_takes_off_tools_out_of_the_toolset() {
+        let gate = ToolGate::new(BTreeMap::new());
+        gate.set_mode(PermissionMode::ReadOnly);
+        for (tool, offered) in [
+            ("read", true),
+            ("bash", true),
+            ("web_fetch", true),
+            ("write", false),
+            ("edit", false),
+            ("mcp__github__create_issue", false),
+        ] {
+            assert_eq!(gate.available(tool), offered, "{tool}");
+        }
+        let refused = gate.before_hook()(call("write"), None).await.unwrap();
+        assert!(refused.block, "a call to a removed tool is still refused");
+        gate.set_mode(PermissionMode::Ask);
+        assert!(gate.available("write") && gate.available("mcp__github__create_issue"));
     }
 
     #[tokio::test]
