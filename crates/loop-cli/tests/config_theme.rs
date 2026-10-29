@@ -31,6 +31,104 @@ fn parse_command_splits_args() {
 }
 
 #[test]
+fn parse_command_preserves_slash_in_skill_and_template_names() {
+    let skill_cmd = commands::parse_command("/skill:ops/review").unwrap();
+    assert_eq!(skill_cmd.name, "skill:ops/review");
+    assert_eq!(skill_cmd.args, "");
+
+    let tmpl_cmd = commands::parse_command("/ops/template arg1 arg2").unwrap();
+    assert_eq!(tmpl_cmd.name, "ops/template");
+    assert_eq!(tmpl_cmd.args, "arg1 arg2");
+}
+
+#[test]
+fn dispatch_slash_in_skill_and_template_names() {
+    let skill_names = vec!["ops/review".to_string()];
+    let template_names = vec!["ops/template".to_string()];
+
+    // Explicit skill: prefix with slash
+    let cmd = commands::parse_command("/skill:ops/review").unwrap();
+    assert!(commands::is_command(&cmd, &skill_names, &template_names));
+    match commands::dispatch(&cmd, &skill_names, &template_names) {
+        commands::CommandEffect::Skill { name, args } => {
+            assert_eq!(name, "ops/review");
+            assert_eq!(args, "");
+        }
+        other => panic!("expected Skill effect, got {other:?}"),
+    }
+
+    // Bare skill name containing slash
+    let cmd = commands::parse_command("/ops/review arg").unwrap();
+    assert!(commands::is_command(&cmd, &skill_names, &template_names));
+    match commands::dispatch(&cmd, &skill_names, &template_names) {
+        commands::CommandEffect::Skill { name, args } => {
+            assert_eq!(name, "ops/review");
+            assert_eq!(args, "arg");
+        }
+        other => panic!("expected Skill effect, got {other:?}"),
+    }
+
+    // Template name containing slash
+    let cmd = commands::parse_command("/ops/template arg").unwrap();
+    assert!(commands::is_command(&cmd, &skill_names, &template_names));
+    match commands::dispatch(&cmd, &skill_names, &template_names) {
+        commands::CommandEffect::Template { name, args } => {
+            assert_eq!(name, "ops/template");
+            assert_eq!(args, "arg");
+        }
+        other => panic!("expected Template effect, got {other:?}"),
+    }
+}
+
+#[test]
+fn is_command_differentiates_paths_from_commands() {
+    let skill_names = vec!["ops/review".to_string()];
+    let template_names = vec!["ops/template".to_string()];
+
+    // Paths starting with slash are parsed by parse_command, but not recognized as commands
+    let path_cmd = commands::parse_command("/home/user/app.rs explain").unwrap();
+    assert!(!commands::is_command(
+        &path_cmd,
+        &skill_names,
+        &template_names
+    ));
+
+    // Relative path does not start with slash
+    assert!(commands::parse_command("./src/main.rs").is_none());
+
+    // Standard builtin commands and unknown single-token commands are treated as commands
+    let model_cmd = commands::parse_command("/model soket/qwen3-30b").unwrap();
+    assert!(commands::is_command(
+        &model_cmd,
+        &skill_names,
+        &template_names
+    ));
+
+    let unknown_cmd = commands::parse_command("/unknown_cmd").unwrap();
+    assert!(commands::is_command(
+        &unknown_cmd,
+        &skill_names,
+        &template_names
+    ));
+
+    // Autocomplete on file paths returns empty
+    assert!(commands::autocomplete("/home/user", &[]).is_empty());
+}
+
+#[test]
+fn autocomplete_slash_in_dynamic_commands() {
+    let extra = vec![
+        ("skill:ops/review".to_string(), "review code".to_string()),
+        ("ops/template".to_string(), "template".to_string()),
+    ];
+    let hits = commands::autocomplete("/skill:ops/", &extra);
+    assert!(hits.contains(&"/skill:ops/review".to_string()));
+
+    let hits = commands::autocomplete("/ops/", &extra);
+    assert!(hits.contains(&"/ops/template".to_string()));
+}
+
+#[test]
 fn theme_builtins_load() {
     let dark = Theme::dark();
     assert_eq!(dark.name, "dark");

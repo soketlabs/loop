@@ -2839,7 +2839,7 @@ async fn handle_key(
                         command,
                     )
                     .await;
-                } else if line.starts_with('/') {
+                } else if let Some(cmd) = commands::parse_command(&line) {
                     let skill_names: Vec<_> = runtime
                         .resources
                         .skills
@@ -2852,7 +2852,7 @@ async fn handle_key(
                         .iter()
                         .map(|p| p.name.clone())
                         .collect();
-                    if let Some(cmd) = commands::parse_command(&line) {
+                    if commands::is_command(&cmd, &skill_names, &template_names) {
                         let effect = commands::dispatch(&cmd, &skill_names, &template_names);
                         *should_quit = apply_effect(
                             effect,
@@ -2878,6 +2878,19 @@ async fn handle_key(
                             refresh_token_bar,
                         )
                         .await?;
+                    } else {
+                        submit_user_text(
+                            runtime,
+                            chat,
+                            status,
+                            turn_step,
+                            streaming_assistant,
+                            streaming_thinking,
+                            working,
+                            message_queue,
+                            line,
+                            tx,
+                        );
                     }
                 } else {
                     submit_user_text(
