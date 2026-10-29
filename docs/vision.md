@@ -113,7 +113,7 @@ An unanswered Escalation blocks only its own branch, not the whole Swarm.
 
 Today's permission modes (read-only, ask, accept-edits, full-access) become named presets.
 
-**Policy layers that only tighten** ([ADR-0004](adr/0004-policy-only-tightens.md)). The layers are **Managed Policy → Org → Group → User → Agent Definition → Session**. A lower layer can only tighten what's above it, and an admin can **Lock** any Capability.
+**Policy layers that only tighten** ([ADR-0004](adr/0004-policy-only-tightens.md)). The layers are **Managed Policy → Org → Group → User → Project → Agent Definition → Session**. A lower layer can only tighten what's above it, and an admin can **Lock** any Capability.
 
 **Off means unavailable.** A Capability that is off is removed from the agent's toolset and from its Workspace (no network route, read-only mount, no shell). It isn't just refused at a prompt.
 
