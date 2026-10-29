@@ -21,6 +21,8 @@ use crate::transport::Transport;
 
 /// JSON-RPC error codes.
 pub mod codes {
+    /// The message is not a valid request, or arrived too early.
+    pub const INVALID_REQUEST: i64 = -32600;
     /// The method does not exist or is not offered.
     pub const METHOD_NOT_FOUND: i64 = -32601;
     /// The parameters could not be parsed.
@@ -201,6 +203,23 @@ impl Connection {
         self.outgoing
             .send(json!({"jsonrpc": "2.0", "method": method, "params": params}))
             .map_err(|_| RpcError::Closed)
+    }
+
+    /// Answer a request from the peer with an error that carries `data`.
+    pub fn respond_error(
+        &self,
+        id: PeerRequestId,
+        code: i64,
+        message: String,
+        data: Option<Value>,
+    ) {
+        let mut error = json!({"code": code, "message": message});
+        if let Some(data) = data {
+            error["data"] = data;
+        }
+        let _ = self
+            .outgoing
+            .send(json!({"jsonrpc": "2.0", "id": id, "error": error}));
     }
 
     /// Answer a request from the peer.

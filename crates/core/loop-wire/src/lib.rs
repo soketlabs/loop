@@ -4,13 +4,19 @@
 //!   or in one process ([`transport::memory`]).
 //! - [`connection`]: JSON-RPC 2.0 over a transport, with responses kept in
 //!   order with the notifications sent before them.
+//! - [`server`]: [`serve`] an `AgentBackend` to one client.
+//! - [`client`]: [`RemoteBackend`], the `AgentBackend` on the other end.
 //!
 //! See `docs/design/protocol-wire.md`.
 
 #![deny(missing_docs)]
 
+pub mod client;
 pub mod connection;
+pub mod server;
 pub mod transport;
 
+pub use client::RemoteBackend;
 pub use connection::{codes, Connection, Incoming, PeerRequestId, RpcError};
+pub use server::{serve, Served};
 pub use transport::Transport;

@@ -11,6 +11,12 @@ carry it.
   seen only after every notification sent before it. Pending requests fail
   when the transport closes.
 
+- `server::serve`: serve an `AgentBackend` to one client. `session/prompt` is
+  answered only after that turn's `turn_ended` has been sent. `host/interact`
+  lets the backend ask the client (`Served::host`).
+- `client::RemoteBackend`: the `AgentBackend` on the other end, so a Surface
+  can't tell a served backend from an in-process one.
+
 `loop-acp` uses this connection, over `lines`, to talk to external agents.
 `loop-protocol` itself stays free of transports.
 

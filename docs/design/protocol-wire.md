@@ -63,9 +63,15 @@ JSON-RPC 2.0. Params and results are snake_case, with the same lenient-reader ru
 | `shutdown` | c → s | request | `{}` → `{}` |
 
 - **Ordering:** the `session/prompt` response is sent only after that turn's `turn_ended` update. A client that has the outcome has therefore seen the whole turn.
+  - Backends don't promise which comes first: ACP resolves the outcome before it publishes `turn_ended`. So one forwarder task sends everything to the client.
+  - A prompt is registered with the forwarder before the backend starts it. Its turn is the session's next `turn_started`, and the response goes out once that turn's `turn_ended` has been sent and the outcome is known.
+  - If the backend refused the prompt before any turn started, the response goes out 2 s after the outcome.
 - **Busy:** a second `session/prompt` on a busy session fails with `BackendError::Busy`, as it does in-process.
+  - `RemoteBackend` tracks running turns from the update stream and refuses locally.
+  - A turn another client started first comes back as a `-32001` error, which `RemoteBackend` reports as a failed outcome, because by then `prompt()` has already returned its handle.
 - **Optional services:** `ModelControl`, `Compaction`, `SessionStats` and `LocalShell`, and the host's file system and terminals. Each is advertised in `capabilities` and gets methods in a later version. In v1, `RemoteBackend` returns `None` for each.
 - **Errors:** a `BackendError` maps to a JSON-RPC error. The code is `-32000 - variant` (busy, unsupported, session not found, failed), and `data` carries the `ErrorInfo`. Malformed requests use the standard codes.
+- **Lost connection:** a prompt whose connection closes before its response resolves as `TurnOutcome::Uncertain`.
 - **Lag:** if the server falls behind the backend's broadcast (`RecvError::Lagged`), it sends `session/update` with a `notice` saying how many updates were missed, then closes the connection. A client never silently misses part of a turn.
 
 ## 5. Versioning and negotiation

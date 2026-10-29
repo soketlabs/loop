@@ -31,6 +31,13 @@ Readers are lenient: an update, content block or tool content with an unknown
 unknown enum values such as a new tool kind become `Other`. A newer producer
 therefore never breaks an older reader.
 
+## Methods
+
+`rpc` names the JSON-RPC methods that carry `AgentBackend` and `HostServices`
+over a connection (`initialize`, `session/*`, `host/interact`, `shutdown`) and
+shapes their params and results. It is serde-only; the connection and
+transports are in `loop-wire`.
+
 ## Backend interface
 
 `backend::AgentBackend` is what every backend implements: sessions, `prompt`
