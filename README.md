@@ -110,6 +110,8 @@ The model list comes from each provider's `/models` endpoint. Use `/model` to se
 
 Not supported yet: the native Anthropic Messages API and the OpenAI Responses API.
 
+To run one prompt from a script, use `loop --print "<prompt>"`. Add `--output-format json` or `stream-json` for machine-readable output; see [Running Loop from scripts](docs/print-mode.md) for the formats and exit codes.
+
 ## Configuration
 
 Global configuration is in `~/.loop/agent/`. A project can override it with `.loop/settings.json`. Run `loop config` to print the paths.
