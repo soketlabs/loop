@@ -475,8 +475,10 @@ mod tests {
             ("mcp__github__*", "ask"),
         ]);
         let permission = |tool: &str, args: Value| rule_for(&r, &call(tool, args)).permission;
+        // Built the way `~/` expands, so the separators match on Windows too.
+        let secret = Path::new("/home/me").join("secrets/key");
         assert_eq!(
-            permission("write", json!({"path": "/home/me/secrets/key"})),
+            permission("write", json!({ "path": secret.to_string_lossy() })),
             ToolPermission::Deny
         );
         assert_eq!(
@@ -486,6 +488,7 @@ mod tests {
         let generated = rule_for(&r, &call("write", json!({"path": "src/generated/a.rs"})));
         assert_eq!(generated.permission, ToolPermission::Ask);
         assert!(generated.specific);
+        #[cfg(unix)]
         assert_eq!(
             permission("write", json!({"path": "/ws/src/generated/a.rs"})),
             ToolPermission::Ask,
