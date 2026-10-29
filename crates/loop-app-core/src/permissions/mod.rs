@@ -19,15 +19,18 @@
 //! matches one, and a command with `$(…)` or backticks never matches an
 //! `allow` pattern. A pattern `ask` still asks in `accept-edits`.
 //!
-//! - [`mode`]: the four modes.
+//! - [`capability`]: Capabilities, their states and scopes.
+//! - [`mode`]: the four modes, as presets over Capabilities.
 //! - [`rules`]: `toolPermissions` patterns and bash command splitting.
 //! - [`policy`]: [`decide`], a pure function of the mode, the rules and a
 //!   [`Call`] the gate resolved first.
 
+pub mod capability;
 pub mod mode;
 pub mod policy;
 pub mod rules;
 
+pub use capability::{Capability, Scope, Setting, State};
 pub use mode::PermissionMode;
 pub use policy::{decide, inside_workspace, workspace_root, Call, Decision};
 pub use rules::{read_only_command, rule_for, split_command, Rule, ToolPermission};
