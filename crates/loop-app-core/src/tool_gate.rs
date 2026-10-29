@@ -105,6 +105,11 @@ impl ToolGate {
         self.policy.lock().available(self.mode(), &call)
     }
 
+    /// The Policy layers over the mode.
+    pub fn policy(&self) -> Policy {
+        self.policy.lock().clone()
+    }
+
     /// Replace the Policy layers over the mode; applies to the next call.
     pub fn set_policy(&self, policy: Policy) {
         *self.policy.lock() = policy;
