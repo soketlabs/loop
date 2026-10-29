@@ -23,7 +23,7 @@ pub use prompt_templates::{format_prompt_template_invocation, load_prompt_templa
 pub use skills::{format_skill_invocation, load_skills};
 pub use system_prompt::format_skills_for_system_prompt;
 
-pub use agent_harness::{AgentHarness, AgentHarnessOptions, TurnSnapshot};
+pub use agent_harness::{AgentHarness, AgentHarnessOptions, ToolFilter, TurnSnapshot};
 pub use compaction::{
     default_compaction_settings, find_cut_point, prepare_compaction, should_compact,
     CompactionSettings,

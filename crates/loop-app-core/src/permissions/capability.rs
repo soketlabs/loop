@@ -96,6 +96,18 @@ impl Scope {
     }
 }
 
+impl Scope {
+    /// Whether some call of `call`'s tool could be within the scope, before
+    /// its arguments are known.
+    pub fn may_contain(&self, call: &Call) -> bool {
+        match self {
+            Self::Workspace => matches!(call.tool.as_str(), "write" | "edit"),
+            Self::ReadOnlyCommands => call.tool == "bash",
+            Self::ReadOnlyHint => self.contains(call),
+        }
+    }
+}
+
 /// Paths `accept-edits` still asks about: version control, Loop's own
 /// settings and environment files.
 fn protected(path: &str) -> bool {
@@ -134,6 +146,15 @@ impl Setting {
             state,
             within: Some((scope, inner)),
         }
+    }
+
+    /// Whether some call of `call`'s tool could be anything but off.
+    pub fn may_allow(&self, call: &Call) -> bool {
+        self.state != State::Off
+            || self
+                .within
+                .as_ref()
+                .is_some_and(|(scope, inner)| *inner != State::Off && scope.may_contain(call))
     }
 
     /// The state for `call`.

@@ -32,5 +32,5 @@ pub mod rules;
 
 pub use capability::{Capability, Scope, Setting, State};
 pub use mode::PermissionMode;
-pub use policy::{decide, inside_workspace, workspace_root, Call, Decision};
+pub use policy::{available, decide, inside_workspace, workspace_root, Call, Decision};
 pub use rules::{read_only_command, rule_for, split_command, Rule, ToolPermission};

@@ -111,6 +111,13 @@ pub fn decide(
     }
 }
 
+/// Whether `call`'s tool stays in the toolset in `mode`: not when its
+/// Capability is off and no scope can turn it on. Only the tool's name and
+/// kind matter; `call` has no arguments yet.
+pub fn available(mode: PermissionMode, call: &Call) -> bool {
+    mode.setting(&Capability::of(call)).may_allow(call)
+}
+
 /// Why a call whose Capability is off in `mode` is refused.
 fn off_reason(mode: PermissionMode, capability: &Capability, tool: &str) -> String {
     let mode = mode.as_str();
@@ -335,6 +342,37 @@ mod tests {
             !Call::resolve("read", ToolKind::Read, &json!({"path": "a"}), &ws).inside_workspace,
             "only writes are resolved"
         );
+    }
+
+    #[test]
+    fn off_capabilities_leave_the_toolset() {
+        let tool = |name: &str, kind: Option<ToolKind>| {
+            let mut call = Call::new(name, Value::Null, "/ws");
+            if let Some(kind) = kind {
+                call.kind = kind;
+            }
+            call
+        };
+        let rows = [
+            (ReadOnly, tool("write", None), false),
+            (ReadOnly, tool("edit", None), false),
+            (ReadOnly, tool("mcp__github__create_issue", None), false),
+            (
+                ReadOnly,
+                tool("mcp__github__list_issues", Some(ToolKind::Read)),
+                true,
+            ),
+            // Read-only commands still run.
+            (ReadOnly, tool("bash", None), true),
+            (ReadOnly, tool("read", None), true),
+            (ReadOnly, tool("web_fetch", None), true),
+            (Ask, tool("write", None), true),
+            (AcceptEdits, tool("mcp__github__create_issue", None), true),
+            (FullAccess, tool("bash", None), true),
+        ];
+        for (mode, call, want) in rows {
+            assert_eq!(available(mode, &call), want, "{mode:?} {}", call.tool);
+        }
     }
 
     #[cfg(unix)]
