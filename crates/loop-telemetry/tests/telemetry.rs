@@ -229,6 +229,89 @@ fn recorders_write_langfuse_attributes() {
     ));
 }
 
+/// A failed generation with a tool child, a warning and full trace attributes.
+fn record_sensitive_run() {
+    let run = obs::agent("loop.run");
+    run.record_trace(&TraceAttrs {
+        name: Some("secret ticket".into()),
+        session_id: Some("sess-1".into()),
+        user_id: Some("alice@example.com".into()),
+        tags: vec!["secret-tag".into()],
+        metadata: BTreeMap::from([("ticket".into(), "secret-123".into())]),
+        ..Default::default()
+    });
+    run.record_input("secret prompt");
+    let _run = run.enter();
+    let generation = obs::generation("llm.generate");
+    generation.record_model("gpt-x", "openai", &serde_json::json!({"temperature": 0.2}));
+    generation.record_input(&serde_json::json!([{"role": "user", "content": "secret prompt"}]));
+    generation.record_output("secret answer");
+    generation.record_metadata("stop_reason", "error");
+    generation.record_usage(&loop_ai::Usage {
+        input: 10,
+        output: 5,
+        total_tokens: 15,
+        ..Default::default()
+    });
+    generation.record_error("provider echoed secret prompt");
+    drop(generation);
+    let tool = obs::tool("read", "call_1");
+    tool.record_input(&serde_json::json!({"path": "/home/alice/secret.txt"}));
+    tool.record_output("secret file contents");
+    tool.in_scope(|| tracing::warn!(target: "loop_agent", "could not read /home/alice/secret.txt"));
+}
+
+fn assert_no_secrets(spans: &[SpanData]) {
+    for span in spans {
+        let dump = format!("{:?} {:?} {:?}", span.attributes, span.events, span.status);
+        assert!(!dump.contains("secret"), "{}: {dump}", span.name);
+        assert!(!dump.contains("alice"), "{}: {dump}", span.name);
+    }
+}
+
+/// Spans written to the usage log by `f`'s handle.
+fn usage_log_spans(f: &Fixture, local: &InMemorySpanExporter) -> Vec<SpanData> {
+    f.handle.flush_local();
+    local.get_finished_spans().unwrap()
+}
+
+#[test]
+fn usage_log_strips_content_but_keeps_shape_and_usage() {
+    let f = Fixture::uninstalled(true);
+    let local = InMemorySpanExporter::default();
+    f.handle
+        .install_local_exporter(local.clone(), "memory-log".into());
+    f.run(record_sensitive_run);
+    let spans = usage_log_spans(&f, &local);
+    assert_eq!(spans.len(), 3);
+    assert_no_secrets(&spans);
+
+    let by_name = |n: &str| spans.iter().find(|s| s.name == n).unwrap();
+    let (run, generation, tool) = (
+        by_name("loop.run"),
+        by_name("llm.generate"),
+        by_name("tool read"),
+    );
+    assert_eq!(tool.parent_span_id, run.span_context.span_id());
+    assert_eq!(attr(run, keys::SESSION_ID).as_deref(), Some("sess-1"));
+    assert_eq!(attr(run, keys::TRACE_NAME), None);
+    assert_eq!(attr(generation, keys::MODEL_NAME).as_deref(), Some("gpt-x"));
+    assert_eq!(attr(generation, keys::MODEL_PARAMETERS), None);
+    assert!(attr(generation, keys::USAGE_DETAILS).is_some());
+    assert_eq!(
+        attr(generation, &format!("{}stop_reason", keys::METADATA_PREFIX)).as_deref(),
+        Some("error")
+    );
+    assert_eq!(attr(generation, keys::LEVEL).as_deref(), Some("ERROR"));
+    assert!(matches!(
+        generation.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
+    assert_eq!(attr(tool, keys::GEN_AI_TOOL_NAME).as_deref(), Some("read"));
+    assert_eq!(attr(tool, keys::GEN_AI_TOOL_CALL_ID), None);
+    assert!(tool.events.is_empty());
+}
+
 #[test]
 fn trace_attrs_are_recorded() {
     let f = Fixture::installed(true);
@@ -359,6 +442,113 @@ fn otlp_exporter_posts_to_collector_with_optional_auth() {
     assert_eq!(request.path, "/v1/traces");
     assert_eq!(request.header("authorization"), Some("Bearer tok"));
     assert!(request.header("x-langfuse-ingestion-version").is_none());
+}
+
+/// The usage log on disk: one versioned JSON object per span, nested by parent id.
+#[test]
+fn usage_log_file_writes_versioned_jsonl_spans() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = TelemetryHandle::new("test-release", true);
+    let path = handle.install_local(&dir.path().join("usage"));
+    assert_eq!(handle.usage_log().map(|log| log.path), Some(path.clone()));
+    assert!(!path.exists(), "file is created on first write");
+    let dispatch = Dispatch::new(tracing_subscriber::registry().with(handle.layer()));
+    tracing::dispatcher::with_default(&dispatch, record_sensitive_run);
+    handle.flush_local();
+    assert_eq!(handle.usage_log().and_then(|log| log.last_error), None);
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("secret") && !text.contains("alice"),
+        "{text}"
+    );
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3);
+    assert!(lines
+        .iter()
+        .all(|l| l["v"] == loop_telemetry::USAGE_LOG_VERSION));
+    let span = |name: &str| lines.iter().find(|l| l["name"] == name).unwrap();
+    let (run, generation) = (span("loop.run"), span("llm.generate"));
+    assert_eq!(generation["parent_span_id"], run["span_id"]);
+    assert_eq!(generation["trace_id"], run["trace_id"]);
+    assert!(run["parent_span_id"].is_null());
+    assert_eq!(generation["attributes"][keys::USAGE_DETAILS]["input"], 10);
+}
+
+/// The usage log works without a destination and is always anonymous, while the
+/// destination keeps full content.
+#[test]
+fn local_usage_log_is_independent_and_always_anonymous() {
+    let f = Fixture::uninstalled(true);
+    let local = InMemorySpanExporter::default();
+    f.handle
+        .install_local_exporter(local.clone(), "memory-log".into());
+    assert!(!f.handle.status().active(), "no destination configured");
+    assert_eq!(
+        f.handle.usage_log().map(|log| log.path),
+        Some("memory-log".into())
+    );
+
+    f.run(record_sensitive_run);
+    f.install();
+    f.run(|| obs::span("both").record_input("secret prompt"));
+    // `/tracing disable` stops the export, never the usage log.
+    f.handle.set_enabled(false);
+    f.run(|| obs::span("local only").record_input("secret prompt"));
+    f.handle.flush();
+
+    let local_spans = local.get_finished_spans().unwrap();
+    assert_eq!(local_spans.len(), 5);
+    assert_no_secrets(&local_spans);
+    let remote = f.spans();
+    assert_eq!(
+        remote
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect::<Vec<_>>(),
+        ["both"]
+    );
+    assert_eq!(
+        attr(&remote[0], keys::INPUT).as_deref(),
+        Some("secret prompt")
+    );
+}
+
+#[test]
+fn flushing_the_usage_log_leaves_the_destination_alone() {
+    let f = Fixture::installed(true);
+    let local = InMemorySpanExporter::default();
+    f.handle
+        .install_local_exporter(local.clone(), "memory-log".into());
+    f.run(|| {
+        let _ = obs::span("one").entered();
+    });
+    f.handle.flush_local();
+    assert_eq!(local.get_finished_spans().unwrap().len(), 1);
+    assert!(
+        f.exporter.get_finished_spans().unwrap().is_empty(),
+        "the destination's queue was not flushed"
+    );
+}
+
+#[test]
+fn failed_usage_log_write_is_reported() {
+    let f = Fixture::uninstalled(true);
+    f.handle
+        .install_local_exporter(FailingExporter, "broken-log".into());
+    f.run(|| {
+        let _ = obs::span("one").entered();
+    });
+    f.handle.flush_local();
+    let log = f.handle.usage_log().unwrap();
+    assert!(log.last_error.is_some());
+    assert!(
+        f.handle.status().last_error.is_none(),
+        "destination unaffected"
+    );
 }
 
 #[test]

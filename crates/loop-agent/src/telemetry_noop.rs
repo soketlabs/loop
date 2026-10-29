@@ -8,7 +8,7 @@ use loop_ai::{
 };
 use tracing::Span;
 
-use crate::types::{AgentMessage, AgentToolResult};
+use crate::types::{AgentMessage, AgentToolResult, RunLabels};
 
 /// `loop.run` (disabled).
 pub(crate) struct RunObserver {
@@ -20,6 +20,7 @@ impl RunObserver {
         _model: &Model,
         _prompts: &[AgentMessage],
         _session_id: Option<&str>,
+        _labels: &RunLabels,
     ) -> Self {
         Self { span: Span::none() }
     }
@@ -59,7 +60,12 @@ pub(crate) fn preflight_span(_tool_call: &ToolCall) -> Span {
 }
 
 /// `tool <name>` (disabled).
-pub(crate) fn tool_span(_tool_call: &ToolCall, _args: &serde_json::Value) -> Span {
+pub(crate) fn tool_span(
+    _tool_call: &ToolCall,
+    _args: &serde_json::Value,
+    _session_id: Option<&str>,
+    _labels: &RunLabels,
+) -> Span {
     Span::none()
 }
 

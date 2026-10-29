@@ -4629,6 +4629,7 @@ dependencies = [
  "loop-agent",
  "loop-ai",
  "loop-app-core",
+ "loop-dashboard",
  "loop-mcp",
  "loop-orchestration",
  "loop-protocol",
@@ -4659,6 +4660,19 @@ dependencies = [
  "unicode-width 0.2.2",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "loop-dashboard"
+version = "0.5.0"
+dependencies = [
+ "chrono",
+ "crossterm 0.28.1",
+ "loop-telemetry",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -4747,6 +4761,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-opentelemetry",

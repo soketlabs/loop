@@ -15,7 +15,7 @@ use crate::messages::convert_to_llm;
 use crate::stream_fn::StreamFn;
 use crate::types::{
     AfterToolCallFn, AgentContext, AgentEventSink, AgentLoopConfig, AgentMessage, AgentTool,
-    AgentToolResult, BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult,
+    AgentToolResult, BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult, RunLabels,
 };
 
 /// The host's tool-call hooks, applied to every tool a workflow task runs so
@@ -168,6 +168,7 @@ impl Worker for AgentWorker {
         config.stream_options.base.session_id = Some(format!("wf-task-{}", task.id));
         config.before_tool_call = self.hooks.before.clone();
         config.after_tool_call = self.hooks.after.clone();
+        config.run_labels.agent = Some(RunLabels::SUB_AGENT);
 
         let signal_rx = Arc::new(tokio::sync::Mutex::new(ctx.signal_rx));
         let steer_rx = Arc::clone(&signal_rx);

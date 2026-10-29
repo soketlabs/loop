@@ -1,0 +1,37 @@
+# loop-dashboard
+
+The terminal usage view for Loop (`/usage`, `loop usage`). It has two sources:
+
+- The **live status** of the running loop: its session, context window, agents, skills and
+  MCP servers. Only `/usage` inside the chat has this.
+- The **history** in the anonymous usage log that Loop always writes to
+  `~/.loop/agent/usage`, one JSON-lines file per process.
+
+| View | Shows |
+|------|-------|
+| **Now** | Codex `/status`-style session card: model and effort, directory, permissions, sandbox, web tools, session. Context window gauge and this session's tokens. Agents: the main agent (working or idle), the subscription agent, and running and finished subagents. Skills loaded and active, MCP servers with their tool counts, extensions and hooks. Today's totals. |
+| **Usage** | tokens, cached tokens, model calls, tool calls, agent runs and sessions; tokens per day; model and tool calls per day; model calls by hour; top tools; models by tokens |
+| **Models** | calls, input, output and cached tokens, average and p95 latency, and time to first token for each model |
+| **Tools** | calls and average and p95 duration for each tool, its source (built-in or MCP server), the slowest tools, and calls by source |
+| **Agents** | main agent and subagent runs, subagents spawned, agent runs per day, skills used, and calls to each MCP server |
+| **Sessions** | recent sessions: last active, runs, subagents, calls, tokens and models |
+
+Open it with `/usage` inside the chat, or with `loop usage` on its own, which has history
+only. It uses the terminal's alternate screen, so the transcript is untouched when you
+close it. While it is open, turns and Subagents keep running and **Now** stays current.
+History reloads every 5 seconds.
+
+| Key | Action |
+|------|--------|
+| `1`–`6`, `Tab` | switch view |
+| `←` `→` | change the period: 24h, 7d, 30d or all |
+| `↑` `↓`, `PgUp` `PgDn` | scroll tables |
+| `r` | reload now |
+| `q`, `Esc` | close |
+
+Skill use is recorded in two ways: skills you activate with `/skill` are tagged on the
+run, and a `read` of a registered skill's `SKILL.md` is tagged with that skill's name.
+Subagents are workflow tasks, which run in their own `wf-task-*` sessions. MCP usage comes
+from tool names (`mcp__<server>__<tool>`). None of this records user content.
+
+`loop_dashboard::summarize_dir` returns the same history without the UI.

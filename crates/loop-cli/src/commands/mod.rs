@@ -26,6 +26,12 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             description: "Show or change sandbox mode",
             args_hint: Some("[status|off|local [--full|--partial] [--crun|--runc|--runsc|--krun]]"),
         },
+        #[cfg(feature = "usage")]
+        SlashCommand {
+            name: "usage",
+            description: "Usage: live agents, tokens, models, tools, sessions",
+            args_hint: None,
+        },
         #[cfg(feature = "telemetry")]
         SlashCommand {
             name: "tracing",
@@ -341,6 +347,9 @@ pub enum CommandEffect {
     /// Langfuse tracing control.
     #[cfg(feature = "telemetry")]
     Tracing(TracingCommand),
+    /// Open the local usage view.
+    #[cfg(feature = "usage")]
+    Usage,
     /// Login flow.
     Login(Option<String>),
     /// Logout.
@@ -537,6 +546,8 @@ pub fn dispatch(
             }
         }
         "sandbox" => CommandEffect::SetSandbox(cmd.args.clone()),
+        #[cfg(feature = "usage")]
+        "usage" => CommandEffect::Usage,
         #[cfg(feature = "telemetry")]
         "tracing" => match parse_tracing(&cmd.args) {
             Ok(command) => CommandEffect::Tracing(command),

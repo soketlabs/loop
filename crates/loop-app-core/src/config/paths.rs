@@ -53,6 +53,11 @@ pub fn settings_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("settings.json")
 }
 
+/// Folder of the anonymous usage log read by `/usage`.
+pub fn usage_dir(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("usage")
+}
+
 /// Auth path.
 pub fn auth_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("auth.json")

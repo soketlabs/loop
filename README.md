@@ -27,6 +27,7 @@ loop is a **developer preview (alpha)**. Settings, session files and CLI flags c
 | **loop-update** | [`crates/ops/loop-update`](crates/ops/loop-update) | Release checks, verified updates, rollback and uninstall |
 | **loop-protocol** | [`crates/core/loop-protocol`](crates/core/loop-protocol) | Versioned event model and backend interface shared by every agent and surface |
 | **loop-acp** | [`crates/extend/loop-acp`](crates/extend/loop-acp) | Run any Agent Client Protocol agent (Codex, Claude, Gemini, …) as a backend |
+| **loop-dashboard** | [`crates/extend/loop-dashboard`](crates/extend/loop-dashboard) | Terminal usage view (`/usage`, `loop usage`) built from the anonymous usage log |
 
 ## Quick start
 
@@ -125,14 +126,18 @@ cargo test -p loop-agent
 cargo test -p loop-cli
 ```
 
-### Tracing (optional `telemetry` feature)
+### Usage log and tracing
 
-OpenTelemetry tracing to Langfuse or any OTLP collector is off by default, so the standard build carries no OpenTelemetry dependencies. Build with the feature to get `/tracing` in the TUI and the `--trace-*` flags for benchmark runs with `--print`:
+Loop always keeps an **anonymous usage log** on your machine. It records the shape of each run and nothing else: model and provider names, token usage, timings, tool names (including MCP `mcp__<server>__<tool>`), skill names, session ids, run labels and error levels. It never records prompts, completions, tool arguments or results, error messages or file paths, and nothing is sent anywhere. Each loop process writes one `loop-<time>-<pid>.jsonl` file under `~/.loop/agent/usage` (readable only by you on Linux and macOS). Files older than 30 days are deleted when loop starts. This is a usage record, not an audit log.
+
+To see your usage, type `/usage` inside loop, or run `loop usage`. It opens a full-screen view in the terminal. **Now** shows the running session, Codex `/status`-style: model, permissions, sandbox, a context window gauge, the main agent and running subagents, and loaded skills, MCP servers, extensions and hooks. **Usage**, **Models**, **Tools**, **Agents** and **Sessions** show history from the usage log: tokens and calls per day, latency and time to first token per model, tool use by source, main and subagent runs, skill and MCP server use, and recent sessions. Press `q` to return to the chat.
+
+Full traces can also go to Langfuse or any OTLP collector. Run `/tracing setup`, or set `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`. `/tracing disable` stops that export; the usage log stays on. The `--trace-*` flags label benchmark runs with `--print`.
+
+All of this is the `telemetry` feature, which is on by default. To build without it:
 
 ```bash
-cargo build -p loop-cli --release --features telemetry
-cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli \
-  --features loop-agent/telemetry,loop-app-core/telemetry,loop-cli/telemetry
+cargo build -p loop-cli --release --no-default-features
 ```
 
 Maintainers: see [docs/releasing.md](docs/releasing.md) to cut a release.
