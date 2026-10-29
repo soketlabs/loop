@@ -62,36 +62,7 @@ impl ApprovalPolicy {
     }
 }
 
-/// Per-tool default from `~/.loop/agent/settings.json`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolPermission {
-    /// Prompt when approval policy says so.
-    Ask,
-    /// Never prompt.
-    Allow,
-    /// Always block.
-    Deny,
-}
-
-impl ToolPermission {
-    /// Parse `ask` / `allow` / `deny`.
-    pub fn parse(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "allow" | "auto" | "yes" => Self::Allow,
-            "deny" | "block" | "no" => Self::Deny,
-            _ => Self::Ask,
-        }
-    }
-
-    /// Settings label.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ask => "ask",
-            Self::Allow => "allow",
-            Self::Deny => "deny",
-        }
-    }
-}
+pub use crate::permissions::ToolPermission;
 
 /// Default per-tool permissions (others can be added in settings).
 pub fn default_tool_permissions() -> BTreeMap<String, String> {

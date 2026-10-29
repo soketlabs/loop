@@ -27,7 +27,7 @@ use parking_lot::Mutex;
 
 use loop_protocol::ToolKind;
 
-use crate::permissions::{Decision, PermissionMode};
+use crate::permissions::{Call, Decision, PermissionMode};
 use crate::tool_approval::{ToolApprovalBridge, ToolPermission};
 
 /// Why a call that needs approval is refused when nobody can approve it,
@@ -139,16 +139,8 @@ impl ToolGate {
 
     /// What the mode says about a call, before hooks and the approver.
     pub async fn decide(&self, tool: &str, args: &serde_json::Value) -> Decision {
-        let workspace = self.workspace();
-        let rule = crate::permissions::rule_for(&self.permissions.lock(), tool, args, &workspace);
-        crate::permissions::decide(
-            self.mode(),
-            rule,
-            tool,
-            self.kind(tool).await,
-            args,
-            &workspace,
-        )
+        let call = Call::resolve(tool, self.kind(tool).await, args, &self.workspace());
+        crate::permissions::decide(self.mode(), &self.permissions.lock(), &call)
     }
 
     /// Run `hooks` without a harness (tests, hosts that only gate agents).
