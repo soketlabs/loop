@@ -460,11 +460,7 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
         project.tool_permissions
     };
     for (key, value) in project_rules {
-        let strictness = |v: &str| match crate::tool_approval::ToolPermission::parse(v) {
-            crate::tool_approval::ToolPermission::Allow => 0,
-            crate::tool_approval::ToolPermission::Ask => 1,
-            crate::tool_approval::ToolPermission::Deny => 2,
-        };
+        let strictness = |v: &str| crate::permissions::ToolPermission::parse(v).strictness();
         let global = base
             .tool_permissions
             .get(&key)
