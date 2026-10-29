@@ -32,6 +32,19 @@ pub enum Capability {
 }
 
 impl Capability {
+    /// The name in notices and refusals.
+    pub fn label(&self) -> String {
+        match self {
+            Self::ReadFiles => "reading files".into(),
+            Self::WriteFiles => "writing files".into(),
+            Self::Shell => "the shell".into(),
+            Self::WebFetch => "web fetch".into(),
+            Self::WebSearch => "web search".into(),
+            Self::Mcp(server) => format!("the MCP server `{server}`"),
+            Self::Other => "other tools".into(),
+        }
+    }
+
     /// The Capability `call` exercises, by tool name and then by kind.
     pub fn of(call: &Call) -> Self {
         match call.tool.as_str() {

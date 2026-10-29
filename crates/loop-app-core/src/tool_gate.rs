@@ -27,7 +27,7 @@ use parking_lot::Mutex;
 
 use loop_protocol::ToolKind;
 
-use crate::permissions::{Call, Decision, PermissionMode};
+use crate::permissions::{Call, Decision, PermissionMode, Policy};
 use crate::tool_approval::{ToolApprovalBridge, ToolPermission};
 
 /// Why a call that needs approval is refused when nobody can approve it,
@@ -63,6 +63,7 @@ pub struct ToolGate {
     hooks: Mutex<Option<HookRegistry>>,
     harness: Mutex<Weak<AgentHarness>>,
     mode: Mutex<PermissionMode>,
+    policy: Mutex<Policy>,
     workspace: Mutex<Option<PathBuf>>,
     /// Calls allowed without asking, counted by [`call_key`]; their
     /// after-call review is skipped. Keyed by more than the id, which a
@@ -101,7 +102,13 @@ impl ToolGate {
             kind: self.kind_now(tool),
             ..Call::new(tool, serde_json::Value::Null, self.workspace())
         };
-        crate::permissions::available(self.mode(), &call)
+        self.policy.lock().available(self.mode(), &call)
+    }
+
+    /// Replace the Policy layers over the mode; applies to the next call.
+    pub fn set_policy(&self, policy: Policy) {
+        *self.policy.lock() = policy;
+        self.allowed.lock().clear();
     }
 
     /// [`Self::kind`] without waiting. While the MCP server list is being
@@ -177,10 +184,17 @@ impl ToolGate {
             .unwrap_or_default()
     }
 
-    /// What the mode says about a call, before hooks and the approver.
+    /// What the mode and the Policy say about a call, before hooks and the
+    /// approver.
     pub async fn decide(&self, tool: &str, args: &serde_json::Value) -> Decision {
-        let call = Call::resolve(tool, self.kind(tool).await, args, &self.workspace());
-        crate::permissions::decide(self.mode(), &self.permissions.lock(), &call)
+        let call = self.call(tool, args).await;
+        self.policy
+            .lock()
+            .decide(self.mode(), &self.permissions.lock(), &call)
+    }
+
+    async fn call(&self, tool: &str, args: &serde_json::Value) -> Call {
+        Call::resolve(tool, self.kind(tool).await, args, &self.workspace())
     }
 
     /// Run `hooks` without a harness (tests, hosts that only gate agents).
@@ -307,8 +321,12 @@ impl ToolGate {
                     match outcome.decision {
                         Some(ToolDecision::Block { reason }) => return block(reason),
                         Some(ToolDecision::Allow) => {
-                            gate.mark_allowed(&ctx.tool_call, &ctx.args);
-                            return None;
+                            // A Policy layer's "ask" holds even against a hook.
+                            let call = gate.call(&ctx.tool_call.name, &ctx.args).await;
+                            if !gate.policy.lock().requires_ask(&call) {
+                                gate.mark_allowed(&ctx.tool_call, &ctx.args);
+                                return None;
+                            }
                         }
                         None => {}
                     }
@@ -330,7 +348,13 @@ impl ToolGate {
                             ctx.tool_call.name
                         ))
                     }
-                    Some(approver) => approver.review_before_tool(ctx, cancel).await,
+                    Some(approver) => {
+                        let call = gate.call(&ctx.tool_call.name, &ctx.args).await;
+                        let ignore_grants = gate.policy.lock().requires_ask(&call);
+                        approver
+                            .review_before_tool(ctx, cancel, ignore_grants)
+                            .await
+                    }
                     None => block(headless_refusal(&ctx.tool_call.name, gate.mode())),
                 }
             })
@@ -346,7 +370,11 @@ impl ToolGate {
                 let allowed = gate.take_allowed(&ctx.tool_call, &ctx.args);
                 let patch = match gate.approver() {
                     Some(approver) if !allowed => {
-                        approver.review_after_file_tool(ctx.clone(), cancel).await
+                        let call = gate.call(&ctx.tool_call.name, &ctx.args).await;
+                        let ignore_grants = gate.policy.lock().requires_ask(&call);
+                        approver
+                            .review_after_file_tool(ctx.clone(), cancel, ignore_grants)
+                            .await
                     }
                     _ => None,
                 };
@@ -703,6 +731,41 @@ mod tests {
         assert!(refused.block, "a call to a removed tool is still refused");
         gate.set_mode(PermissionMode::Ask);
         assert!(gate.available("write") && gate.available("mcp__github__create_issue"));
+    }
+
+    #[tokio::test]
+    async fn policy_layers_beat_the_mode_and_hooks() {
+        use crate::permissions::{Capability, Layer, LayerSource, Policy, Setting, State};
+        let (gate, mut prompts) = gate_with_approver(&[("bash", "ask")]);
+        gate.set_mode(PermissionMode::FullAccess);
+        let (_dir, registry) = hooks(&[serde_json::json!(
+            {"on": "tool_call", "action": {"allow": true}}
+        )]);
+        gate.set_hooks(registry);
+        let (policy, _) = Policy::new(vec![
+            Layer::new(LayerSource::Org).set(Capability::WriteFiles, Setting::always(State::Off)),
+            Layer::new(LayerSource::Org).set(Capability::Shell, Setting::always(State::Ask)),
+        ]);
+        gate.set_policy(policy);
+
+        let write = gate.before_hook()(call("write"), None).await.unwrap();
+        assert!(write.reason.unwrap().contains("Org Policy turns off"));
+        assert!(
+            !gate.available("write"),
+            "off in a layer leaves the toolset"
+        );
+
+        gate.approver().unwrap().grant_session("bash");
+        let gate_for_bash = Arc::clone(&gate);
+        let bash =
+            tokio::spawn(async move { gate_for_bash.before_hook()(call("bash"), None).await });
+        let prompt = prompts
+            .recv()
+            .await
+            .expect("a layer's ask is not skipped by a hook");
+        assert_eq!(prompt.tool_name, "bash");
+        drop(prompt);
+        let _ = bash.await;
     }
 
     #[tokio::test]
