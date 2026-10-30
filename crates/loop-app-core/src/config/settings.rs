@@ -208,7 +208,7 @@ pub struct Settings {
     pub disabled_mcp_servers: Vec<String>,
     /// Max wait for the model HTTP response headers (time-to-first-byte), in ms.
     ///
-    /// Default `60000`. Set to `0` to wait indefinitely (useful for long-running
+    /// Default `120000`. Set to `0` to wait indefinitely (useful for long-running
     /// workflows / slow models). Esc still aborts the turn.
     #[serde(default = "default_response_header_timeout_ms")]
     pub response_header_timeout_ms: u64,

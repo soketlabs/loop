@@ -134,7 +134,7 @@ pub(crate) fn apply_on_payload(payload: Value, model: &Model, options: &StreamOp
 /// Send one streaming request, bounded by the time-to-first-byte limit and the
 /// caller's cancellation.
 #[derive(Clone)]
-struct RequestStarted(tokio::time::Instant);
+struct RequestStarted(tokio::time::Instant, u32);
 
 pub(crate) async fn send_request(
     client: &reqwest::Client,
@@ -155,7 +155,9 @@ pub(crate) async fn send_request(
         for attempt in 0..=2u32 {
             match send_once(client, url, headers.clone(), payload, options).await {
                 Ok(mut response) => {
-                    response.extensions_mut().insert(RequestStarted(started));
+                    response
+                        .extensions_mut()
+                        .insert(RequestStarted(started, attempt + 1));
                     return Ok(response);
                 }
                 Err(err)
@@ -282,11 +284,71 @@ pub(crate) async fn check_response(
     if status.is_success() {
         return Ok(response);
     }
-    let body = response.text().await.unwrap_or_default();
+    let body = error_body(response, options).await?;
     Err(StreamFail::new(summarize_http_error(
         status.as_u16(),
         &body,
     )))
+}
+
+/// Read a bounded error body without bypassing cancellation or generation limits.
+pub(crate) async fn error_body(
+    response: reqwest::Response,
+    options: &StreamOptions,
+) -> Result<String, StreamFail> {
+    let started = options
+        .generation_started_at
+        .unwrap_or_else(tokio::time::Instant::now);
+    let total = options
+        .timeouts
+        .generation_budget_ms
+        .or(options.timeout_ms)
+        .unwrap_or(0);
+    let idle = options.timeouts.transport_idle_ms.unwrap_or(900_000);
+    let work = async {
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        loop {
+            let next = async {
+                if idle == 0 {
+                    Ok(stream.next().await)
+                } else {
+                    tokio::time::timeout(Duration::from_millis(idle), stream.next())
+                        .await
+                        .map_err(|_| {
+                            StreamFail::new("transport_idle timeout reading error response")
+                        })
+                }
+            };
+            let next = match &options.cancel {
+                Some(c) => {
+                    tokio::select! { biased; _ = c.cancelled() => return Err(StreamFail::aborted()), next = next => next? }
+                }
+                None => next.await?,
+            };
+            match next {
+                Some(Ok(bytes)) => {
+                    let count = bytes.len().min(65_536 - body.len());
+                    body.extend_from_slice(&bytes[..count]);
+                    if body.len() == 65_536 {
+                        break;
+                    }
+                }
+                Some(Err(_)) => {
+                    return Err(StreamFail::new("error reading provider error response"))
+                }
+                None => break,
+            }
+        }
+        Ok(String::from_utf8_lossy(&body).into_owned())
+    };
+    if total == 0 {
+        work.await
+    } else {
+        tokio::time::timeout_at(started + Duration::from_millis(total), work)
+            .await
+            .map_err(|_| StreamFail::new("generation_budget timeout reading error response"))?
+    }
 }
 
 /// What reading the next SSE event produced.
@@ -592,13 +654,19 @@ pub(crate) fn tracked_events(
         .get::<RequestStarted>()
         .map(|s| s.0)
         .unwrap_or_else(tokio::time::Instant::now);
-    tracked_bytes(response.bytes_stream(), options, started)
+    let attempt = response
+        .extensions()
+        .get::<RequestStarted>()
+        .map(|s| s.1)
+        .unwrap_or(1);
+    tracked_bytes(response.bytes_stream(), options, started, attempt)
 }
 
 fn tracked_bytes<S, E>(
     bytes: S,
     options: &StreamOptions,
     started: tokio::time::Instant,
+    attempt: u32,
 ) -> impl Stream<Item = Result<eventsource_stream::Event, String>> + Unpin
 where
     S: Stream<Item = Result<bytes::Bytes, E>> + Unpin,
@@ -650,7 +718,7 @@ where
                     let expired = [("transport_idle", transport, byte), ("model_progress_idle", progress, last_progress), ("generation_budget", total, started)]
                         .into_iter().find(|(_, ms, base)| *ms > 0 && now.duration_since(*base) >= Duration::from_millis(*ms));
                     if let Some((kind, threshold, _)) = expired {
-                        tracing::warn!(timeout_type=kind, threshold_ms=threshold, elapsed_ms=now.duration_since(started).as_millis() as u64, last_byte_ms=now.duration_since(byte).as_millis() as u64, last_progress_ms=now.duration_since(last_progress).as_millis() as u64, byte_count, chunks, events=count, attempt=1, "stream deadline exceeded");
+                        tracing::warn!(timeout_type=kind, threshold_ms=threshold, elapsed_ms=now.duration_since(started).as_millis() as u64, last_byte_ms=now.duration_since(byte).as_millis() as u64, last_progress_ms=now.duration_since(last_progress).as_millis() as u64, byte_count, chunks, events=count, attempt, "stream deadline exceeded");
                         yield Err(format!("{kind} timeout after {threshold}ms")); break;
                     }
                     continue;
@@ -719,7 +787,7 @@ mod watchdog_tests {
         let mut options = StreamOptions::default();
         options.timeouts.transport_idle_ms = Some(100);
         let input = stream::pending::<Result<Bytes, String>>();
-        let mut events = tracked_bytes(input, &options, tokio::time::Instant::now());
+        let mut events = tracked_bytes(input, &options, tokio::time::Instant::now(), 1);
         assert!(events
             .next()
             .await
@@ -737,7 +805,7 @@ mod watchdog_tests {
         let mut options = StreamOptions::default();
         options.timeouts.model_progress_idle_ms = Some(100);
         options.timeouts.transport_idle_ms = Some(50);
-        let mut events = tracked_bytes(Box::pin(input), &options, tokio::time::Instant::now());
+        let mut events = tracked_bytes(Box::pin(input), &options, tokio::time::Instant::now(), 1);
         assert!(events
             .next()
             .await
@@ -764,6 +832,7 @@ mod watchdog_tests {
             Box::pin(input),
             &StreamOptions::default(),
             tokio::time::Instant::now(),
+            1,
         );
         let mut count = 0;
         while let Some(event) = events.next().await {
@@ -771,5 +840,40 @@ mod watchdog_tests {
             count += 1;
         }
         assert_eq!(count, 5);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn total_budget_is_not_reset_by_progress() {
+        let input = stream::unfold((), |_| async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Some((
+                Ok::<_, String>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
+                )),
+                (),
+            ))
+        });
+        let mut options = StreamOptions::default();
+        options.timeouts.generation_budget_ms = Some(50);
+        let mut events = tracked_bytes(Box::pin(input), &options, tokio::time::Instant::now(), 1);
+        loop {
+            if let Err(error) = events.next().await.unwrap() {
+                assert!(error.contains("generation_budget"));
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn model_override_preserves_unrelated_global_settings() {
+        let mut policy = crate::types::TimeoutPolicy {
+            transport_idle_ms: Some(100),
+            ..Default::default()
+        };
+        policy.overlay(&crate::types::TimeoutPolicy {
+            generation_budget_ms: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(policy.transport_idle_ms, Some(100));
+        assert_eq!(policy.generation_budget_ms, Some(0));
     }
 }

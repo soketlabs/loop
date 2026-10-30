@@ -232,7 +232,19 @@ async fn run_loop_observed(
             message.stop_reason = StopReason::Error;
             message.error_message = Some(format!("run_budget timeout after {budget}ms"));
             let message = AgentMessage::assistant(message);
-            current_context.messages.push(message.clone());
+            if current_context
+                .messages
+                .last()
+                .and_then(|m| m.as_assistant())
+                .is_some_and(|m| m.stop_reason == StopReason::Pending)
+            {
+                *current_context
+                    .messages
+                    .last_mut()
+                    .expect("pending message") = message.clone();
+            } else {
+                current_context.messages.push(message.clone());
+            }
             new_messages.push(message.clone());
             emit_ev(
                 emit,

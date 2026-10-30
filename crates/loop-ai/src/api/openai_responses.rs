@@ -133,7 +133,7 @@ async fn run_stream(
     // Reasoning summaries need a verified organization. Without one, retry once
     // without them (the reasoning itself still runs) and remember the model.
     if payload.pointer("/reasoning/summary").is_some() && response.status().as_u16() == 400 {
-        let body = response.text().await.unwrap_or_default();
+        let body = super::sse::error_body(response, &options).await?;
         if !rejects_summaries(&body) {
             return Err(StreamFail::new(summarize_http_error(400, &body)));
         }

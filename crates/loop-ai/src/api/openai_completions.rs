@@ -196,7 +196,7 @@ async fn run_stream(
     // Some OpenAI-compatible servers reject reasoning parameters for models
     // they serve. Retry once without them and remember the model.
     if reasoning.is_some() && matches!(response.status().as_u16(), 400 | 422) {
-        let body = response.text().await.unwrap_or_default();
+        let body = super::sse::error_body(response, &options).await?;
         if !rejects_reasoning(&body) {
             return Err(StreamFail {
                 message: crate::utils::summarize_http_error(400, &body),
@@ -232,7 +232,7 @@ async fn run_stream(
     }
 
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = super::sse::error_body(response, &options).await?;
         return Err(StreamFail {
             message: crate::utils::summarize_http_error(status.as_u16(), &body),
             aborted: false,
