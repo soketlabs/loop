@@ -1,5 +1,9 @@
 //! One builder for every OpenAI-compatible provider (Soket, OpenRouter, OpenAI, custom).
 //!
+//! Listed models speak the config's `api` (Chat Completions unless a provider says
+//! otherwise, as OpenAI does with Responses); every provider can serve both, so a
+//! pinned model may choose either.
+//!
 //! Each provider gets a dynamic catalog: models-store cache → `GET {base}/models` →
 //! cache write, falling back to cache and then to static `fallback` models.
 
@@ -8,16 +12,21 @@ use std::sync::Arc;
 
 use crate::api::openai_completions::OpenAICompletionsAdapter;
 use crate::api::openai_models::{list_openai_models, MapRemoteModelOptions};
+use crate::api::openai_responses::OpenAIResponsesAdapter;
 use crate::auth::{env_api_key_auth, ProviderAuth};
 use crate::models::{
     create_provider, CreateProviderApi, CreateProviderOptions, Provider, RefreshModelsContext,
+    SharedApiAdapter,
 };
 use crate::models_store::ModelsStoreEntry;
-use crate::types::Model;
+use crate::types::{Model, API_OPENAI_COMPLETIONS, API_OPENAI_RESPONSES};
 use crate::utils::now_ms;
 
 /// Keeps only model ids a provider can chat with (e.g. drops embeddings).
 pub type ModelFilter = fn(&str) -> bool;
+
+/// Fills in what a provider knows about a listed model (e.g. which ids reason).
+pub type ModelTraits = fn(&mut Model);
 
 /// Defaults for models the provider's `/models` endpoint doesn't describe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +72,10 @@ pub struct OpenAiCompatibleConfig {
     pub fallback: Vec<Model>,
     /// Optional filter over listed model ids.
     pub model_filter: Option<ModelFilter>,
+    /// Wire API of listed models: `openai-completions` or `openai-responses`.
+    pub api: String,
+    /// Optional per-model traits applied to listed models.
+    pub model_traits: Option<ModelTraits>,
 }
 
 impl OpenAiCompatibleConfig {
@@ -78,6 +91,15 @@ impl OpenAiCompatibleConfig {
             max_tokens: self.defaults.max_tokens,
             reasoning: self.defaults.reasoning,
         }
+    }
+
+    /// A freshly listed model on this provider's api, with its traits.
+    fn listed(&self, mut model: Model) -> Model {
+        model.api = self.api.clone();
+        if let Some(traits) = self.model_traits {
+            traits(&mut model);
+        }
+        model
     }
 
     /// Listed models, filtered, with pinned entries taking precedence by id.
@@ -124,7 +146,16 @@ pub fn openai_compatible_provider(config: OpenAiCompatibleConfig) -> Provider {
         headers: config.headers.clone(),
         auth,
         models: config.offline_models(),
-        api: CreateProviderApi::Single(Arc::new(OpenAICompletionsAdapter::new())),
+        api: CreateProviderApi::ByApi(HashMap::from([
+            (
+                API_OPENAI_COMPLETIONS.to_string(),
+                Arc::new(OpenAICompletionsAdapter::new()) as SharedApiAdapter,
+            ),
+            (
+                API_OPENAI_RESPONSES.to_string(),
+                Arc::new(OpenAIResponsesAdapter::new()) as SharedApiAdapter,
+            ),
+        ])),
         fetch_models: Some(Arc::new(move |ctx| {
             let config = Arc::clone(&fetch_config);
             Box::pin(async move { fetch_models(&config, ctx).await })
@@ -156,6 +187,7 @@ async fn fetch_models(
 
     match list_openai_models(&config.base_url, ctx.api_key.as_deref(), &config.map_opts()).await {
         Ok(listed) => {
+            let listed = listed.into_iter().map(|m| config.listed(m)).collect();
             let models = config.merge_with_pinned(listed);
             if models.is_empty() {
                 return Ok(config.offline_models());
@@ -182,7 +214,7 @@ async fn fetch_models(
 
 #[cfg(test)]
 mod tests {
-    use crate::types::{InputModality, ModelCost, API_OPENAI_COMPLETIONS};
+    use crate::types::{InputModality, ModelCost};
 
     use super::*;
 
@@ -215,6 +247,8 @@ mod tests {
             pinned,
             fallback: vec![],
             model_filter,
+            api: API_OPENAI_COMPLETIONS.into(),
+            model_traits: None,
         }
     }
 

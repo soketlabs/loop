@@ -3,11 +3,13 @@
 
 use std::sync::Arc;
 
-use loop_ai::providers::anthropic_provider;
+use loop_ai::providers::{
+    anthropic_provider, openai_compatible_provider, provider_preset, OpenAiCompatibleConfig,
+};
 use loop_ai::{
     Context, CreateModelsOptions, Credential, CredentialStore, InMemoryCredentialStore,
     InMemoryModelsStore, Message, Models, ModelsRefreshOptions, SimpleStreamOptions, StopReason,
-    API_ANTHROPIC_MESSAGES,
+    API_ANTHROPIC_MESSAGES, API_OPENAI_COMPLETIONS, API_OPENAI_RESPONSES,
 };
 use loop_test_support::{FakeHttpServer, FakeResponse, RecordedRequest};
 
@@ -112,4 +114,67 @@ async fn anthropic_rejects_a_bad_key_when_listing() {
     let error = &result.errors["anthropic"];
     assert!(error.starts_with("HTTP 401"), "{error}");
     assert!(!error.contains("sk-ant-bad"));
+}
+
+fn openai_route(req: &RecordedRequest) -> FakeResponse {
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/v1/models") => FakeResponse::json(
+            r#"{"object":"list","data":[{"id":"gpt-5.1","object":"model"},{"id":"gpt-4.1","object":"model"}]}"#,
+        ),
+        ("POST", "/v1/responses") => FakeResponse::new(
+            200,
+            "text/event-stream",
+            concat!(
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[]}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hi there\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\n",
+            ),
+        ),
+        _ => FakeResponse::new(404, "text/plain", "not found"),
+    }
+}
+
+#[tokio::test]
+async fn openai_preset_models_use_responses_and_pinned_completions_still_route() {
+    let server = FakeHttpServer::start(openai_route);
+    let mut pinned = loop_ai::map_remote_model(
+        "legacy-chat",
+        None,
+        &loop_ai::MapRemoteModelOptions::default(),
+    );
+    pinned.provider = "openai".into();
+    let config = OpenAiCompatibleConfig {
+        base_url: format!("{}/v1", server.base_url()),
+        pinned: vec![pinned],
+        ..provider_preset("openai").unwrap().compatible_config()
+    };
+    let models = models_with(openai_compatible_provider(config), "openai", "sk-good");
+    assert!(refresh(&models, "openai").await.errors.is_empty());
+
+    let gpt5 = models.get_model("openai", "gpt-5.1").unwrap();
+    assert_eq!(gpt5.api, API_OPENAI_RESPONSES);
+    assert!(gpt5.reasoning, "gpt-5 family reasons");
+    let gpt41 = models.get_model("openai", "gpt-4.1").unwrap();
+    assert!(!gpt41.reasoning);
+    assert_eq!(
+        models.get_model("openai", "legacy-chat").unwrap().api,
+        API_OPENAI_COMPLETIONS,
+        "pinned models keep their api"
+    );
+
+    let context = Context {
+        messages: vec![Message::user_text("hi")],
+        ..Default::default()
+    };
+    let reply = models
+        .complete_simple(&gpt5, &context, SimpleStreamOptions::default())
+        .await;
+    assert_eq!(
+        reply.stop_reason,
+        StopReason::Stop,
+        "{:?}",
+        reply.error_message
+    );
+    assert_eq!(reply.api, API_OPENAI_RESPONSES);
 }
