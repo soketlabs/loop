@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 use crate::types::{AssistantMessage, AssistantMessageEvent, StopReason, Usage};
 
 struct SharedState<T, R> {
+    receiver_cancel: tokio_util::sync::CancellationToken,
     queue: Vec<T>,
     done: bool,
     waker: Option<std::task::Waker>,
@@ -26,6 +27,12 @@ pub struct EventStream<T, R> {
     extract_result: fn(&T) -> R,
 }
 
+impl<T, R> Drop for EventStream<T, R> {
+    fn drop(&mut self) {
+        self.state.lock().receiver_cancel.cancel();
+    }
+}
+
 impl<T, R> EventStream<T, R>
 where
     T: Send + 'static,
@@ -35,6 +42,7 @@ where
     pub fn new(is_complete: fn(&T) -> bool, extract_result: fn(&T) -> R) -> Self {
         Self {
             state: Arc::new(Mutex::new(SharedState {
+                receiver_cancel: tokio_util::sync::CancellationToken::new(),
                 queue: Vec::new(),
                 done: false,
                 waker: None,
@@ -146,6 +154,11 @@ pub struct EventStreamHandle<T, R> {
 }
 
 impl<T, R> EventStreamHandle<T, R> {
+    /// Cancellation when the receiving stream is dropped.
+    pub fn receiver_cancel(&self) -> tokio_util::sync::CancellationToken {
+        self.state.lock().receiver_cancel.clone()
+    }
+
     /// Push an event.
     pub fn push(&self, event: T) {
         let mut state = self.state.lock();
@@ -203,6 +216,11 @@ impl AssistantMessageEventStream {
     /// Push handle for background producers.
     pub fn handle(&self) -> AssistantMessageEventStreamHandle {
         self.inner.handle()
+    }
+
+    /// Cancellation when the receiving stream is dropped.
+    pub fn receiver_cancel(&self) -> tokio_util::sync::CancellationToken {
+        self.inner.state.lock().receiver_cancel.clone()
     }
 
     /// Push an event.

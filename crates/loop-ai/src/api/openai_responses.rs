@@ -10,7 +10,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use eventsource_stream::Eventsource;
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use serde_json::{json, Value};
 
@@ -102,11 +101,14 @@ async fn run_stream(
     client: reqwest::Client,
     model: Model,
     context: Context,
-    options: StreamOptions,
+    mut options: StreamOptions,
     auth: ModelAuth,
     reasoning: Option<ThinkingLevel>,
     handle: AssistantMessageEventStreamHandle,
 ) -> Result<(), StreamFail> {
+    options
+        .generation_started_at
+        .get_or_insert_with(tokio::time::Instant::now);
     check_cancelled(&options)?;
 
     let base_url = auth
@@ -148,10 +150,16 @@ async fn run_stream(
     // Output index -> content index.
     let mut items: HashMap<u64, usize> = HashMap::new();
     let mut finish: Option<(StopReason, Option<String>)> = None;
-    let mut events = response.bytes_stream().eventsource();
+    let mut events = super::sse::tracked_events(response, &options);
 
     loop {
-        let data = match next_event(&mut events, options.cancel.as_ref()).await? {
+        let data = match match next_event(&mut events, options.cancel.as_ref()).await {
+            Ok(next) => next,
+            Err(err) => {
+                out.fail(err.message, None);
+                return Ok(());
+            }
+        } {
             Next::Event { data, .. } => data,
             Next::End => break,
             Next::Cancelled => {

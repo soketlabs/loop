@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
@@ -97,14 +96,17 @@ impl OpenAICompletionsAdapter {
         let context = context.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = run_stream(
-                client,
-                model.clone(),
-                context,
-                options,
-                auth,
-                reasoning,
-                handle.clone(),
+            if let Err(err) = super::sse::until_closed(
+                &handle,
+                run_stream(
+                    client,
+                    model.clone(),
+                    context,
+                    options,
+                    auth,
+                    reasoning,
+                    handle.clone(),
+                ),
             )
             .await
             {
@@ -128,11 +130,14 @@ async fn run_stream(
     client: reqwest::Client,
     model: Model,
     context: Context,
-    options: StreamOptions,
+    mut options: StreamOptions,
     auth: ModelAuth,
     reasoning: Option<ThinkingLevel>,
     handle: crate::stream::AssistantMessageEventStreamHandle,
 ) -> Result<(), StreamFail> {
+    options
+        .generation_started_at
+        .get_or_insert_with(tokio::time::Instant::now);
     if let Some(token) = &options.cancel {
         if token.is_cancelled() {
             return Err(StreamFail {
@@ -247,63 +252,51 @@ async fn run_stream(
     let mut tool_args: HashMap<usize, String> = HashMap::new();
     let mut finish_reason: Option<String> = None;
 
-    let byte_stream = response.bytes_stream();
-    let mut event_stream = byte_stream.eventsource();
-
-    // If no SSE chunk arrives within this window, treat the connection as stalled.
-    const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
+    let mut event_stream = super::sse::tracked_events(response, &options);
+    let mut completed = false;
     loop {
         let next = if let Some(token) = &cancel {
             tokio::select! {
+                biased;
                 _ = token.cancelled() => {
                     partial.stop_reason = StopReason::Aborted;
                     partial.error_message = Some("aborted".into());
                     close_open_blocks(&mut partial, &mut text_index, &mut thinking_index, &mut tool_map, &mut tool_args, &handle);
-                    handle.push(AssistantMessageEvent::Error {
-                        reason: StopReason::Aborted,
-                        error: partial,
-                    });
+                handle.push(AssistantMessageEvent::Error { reason: StopReason::Aborted, error: partial });
                     return Ok(());
                 }
-                ev = tokio::time::timeout(SSE_IDLE_TIMEOUT, event_stream.next()) => {
-                    match ev {
-                        Ok(inner) => inner,
-                        Err(_) => {
-                            return Err(StreamFail {
-                                message: format!("server stopped responding (no data for {}s)", SSE_IDLE_TIMEOUT.as_secs()),
-                                aborted: false,
-                            });
-                        }
-                    }
-                }
+                ev = event_stream.next() => ev,
             }
         } else {
-            match tokio::time::timeout(SSE_IDLE_TIMEOUT, event_stream.next()).await {
-                Ok(inner) => inner,
-                Err(_) => {
-                    return Err(StreamFail {
-                        message: format!(
-                            "server stopped responding (no data for {}s)",
-                            SSE_IDLE_TIMEOUT.as_secs()
-                        ),
-                        aborted: false,
-                    });
-                }
+            event_stream.next().await
+        };
+        let Some(event) = next else { break };
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                partial.stop_reason = StopReason::Error;
+                partial.error_message = Some(error);
+                close_open_blocks(
+                    &mut partial,
+                    &mut text_index,
+                    &mut thinking_index,
+                    &mut tool_map,
+                    &mut tool_args,
+                    &handle,
+                );
+                handle.push(AssistantMessageEvent::Error {
+                    reason: StopReason::Error,
+                    error: partial,
+                });
+                return Ok(());
             }
         };
-
-        let Some(event) = next else { break };
-        let event = event.map_err(|e| StreamFail {
-            message: format!("sse error: {e}"),
-            aborted: false,
-        })?;
-
         let data = event.data.trim();
         if data.is_empty() {
             continue;
         }
         if data == "[DONE]" {
+            completed = true;
             break;
         }
 
@@ -487,6 +480,28 @@ async fn run_stream(
                 }
             }
         }
+    }
+
+    if !completed && finish_reason.is_none()
+        || tool_args
+            .values()
+            .any(|raw| serde_json::from_str::<Value>(raw).is_err())
+    {
+        partial.stop_reason = StopReason::Error;
+        partial.error_message = Some("incomplete model response or invalid tool arguments".into());
+        close_open_blocks(
+            &mut partial,
+            &mut text_index,
+            &mut thinking_index,
+            &mut tool_map,
+            &mut tool_args,
+            &handle,
+        );
+        handle.push(AssistantMessageEvent::Error {
+            reason: StopReason::Error,
+            error: partial,
+        });
+        return Ok(());
     }
 
     // Close open blocks.

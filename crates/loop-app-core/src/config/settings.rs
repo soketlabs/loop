@@ -212,6 +212,12 @@ pub struct Settings {
     /// workflows / slow models). Esc still aborts the turn.
     #[serde(default = "default_response_header_timeout_ms")]
     pub response_header_timeout_ms: u64,
+    /// Native streaming deadline overrides.
+    #[serde(default)]
+    pub timeouts: loop_ai::TimeoutPolicy,
+    /// Provider and model streaming deadline overrides.
+    #[serde(default)]
+    pub timeout_overrides: loop_ai::TimeoutOverrides,
     /// Langfuse tracing (global only; see [`TracingSettings`]).
     #[serde(default)]
     pub tracing: TracingSettings,
@@ -246,7 +252,7 @@ fn default_tool_permissions_settings() -> BTreeMap<String, String> {
     crate::tool_approval::default_tool_permissions()
 }
 fn default_response_header_timeout_ms() -> u64 {
-    60_000
+    120_000
 }
 
 impl Default for Settings {
@@ -280,6 +286,8 @@ impl Default for Settings {
             mcp_servers: BTreeMap::new(),
             disabled_mcp_servers: Vec::new(),
             response_header_timeout_ms: default_response_header_timeout_ms(),
+            timeouts: Default::default(),
+            timeout_overrides: Default::default(),
             tracing: TracingSettings::default(),
             providers: Vec::new(),
             agents: Vec::new(),
@@ -484,6 +492,21 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
             base.disabled_mcp_servers.push(name);
         }
     }
+    base.timeouts.overlay(&project.timeouts);
+    for (key, value) in project.timeout_overrides.providers {
+        base.timeout_overrides
+            .providers
+            .entry(key)
+            .or_default()
+            .overlay(&value);
+    }
+    for (key, value) in project.timeout_overrides.models {
+        base.timeout_overrides
+            .models
+            .entry(key)
+            .or_default()
+            .overlay(&value);
+    }
     base.response_header_timeout_ms = project.response_header_timeout_ms;
     base
 }
@@ -499,7 +522,12 @@ pub fn load_settings(
     if project_trusted {
         let project_settings = get_project_dir(cwd).join("settings.json");
         if project_settings.exists() {
-            let project = Settings::load_file(&project_settings)?;
+            let mut project = Settings::load_file(&project_settings)?;
+            let raw: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&project_settings)?)?;
+            if raw.get("responseHeaderTimeoutMs").is_none() {
+                project.response_header_timeout_ms = settings.response_header_timeout_ms;
+            }
             settings.merge_project(project);
         }
     }
