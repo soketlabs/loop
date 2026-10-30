@@ -2,6 +2,7 @@
 
 pub mod anthropic_messages;
 pub mod detect_compat;
+pub mod google_generative_ai;
 pub mod http;
 pub mod openai_completions;
 pub mod openai_models;
@@ -11,6 +12,7 @@ pub mod transform_messages;
 
 pub use anthropic_messages::AnthropicMessagesAdapter;
 pub use detect_compat::{detect_compat, resolve_compat};
+pub use google_generative_ai::GoogleGenerativeAiAdapter;
 pub use http::{http_client, streaming_http_client};
 pub use openai_completions::OpenAICompletionsAdapter;
 pub use openai_models::{

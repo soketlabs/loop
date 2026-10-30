@@ -4,6 +4,7 @@
 
 mod anthropic_messages;
 mod faux;
+mod google_generative_ai;
 mod harness;
 mod openai_completions;
 mod openai_responses;

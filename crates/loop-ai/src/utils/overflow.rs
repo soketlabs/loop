@@ -39,6 +39,7 @@ const OVERFLOW_PATTERNS: &[&str] = &[
     "string_above_max_length",
     "input is too long",
     "request too large",
+    "exceeds the maximum number of tokens",
 ];
 
 #[cfg(test)]
@@ -83,6 +84,19 @@ mod tests {
             ..Usage::empty()
         };
         assert!(is_context_overflow(&model(), &msg));
+    }
+
+    #[test]
+    fn detects_gemini_and_responses_wording() {
+        let mut msg = AssistantMessage::pending(&model());
+        msg.stop_reason = StopReason::Error;
+        for text in [
+            "HTTP 400 Bad Request: The input token count (1200000) exceeds the maximum number of tokens allowed (1048576).",
+            "HTTP 400 Bad Request: Your input exceeds the context window of this model.",
+        ] {
+            msg.error_message = Some(text.into());
+            assert!(is_context_overflow(&model(), &msg), "{text}");
+        }
     }
 
     #[test]
