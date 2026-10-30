@@ -327,6 +327,10 @@ pub async fn print_turn(
     }
 }
 
+/// How long `--print` waits, after a turn ends, for the backend to finish
+/// with it (Loop's own agent saves the turn to the Session then).
+const TURN_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Run one turn, handing each of its updates to `on_update` as it arrives.
 pub async fn run_turn(
     backend: &dyn AgentBackend,
@@ -386,6 +390,10 @@ pub async fn run_turn(
                     (None, StopReason::Cancelled) => TurnEnd::Cancelled,
                     (None, _) => TurnEnd::Completed,
                 };
+                // The backend saves the turn after it ends on the stream;
+                // `--print` exits right after this, so wait for that (with
+                // a bound, in case a backend never settles its handle).
+                let _ = tokio::time::timeout(TURN_SETTLE_TIMEOUT, turn.outcome()).await;
                 return report;
             }
             _ => {}
