@@ -278,6 +278,56 @@ impl AgentHarness {
         Ok(sid)
     }
 
+    /// The current Session's branches as `/tree` rows.
+    pub async fn session_tree(
+        &self,
+    ) -> Result<Vec<crate::harness::session::SessionTreeRow>, AgentHarnessError> {
+        let reader = self.session.lock().await.reader();
+        let head = reader
+            .read_head()
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        let entries = reader
+            .read_entries(None)
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        Ok(crate::harness::session::session_tree_rows(
+            &entries,
+            head.as_deref(),
+        ))
+    }
+
+    /// The Session the current one was forked or cloned from, and the
+    /// Sessions forked or cloned from it, newest first.
+    pub async fn session_family(
+        &self,
+    ) -> Result<
+        (
+            Option<crate::harness::session::SessionMetadata>,
+            Vec<crate::harness::session::SessionMetadata>,
+        ),
+        AgentHarnessError,
+    > {
+        let (store, meta) = {
+            let session = self.session.lock().await;
+            (session.store(), session.metadata().clone())
+        };
+        let all = store
+            .list(meta.cwd.as_deref())
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        let parent = meta
+            .parent_session_id
+            .as_deref()
+            .and_then(|id| all.iter().find(|m| m.id == id).cloned());
+        let mut children: Vec<_> = all
+            .into_iter()
+            .filter(|m| m.parent_session_id.as_deref() == Some(meta.id.as_str()))
+            .collect();
+        children.sort_by_key(|m| std::cmp::Reverse(m.created_at));
+        Ok((parent, children))
+    }
+
     /// The current Session's active branch, for `/export`.
     pub async fn export_session(
         &self,
@@ -943,6 +993,16 @@ impl AgentHarness {
         target_id: &str,
         summarize: bool,
     ) -> Result<NavigateTreeResult, AgentHarnessError> {
+        self.navigate_tree_to(Some(target_id), summarize).await
+    }
+
+    /// Navigate the session tree to a target entry, or to before the first
+    /// entry when `target_id` is `None` (idle only).
+    pub async fn navigate_tree_to(
+        &self,
+        target_id: Option<&str>,
+        summarize: bool,
+    ) -> Result<NavigateTreeResult, AgentHarnessError> {
         self.acquire_idle_phase(AgentHarnessPhase::BranchSummary)
             .await?;
 
@@ -959,13 +1019,13 @@ impl AgentHarness {
 
     async fn navigate_tree_inner(
         &self,
-        target_id: &str,
+        target_id: Option<&str>,
         summarize: bool,
     ) -> Result<NavigateTreeResult, AgentHarnessError> {
         let hook = self
             .hooks
             .emit(HarnessHookEvent::SessionBeforeTree {
-                target_id: target_id.to_string(),
+                target_id: target_id.unwrap_or_default().to_string(),
             })
             .await;
 
@@ -1005,7 +1065,7 @@ impl AgentHarness {
         {
             let session = self.session.lock().await;
             session
-                .move_to(Some(target_id.to_string()))
+                .move_to(target_id.map(str::to_string))
                 .await
                 .map_err(AgentHarnessError::Session)?;
         }

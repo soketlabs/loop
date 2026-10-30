@@ -18,8 +18,9 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
 use loop_agent::harness::{
-    format_prompt_template_invocation, KrunSandbox, Sandbox, SandboxMode, SessionForkPoint,
-    SessionForkSelection,
+    format_prompt_template_invocation,
+    session::{SessionTreeRow, SessionTreeRowKind},
+    KrunSandbox, Sandbox, SandboxMode, SessionForkPoint, SessionForkSelection,
 };
 use loop_ai::providers::SOKET_BASE_URL;
 use loop_ai::{calculate_context_tokens, CredentialStore, ModelsRefreshOptions, Usage};
@@ -482,6 +483,7 @@ async fn run_loop(
     let mut skill_picker: Option<SkillPickerState> = None;
     let mut mcp_picker: Option<McpPickerState> = None;
     let mut session_picker: Option<SessionPickerState> = None;
+    let mut tree_picker: Option<TreePickerState> = None;
     let mut active_approval: Option<ActiveApproval> = None;
     let mut ac_selected: usize = 0;
     let mut last_ac_filter = String::new();
@@ -590,6 +592,7 @@ async fn run_loop(
             && skill_picker.is_none()
             && mcp_picker.is_none()
             && session_picker.is_none()
+            && tree_picker.is_none()
             && active_approval.is_none()
         {
             let extra = dynamic_command_entries(runtime);
@@ -604,6 +607,7 @@ async fn run_loop(
             && skill_picker.is_none()
             && mcp_picker.is_none()
             && session_picker.is_none()
+            && tree_picker.is_none()
             && active_approval.is_none()
         {
             find_at_mention(input.as_str(), input.cursor())
@@ -739,6 +743,14 @@ async fn run_loop(
                     format!("Sessions matching \"{}\"", p.query)
                 },
             }
+        } else if let Some(p) = &tree_picker {
+            PickerView::Sessions {
+                rows: p.rows(),
+                selected: p.selected,
+                hint: "Session tree: ❯ prompts, answers, ⑂ forks and clones. Choosing a prompt \
+                       goes back to just before it, to edit."
+                    .into(),
+            }
         } else if let Some(prompt) = &pending_setup {
             PickerView::Setup {
                 prompt: prompt.clone(),
@@ -780,6 +792,8 @@ async fn run_loop(
             "↑↓ select · enter edit · esc cancel".into()
         } else if session_picker.is_some() {
             "↑↓ select · enter resume · type to filter · esc cancel".into()
+        } else if tree_picker.is_some() {
+            "↑↓ select · enter go there · esc cancel".into()
         } else if skill_picker.is_some() || mcp_picker.is_some() {
             "↑↓ select · space/enter toggle · type to filter · esc close".into()
         } else if let Some(prompt) = &pending_setup {
@@ -983,6 +997,7 @@ async fn run_loop(
                             &mut skill_picker,
                             &mut mcp_picker,
                             &mut session_picker,
+                            &mut tree_picker,
                             &mut active_approval,
                             &mut working,
                             &mut message_queue,
@@ -2332,6 +2347,7 @@ async fn handle_key(
     skill_picker: &mut Option<SkillPickerState>,
     mcp_picker: &mut Option<McpPickerState>,
     session_picker: &mut Option<SessionPickerState>,
+    tree_picker: &mut Option<TreePickerState>,
     active_approval: &mut Option<ActiveApproval>,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
@@ -2558,6 +2574,100 @@ async fn handle_key(
             KeyCode::Backspace => {
                 picker.query.pop();
                 picker.refilter();
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if let Some(picker) = tree_picker.as_mut() {
+        match key.code {
+            KeyCode::Esc => {
+                *tree_picker = None;
+                *status = "ready".into();
+            }
+            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Down => {
+                if picker.selected + 1 < picker.choices.len() {
+                    picker.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let choice = picker.choices.get(picker.selected).cloned();
+                *tree_picker = None;
+                match choice {
+                    Some(TreeChoice::Session { id, .. }) => {
+                        let choice = runtime
+                            .list_sessions()
+                            .await
+                            .ok()
+                            .and_then(|choices| choices.into_iter().find(|c| c.id == id));
+                        match choice {
+                            Some(choice) => {
+                                resume_session(
+                                    choice,
+                                    runtime,
+                                    chat,
+                                    status,
+                                    working,
+                                    message_queue,
+                                    streaming_assistant,
+                                    streaming_thinking,
+                                    redraw_request,
+                                    purge_ui_events,
+                                    tx,
+                                    token_bar,
+                                    refresh_token_bar,
+                                )
+                                .await
+                            }
+                            None => chat.push(sys(format!("session {id} has no messages"))),
+                        }
+                    }
+                    Some(TreeChoice::Entry(row)) => {
+                        let (target, draft) = tree_target(&row);
+                        match runtime
+                            .harness
+                            .navigate_tree_to(target.as_deref(), false)
+                            .await
+                        {
+                            Ok(_) => {
+                                *chat = match runtime
+                                    .backend
+                                    .transcript(&runtime.session_ref())
+                                    .await
+                                {
+                                    Ok(updates) => chat_from_transcript(updates),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "failed to load the session transcript: {e}"
+                                        );
+                                        Vec::new()
+                                    }
+                                };
+                                *redraw_request = true;
+                                *purge_ui_events = true;
+                                *refresh_token_bar = true;
+                                match draft {
+                                    Some(text) => {
+                                        input.set(text);
+                                        chat.push(sys(
+                                            "moved to just before this prompt · edit it and send \
+                                             to start a new branch (the old one stays in /tree)",
+                                        ));
+                                    }
+                                    None => chat.push(sys(
+                                        "moved here · your next prompt continues from this point \
+                                         (the other branches stay in /tree)",
+                                    )),
+                                }
+                                *status = "ready".into();
+                            }
+                            Err(e) => chat.push(error_item(format!("could not move there: {e}"))),
+                        }
+                    }
+                    None => {}
+                }
             }
             _ => {}
         }
@@ -2939,6 +3049,7 @@ async fn handle_key(
                             skill_picker,
                             mcp_picker,
                             session_picker,
+                            tree_picker,
                             hide_thinking,
                             working,
                             message_queue,
@@ -3051,6 +3162,10 @@ async fn handle_key(
             }
             Action::SessionFork => {
                 open_fork_picker(runtime, fork_picker, model_picker, chat, status).await;
+                return Ok(());
+            }
+            Action::SessionTree => {
+                open_tree_picker(runtime, tree_picker, chat, status, *working).await;
                 return Ok(());
             }
             Action::ModelCycleForward | Action::ModelCycleBackward => {
@@ -3330,6 +3445,129 @@ async fn resume_session(
             Err(e) => chat.push(error_item(format!("could not resume {}: {e:#}", choice.id))),
         },
     }
+}
+
+/// One `/tree` row: a point in this Session, or a related Session.
+#[derive(Debug, Clone)]
+enum TreeChoice {
+    Entry(SessionTreeRow),
+    /// The Session this one was forked or cloned from, or one forked or
+    /// cloned from it.
+    Session {
+        id: String,
+        label: String,
+    },
+}
+
+struct TreePickerState {
+    choices: Vec<TreeChoice>,
+    selected: usize,
+}
+
+impl TreePickerState {
+    /// The rows with the current one selected, then the related Sessions.
+    fn new(rows: Vec<SessionTreeRow>, sessions: Vec<(String, String)>) -> Self {
+        let selected = rows.iter().position(|row| row.current).unwrap_or(0);
+        let mut choices: Vec<TreeChoice> = rows.into_iter().map(TreeChoice::Entry).collect();
+        choices.extend(
+            sessions
+                .into_iter()
+                .map(|(id, label)| TreeChoice::Session { id, label }),
+        );
+        Self { choices, selected }
+    }
+
+    fn rows(&self) -> Vec<PickerRow> {
+        self.choices
+            .iter()
+            .map(|choice| match choice {
+                TreeChoice::Entry(row) => {
+                    let icon = match row.kind {
+                        SessionTreeRowKind::User => "❯",
+                        SessionTreeRowKind::Assistant => " ",
+                        SessionTreeRowKind::Summary => "≡",
+                    };
+                    PickerRow {
+                        label: format!("{}{icon} {}", "  ".repeat(row.depth), row.preview),
+                        description: if row.current {
+                            "you are here".into()
+                        } else if row.on_branch {
+                            "this branch".into()
+                        } else {
+                            String::new()
+                        },
+                        mark: row.current.then(|| "●".into()),
+                    }
+                }
+                TreeChoice::Session { label, id } => PickerRow {
+                    label: format!("⑂ {label}"),
+                    description: id.clone(),
+                    mark: None,
+                },
+            })
+            .collect()
+    }
+}
+
+/// Where choosing `row` moves the Session, and the prompt to edit: a
+/// prompt goes back to just before it, any other row to itself.
+fn tree_target(row: &SessionTreeRow) -> (Option<String>, Option<String>) {
+    match row.kind {
+        SessionTreeRowKind::User => (row.parent_id.clone(), row.text.clone()),
+        _ => (Some(row.entry_id.clone()), None),
+    }
+}
+
+async fn open_tree_picker(
+    runtime: &CliRuntime,
+    tree_picker: &mut Option<TreePickerState>,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    working: bool,
+) {
+    if working {
+        chat.push(sys("wait for the current turn to finish, then /tree"));
+        return;
+    }
+    if !runtime.is_native() {
+        chat.push(sys(
+            "/tree shows Loop's own sessions · pick a Loop model with /model first",
+        ));
+        return;
+    }
+    let rows = match runtime.harness.session_tree().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            chat.push(error_item(format!("could not read the session tree: {e}")));
+            return;
+        }
+    };
+    let titles: std::collections::HashMap<String, String> = runtime
+        .list_sessions()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| (c.id, c.title))
+        .collect();
+    let title = |id: &str| titles.get(id).cloned().unwrap_or_else(|| id.to_owned());
+    let mut sessions = Vec::new();
+    if let Ok((parent, children)) = runtime.harness.session_family().await {
+        if let Some(parent) = parent {
+            sessions.push((
+                parent.id.clone(),
+                format!("forked from · {}", title(&parent.id)),
+            ));
+        }
+        for child in children {
+            sessions.push((child.id.clone(), format!("fork · {}", title(&child.id))));
+        }
+    }
+    if rows.is_empty() && sessions.is_empty() {
+        chat.push(sys("nothing in this session yet"));
+        return;
+    }
+    *tree_picker = Some(TreePickerState::new(rows, sessions));
+    *status = "tree · pick a point or a session".into();
 }
 
 struct ForkPickerState {
@@ -4564,6 +4802,7 @@ async fn apply_effect(
     skill_picker: &mut Option<SkillPickerState>,
     mcp_picker: &mut Option<McpPickerState>,
     session_picker: &mut Option<SessionPickerState>,
+    tree_picker: &mut Option<TreePickerState>,
     hide_thinking: &mut bool,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
@@ -5206,9 +5445,7 @@ async fn apply_effect(
             }
         }
         CommandEffect::Tree => {
-            chat.push(sys(
-                "session tree stored in SQLite — use /fork /clone; full tree UI forthcoming",
-            ));
+            open_tree_picker(runtime, tree_picker, chat, status, *working).await;
         }
         CommandEffect::SetName(name) if name.trim().is_empty() => {
             chat.push(sys("Usage: /name <name>"));
@@ -6092,5 +6329,56 @@ mod changelog_tests {
         assert!(err.contains("no release notes for Loop 0.6.0-dev"), "{err}");
         assert!(err.contains("404"), "{err}");
         assert!(err.contains(RELEASES_URL), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod tree_picker_tests {
+    use super::*;
+
+    fn row(id: &str, parent: &str, kind: SessionTreeRowKind, depth: usize) -> SessionTreeRow {
+        SessionTreeRow {
+            entry_id: id.into(),
+            parent_id: Some(parent.into()),
+            depth,
+            kind,
+            preview: format!("{id} text"),
+            text: (kind == SessionTreeRowKind::User).then(|| format!("{id} full")),
+            on_branch: id != "u2",
+            current: id == "a3",
+        }
+    }
+
+    #[test]
+    fn rows_indent_mark_the_current_point_and_list_related_sessions() {
+        use SessionTreeRowKind::*;
+        let picker = TreePickerState::new(
+            vec![
+                row("u1", "m", User, 0),
+                row("u2", "u1", User, 1),
+                row("a3", "u1", Assistant, 1),
+            ],
+            vec![("s-1".into(), "fork · try again".into())],
+        );
+        assert_eq!(picker.selected, 2, "starts at the current point");
+        let rows = picker.rows();
+        assert_eq!(rows[0].label, "❯ u1 text");
+        assert_eq!(rows[0].description, "this branch");
+        assert_eq!(rows[1].label, "  ❯ u2 text");
+        assert_eq!(rows[1].description, "");
+        assert_eq!(rows[2].description, "you are here");
+        assert_eq!(rows[2].mark.as_deref(), Some("●"));
+        assert_eq!(rows[3].label, "⑂ fork · try again");
+    }
+
+    #[test]
+    fn a_prompt_goes_back_to_just_before_it_and_other_rows_to_themselves() {
+        let prompt = row("u2", "a1", SessionTreeRowKind::User, 1);
+        assert_eq!(
+            tree_target(&prompt),
+            (Some("a1".into()), Some("u2 full".into()))
+        );
+        let answer = row("a3", "u1", SessionTreeRowKind::Assistant, 1);
+        assert_eq!(tree_target(&answer), (Some("a3".into()), None));
     }
 }

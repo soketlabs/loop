@@ -83,6 +83,10 @@ Context files are loaded automatically from the agent dir, `~/.claude/CLAUDE.md`
 - **Title:** the session's `/name` when set, otherwise its first prompt.
 - **`/resume <id>`** resumes directly. A unique prefix of the id is enough.
 - **From the shell:** `loop --resume` with no id opens the picker, and `loop --continue` resumes the most recent session.
+- **`/tree`** shows the session as a tree: prompts (`❯`) and answers, indented where you went back and tried something else, with `●` where you are. Below them are the session this one was forked or cloned from and the sessions forked or cloned from it (`⑂`).
+  - **Enter on a prompt** goes back to just before it and puts it in the input box. Edit it and send to start a new branch; the old branch stays in `/tree`.
+  - **Enter on an answer** goes back to that point; your next prompt continues from there.
+  - **Enter on a `⑂` row** switches to that session.
 - **`/export [path]`** saves the current session twice, side by side: a Markdown transcript (`path.md`) and a session file (`path.loop.jsonl`). With no path they are `loop-<id>.md` and `loop-<id>.loop.jsonl` in this folder. The transcript leaves out thinking and images and keeps the first 20 lines of each tool result. Only the active branch is saved. Subscription sessions can't be exported.
 - **`/import <file.loop.jsonl>`** opens an exported session file as a new session in this folder and switches to it, so you can continue it. "Accept all … for this session" approvals in the file are not imported.
 - **Not listed:**
