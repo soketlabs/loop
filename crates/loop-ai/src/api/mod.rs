@@ -5,6 +5,7 @@ pub mod detect_compat;
 pub mod http;
 pub mod openai_completions;
 pub mod openai_models;
+pub mod openai_responses;
 pub(crate) mod sse;
 pub mod transform_messages;
 
@@ -15,4 +16,5 @@ pub use openai_completions::OpenAICompletionsAdapter;
 pub use openai_models::{
     list_openai_models, map_remote_model, verify_api_key, ListModelsError, MapRemoteModelOptions,
 };
+pub use openai_responses::OpenAIResponsesAdapter;
 pub use transform_messages::transform_messages;

@@ -6,3 +6,4 @@ mod anthropic_messages;
 mod faux;
 mod harness;
 mod openai_completions;
+mod openai_responses;

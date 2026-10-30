@@ -11,6 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 /// Known wire-protocol identifiers. Custom APIs may use any string.
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";
+/// OpenAI Responses (`/v1/responses`).
+pub const API_OPENAI_RESPONSES: &str = "openai-responses";
 /// Anthropic Messages (`/v1/messages`).
 pub const API_ANTHROPIC_MESSAGES: &str = "anthropic-messages";
 
