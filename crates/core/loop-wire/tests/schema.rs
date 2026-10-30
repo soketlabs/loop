@@ -84,7 +84,10 @@ fn real_messages_validate() {
     ];
     for (definition, message) in cases {
         let validator = validator(definition);
-        let errors: Vec<String> = validator.iter_errors(&message).map(|e| e.to_string()).collect();
+        let errors: Vec<String> = validator
+            .iter_errors(&message)
+            .map(|e| e.to_string())
+            .collect();
         assert!(errors.is_empty(), "{definition}: {errors:?}\n{message}");
     }
     assert!(
