@@ -200,13 +200,9 @@ async fn send_once(
 ) -> Result<reqwest::Response, StreamFail> {
     let owned;
     let client = if let Some(ms) = options.timeouts.connection_ms {
-        let mut builder = reqwest::Client::builder();
-        if ms > 0 {
-            builder = builder.connect_timeout(Duration::from_millis(ms));
-        }
-        owned = builder
-            .build()
-            .map_err(|_| StreamFail::new("failed to build streaming client"))?;
+        owned = crate::api::http::streaming_http_client_with_connect(
+            (ms > 0).then(|| Duration::from_millis(ms)),
+        );
         &owned
     } else {
         client
@@ -217,7 +213,7 @@ async fn send_once(
 
     let cancel = options.cancel.clone();
     let response_fut = req.send();
-    // None => default 60s; Some(0) => no limit; Some(n) => n ms.
+    // None => default 120s; Some(0) => no limit; Some(n) => n ms.
     let ttfb: Option<Duration> = match options
         .timeouts
         .response_header_ms
