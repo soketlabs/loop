@@ -4563,6 +4563,7 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "jsonschema",
+ "loop-protocol",
  "loop-test-support",
  "parking_lot",
  "reqwest 0.12.28",

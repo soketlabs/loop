@@ -17,7 +17,7 @@ use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, Context, MaxTokensField, Message,
     Model, ProviderResponse, ResolvedOpenAICompletionsCompat, SimpleStreamOptions, StopReason,
     StreamOptions, TextContent, ThinkingContent, ThinkingFormat, ThinkingLevel, ToolCall,
-    ToolResultContent, Usage, UserContent, UserMessageContent, API_OPENAI_COMPLETIONS,
+    ToolResultContent, Usage, UserContent, UserMessageContent,
 };
 use crate::utils::{calculate_cost, parse_streaming_json};
 
@@ -583,7 +583,9 @@ async fn run_stream(
             partial: partial.clone(),
         });
     }
-    for (_stream_idx, content_index) in tool_map {
+    let mut tool_indexes: Vec<usize> = tool_map.into_values().collect();
+    tool_indexes.sort_unstable();
+    for content_index in tool_indexes {
         if let AssistantContent::ToolCall(call) = &partial.content[content_index] {
             let finalized = {
                 let raw = tool_args.get(&content_index).cloned().unwrap_or_default();
@@ -607,14 +609,10 @@ async fn run_stream(
     }
 
     calculate_cost(&model, &mut partial.usage);
-    if partial.usage.total_tokens == 0 {
-        partial.usage.total_tokens = partial.usage.input + partial.usage.output;
-    }
 
     let reason = map_finish_reason(finish_reason.as_deref(), &partial, &compat);
     partial.stop_reason = reason;
     partial.raw_stop_reason = finish_reason;
-    partial.api = API_OPENAI_COMPLETIONS.to_string();
 
     if reason.is_error() {
         handle.push(AssistantMessageEvent::Error {
@@ -655,7 +653,9 @@ fn close_open_blocks(
             partial: partial.clone(),
         });
     }
-    for (_k, content_index) in tool_map.drain() {
+    let mut tool_indexes: Vec<usize> = tool_map.drain().map(|(_, i)| i).collect();
+    tool_indexes.sort_unstable();
+    for content_index in tool_indexes {
         if let AssistantContent::ToolCall(call) = &partial.content[content_index] {
             let mut finalized = call.clone();
             if let Some(raw) = tool_args.get(&content_index) {
@@ -699,26 +699,28 @@ fn extract_reasoning_delta(delta: &Value) -> Option<String> {
     None
 }
 
+/// `prompt_tokens` includes cached tokens; [`Usage::input`] counts only the uncached ones.
 fn apply_usage(usage: &mut Usage, value: &Value) {
-    if let Some(v) = value.get("prompt_tokens").and_then(|v| v.as_u64()) {
-        usage.input = v;
+    let prompt = value.get("prompt_tokens").and_then(|v| v.as_u64());
+    let cached = value
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(|v| v.as_u64());
+    if let Some(v) = cached {
+        usage.cache_read = v;
+    }
+    if let Some(v) = prompt {
+        usage.input = v.saturating_sub(usage.cache_read);
     }
     if let Some(v) = value.get("completion_tokens").and_then(|v| v.as_u64()) {
         usage.output = v;
     }
-    if let Some(v) = value.get("total_tokens").and_then(|v| v.as_u64()) {
-        usage.total_tokens = v;
+    if let Some(v) = value
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(|v| v.as_u64())
+    {
+        usage.reasoning = Some(v);
     }
-    if let Some(details) = value.get("prompt_tokens_details") {
-        if let Some(v) = details.get("cached_tokens").and_then(|v| v.as_u64()) {
-            usage.cache_read = v;
-        }
-    }
-    if let Some(details) = value.get("completion_tokens_details") {
-        if let Some(v) = details.get("reasoning_tokens").and_then(|v| v.as_u64()) {
-            usage.reasoning = Some(v);
-        }
-    }
+    usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
 
 fn map_finish_reason(
