@@ -8,7 +8,7 @@
 //! function call's in `thought_signature`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use eventsource_stream::Eventsource;
 use reqwest::header::{HeaderMap, AUTHORIZATION};
@@ -26,6 +26,7 @@ use crate::types::{
     AssistantContent, Context, ImageContent, Message, Model, SimpleStreamOptions, StopReason,
     StreamOptions, ThinkingLevel, ToolResultContent, Usage, UserContent, UserMessageContent,
 };
+use crate::utils::summarize_http_error;
 
 /// Adapter for the OpenAI Responses API.
 #[derive(Debug, Clone)]
@@ -116,7 +117,7 @@ async fn run_stream(
     let url = format!("{base_url}/responses");
     let messages = transform_messages(&context.messages, &model);
     let payload = build_payload(&model, &context, &messages, &options, reasoning);
-    let payload = apply_on_payload(payload, &model, &options);
+    let mut payload = apply_on_payload(payload, &model, &options);
 
     let mut headers = HeaderMap::new();
     merge_headers(&mut headers, &options);
@@ -126,7 +127,21 @@ async fn run_stream(
         }
     }
 
-    let response = send_request(&client, &url, headers, &payload, &options).await?;
+    let mut response = send_request(&client, &url, headers.clone(), &payload, &options).await?;
+    // Reasoning summaries need a verified organization. Without one, retry once
+    // without them (the reasoning itself still runs) and remember the model.
+    if payload.pointer("/reasoning/summary").is_some() && response.status().as_u16() == 400 {
+        let body = response.text().await.unwrap_or_default();
+        if !rejects_summaries(&body) {
+            return Err(StreamFail::new(summarize_http_error(400, &body)));
+        }
+        tracing::warn!(model = %model.id, "reasoning summaries are not available; retrying without them");
+        mark_summaries_rejected(&model);
+        if let Some(reasoning) = payload["reasoning"].as_object_mut() {
+            reasoning.remove("summary");
+        }
+        response = send_request(&client, &url, headers, &payload, &options).await?;
+    }
     let response = check_response(response, &model, &options).await?;
 
     let mut out = MessageBuilder::start(&model, handle);
@@ -273,6 +288,35 @@ async fn run_stream(
     Ok(())
 }
 
+/// Models whose organization may not receive reasoning summaries, as
+/// `provider/id`.
+static SUMMARIES_REJECTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn model_key(model: &Model) -> String {
+    format!("{}/{}", model.provider, model.id)
+}
+
+fn mark_summaries_rejected(model: &Model) {
+    let mut rejected = SUMMARIES_REJECTED.lock().unwrap_or_else(|p| p.into_inner());
+    let key = model_key(model);
+    if !rejected.contains(&key) {
+        rejected.push(key);
+    }
+}
+
+fn summaries_rejected(model: &Model) -> bool {
+    SUMMARIES_REJECTED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&model_key(model))
+}
+
+/// Whether an error body refuses reasoning summaries.
+fn rejects_summaries(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    body.contains("summar") && (body.contains("verif") || body.contains("unsupported"))
+}
+
 /// The reasoning item to replay: what the API sent, minus streaming-only fields.
 fn reasoning_item(item: &Value) -> Value {
     let mut item = item.clone();
@@ -369,7 +413,10 @@ fn build_payload(
             .collect();
     }
     if let (true, Some(level)) = (model.reasoning, reasoning) {
-        payload["reasoning"] = json!({ "effort": effort(level), "summary": "auto" });
+        payload["reasoning"] = json!({ "effort": effort(level) });
+        if !summaries_rejected(model) {
+            payload["reasoning"]["summary"] = json!("auto");
+        }
     }
     if let Some(session_id) = &options.session_id {
         payload["prompt_cache_key"] = json!(session_id);
