@@ -28,8 +28,9 @@ use loop_app_core::interaction::{
     approval_kind, ApprovalReply, InteractionQueue, PendingInteraction,
 };
 use loop_protocol::{
-    AgentBackend, ContentBlock, InteractionOutcome, InteractionRequest, NoticeLevel, Origin, Role,
-    SessionUpdate, StopReason, ToolCallStatus, ToolContent, TurnOutcome, UpdateEnvelope,
+    AgentBackend, ContentBlock, InteractionOutcome, InteractionRequest, NoticeLevel, Origin,
+    PlanEntry, Role, SessionUpdate, StopReason, ToolCallStatus, ToolContent, TurnOutcome,
+    UpdateEnvelope,
 };
 
 #[cfg(feature = "telemetry")]
@@ -498,6 +499,9 @@ async fn run_loop(
     let mut session_picker: Option<SessionPickerState> = None;
     let mut tree_picker: Option<TreePickerState> = None;
     let mut attachments = Attachments::default();
+    // This turn's checklist: shown live under the transcript and updated in
+    // place; it lands in the transcript when the turn ends.
+    let mut live_plan: Option<Vec<PlanEntry>> = None;
     let mut active_approval: Option<ActiveApproval> = None;
     let mut ac_selected: usize = 0;
     let mut last_ac_filter = String::new();
@@ -853,7 +857,12 @@ async fn run_loop(
             status.clone()
         };
 
-        let live: Vec<ChatItem> = chat[flushed..].to_vec();
+        let mut live: Vec<ChatItem> = chat[flushed..].to_vec();
+        if let Some(entries) = &live_plan {
+            live.push(ChatItem::Plan {
+                entries: entries.clone(),
+            });
+        }
         let setup_mode = pending_setup.is_some();
         if refresh_token_bar {
             token_bar.refresh(runtime).await;
@@ -928,6 +937,7 @@ async fn run_loop(
                 &mut message_queue,
                 &mut token_bar,
                 &mut refresh_token_bar,
+                &mut live_plan,
                 &tx,
             )
             .await;
@@ -1056,6 +1066,7 @@ async fn run_loop(
                 });
             }
             purge_ui_events = false;
+            live_plan = None;
             working = false;
             turn_step.clear();
             streaming_assistant = None;
@@ -1097,6 +1108,7 @@ async fn run_loop(
             &mut message_queue,
             &mut token_bar,
             &mut refresh_token_bar,
+            &mut live_plan,
             &tx,
         )
         .await;
@@ -1444,6 +1456,7 @@ async fn drain_ui_events(
     message_queue: &mut VecDeque<QueuedMessage>,
     token_bar: &mut TokenBarState,
     refresh_token_bar: &mut bool,
+    live_plan: &mut Option<Vec<PlanEntry>>,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
     while let Ok(ev) = rx.try_recv() {
@@ -1510,6 +1523,7 @@ async fn drain_ui_events(
                     token_bar,
                     refresh_token_bar,
                     active_agent_name(runtime),
+                    live_plan,
                 );
             }
             UiEvent::AgentReady { id, model, result } => {
@@ -4258,6 +4272,7 @@ fn handle_update(
     token_bar: &mut TokenBarState,
     refresh_token_bar: &mut bool,
     source: Option<&str>,
+    live_plan: &mut Option<Vec<PlanEntry>>,
 ) {
     let live = origin == Origin::Live;
     match update {
@@ -4282,6 +4297,10 @@ fn handle_update(
             }
         }
         SessionUpdate::MessageStarted { role, .. } => {
+            // A prompt starts a new turn (a replay has no turn ends).
+            if role == Role::User {
+                land_plan(chat, live_plan);
+            }
             // Agent items are created lazily on the first chunk so that
             // thinking and tool items land in true stream order.
             if role == Role::Agent {
@@ -4443,6 +4462,7 @@ fn handle_update(
             }
         }
         SessionUpdate::TurnEnded { stop, error, .. } => {
+            land_plan(chat, live_plan);
             if let Some(error) = error {
                 push_before_queued(chat, error_item(format!("error: {}", error.message)));
             } else if live && stop == StopReason::Cancelled {
@@ -4465,16 +4485,28 @@ fn handle_update(
                 *refresh_token_bar = true;
             }
         }
-        SessionUpdate::Plan { entries } => {
-            *streaming_assistant = None;
-            finish_thinking(chat, streaming_thinking);
-            push_before_queued(chat, ChatItem::Plan { entries });
-        }
+        // Within a turn only the latest checklist shows, in place.
+        SessionUpdate::Plan { entries } => *live_plan = Some(entries),
         // Approvals arrive through HostServices, not the update stream;
         // unknown updates come from newer backends.
         SessionUpdate::InteractionRequested { .. }
         | SessionUpdate::InteractionResolved { .. }
         | SessionUpdate::Unknown(_) => {}
+    }
+}
+
+/// Put the turn's checklist in the transcript, unless it is the one shown
+/// last.
+fn land_plan(chat: &mut Vec<ChatItem>, live_plan: &mut Option<Vec<PlanEntry>>) {
+    let Some(entries) = live_plan.take() else {
+        return;
+    };
+    let last = chat.iter().rev().find_map(|item| match item {
+        ChatItem::Plan { entries } => Some(entries),
+        _ => None,
+    });
+    if last != Some(&entries) {
+        push_before_queued(chat, ChatItem::Plan { entries });
     }
 }
 
@@ -4675,6 +4707,7 @@ fn chat_from_agent_transcript(updates: Vec<SessionUpdate>, source: Option<&str>)
         context_tokens: None,
         context_window: 0,
     };
+    let mut live_plan = None;
     for update in updates {
         handle_update(
             update,
@@ -4688,8 +4721,10 @@ fn chat_from_agent_transcript(updates: Vec<SessionUpdate>, source: Option<&str>)
             &mut token_bar,
             &mut refresh,
             source,
+            &mut live_plan,
         );
     }
+    land_plan(&mut chat, &mut live_plan);
     chat
 }
 
@@ -6115,6 +6150,7 @@ mod tests {
                 &mut token_bar,
                 &mut refresh,
                 None,
+                &mut None,
             );
         }
         (chat, status)
@@ -6158,6 +6194,7 @@ mod tests {
                 &mut token_bar,
                 &mut refresh,
                 None,
+                &mut None,
             );
         }
         chat
@@ -6477,6 +6514,119 @@ mod plan_tests {
                 }]
             ),
             "{chat:?}"
+        );
+    }
+
+    fn user(text: &str, n: u32) -> Vec<SessionUpdate> {
+        let id = loop_protocol::MessageId(format!("u{n}"));
+        vec![
+            SessionUpdate::MessageStarted {
+                message_id: id.clone(),
+                role: loop_protocol::Role::User,
+            },
+            SessionUpdate::MessageChunk {
+                message_id: id.clone(),
+                role: loop_protocol::Role::User,
+                content: loop_protocol::ContentBlock::text(text),
+            },
+            SessionUpdate::MessageEnded { message_id: id },
+        ]
+    }
+
+    fn turn_ended() -> SessionUpdate {
+        SessionUpdate::TurnEnded {
+            turn_id: loop_protocol::TurnId("t".into()),
+            stop: StopReason::EndTurn,
+            error: None,
+        }
+    }
+
+    fn plans(chat: &[ChatItem]) -> Vec<Vec<PlanEntryStatus>> {
+        chat.iter()
+            .filter_map(|item| match item {
+                ChatItem::Plan { entries } => Some(entries.iter().map(|e| e.status).collect()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn within_a_turn_the_checklist_updates_in_place_and_lands_once() {
+        use PlanEntryStatus::*;
+        let mut chat = Vec::new();
+        let mut live_plan = None;
+        let (mut status, mut step) = (String::new(), String::new());
+        let (mut assistant, mut thinking, mut working, mut refresh) = (None, None, true, false);
+        let mut token_bar = TokenBarState {
+            total_tokens: 0,
+            context_tokens: None,
+            context_window: 0,
+        };
+        let mut feed = |update, chat: &mut Vec<ChatItem>, live_plan: &mut _| {
+            handle_update(
+                update,
+                Origin::Live,
+                chat,
+                &mut status,
+                &mut step,
+                &mut assistant,
+                &mut thinking,
+                &mut working,
+                &mut token_bar,
+                &mut refresh,
+                None,
+                live_plan,
+            )
+        };
+        feed(
+            plan(&[("a", InProgress), ("b", Pending)]),
+            &mut chat,
+            &mut live_plan,
+        );
+        feed(
+            plan(&[("a", Completed), ("b", InProgress)]),
+            &mut chat,
+            &mut live_plan,
+        );
+        assert!(plans(&chat).is_empty(), "nothing lands mid-turn");
+        assert_eq!(
+            live_plan.as_ref().map(|e: &Vec<PlanEntry>| e[1].status),
+            Some(InProgress),
+            "the live checklist is the latest one"
+        );
+        feed(turn_ended(), &mut chat, &mut live_plan);
+        assert_eq!(plans(&chat), [vec![Completed, InProgress]]);
+        assert!(live_plan.is_none());
+
+        // The next turn sends the same checklist: it is not shown again.
+        feed(
+            plan(&[("a", Completed), ("b", InProgress)]),
+            &mut chat,
+            &mut live_plan,
+        );
+        feed(turn_ended(), &mut chat, &mut live_plan);
+        assert_eq!(plans(&chat).len(), 1);
+    }
+
+    #[test]
+    fn replay_shows_one_checklist_per_turn_like_live() {
+        use PlanEntryStatus::*;
+        let mut updates = user("go", 1);
+        updates.push(plan(&[("a", InProgress), ("b", Pending)]));
+        updates.push(plan(&[("a", Completed), ("b", Completed)]));
+        updates.extend(user("again", 2));
+        updates.push(plan(&[("a", Completed), ("b", Completed)]));
+        updates.extend(user("more", 3));
+        updates.push(plan(&[("c", Pending)]));
+        let chat = chat_from_transcript(updates);
+        assert_eq!(plans(&chat), [vec![Completed, Completed], vec![Pending]]);
+        let first = chat
+            .iter()
+            .position(|item| matches!(item, ChatItem::Plan { .. }))
+            .unwrap();
+        assert!(
+            matches!(&chat[first + 1], ChatItem::User { text } if text == "again"),
+            "the checklist closes its turn: {chat:?}"
         );
     }
 }
