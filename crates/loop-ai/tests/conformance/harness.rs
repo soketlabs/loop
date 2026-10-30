@@ -78,6 +78,8 @@ pub struct Caps {
     pub cache_writes: bool,
     /// The provider can report a failure inside a `200` stream.
     pub stream_errors: bool,
+    /// The provider reports reasoning tokens separately.
+    pub reasoning_tokens: bool,
 }
 
 /// One adapter's wire format, for the shared scenarios.
@@ -378,7 +380,7 @@ pub fn assert_contract(run: &Run, model: &Model) {
             let u = &message.usage;
             assert_eq!(
                 u.total_tokens,
-                u.input + u.output + u.cache_read + u.cache_write,
+                u.input + u.output + u.cache_read + u.cache_write + u.cache_write_1h.unwrap_or(0),
                 "total is the sum of the parts"
             );
         }
@@ -571,7 +573,8 @@ pub async fn reports_usage_with_cached_tokens(fixture: impl WireFixture) {
     assert_eq!(usage.cache_read, USAGE_CACHE_READ);
     assert_eq!(usage.cache_write, cache_write);
     assert_eq!(usage.output, USAGE_OUTPUT);
-    assert_eq!(usage.reasoning, Some(USAGE_REASONING));
+    let reasoning = fixture.caps().reasoning_tokens.then_some(USAGE_REASONING);
+    assert_eq!(usage.reasoning, reasoning);
     assert_eq!(
         usage.total_tokens,
         USAGE_INPUT + USAGE_CACHE_READ + cache_write + USAGE_OUTPUT

@@ -9,6 +9,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT
 use serde_json::{json, Value};
 
 use crate::api::detect_compat::resolve_compat;
+use crate::api::sse::{send_request, StreamFail};
 use crate::api::transform_messages::transform_messages;
 use crate::auth::ModelAuth;
 use crate::models::ApiAdapter;
@@ -121,84 +122,6 @@ impl OpenAICompletionsAdapter {
 
         stream
     }
-}
-
-struct StreamFail {
-    message: String,
-    aborted: bool,
-}
-
-/// Send one chat completions request, bounded by the time-to-first-byte
-/// limit and the caller's cancellation.
-async fn send_request(
-    client: &reqwest::Client,
-    url: &str,
-    headers: HeaderMap,
-    payload: &Value,
-    options: &StreamOptions,
-) -> Result<reqwest::Response, StreamFail> {
-    let req = client.post(url).headers(headers).json(payload);
-    // Do not set an overall reqwest timeout here — it would abort long SSE bodies.
-    // Bound only time-to-first-byte (headers) via `response_header_timeout_ms`.
-
-    let cancel = options.cancel.clone();
-    let response_fut = req.send();
-    // None => default 60s; Some(0) => no limit; Some(n) => n ms.
-    const DEFAULT_TTFB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-    let ttfb: Option<std::time::Duration> = match options.response_header_timeout_ms {
-        None => Some(DEFAULT_TTFB_TIMEOUT),
-        Some(0) => None,
-        Some(ms) => Some(std::time::Duration::from_millis(ms)),
-    };
-
-    match (cancel.as_ref(), ttfb) {
-        (Some(token), Some(bound)) => {
-            tokio::select! {
-                _ = token.cancelled() => {
-                    return Err(StreamFail { message: "aborted".into(), aborted: true });
-                }
-                res = tokio::time::timeout(bound, response_fut) => {
-                    match res {
-                        Ok(inner) => inner,
-                        Err(_) => {
-                            return Err(StreamFail {
-                                message: format!(
-                                    "timed out waiting for model response ({}s); set responseHeaderTimeoutMs to 0 for long-running waits",
-                                    bound.as_secs()
-                                ),
-                                aborted: false,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        (Some(token), None) => {
-            tokio::select! {
-                _ = token.cancelled() => {
-                    return Err(StreamFail { message: "aborted".into(), aborted: true });
-                }
-                res = response_fut => res,
-            }
-        }
-        (None, Some(bound)) => match tokio::time::timeout(bound, response_fut).await {
-            Ok(inner) => inner,
-            Err(_) => {
-                return Err(StreamFail {
-                    message: format!(
-                        "timed out waiting for model response ({}s); set responseHeaderTimeoutMs to 0 for long-running waits",
-                        bound.as_secs()
-                    ),
-                    aborted: false,
-                });
-            }
-        },
-        (None, None) => response_fut.await,
-    }
-    .map_err(|e| StreamFail {
-        message: e.to_string(),
-        aborted: false,
-    })
 }
 
 async fn run_stream(

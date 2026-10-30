@@ -1,11 +1,14 @@
 //! Wire-protocol adapters.
 
+pub mod anthropic_messages;
 pub mod detect_compat;
 pub mod http;
 pub mod openai_completions;
 pub mod openai_models;
+pub(crate) mod sse;
 pub mod transform_messages;
 
+pub use anthropic_messages::AnthropicMessagesAdapter;
 pub use detect_compat::{detect_compat, resolve_compat};
 pub use http::{http_client, streaming_http_client};
 pub use openai_completions::OpenAICompletionsAdapter;

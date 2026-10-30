@@ -59,6 +59,7 @@ impl WireFixture for Completions {
             reasoning_signatures: false,
             cache_writes: false,
             stream_errors: false,
+            reasoning_tokens: true,
         }
     }
 

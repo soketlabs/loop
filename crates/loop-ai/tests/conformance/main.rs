@@ -2,6 +2,7 @@
 //! a local fake server, so the agent loop behaves the same whichever provider
 //! answers. No real network.
 
+mod anthropic_messages;
 mod faux;
 mod harness;
 mod openai_completions;
