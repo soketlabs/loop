@@ -971,8 +971,8 @@ pub fn ensure_provider_connected(
     }
     if !interactive {
         bail!(
-            "No LLM provider connected. Set SOKET_API_KEY, OPENROUTER_API_KEY or OPENAI_API_KEY, \
-             or run `loop` and use /login. Logged-out providers must reconnect through /login."
+            "No LLM provider connected. Set SOKET_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY, \
+             ANTHROPIC_API_KEY or GEMINI_API_KEY, or run `loop` and use /login. Logged-out providers must reconnect through /login."
         );
     }
     Ok(true)

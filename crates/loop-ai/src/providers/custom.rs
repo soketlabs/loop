@@ -129,5 +129,7 @@ pub fn custom_provider(config: CustomProviderConfig) -> Provider {
         pinned,
         fallback: vec![],
         model_filter: None,
+        api: API_OPENAI_COMPLETIONS.into(),
+        model_traits: None,
     })
 }

@@ -28,6 +28,7 @@ chrono = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
 loop-test-support = { workspace = true }
+loop-protocol = { workspace = true }
 
 [features]
 default = []

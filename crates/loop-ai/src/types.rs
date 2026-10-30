@@ -11,6 +11,12 @@ use tokio_util::sync::CancellationToken;
 
 /// Known wire-protocol identifiers. Custom APIs may use any string.
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";
+/// OpenAI Responses (`/v1/responses`).
+pub const API_OPENAI_RESPONSES: &str = "openai-responses";
+/// Gemini API (`streamGenerateContent`).
+pub const API_GOOGLE_GENERATIVE_AI: &str = "google-generative-ai";
+/// Anthropic Messages (`/v1/messages`).
+pub const API_ANTHROPIC_MESSAGES: &str = "anthropic-messages";
 
 /// Thinking / reasoning effort levels used by [`SimpleStreamOptions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
