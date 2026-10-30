@@ -10,6 +10,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::capabilities::Capabilities;
@@ -59,16 +60,21 @@ impl fmt::Display for BackendError {
 impl std::error::Error for BackendError {}
 
 /// How to open a session.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(default)]
 pub struct SessionSpec {
     /// Absolute working directory for the session.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     /// Display name.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
 
 /// A session as both Loop and the backend know it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionRef {
     /// Backend instance that owns the session.
     pub instance: BackendInstanceId,

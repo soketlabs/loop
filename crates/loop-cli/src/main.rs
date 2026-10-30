@@ -58,6 +58,13 @@ struct Cli {
     #[arg(long, global = true)]
     print: Option<String>,
 
+    /// With `--print`: `text` (the answer), `json` (one result object) or
+    /// `stream-json` (every update as a JSON line, then the result).
+    /// Exit codes: 0 completed, 1 failed, 2 usage error, 3 lost contact
+    /// with the agent mid-turn, 130 cancelled.
+    #[arg(long, global = true, value_enum, default_value_t = print_mode::OutputFormat::Text, requires = "print")]
+    output_format: print_mode::OutputFormat,
+
     /// Write verbose session logs to `target/debug/logs/` (also: `LOOP_DEBUG=1`).
     #[arg(long, global = true)]
     debug: bool,
@@ -314,9 +321,18 @@ async fn real_main() -> anyhow::Result<()> {
         )
         .await
     } else if let Some(prompt) = cli.print {
-        let result = print_mode::run_print(&mut runtime, prompt, &cli.trace).await;
+        let result =
+            print_mode::run_print(&mut runtime, prompt, cli.output_format, &cli.trace).await;
         runtime.agents.shutdown().await;
-        result
+        match result {
+            Ok(0) => Ok(()),
+            Ok(code) => {
+                #[cfg(feature = "telemetry")]
+                print_mode::shutdown_telemetry(&telemetry).await;
+                std::process::exit(code);
+            }
+            Err(err) => Err(err),
+        }
     } else {
         loop_cli::app::run(runtime).await
     };

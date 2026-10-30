@@ -190,7 +190,8 @@ impl AcpBackend {
                     format!("could not start {}: {e}", self.config.name),
                 )
             })?;
-        let (conn, incoming) = Connection::new(agent.reader, agent.writer);
+        let (conn, incoming) =
+            Connection::new(loop_wire::transport::lines(agent.reader, agent.writer));
         let mut live = Live {
             conn: Arc::clone(&conn),
             generation,

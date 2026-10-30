@@ -1,0 +1,1732 @@
+{
+  "$defs": {
+    "BackendInstanceId": {
+      "description": "One configured backend: an agent kind plus its account and settings.",
+      "type": "string"
+    },
+    "Capabilities": {
+      "description": "Features a backend declares. Each must match what the backend can actually\ndo: a surface hides or rejects an operation whose capability is false.",
+      "properties": {
+        "fs_client": {
+          "default": false,
+          "description": "Sends file reads and writes to Loop instead of touching disk itself.",
+          "type": "boolean"
+        },
+        "images": {
+          "default": false,
+          "description": "Accepts images in prompts.",
+          "type": "boolean"
+        },
+        "load_session": {
+          "default": false,
+          "description": "Can reopen a past session, replaying its history.",
+          "type": "boolean"
+        },
+        "modes": {
+          "default": false,
+          "description": "Has selectable session modes.",
+          "type": "boolean"
+        },
+        "resume_session": {
+          "default": false,
+          "description": "Can reopen a past session without replaying history.",
+          "type": "boolean"
+        },
+        "set_model": {
+          "default": false,
+          "description": "Can switch models within a session.",
+          "type": "boolean"
+        },
+        "steering": {
+          "default": false,
+          "description": "Accepts more input while a turn is running.",
+          "type": "boolean"
+        },
+        "terminal_client": {
+          "default": false,
+          "description": "Runs commands through Loop's terminal instead of its own.",
+          "type": "boolean"
+        },
+        "usage": {
+          "default": false,
+          "description": "Reports token usage.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "Choice": {
+      "description": "One choice in a question.",
+      "properties": {
+        "label": {
+          "description": "Label to show.",
+          "type": "string"
+        },
+        "native_id": {
+          "description": "The backend's own choice id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "native_id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "ClientCapabilities": {
+      "description": "What a client can do for the server.",
+      "properties": {
+        "interact": {
+          "default": false,
+          "description": "Answers `host/interact` (permission prompts, questions).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "ContentBlock": {
+      "anyOf": [
+        {
+          "description": "Plain text.",
+          "properties": {
+            "text": {
+              "description": "Text payload.",
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Base64-encoded image.",
+          "properties": {
+            "data": {
+              "description": "Base64 data.",
+              "type": "string"
+            },
+            "mime_type": {
+              "description": "MIME type, such as `image/png`.",
+              "type": "string"
+            },
+            "type": {
+              "const": "image",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data",
+            "mime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A reference to a resource the reader may fetch or open.",
+          "properties": {
+            "name": {
+              "description": "Display name.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "resource_link",
+              "type": "string"
+            },
+            "uri": {
+              "description": "Resource URI.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "uri"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A block with a `type` this reader does not know. The raw JSON is kept."
+        }
+      ],
+      "description": "A unit of content."
+    },
+    "ErrorCategory": {
+      "description": "Why a turn failed, as far as Loop can tell.",
+      "oneOf": [
+        {
+          "const": "auth",
+          "description": "Sign-in missing, expired or rejected.",
+          "type": "string"
+        },
+        {
+          "const": "quota",
+          "description": "The plan's usage allowance is used up. Retrying will not help until it resets.",
+          "type": "string"
+        },
+        {
+          "const": "rate_limit",
+          "description": "Temporarily throttled. Retrying later can succeed.",
+          "type": "string"
+        },
+        {
+          "const": "network",
+          "description": "The backend or provider could not be reached, or the connection dropped.",
+          "type": "string"
+        },
+        {
+          "const": "protocol",
+          "description": "A message violated the protocol, or versions do not match.",
+          "type": "string"
+        },
+        {
+          "const": "agent",
+          "description": "The agent or model reported a failure.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "The user or caller cancelled the turn.",
+          "type": "string"
+        },
+        {
+          "const": "internal",
+          "description": "A bug or unexpected state inside Loop.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "A category this reader does not know.",
+          "type": "string"
+        }
+      ]
+    },
+    "ErrorInfo": {
+      "description": "A failure with enough structure for a surface to decide what to do next.",
+      "properties": {
+        "category": {
+          "$ref": "#/$defs/ErrorCategory",
+          "description": "Failure category."
+        },
+        "message": {
+          "description": "Human-readable description. Never contains secrets.",
+          "type": "string"
+        },
+        "retryable": {
+          "description": "Whether retrying the same request can succeed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "category",
+        "retryable",
+        "message"
+      ],
+      "type": "object"
+    },
+    "InitializeParams": {
+      "description": "`initialize` params.",
+      "properties": {
+        "client_capabilities": {
+          "$ref": "#/$defs/ClientCapabilities",
+          "default": {
+            "interact": false
+          },
+          "description": "What the client can do."
+        },
+        "client_info": {
+          "$ref": "#/$defs/PeerInfo",
+          "description": "The client."
+        },
+        "protocol_version": {
+          "description": "The highest version the client speaks.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "client_info"
+      ],
+      "type": "object"
+    },
+    "InitializeResult": {
+      "description": "`initialize` result.",
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/Capabilities",
+          "description": "What the backend supports."
+        },
+        "instance": {
+          "$ref": "#/$defs/BackendInstanceId",
+          "description": "The backend instance behind the server."
+        },
+        "protocol_version": {
+          "description": "The version to use: the client's, when the server speaks it, or else\nthe server's highest. A client that can't use it closes.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "server_info": {
+          "$ref": "#/$defs/PeerInfo",
+          "description": "The server."
+        }
+      },
+      "required": [
+        "protocol_version",
+        "server_info",
+        "instance",
+        "capabilities"
+      ],
+      "type": "object"
+    },
+    "InteractionId": {
+      "description": "One pending interaction (permission prompt, question, form or URL flow).",
+      "type": "string"
+    },
+    "InteractionOutcome": {
+      "description": "The user's answer to an interaction.",
+      "oneOf": [
+        {
+          "description": "A permission option or question choice, by its native id.",
+          "properties": {
+            "native_id": {
+              "description": "The chosen native id.",
+              "type": "string"
+            },
+            "note": {
+              "description": "Optional note from the user, such as why they rejected a call.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "outcome": {
+              "const": "selected",
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "native_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A free-text or form answer.",
+          "properties": {
+            "outcome": {
+              "const": "answered",
+              "type": "string"
+            },
+            "value": {
+              "description": "The answer."
+            }
+          },
+          "required": [
+            "outcome",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The interaction was withdrawn, for example because the turn was cancelled.",
+          "properties": {
+            "outcome": {
+              "const": "cancelled",
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Loop could not present the interaction.",
+          "properties": {
+            "outcome": {
+              "const": "rejected",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Why.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "InteractionRequest": {
+      "description": "Something the backend needs from the user before it can continue.",
+      "oneOf": [
+        {
+          "description": "Approve or reject a tool call.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "permission",
+              "type": "string"
+            },
+            "options": {
+              "description": "The choices the backend offers, in its order.",
+              "items": {
+                "$ref": "#/$defs/PermissionOption"
+              },
+              "type": "array"
+            },
+            "tool_call": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolCallUpdate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The tool call awaiting approval, when the backend names one."
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "options"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A free-text or multiple-choice question.",
+          "properties": {
+            "choices": {
+              "description": "Offered answers. `None` means free text.",
+              "items": {
+                "$ref": "#/$defs/Choice"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "question",
+              "type": "string"
+            },
+            "prompt": {
+              "description": "Question text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "prompt"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A structured form. The answer is a JSON value matching `schema`.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "form",
+              "type": "string"
+            },
+            "schema": {
+              "description": "JSON Schema of the expected answer."
+            },
+            "title": {
+              "description": "Form title.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "schema"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The user must open a URL, for example to sign in.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "url",
+              "type": "string"
+            },
+            "purpose": {
+              "description": "Why the backend needs it.",
+              "type": "string"
+            },
+            "url": {
+              "description": "URL to open.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "url",
+            "purpose"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A request this Loop version cannot present. It is answered with an\nexplicit error, never left pending.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "unsupported",
+              "type": "string"
+            },
+            "method": {
+              "description": "The backend's method or request type.",
+              "type": "string"
+            },
+            "raw": {
+              "description": "The raw request."
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "method",
+            "raw"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "LoadParams": {
+      "description": "`session/load` params.",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The session to reopen."
+        },
+        "spec": {
+          "$ref": "#/$defs/SessionSpec",
+          "default": {},
+          "description": "How to open it."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "MessageId": {
+      "description": "One user or agent message within a turn.",
+      "type": "string"
+    },
+    "NoticeLevel": {
+      "description": "Severity of a notice.",
+      "oneOf": [
+        {
+          "const": "info",
+          "description": "Status or progress.",
+          "type": "string"
+        },
+        {
+          "const": "warning",
+          "description": "Something the user may want to act on.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "Something went wrong but the turn continues.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "A level this reader does not know.",
+          "type": "string"
+        }
+      ]
+    },
+    "Origin": {
+      "description": "Where an update comes from.",
+      "oneOf": [
+        {
+          "const": "live",
+          "description": "Produced by the running session.",
+          "type": "string"
+        },
+        {
+          "const": "replay",
+          "description": "Replayed history from reopening a session. Rebuilds the display; never\nstored again.",
+          "type": "string"
+        }
+      ]
+    },
+    "PeerInfo": {
+      "description": "Who is on the other end, for logs. Never used for feature checks.",
+      "properties": {
+        "name": {
+          "description": "Program name, e.g. `loop`.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Program version.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "type": "object"
+    },
+    "PermissionKind": {
+      "description": "The meaning of a permission option, as a presentation hint.",
+      "oneOf": [
+        {
+          "const": "allow_once",
+          "description": "Allow this call.",
+          "type": "string"
+        },
+        {
+          "const": "allow_always",
+          "description": "Allow this call and remember the choice.",
+          "type": "string"
+        },
+        {
+          "const": "reject_once",
+          "description": "Reject this call.",
+          "type": "string"
+        },
+        {
+          "const": "reject_always",
+          "description": "Reject this call and remember the choice.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "A kind this reader does not know.",
+          "type": "string"
+        }
+      ]
+    },
+    "PermissionOption": {
+      "description": "One choice in a permission prompt.",
+      "properties": {
+        "kind_hint": {
+          "$ref": "#/$defs/PermissionKind",
+          "description": "What the option means, for presentation only. Loop does not infer a\ngrant or suppress later prompts from it: the backend defines the scope."
+        },
+        "label": {
+          "description": "Label to show.",
+          "type": "string"
+        },
+        "native_id": {
+          "description": "The backend's own option id, sent back unchanged.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "native_id",
+        "label",
+        "kind_hint"
+      ],
+      "type": "object"
+    },
+    "PlanEntry": {
+      "description": "One step of the agent's plan.",
+      "properties": {
+        "content": {
+          "description": "What the step does.",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/PlanEntryStatus",
+          "description": "Progress."
+        }
+      },
+      "required": [
+        "content",
+        "status"
+      ],
+      "type": "object"
+    },
+    "PlanEntryStatus": {
+      "description": "Progress of a plan step.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Not started.",
+          "type": "string"
+        },
+        {
+          "const": "in_progress",
+          "description": "Under way.",
+          "type": "string"
+        },
+        {
+          "const": "completed",
+          "description": "Done.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "A status this reader does not know.",
+          "type": "string"
+        }
+      ]
+    },
+    "PromptParams": {
+      "description": "`session/prompt` params.",
+      "properties": {
+        "content": {
+          "description": "The prompt.",
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "type": "array"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session",
+        "content"
+      ],
+      "type": "object"
+    },
+    "PromptResult": {
+      "description": "`session/prompt` result: how the turn ended.",
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Failure details when `stop` is `error`."
+        },
+        "stop": {
+          "$ref": "#/$defs/StopReason",
+          "description": "Why the turn ended."
+        },
+        "uncertain": {
+          "description": "The backend lost contact with its agent mid-turn: edits or commands\nmay already have run, so the prompt must not be re-sent automatically.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "stop"
+      ],
+      "type": "object"
+    },
+    "Role": {
+      "description": "Who wrote a message.",
+      "oneOf": [
+        {
+          "const": "user",
+          "description": "The person using Loop.",
+          "type": "string"
+        },
+        {
+          "const": "agent",
+          "description": "The agent.",
+          "type": "string"
+        }
+      ]
+    },
+    "RpcErrorBody": {
+      "description": "A JSON-RPC error: code, message and optional data.",
+      "properties": {
+        "code": {
+          "description": "Error code.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "data": {
+          "description": "Structured details."
+        },
+        "message": {
+          "description": "Message.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "SessionKey": {
+      "description": "A conversation as Loop knows it. Stable across process restarts.",
+      "type": "string"
+    },
+    "SessionParams": {
+      "description": "Params naming one session.",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "SessionRef": {
+      "description": "A session as both Loop and the backend know it.",
+      "properties": {
+        "instance": {
+          "$ref": "#/$defs/BackendInstanceId",
+          "description": "Backend instance that owns the session."
+        },
+        "key": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "Loop's key for the session."
+        },
+        "native_id": {
+          "description": "The backend's own id for the session.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instance",
+        "key",
+        "native_id"
+      ],
+      "type": "object"
+    },
+    "SessionSpec": {
+      "description": "How to open a session.",
+      "properties": {
+        "cwd": {
+          "description": "Absolute working directory for the session.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Display name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SessionUpdate": {
+      "anyOf": [
+        {
+          "description": "A turn began.",
+          "properties": {
+            "turn_id": {
+              "$ref": "#/$defs/TurnId",
+              "description": "Turn id."
+            },
+            "type": {
+              "const": "turn_started",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "turn_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A message began.",
+          "properties": {
+            "message_id": {
+              "$ref": "#/$defs/MessageId",
+              "description": "Message id."
+            },
+            "role": {
+              "$ref": "#/$defs/Role",
+              "description": "Author."
+            },
+            "type": {
+              "const": "message_started",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "message_id",
+            "role"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Part of a message.",
+          "properties": {
+            "content": {
+              "$ref": "#/$defs/ContentBlock",
+              "description": "Content to append."
+            },
+            "message_id": {
+              "$ref": "#/$defs/MessageId",
+              "description": "Message id."
+            },
+            "role": {
+              "$ref": "#/$defs/Role",
+              "description": "Author."
+            },
+            "type": {
+              "const": "message_chunk",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "message_id",
+            "role",
+            "content"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A message is complete.",
+          "properties": {
+            "message_id": {
+              "$ref": "#/$defs/MessageId",
+              "description": "Message id."
+            },
+            "type": {
+              "const": "message_ended",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "message_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Part of the agent's reasoning.",
+          "properties": {
+            "content": {
+              "$ref": "#/$defs/ContentBlock",
+              "description": "Content to append."
+            },
+            "message_id": {
+              "$ref": "#/$defs/MessageId",
+              "description": "Message the thought belongs to."
+            },
+            "type": {
+              "const": "thought_chunk",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "message_id",
+            "content"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ToolCall",
+          "description": "A tool call began.",
+          "properties": {
+            "type": {
+              "const": "tool_call",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ToolCallUpdate",
+          "description": "A tool call changed. Only changed fields are set.",
+          "properties": {
+            "type": {
+              "const": "tool_call_update",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The agent's plan, replacing any earlier plan.",
+          "properties": {
+            "entries": {
+              "description": "Plan entries in order.",
+              "items": {
+                "$ref": "#/$defs/PlanEntry"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "plan",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "entries"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Usage",
+          "description": "Token usage so far.",
+          "properties": {
+            "type": {
+              "const": "usage",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Something to show that is not part of the conversation.",
+          "properties": {
+            "level": {
+              "$ref": "#/$defs/NoticeLevel",
+              "description": "Severity."
+            },
+            "text": {
+              "description": "Text to show.",
+              "type": "string"
+            },
+            "type": {
+              "const": "notice",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "level",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The backend is waiting for the user.",
+          "properties": {
+            "request": {
+              "$ref": "#/$defs/InteractionRequest",
+              "description": "The request."
+            },
+            "type": {
+              "const": "interaction_requested",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A pending interaction was answered or withdrawn.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "outcome": {
+              "$ref": "#/$defs/InteractionOutcome",
+              "description": "The answer."
+            },
+            "type": {
+              "const": "interaction_resolved",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "outcome"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The turn is over. Emitted exactly once per turn.",
+          "properties": {
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ErrorInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Failure details when `stop` is `Error`."
+            },
+            "stop": {
+              "$ref": "#/$defs/StopReason",
+              "description": "Why it ended."
+            },
+            "turn_id": {
+              "$ref": "#/$defs/TurnId",
+              "description": "Turn id."
+            },
+            "type": {
+              "const": "turn_ended",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "turn_id",
+            "stop"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An update with a `type` this reader does not know. The raw JSON is kept."
+        }
+      ],
+      "description": "One change in a session."
+    },
+    "StopReason": {
+      "description": "Why a turn ended.",
+      "oneOf": [
+        {
+          "const": "end_turn",
+          "description": "The agent finished.",
+          "type": "string"
+        },
+        {
+          "const": "max_tokens",
+          "description": "The model hit its output limit.",
+          "type": "string"
+        },
+        {
+          "const": "max_turn_requests",
+          "description": "The turn hit its request limit.",
+          "type": "string"
+        },
+        {
+          "const": "refusal",
+          "description": "The model refused.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "The turn was cancelled.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "The turn failed. `TurnEnded::error` says why.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "A reason this reader does not know.",
+          "type": "string"
+        }
+      ]
+    },
+    "ToolCall": {
+      "description": "A tool call as first reported.",
+      "properties": {
+        "content": {
+          "description": "Output so far.",
+          "items": {
+            "$ref": "#/$defs/ToolContent"
+          },
+          "type": "array"
+        },
+        "id": {
+          "$ref": "#/$defs/ToolCallId",
+          "description": "Tool call id."
+        },
+        "kind": {
+          "$ref": "#/$defs/ToolKind",
+          "description": "What kind of action the tool performs."
+        },
+        "locations": {
+          "description": "Files the call touches.",
+          "items": {
+            "$ref": "#/$defs/ToolLocation"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "The tool's own name, when the backend reports one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "raw_input": {
+          "description": "The tool's input, as the backend reported it."
+        },
+        "status": {
+          "$ref": "#/$defs/ToolCallStatus",
+          "description": "Current status."
+        },
+        "title": {
+          "description": "Short description to show, such as `edit src/main.rs`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "kind",
+        "status"
+      ],
+      "type": "object"
+    },
+    "ToolCallId": {
+      "description": "One tool call, as named by the backend.",
+      "type": "string"
+    },
+    "ToolCallStatus": {
+      "description": "Progress of a tool call.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Waiting to start, for example for approval.",
+          "type": "string"
+        },
+        {
+          "const": "in_progress",
+          "description": "Running.",
+          "type": "string"
+        },
+        {
+          "const": "completed",
+          "description": "Finished successfully.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "Failed or was rejected.",
+          "type": "string"
+        }
+      ]
+    },
+    "ToolCallUpdate": {
+      "description": "Changed fields of a tool call. `content`, when set, replaces the earlier content.",
+      "properties": {
+        "content": {
+          "description": "Replacement content.",
+          "items": {
+            "$ref": "#/$defs/ToolContent"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/ToolCallId",
+          "description": "Tool call id."
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "New kind."
+        },
+        "locations": {
+          "description": "Replacement locations.",
+          "items": {
+            "$ref": "#/$defs/ToolLocation"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The tool's own name, when the backend reports one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "raw_input": {
+          "description": "The tool's input, when the backend reports or changes it."
+        },
+        "raw_output": {
+          "description": "The tool's raw output, as the backend reported it."
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolCallStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "New status."
+        },
+        "title": {
+          "description": "New title.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "ToolContent": {
+      "anyOf": [
+        {
+          "description": "Ordinary content: text, an image or a resource link.",
+          "properties": {
+            "content": {
+              "$ref": "#/$defs/ContentBlock",
+              "description": "The content."
+            },
+            "type": {
+              "const": "content",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "content"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A file change as full before and after text.",
+          "properties": {
+            "new_text": {
+              "description": "New text.",
+              "type": "string"
+            },
+            "old_text": {
+              "description": "Previous text. `None` for a new file.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "description": "File path.",
+              "type": "string"
+            },
+            "type": {
+              "const": "diff",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "path",
+            "new_text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A file change as a unified diff.",
+          "properties": {
+            "diff": {
+              "description": "Unified diff text.",
+              "type": "string"
+            },
+            "path": {
+              "description": "File path.",
+              "type": "string"
+            },
+            "type": {
+              "const": "unified_diff",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "path",
+            "diff"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Live output of a terminal Loop runs for the backend.",
+          "properties": {
+            "terminal_id": {
+              "description": "Terminal id.",
+              "type": "string"
+            },
+            "type": {
+              "const": "terminal",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "terminal_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Tool content with a `type` this reader does not know. The raw JSON is kept."
+        }
+      ],
+      "description": "Output of a tool call."
+    },
+    "ToolKind": {
+      "description": "What kind of action a tool performs. Used for icons and approval policy.",
+      "oneOf": [
+        {
+          "const": "read",
+          "description": "Reads files or data.",
+          "type": "string"
+        },
+        {
+          "const": "edit",
+          "description": "Changes files.",
+          "type": "string"
+        },
+        {
+          "const": "delete",
+          "description": "Deletes files.",
+          "type": "string"
+        },
+        {
+          "const": "move",
+          "description": "Moves or renames files.",
+          "type": "string"
+        },
+        {
+          "const": "search",
+          "description": "Searches files or data.",
+          "type": "string"
+        },
+        {
+          "const": "execute",
+          "description": "Runs a command.",
+          "type": "string"
+        },
+        {
+          "const": "fetch",
+          "description": "Fetches from the network.",
+          "type": "string"
+        },
+        {
+          "const": "think",
+          "description": "Internal reasoning step.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "Anything else, including kinds this reader does not know.",
+          "type": "string"
+        }
+      ]
+    },
+    "ToolLocation": {
+      "description": "A file location a tool call touches.",
+      "properties": {
+        "line": {
+          "description": "1-based line, when known.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "File path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "TurnId": {
+      "description": "One user prompt and everything the agent does in response.",
+      "type": "string"
+    },
+    "UpdateEnvelope": {
+      "description": "An update together with everything needed to route it.\n\nA backend publishes one stream of envelopes for all its sessions; readers\nroute by `session` and discard envelopes from an older `generation`.",
+      "properties": {
+        "generation": {
+          "description": "Process generation. Increases each time the backend's process restarts.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "instance": {
+          "$ref": "#/$defs/BackendInstanceId",
+          "description": "Backend instance that produced the update."
+        },
+        "origin": {
+          "$ref": "#/$defs/Origin",
+          "description": "Whether this is live activity or replayed history."
+        },
+        "seq": {
+          "description": "Position in the backend's stream for this session. Strictly increasing.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "Session the update belongs to."
+        },
+        "turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Turn the update belongs to, when it belongs to one."
+        },
+        "update": {
+          "$ref": "#/$defs/SessionUpdate",
+          "description": "The update."
+        },
+        "v": {
+          "description": "Protocol version of this envelope.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "v",
+        "instance",
+        "generation",
+        "session",
+        "seq",
+        "origin",
+        "update"
+      ],
+      "type": "object"
+    },
+    "Usage": {
+      "description": "Token usage reported by a backend.",
+      "properties": {
+        "cache_write_tokens": {
+          "description": "Prompt tokens written to cache.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cached_input_tokens": {
+          "description": "Prompt tokens served from cache.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "context_window": {
+          "description": "The model's context window, when known.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cost_usd": {
+          "description": "Cost of the latest request in US dollars, when known.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "input_tokens": {
+          "description": "Prompt tokens of the latest request.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_tokens": {
+          "description": "Output tokens of the latest request.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reasoning_tokens": {
+          "description": "Reasoning tokens, when reported separately.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_tokens": {
+          "description": "Tokens in the context after the latest request.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "total_tokens"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Loop's wire format: JSON-RPC 2.0 methods and the event model. See docs/design/protocol-wire.md.",
+  "error": {
+    "$ref": "#/$defs/RpcErrorBody"
+  },
+  "methods": {
+    "host/interact": {
+      "direction": "server_to_client",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/InteractionRequest"
+      },
+      "result": {
+        "$ref": "#/$defs/InteractionOutcome"
+      }
+    },
+    "initialize": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/InitializeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/InitializeResult"
+      }
+    },
+    "session/cancel": {
+      "direction": "client_to_server",
+      "kind": "notification",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      }
+    },
+    "session/load": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/LoadParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionRef"
+      }
+    },
+    "session/new": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionSpec"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionRef"
+      }
+    },
+    "session/prompt": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/PromptParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PromptResult"
+      }
+    },
+    "session/transcript": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "items": {
+          "$ref": "#/$defs/SessionUpdate"
+        },
+        "type": "array"
+      }
+    },
+    "session/update": {
+      "direction": "server_to_client",
+      "kind": "notification",
+      "params": {
+        "$ref": "#/$defs/UpdateEnvelope"
+      }
+    },
+    "shutdown": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "type": "object"
+      },
+      "result": {
+        "type": "object"
+      }
+    }
+  },
+  "protocol_version": 1,
+  "title": "loop-protocol"
+}

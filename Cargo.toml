@@ -11,6 +11,7 @@ members = [
     "crates/loop-cli",
     "crates/ops/loop-update",
     "crates/core/loop-protocol",
+    "crates/core/loop-wire",
     "crates/extend/loop-acp",
     "crates/loop-desktop"
 ]
@@ -26,6 +27,7 @@ default-members = [
     "crates/loop-cli",
     "crates/ops/loop-update",
     "crates/core/loop-protocol",
+    "crates/core/loop-wire",
     "crates/extend/loop-acp",
 ]
 
@@ -46,6 +48,7 @@ loop-telemetry = { path = "crates/loop-telemetry" }
 loop-test-support = { path = "crates/loop-test-support" }
 loop-update = { path = "crates/ops/loop-update" }
 loop-protocol = { path = "crates/core/loop-protocol" }
+loop-wire = { path = "crates/core/loop-wire" }
 loop-acp = { path = "crates/extend/loop-acp" }
 agent-client-protocol-schema = { version = "1.11", default-features = false }
 sha2 = "0.10"
@@ -63,6 +66,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "signal", "net"] }
 tokio-util = { version = "0.7", default-features = true }
 futures = "0.3"
+schemars = "1"
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake"] }
 async-stream = "0.3"
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

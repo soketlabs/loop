@@ -7,8 +7,14 @@ rust-version.workspace = true
 description = "Versioned event model shared by every Loop agent backend and surface"
 readme = "README.md"
 
+[features]
+# `json_schema()` and `JsonSchema` on every wire type, for the checked-in
+# schema and the SDK generated from it.
+schema = ["dep:schemars"]
+
 [dependencies]
 async-trait = { workspace = true }
+schemars = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

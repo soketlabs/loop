@@ -9,6 +9,7 @@ use loop_agent::AgentMessage;
 use loop_ai::{AssistantContent, Message};
 use loop_protocol::{
     AgentBackend, ContentBlock, Role, SessionRef, SessionUpdate, StopReason, TurnOutcome,
+    UpdateEnvelope, Usage,
 };
 #[cfg(feature = "telemetry")]
 use loop_telemetry::{obs, ObservationExt, TelemetryHandle, TraceAttrs};
@@ -142,12 +143,14 @@ where
     }
 }
 
-/// `loop --print`: run one prompt, print the answer, report the trace id on stderr.
+/// `loop --print`: run one prompt, write the result in `format`, report the
+/// trace id on stderr. Returns the process exit code ([`TurnEnd::exit_code`]).
 pub async fn run_print(
     runtime: &mut CliRuntime,
     prompt: String,
+    format: OutputFormat,
     trace: &TraceArgs,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i32> {
     for notice in std::mem::take(&mut runtime.startup_notices) {
         eprintln!("loop: {notice}");
     }
@@ -161,16 +164,52 @@ pub async fn run_print(
     let backend = runtime.backend.clone();
     let session = runtime.session_ref();
     let input = prompt.clone();
+    let turn_session = session.clone();
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let report_slot = std::sync::Arc::clone(&slot);
     let outcome = traced_print(&input, trace, &runtime.session_id, || async move {
-        print_turn(backend.as_ref(), &session, prompt).await
+        let report = run_turn(backend.as_ref(), &turn_session, prompt, |envelope| {
+            if format == OutputFormat::StreamJson {
+                print_json_line(&serde_json::to_value(envelope).unwrap_or_default());
+            }
+        })
+        .await;
+        // The trace records the answer, or why there is none.
+        let traced = match report.end.error() {
+            None => Ok(report.text.clone()),
+            Some(error) => Err(anyhow::anyhow!(error)),
+        };
+        *report_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(report);
+        traced
     })
     .await;
     if let Some(trace_id) = &outcome.trace_id {
         eprintln!("{TRACE_ID_PREFIX}{trace_id}");
     }
-    let text = outcome.result?;
-    println!("{text}");
-    Ok(())
+    let report = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some(report) = report else {
+        // The run never reached the turn.
+        return outcome.result.map(|_| 1);
+    };
+    match format {
+        OutputFormat::Text => match report.end.error() {
+            None => println!("{}", report.text),
+            Some(error) => eprintln!("loop: {error}"),
+        },
+        OutputFormat::Json | OutputFormat::StreamJson => {
+            print_json_line(&report.result_json(&session))
+        }
+    }
+    Ok(report.exit_code())
+}
+
+/// Write one JSON value as a line on stdout and flush it, so a reader sees
+/// each update as it happens.
+fn print_json_line(value: &serde_json::Value) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{value}");
+    let _ = out.flush();
 }
 
 /// Flush and stop exporting before the process exits; reports a failed last export.
@@ -184,6 +223,95 @@ pub async fn shutdown_telemetry(telemetry: &TelemetryHandle) {
     }
 }
 
+/// How `--print` writes its result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum OutputFormat {
+    /// The text of the agent's last message.
+    #[default]
+    Text,
+    /// One `result` object when the turn ends.
+    Json,
+    /// Every update of the turn as one JSON line, then the `result` object.
+    StreamJson,
+}
+
+/// How a `--print` turn ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnEnd {
+    /// The turn finished.
+    Completed,
+    /// The turn failed, or could not start.
+    Failed(String),
+    /// The turn was cancelled.
+    Cancelled,
+    /// Contact with the agent was lost mid-turn; edits or commands may have
+    /// run.
+    Uncertain,
+}
+
+impl TurnEnd {
+    /// The process exit code: 0 completed, 1 failed, 3 lost contact, 130
+    /// cancelled. Clap uses 2 for usage errors.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Completed => 0,
+            Self::Failed(_) => 1,
+            Self::Uncertain => 3,
+            Self::Cancelled => 130,
+        }
+    }
+
+    /// Why the turn did not complete.
+    pub fn error(&self) -> Option<String> {
+        match self {
+            Self::Completed => None,
+            Self::Failed(message) => Some(message.clone()),
+            Self::Cancelled => Some("the turn was cancelled".into()),
+            Self::Uncertain => {
+                Some("lost contact with the agent; the turn may be incomplete".into())
+            }
+        }
+    }
+}
+
+/// What one `--print` turn produced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnReport {
+    /// The text of the agent's last message.
+    pub text: String,
+    /// Why the turn ended, when the backend said.
+    pub stop: Option<StopReason>,
+    /// The latest token usage.
+    pub usage: Option<Usage>,
+    /// How it ended.
+    pub end: TurnEnd,
+}
+
+impl TurnReport {
+    /// The process exit code ([`TurnEnd::exit_code`]).
+    pub fn exit_code(&self) -> i32 {
+        self.end.exit_code()
+    }
+
+    /// The `result` object for `--output-format json` and `stream-json`.
+    pub fn result_json(&self, session: &SessionRef) -> serde_json::Value {
+        let stop = self.stop.unwrap_or(match self.end {
+            TurnEnd::Completed => StopReason::EndTurn,
+            TurnEnd::Cancelled => StopReason::Cancelled,
+            TurnEnd::Failed(_) | TurnEnd::Uncertain => StopReason::Error,
+        });
+        serde_json::json!({
+            "type": "result",
+            "session": session.key,
+            "stop": stop,
+            "text": self.text,
+            "usage": self.usage,
+            "error": self.end.error(),
+            "exit_code": self.exit_code(),
+        })
+    }
+}
+
 /// Run one turn and return the text of the agent's last message, or why the
 /// turn failed.
 pub async fn print_turn(
@@ -191,57 +319,88 @@ pub async fn print_turn(
     session: &SessionRef,
     prompt: String,
 ) -> anyhow::Result<String> {
+    let report = run_turn(backend, session, prompt, |_| {}).await;
+    match report.end.error() {
+        None => Ok(report.text),
+        Some(error) => Err(anyhow::anyhow!(error)),
+    }
+}
+
+/// Run one turn, handing each of its updates to `on_update` as it arrives.
+pub async fn run_turn(
+    backend: &dyn AgentBackend,
+    session: &SessionRef,
+    prompt: String,
+    mut on_update: impl FnMut(&UpdateEnvelope),
+) -> TurnReport {
+    let mut report = TurnReport {
+        text: String::new(),
+        stop: None,
+        usage: None,
+        end: TurnEnd::Completed,
+    };
     // Subscribe before prompting so no update of this turn is missed.
     let mut updates = backend.subscribe();
-    let turn = backend
+    let turn = match backend
         .prompt(session, vec![ContentBlock::text(prompt)])
-        .await?;
-    let mut last_text = String::new();
+        .await
+    {
+        Ok(turn) => turn,
+        Err(err) => {
+            report.end = TurnEnd::Failed(err.to_string());
+            return report;
+        }
+    };
     loop {
         let envelope = match updates.recv().await {
             Ok(envelope) => envelope,
             Err(RecvError::Lagged(missed)) => {
-                anyhow::bail!("missed {missed} updates from the agent")
+                report.end = TurnEnd::Failed(format!("missed {missed} updates from the agent"));
+                return report;
             }
             Err(RecvError::Closed) => break,
         };
         if envelope.session != session.key {
             continue;
         }
+        on_update(&envelope);
         match envelope.update {
             SessionUpdate::MessageStarted {
                 role: Role::Agent, ..
-            } => last_text.clear(),
+            } => report.text.clear(),
             SessionUpdate::MessageChunk {
                 role: Role::Agent,
                 content,
                 ..
             } => {
                 if let Some(text) = content.as_text() {
-                    last_text.push_str(text);
+                    report.text.push_str(text);
                 }
             }
+            SessionUpdate::Usage(usage) => report.usage = Some(usage),
             SessionUpdate::TurnEnded { stop, error, .. } => {
-                if let Some(error) = error {
-                    anyhow::bail!("{}", error.message);
-                }
-                if stop == StopReason::Cancelled {
-                    anyhow::bail!("the turn was cancelled");
-                }
-                return Ok(last_text);
+                report.stop = Some(stop);
+                report.end = match (error, stop) {
+                    (Some(error), _) => TurnEnd::Failed(error.message),
+                    (None, StopReason::Cancelled) => TurnEnd::Cancelled,
+                    (None, _) => TurnEnd::Completed,
+                };
+                return report;
             }
             _ => {}
         }
     }
     // The stream closed without a turn end; the turn's outcome decides.
-    match turn.outcome().await {
-        TurnOutcome::Completed(_) => Ok(last_text),
-        TurnOutcome::Cancelled => anyhow::bail!("the turn was cancelled"),
-        TurnOutcome::Failed(error) => anyhow::bail!("{}", error.message),
-        TurnOutcome::Uncertain => {
-            anyhow::bail!("lost contact with the agent; the turn may be incomplete")
+    report.end = match turn.outcome().await {
+        TurnOutcome::Completed(stop) => {
+            report.stop = Some(stop);
+            TurnEnd::Completed
         }
-    }
+        TurnOutcome::Cancelled => TurnEnd::Cancelled,
+        TurnOutcome::Failed(error) => TurnEnd::Failed(error.message),
+        TurnOutcome::Uncertain => TurnEnd::Uncertain,
+    };
+    report
 }
 
 /// The assistant's text, or an error when the run stopped on error / abort.
@@ -324,6 +483,16 @@ mod tests {
     fn malformed_metadata_is_rejected() {
         assert!(parse(&["--trace-metadata", "novalue"]).is_err());
         assert!(parse(&["--trace-metadata", "=x"]).is_err());
+    }
+
+    #[test]
+    fn exit_codes_follow_how_the_turn_ended() {
+        assert_eq!(TurnEnd::Completed.exit_code(), 0);
+        assert_eq!(TurnEnd::Failed("x".into()).exit_code(), 1);
+        assert_eq!(TurnEnd::Uncertain.exit_code(), 3);
+        assert_eq!(TurnEnd::Cancelled.exit_code(), 130);
+        assert_eq!(TurnEnd::Completed.error(), None);
+        assert!(TurnEnd::Uncertain.error().unwrap().contains("lost contact"));
     }
 
     #[test]
