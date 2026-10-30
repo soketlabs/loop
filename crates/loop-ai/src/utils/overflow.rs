@@ -6,8 +6,10 @@ use crate::types::{AssistantMessage, Model, StopReason};
 pub fn is_context_overflow(model: &Model, message: &AssistantMessage) -> bool {
     if message.stop_reason != StopReason::Error {
         // Silent overflow: input beyond context window with length stop and tiny output.
+        let u = &message.usage;
+        let prompt = u.input + u.cache_read + u.cache_write;
         if message.stop_reason == StopReason::Length
-            && message.usage.input > model.context_window
+            && prompt > model.context_window
             && message.usage.output == 0
         {
             return true;
@@ -78,6 +80,19 @@ mod tests {
             input: 2000,
             output: 0,
             total_tokens: 2000,
+            ..Usage::empty()
+        };
+        assert!(is_context_overflow(&model(), &msg));
+    }
+
+    #[test]
+    fn silent_overflow_counts_cached_input() {
+        let mut msg = AssistantMessage::pending(&model());
+        msg.stop_reason = StopReason::Length;
+        msg.usage = Usage {
+            input: 100,
+            cache_read: 1500,
+            output: 0,
             ..Usage::empty()
         };
         assert!(is_context_overflow(&model(), &msg));
