@@ -20,6 +20,8 @@ pub struct FakeResponse {
     pub body: Vec<u8>,
     /// Delay between the response headers and body.
     pub body_delay: Option<Duration>,
+    /// Pause after this many body bytes, for mid-stream cancellation tests.
+    pub stall: Option<(usize, Duration)>,
 }
 
 impl FakeResponse {
@@ -36,6 +38,7 @@ impl FakeResponse {
             headers: Vec::new(),
             body: body.into(),
             body_delay: None,
+            stall: None,
         }
     }
 
@@ -48,6 +51,12 @@ impl FakeResponse {
     /// Delay sending the body after response headers, for cancellation tests.
     pub fn with_body_delay(mut self, delay: Duration) -> Self {
         self.body_delay = Some(delay);
+        self
+    }
+
+    /// Send the first `bytes` of the body, then pause for `delay` before the rest.
+    pub fn with_stall_after(mut self, bytes: usize, delay: Duration) -> Self {
+        self.stall = Some((bytes, delay));
         self
     }
 }
@@ -164,7 +173,18 @@ fn serve(stream: TcpStream, requests: &Mutex<Vec<RecordedRequest>>, route: &Rout
     if let Some(delay) = response.body_delay {
         std::thread::sleep(delay);
     }
-    let _ = stream.write_all(&response.body);
+    match response.stall {
+        Some((bytes, delay)) => {
+            let (head, rest) = response.body.split_at(bytes.min(response.body.len()));
+            let _ = stream.write_all(head);
+            let _ = stream.flush();
+            std::thread::sleep(delay);
+            let _ = stream.write_all(rest);
+        }
+        None => {
+            let _ = stream.write_all(&response.body);
+        }
+    }
 }
 
 fn read_request(stream: &TcpStream) -> Option<RecordedRequest> {
@@ -228,5 +248,17 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].method, "GET");
         assert_eq!(requests[0].header("X-Test"), Some("1"));
+    }
+
+    #[test]
+    fn stalled_body_arrives_in_two_parts() {
+        let server = FakeHttpServer::always(
+            FakeResponse::new(200, "text/plain", "first|second")
+                .with_stall_after(6, Duration::from_millis(300)),
+        );
+        let started = std::time::Instant::now();
+        let out = get(server.base_url(), "/");
+        assert!(out.ends_with("first|second"));
+        assert!(started.elapsed() >= Duration::from_millis(300));
     }
 }
