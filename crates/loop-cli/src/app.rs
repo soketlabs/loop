@@ -5217,11 +5217,56 @@ async fn apply_effect(
             Ok(()) => chat.push(sys(format!("session name → {}", name.trim()))),
             Err(e) => chat.push(error_item(format!("could not name the session: {e:#}"))),
         },
-        CommandEffect::Export(path) => {
-            chat.push(sys(format!("export: path {:?}", path)));
-        }
+        CommandEffect::Export(path) => match runtime.export_session(path.as_deref()).await {
+            Ok((markdown, session_file)) => chat.push(sys(format!(
+                "exported\n  transcript    {}\n  session file  {} (open it with /import)",
+                markdown.display(),
+                session_file.display()
+            ))),
+            Err(e) => chat.push(error_item(format!("could not export: {e:#}"))),
+        },
         CommandEffect::Import(path) => {
-            chat.push(sys(format!("import not yet wired: {path}")));
+            if *working {
+                chat.push(sys("wait for the current turn to finish, then /import"));
+                return Ok(false);
+            }
+            let id = match runtime.import_session(path.trim()).await {
+                Ok(id) => id,
+                Err(e) => {
+                    chat.push(error_item(format!("could not import: {e:#}")));
+                    return Ok(false);
+                }
+            };
+            let choice = runtime
+                .list_sessions()
+                .await
+                .ok()
+                .and_then(|choices| choices.into_iter().find(|c| c.id == id));
+            match choice {
+                Some(choice) => {
+                    chat.push(sys(format!("imported {} as a new session", path.trim())));
+                    resume_session(
+                        choice,
+                        runtime,
+                        chat,
+                        status,
+                        working,
+                        message_queue,
+                        streaming_assistant,
+                        streaming_thinking,
+                        redraw_request,
+                        purge_ui_events,
+                        tx,
+                        token_bar,
+                        refresh_token_bar,
+                    )
+                    .await
+                }
+                // `/sessions` lists only Sessions with messages.
+                None => chat.push(sys(format!(
+                    "imported as {id}, but the file has no messages to continue"
+                ))),
+            }
         }
         CommandEffect::Changelog => {
             if !*working {

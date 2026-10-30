@@ -304,6 +304,38 @@ impl Runtime {
         ))
     }
 
+    /// Write the current Session as a Markdown transcript and a session file
+    /// (see [`crate::sessions::export_paths`]); returns both paths.
+    pub async fn export_session(
+        &self,
+        path: Option<&str>,
+    ) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+        if !self.is_native() {
+            bail!("/export saves Loop's own sessions; this one runs in a subscription agent");
+        }
+        let file = self.harness.export_session().await?;
+        let (markdown, session_file) =
+            crate::sessions::export_paths(&self.cwd, &self.session_id, path);
+        if let Some(dir) = markdown.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&markdown, file.markdown())?;
+        std::fs::write(&session_file, file.to_jsonl())?;
+        Ok((markdown, session_file))
+    }
+
+    /// Read a session file written by `/export` into a new Session opened in
+    /// this folder, and return its id. The current Session stays active.
+    pub async fn import_session(&self, path: &str) -> anyhow::Result<String> {
+        let path = self.cwd.join(path);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("could not read {}: {e}", path.display()))?;
+        let file = loop_agent::harness::session::SessionFile::from_jsonl(&text)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let cwd = Some(self.cwd.to_string_lossy().into_owned());
+        Ok(self.harness.import_session(&file, cwd).await?)
+    }
+
     /// Switch to Loop's own session `id`, leaving any subscription, and go
     /// back to the model it last used when one is recorded and still
     /// available (as `--resume` does; the saved default is left alone).

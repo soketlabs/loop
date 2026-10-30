@@ -8,6 +8,7 @@ mod repository;
 mod search;
 pub mod stats;
 mod summary;
+mod transfer;
 pub mod types;
 
 #[cfg(feature = "sqlite")]
@@ -26,6 +27,7 @@ pub use stats::{
     UsageTotals, CACHE_TTL_MS,
 };
 pub use summary::{list_session_summaries, summarize_session, SessionSummary};
+pub use transfer::{import_session_file, SessionFile, SESSION_FILE_VERSION};
 pub use types::*;
 
 #[cfg(feature = "sqlite")]

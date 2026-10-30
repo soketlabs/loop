@@ -64,12 +64,12 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "export",
-            description: "Export session to JSONL/HTML path",
+            description: "Save this session as Markdown and a session file",
             args_hint: Some("[path]"),
         },
         SlashCommand {
             name: "import",
-            description: "Import a JSONL session",
+            description: "Open an exported session file as a new session",
             args_hint: Some("<path>"),
         },
         SlashCommand {
@@ -621,7 +621,7 @@ pub fn dispatch(
         }),
         "import" => {
             if cmd.args.is_empty() {
-                CommandEffect::Status("Usage: /import <path.jsonl>".into())
+                CommandEffect::Status("Usage: /import <file.loop.jsonl>".into())
             } else {
                 CommandEffect::Import(cmd.args.clone())
             }

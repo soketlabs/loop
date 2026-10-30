@@ -72,7 +72,7 @@ Context files are loaded automatically from the agent dir, `~/.claude/CLAUDE.md`
 
 ## Slash commands (highlights)
 
-`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/websearch`, `/new`, `/review`, `/compact`, `/sessions`, `/resume`, `/name`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/changelog`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
+`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/websearch`, `/new`, `/review`, `/compact`, `/sessions`, `/resume`, `/name`, `/export`, `/import`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/changelog`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
 
 `/changelog` shows the notes published with this version's GitHub release. It needs network access; a build from source that isn't a release has none and says so.
 
@@ -83,6 +83,8 @@ Context files are loaded automatically from the agent dir, `~/.claude/CLAUDE.md`
 - **Title:** the session's `/name` when set, otherwise its first prompt.
 - **`/resume <id>`** resumes directly. A unique prefix of the id is enough.
 - **From the shell:** `loop --resume` with no id opens the picker, and `loop --continue` resumes the most recent session.
+- **`/export [path]`** saves the current session twice, side by side: a Markdown transcript (`path.md`) and a session file (`path.loop.jsonl`). With no path they are `loop-<id>.md` and `loop-<id>.loop.jsonl` in this folder. The transcript leaves out thinking and images and keeps the first 20 lines of each tool result. Only the active branch is saved. Subscription sessions can't be exported.
+- **`/import <file.loop.jsonl>`** opens an exported session file as a new session in this folder and switches to it, so you can continue it. "Accept all … for this session" approvals in the file are not imported.
 - **Not listed:**
   - sessions with no messages;
   - subscription sessions from before this version, which have no recorded title. `--resume <id>` still opens those.

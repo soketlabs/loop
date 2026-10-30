@@ -278,6 +278,29 @@ impl AgentHarness {
         Ok(sid)
     }
 
+    /// The current Session's active branch, for `/export`.
+    pub async fn export_session(
+        &self,
+    ) -> Result<crate::harness::session::SessionFile, AgentHarnessError> {
+        let reader = self.session.lock().await.reader();
+        crate::harness::session::SessionFile::from_reader(reader.as_ref())
+            .await
+            .map_err(AgentHarnessError::Session)
+    }
+
+    /// Write `file` into this harness's store as a new Session opened in
+    /// `cwd`, and return its id. The current Session stays active.
+    pub async fn import_session(
+        &self,
+        file: &crate::harness::session::SessionFile,
+        cwd: Option<String>,
+    ) -> Result<String, AgentHarnessError> {
+        let store = self.session.lock().await.store();
+        crate::harness::session::import_session_file(store.as_ref(), file, cwd)
+            .await
+            .map_err(AgentHarnessError::Session)
+    }
+
     /// The sessions with messages in this harness's store, most recently
     /// used first; only those opened in `cwd`, when given.
     pub async fn session_summaries(

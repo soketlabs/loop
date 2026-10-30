@@ -1,6 +1,8 @@
 //! The sessions `/sessions` offers: Loop's own and subscription ones opened
 //! in this folder, most recently used first.
 
+use std::path::{Path, PathBuf};
+
 use loop_agent::harness::session::SessionSummary;
 
 use crate::agents::AgentSessionRecord;
@@ -37,6 +39,32 @@ pub fn short_title(text: &str) -> Option<String> {
     let mut short: String = line.chars().take(TITLE_CHARS - 1).collect();
     short.push('…');
     Some(short)
+}
+
+/// The extension of the session files `/export` writes and `/import` reads.
+pub const SESSION_FILE_EXTENSION: &str = ".loop.jsonl";
+
+/// Where `/export [path]` writes the Markdown transcript and the session
+/// file: side by side, named after `path` (relative to `cwd`) without its
+/// extension, or `loop-<id>` in `cwd`.
+pub fn export_paths(cwd: &Path, id: &str, path: Option<&str>) -> (PathBuf, PathBuf) {
+    let stem = match path.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(path) => {
+            let path = path
+                .strip_suffix(SESSION_FILE_EXTENSION)
+                .or_else(|| path.strip_suffix(".jsonl"))
+                .or_else(|| path.strip_suffix(".md"))
+                .unwrap_or(path);
+            cwd.join(path)
+        }
+        None => cwd.join(format!("loop-{id}")),
+    };
+    let with = |ext: &str| {
+        let mut name = stem.clone().into_os_string();
+        name.push(ext);
+        PathBuf::from(name)
+    };
+    (with(".md"), with(SESSION_FILE_EXTENSION))
 }
 
 /// Loop's sessions and subscription sessions in one list, newest first.
@@ -134,5 +162,39 @@ mod tests {
         assert_eq!(ago(3 * 3_600_000, 0), "3h ago");
         assert_eq!(ago(2 * 86_400_000, 0), "2d ago");
         assert_eq!(ago(0, 5_000), "just now", "a clock skew is not negative");
+    }
+
+    #[test]
+    fn export_writes_a_transcript_and_a_session_file_side_by_side() {
+        let cwd = std::path::Path::new("/work");
+        let paths = |arg: Option<&str>| {
+            let (md, file) = export_paths(cwd, "01a18bf7-9c86-7d50", arg);
+            (
+                md.to_string_lossy().replace('\\', "/"),
+                file.to_string_lossy().replace('\\', "/"),
+            )
+        };
+        assert_eq!(
+            paths(None),
+            (
+                "/work/loop-01a18bf7-9c86-7d50.md".into(),
+                "/work/loop-01a18bf7-9c86-7d50.loop.jsonl".into()
+            )
+        );
+        assert_eq!(
+            paths(Some("notes/review.md")),
+            (
+                "/work/notes/review.md".into(),
+                "/work/notes/review.loop.jsonl".into()
+            )
+        );
+        assert_eq!(
+            paths(Some("review.loop.jsonl")),
+            ("/work/review.md".into(), "/work/review.loop.jsonl".into())
+        );
+        assert_eq!(
+            paths(Some("review")),
+            ("/work/review.md".into(), "/work/review.loop.jsonl".into())
+        );
     }
 }
