@@ -298,7 +298,7 @@ fn extract_binary(archive: &Path, binary: &Path, target: &str) -> Result<()> {
         let mut zip = zip::ZipArchive::new(file)?;
         for index in 0..zip.len() {
             let mut entry = zip.by_index(index)?;
-            if entry.name() == expected && entry.is_file() {
+            if entry.name()? == expected && entry.is_file() {
                 if entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
                     return Err(Error::Invalid(
                         "Release executable must not be a symlink".into(),
