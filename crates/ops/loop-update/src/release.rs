@@ -64,6 +64,25 @@ struct GithubRelease {
     prerelease: bool,
 }
 
+/// One release's published notes, as GitHub shows them on its page.
+#[derive(Debug, Clone)]
+pub struct ReleaseNotes {
+    pub tag: String,
+    /// Markdown; empty when the release has none.
+    pub body: String,
+    /// The release page.
+    pub url: String,
+}
+
+#[derive(Deserialize)]
+struct GithubReleaseNotes {
+    tag_name: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    html_url: String,
+}
+
 #[derive(Serialize, Deserialize)]
 struct CachedRelease {
     checked_at: u64,
@@ -193,6 +212,18 @@ impl ReleaseClient {
             let _ = write();
         }
         Ok(release)
+    }
+
+    /// The notes published with `release`.
+    pub async fn notes(&self, release: &ReleaseVersion) -> Result<ReleaseNotes> {
+        let url = self.endpoint(&self.api, &format!("tags/{}", release.tag))?;
+        let body = self.small_file(url, 1024 * 1024).await?;
+        let notes: GithubReleaseNotes = serde_json::from_slice(&body)?;
+        Ok(ReleaseNotes {
+            tag: notes.tag_name,
+            body: notes.body.unwrap_or_default(),
+            url: notes.html_url,
+        })
     }
 
     fn endpoint(&self, origin: &Url, path: &str) -> Result<Url> {

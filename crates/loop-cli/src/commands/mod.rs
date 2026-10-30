@@ -89,7 +89,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "changelog",
-            description: "Show changelog",
+            description: "Show the release notes for this version",
             args_hint: None,
         },
         SlashCommand {

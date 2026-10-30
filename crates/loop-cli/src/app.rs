@@ -64,6 +64,8 @@ use loop_app_core::permissions::PermissionMode;
 
 enum UiEvent {
     UpdateAvailable(String),
+    /// `/changelog` loaded the running version's release notes (or failed).
+    Changelog(Result<String, String>),
     /// An update from the agent backend.
     Update(Box<UpdateEnvelope>),
     /// The backend refused to start a turn (no update was emitted for it).
@@ -1414,6 +1416,18 @@ async fn drain_ui_events(
         match ev {
             UiEvent::UpdateAvailable(message) => {
                 push_before_queued(chat, sys(message));
+            }
+            UiEvent::Changelog(text) => {
+                if !*working {
+                    *status = "ready".into();
+                }
+                push_before_queued(
+                    chat,
+                    match text {
+                        Ok(text) => sys(text),
+                        Err(err) => error_item(err),
+                    },
+                );
             }
             UiEvent::Update(envelope) => {
                 // Updates for another session (for example one just left with
@@ -4168,6 +4182,33 @@ fn apply_tool_update(
     }
 }
 
+/// Where every release's notes are published.
+const RELEASES_URL: &str = "https://github.com/soketlabs/loop/releases";
+
+/// What `/changelog` shows for `version`: the notes published with its
+/// release, never text of Loop's own.
+fn changelog_text(
+    version: &str,
+    notes: Result<loop_update::ReleaseNotes, String>,
+) -> Result<String, String> {
+    let notes = notes.map_err(|e| {
+        format!(
+            "no release notes for Loop {version} ({e}). A build from source may not be a \
+             release; all notes are at {RELEASES_URL}"
+        )
+    })?;
+    let body = notes.body.trim();
+    let body = if body.is_empty() {
+        "This release has no notes."
+    } else {
+        body
+    };
+    Ok(format!(
+        "Loop {} release notes\n{}\n\n{body}",
+        notes.tag, notes.url
+    ))
+}
+
 /// Text of tool output, one block per line. Diffs and other non-text content
 /// are left to dedicated views.
 fn tool_text(content: &[ToolContent]) -> String {
@@ -5183,9 +5224,22 @@ async fn apply_effect(
             chat.push(sys(format!("import not yet wired: {path}")));
         }
         CommandEffect::Changelog => {
-            chat.push(sys(
-                "Loop 0.1.0 — interactive coding agent by Soket AI\n- Soket dynamic models\n- ratatui CLI\n- skills, themes, sandbox",
-            ));
+            if !*working {
+                *status = "changelog · loading the release notes…".into();
+            }
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let version = env!("CARGO_PKG_VERSION");
+                let notes = async {
+                    let client = loop_update::ReleaseClient::github(Duration::from_secs(10))?;
+                    client
+                        .notes(&loop_update::ReleaseVersion::parse(version)?)
+                        .await
+                }
+                .await
+                .map_err(|e| e.to_string());
+                let _ = tx.send(UiEvent::Changelog(changelog_text(version, notes)));
+            });
         }
         CommandEffect::ScopedModels => {
             chat.push(sys(format!(
@@ -5957,5 +6011,41 @@ mod plan_tests {
             ),
             "{chat:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod changelog_tests {
+    use super::*;
+
+    #[test]
+    fn the_changelog_is_the_published_release_notes() {
+        let notes = loop_update::ReleaseNotes {
+            tag: "v0.5.0".into(),
+            body: "## What's Changed\n* grep tool".into(),
+            url: "https://github.com/soketlabs/loop/releases/tag/v0.5.0".into(),
+        };
+        assert_eq!(
+            changelog_text("0.5.0", Ok(notes)).unwrap(),
+            "Loop v0.5.0 release notes\nhttps://github.com/soketlabs/loop/releases/tag/v0.5.0\n\n\
+             ## What's Changed\n* grep tool"
+        );
+    }
+
+    #[test]
+    fn missing_notes_say_so_and_point_to_the_releases() {
+        let empty = loop_update::ReleaseNotes {
+            tag: "v0.5.0".into(),
+            body: "  ".into(),
+            url: "https://github.com/soketlabs/loop/releases/tag/v0.5.0".into(),
+        };
+        let text = changelog_text("0.5.0", Ok(empty)).unwrap();
+        assert!(text.ends_with("This release has no notes."), "{text}");
+
+        let err =
+            changelog_text("0.6.0-dev", Err("HTTP status client error (404)".into())).unwrap_err();
+        assert!(err.contains("no release notes for Loop 0.6.0-dev"), "{err}");
+        assert!(err.contains("404"), "{err}");
+        assert!(err.contains(RELEASES_URL), "{err}");
     }
 }

@@ -72,7 +72,9 @@ Context files are loaded automatically from the agent dir, `~/.claude/CLAUDE.md`
 
 ## Slash commands (highlights)
 
-`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/websearch`, `/new`, `/review`, `/compact`, `/sessions`, `/resume`, `/name`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
+`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/websearch`, `/new`, `/review`, `/compact`, `/sessions`, `/resume`, `/name`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/changelog`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
+
+`/changelog` shows the notes published with this version's GitHub release. It needs network access; a build from source that isn't a release has none and says so.
 
 ## Sessions
 
