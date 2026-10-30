@@ -71,6 +71,9 @@ pub fn default_tool_permissions() -> BTreeMap<String, String> {
         ("edit".into(), "ask".into()),
         ("bash".into(), "ask".into()),
         ("read".into(), "allow".into()),
+        ("grep".into(), "allow".into()),
+        ("glob".into(), "allow".into()),
+        ("ls".into(), "allow".into()),
         ("web_fetch".into(), "allow".into()),
         ("web_search".into(), "allow".into()),
     ])

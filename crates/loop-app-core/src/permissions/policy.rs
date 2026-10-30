@@ -242,6 +242,34 @@ mod tests {
     }
 
     #[test]
+    fn search_tools_run_without_asking_in_every_mode() {
+        let rows = [
+            ("grep", json!({"pattern": "fn main", "path": "src"})),
+            ("glob", json!({"pattern": "*.rs"})),
+            ("ls", json!({})),
+        ];
+        for mode in PermissionMode::ALL {
+            for (tool, args) in &rows {
+                let got = decide(mode, &defaults(), &call(tool, args.clone(), false));
+                assert_eq!(got, Decision::Allow, "{mode:?} {tool}");
+                assert!(available(mode, &call(tool, Value::Null, false)));
+            }
+        }
+        let r = crate::tool_approval::permissions_from_settings(
+            &[("grep(~/secrets/*)".to_owned(), "deny".to_owned())].into(),
+        );
+        let secret = Call {
+            home: Some("/home/me".into()),
+            ..call(
+                "grep",
+                json!({"pattern": "key", "path": "~/secrets/a"}),
+                false,
+            )
+        };
+        assert!(matches!(decide(ReadOnly, &r, &secret), Decision::Deny(_)));
+    }
+
+    #[test]
     fn accept_edits_asks_outside_the_workspace_and_for_protected_files() {
         for (path, inside) in [
             ("../elsewhere.txt", false),

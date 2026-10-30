@@ -16,6 +16,7 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 | `accept-edits` | allow | allow inside the workspace; ask outside it and for `.git/`, `.loop/`, `.env*` | per `toolPermissions` | per `toolPermissions` |
 | `full-access` | allow | allow | allow | allow |
 
+- **Search tools** (`grep`, `glob` and `ls`) only read, so every mode runs them without asking. `grep` and `glob` respect `.gitignore` and skip hidden files unless the call asks for them; `.git/` is never searched.
 - **The workspace** is the git root of the directory Loop runs in, or that directory itself. Paths are resolved through symlinks, so a link that points outside the workspace counts as outside.
 - **`read-only` is a ceiling.** A hook can't allow a call that changes files or runs commands.
 - **What `read-only` turns off is taken away, not just refused.** The model isn't offered `write`, `edit`, or MCP tools that their server doesn't mark read-only, in the agent loop or through `loop mcp serve`. `bash` stays, for read-only commands. Switching mode changes the toolset from the next turn.
@@ -41,7 +42,7 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 
 ## Rules
 
-`toolPermissions` maps a tool to `allow`, `ask` or `deny`. A key can carry a pattern on the call's main argument: the command for `bash`, the path for `read`/`write`/`edit`, the URL for `web_fetch`, the query for `web_search`.
+`toolPermissions` maps a tool to `allow`, `ask` or `deny`. A key can carry a pattern on the call's main argument: the command for `bash`, the path for `read`/`write`/`edit`, the search root for `grep`/`glob`/`ls` (`.` when the call names none), the URL for `web_fetch`, the query for `web_search`.
 
 ```json
 {
@@ -51,6 +52,7 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
     "bash(cargo test*)": "allow",
     "bash(rm -rf *)": "deny",
     "write(~/secrets/*)": "deny",
+    "grep(~/secrets/*)": "deny",
     "write(src/generated/*)": "ask",
     "web_fetch(https://docs.rs/*)": "allow",
     "mcp__slack__*": "deny"

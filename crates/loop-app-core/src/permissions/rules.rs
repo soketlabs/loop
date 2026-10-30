@@ -2,7 +2,7 @@
 //! splitting.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -76,8 +76,13 @@ fn split_key(key: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The call argument patterns match: the command, path, URL or query.
+/// The call argument patterns match: the command, path, URL or query. A
+/// search tool's subject is its search root, `.` when it names none.
 fn subject(tool: &str, args: &Value) -> Option<String> {
+    if is_search(tool) {
+        let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        return Some(path.to_owned());
+    }
     let key = match tool {
         "bash" => "command",
         "read" | "write" | "edit" => "path",
@@ -86,6 +91,11 @@ fn subject(tool: &str, args: &Value) -> Option<String> {
         _ => return Some(args.to_string()),
     };
     args.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// Loop's read-only search tools, whose patterns match a path.
+fn is_search(tool: &str) -> bool {
+    matches!(tool, "grep" | "glob" | "ls")
 }
 
 /// The parts of a shell command, split at `;`, `&&`, `||`, `|`, `&` and
@@ -262,7 +272,9 @@ fn path_matches(pattern: &str, path: &str, workspace: &Path, home: Option<&Path>
     };
     let pattern = expand(pattern);
     let path = expand(path);
-    let absolute = workspace.join(&path).to_string_lossy().into_owned();
+    // Components drop `.` parts, so `.` is the workspace itself.
+    let absolute: PathBuf = workspace.join(&path).components().collect();
+    let absolute = absolute.to_string_lossy().into_owned();
     glob_match(&pattern, &path) || glob_match(&pattern, &absolute)
 }
 
@@ -294,7 +306,7 @@ pub fn rule_for(rules: &BTreeMap<String, ToolPermission>, call: &Call) -> Rule {
                     }
                 }
             }
-        } else if matches!(tool, "read" | "write" | "edit") {
+        } else if matches!(tool, "read" | "write" | "edit") || is_search(tool) {
             path_matches(pattern, subject, &call.workspace, call.home.as_deref())
         } else {
             glob_match(pattern, subject)
@@ -509,6 +521,26 @@ mod tests {
         );
         assert_eq!(
             permission("mcp__slack__post", json!({})),
+            ToolPermission::Allow
+        );
+    }
+
+    #[test]
+    fn search_tool_rules_match_the_search_root() {
+        let r = rules(&[("grep(~/secrets/*)", "deny"), ("ls(/ws)", "deny")]);
+        let permission = |tool: &str, args: Value| rule_for(&r, &call(tool, args)).permission;
+        assert_eq!(
+            permission("grep", json!({"pattern": "key", "path": "~/secrets/a"})),
+            ToolPermission::Deny
+        );
+        assert_eq!(
+            permission("grep", json!({"pattern": "key", "path": "src"})),
+            ToolPermission::Allow
+        );
+        // No `path` searches the working directory.
+        assert_eq!(permission("ls", json!({})), ToolPermission::Deny);
+        assert_eq!(
+            permission("glob", json!({"pattern": "*.rs"})),
             ToolPermission::Allow
         );
     }

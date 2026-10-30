@@ -1559,7 +1559,9 @@ fn highlight_tool_detail(
             highlight::highlight_lines(detail, None, path, theme, fallback)
         }
         // Bash stdout stays plain — coloring ls/etc would fight the existing look.
-        "bash" => highlight::highlight_lines(detail, None, None, theme, fallback),
+        "bash" | "grep" | "glob" | "ls" => {
+            highlight::highlight_lines(detail, None, None, theme, fallback)
+        }
         _ => highlight::highlight_lines(detail, Some("json"), None, theme, fallback),
     }
 }
@@ -1641,6 +1643,14 @@ pub fn tool_args_summary(name: &str, args: &serde_json::Value) -> String {
     match name {
         "read" | "write" | "edit" => pick(&["path"]).unwrap_or_else(|| "…".into()),
         "bash" => pick(&["command"]).unwrap_or_else(|| "…".into()),
+        "grep" | "glob" => {
+            let pattern = pick(&["pattern"]).unwrap_or_else(|| "…".into());
+            match pick(&["path"]) {
+                Some(path) => format!("{pattern} in {path}"),
+                None => pattern,
+            }
+        }
+        "ls" => pick(&["path"]).unwrap_or_else(|| ".".into()),
         _ => {
             let s = args.to_string();
             let mut t: String = s.chars().take(40).collect();
@@ -1660,6 +1670,23 @@ mod tests {
         AssistantContent, AssistantMessage, Message, StopReason, TextContent, ThinkingContent,
         ToolCall, ToolResultContent, ToolResultMessage, Usage, UserMessage, UserMessageContent,
     };
+
+    #[test]
+    fn search_tools_have_short_summaries() {
+        let summary = |name: &str, args: serde_json::Value| tool_args_summary(name, &args);
+        assert_eq!(
+            summary(
+                "grep",
+                serde_json::json!({"pattern": "TODO", "path": "src"})
+            ),
+            "TODO in src"
+        );
+        assert_eq!(
+            summary("glob", serde_json::json!({"pattern": "*.rs"})),
+            "*.rs"
+        );
+        assert_eq!(summary("ls", serde_json::json!({})), ".");
+    }
 
     #[test]
     fn resume_transcript_reconstructs_user_assistant_tools() {

@@ -6,10 +6,11 @@ use std::sync::Arc;
 use anyhow::bail;
 
 use loop_agent::harness::{
-    create_bash_tool_with, create_edit_tool, create_read_tool, create_session_repository,
-    create_sqlite_session_store, create_write_tool, verify_web_search_key, AgentHarness,
-    AgentHarnessOptions, AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox,
-    LocalSandboxRuntime, Sandbox, SandboxMode, WebSearchConfig,
+    create_bash_tool_with, create_edit_tool, create_glob_tool, create_grep_tool, create_ls_tool,
+    create_read_tool, create_session_repository, create_sqlite_session_store, create_write_tool,
+    verify_web_search_key, AgentHarness, AgentHarnessOptions, AgentHarnessResources,
+    HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime, Sandbox, SandboxMode,
+    WebSearchConfig,
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
 use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
@@ -948,6 +949,9 @@ pub fn build_tools(
 ) -> Vec<AgentTool> {
     let mut tools = vec![
         create_read_tool(Arc::clone(&env)),
+        create_grep_tool(Arc::clone(&env)),
+        create_glob_tool(Arc::clone(&env)),
+        create_ls_tool(Arc::clone(&env)),
         create_write_tool(Arc::clone(&env)),
         create_edit_tool(Arc::clone(&env)),
         create_bash_tool_with(env, None, bash),
@@ -1551,6 +1555,23 @@ pub fn mcp_server_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_standard_tools_include_search() {
+        let env: Arc<dyn loop_agent::harness::ExecutionEnv> = Arc::new(
+            loop_agent::harness::HostExecutionEnv::new(std::env::temp_dir()),
+        );
+        let web = crate::web_tools::WebTools::from_settings(&Default::default(), None, true);
+        let tools = build_tools(env, &web, Default::default());
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        for name in ["read", "write", "edit", "bash", "grep", "glob", "ls"] {
+            assert!(names.contains(&name), "{name}: {names:?}");
+        }
+        let snippets = crate::system_prompt::default_tool_snippets();
+        for name in ["grep", "glob", "ls"] {
+            assert!(snippets.iter().any(|(n, _)| *n == name), "{name} snippet");
+        }
+    }
 
     #[test]
     fn models_json_pins_model_metadata() {

@@ -432,6 +432,14 @@ fn tool_call(id: &str, name: &str, args: &Value) -> ToolCall {
     let path = args.get("path").and_then(Value::as_str);
     let title = match (name, path) {
         ("read" | "write" | "edit", Some(path)) => format!("{name} {path}"),
+        ("grep" | "glob", _) => {
+            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
+            match path {
+                Some(path) => format!("{name} {pattern} in {path}"),
+                None => format!("{name} {pattern}"),
+            }
+        }
+        ("ls", _) => format!("ls {}", path.unwrap_or(".")),
         ("bash", _) => args
             .get("command")
             .and_then(Value::as_str)
@@ -595,5 +603,20 @@ mod tests {
         assert_eq!(tool_kind("edit"), ToolKind::Edit);
         assert_eq!(tool_kind("bash"), ToolKind::Execute);
         assert_eq!(tool_kind("mcp__github__create_issue"), ToolKind::Other);
+    }
+
+    #[test]
+    fn search_calls_are_titled_by_what_they_look_for() {
+        let grep = tool_call(
+            "1",
+            "grep",
+            &serde_json::json!({"pattern": "fn main", "path": "src"}),
+        );
+        assert_eq!(grep.title, "grep fn main in src");
+        assert_eq!(grep.kind, ToolKind::Search);
+        assert_eq!(grep.locations[0].path, "src");
+        let glob = tool_call("2", "glob", &serde_json::json!({"pattern": "*.rs"}));
+        assert_eq!(glob.title, "glob *.rs");
+        assert_eq!(tool_call("3", "ls", &serde_json::json!({})).title, "ls .");
     }
 }

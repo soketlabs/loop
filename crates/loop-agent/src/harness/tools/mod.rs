@@ -1,6 +1,7 @@
 //! Built-in coding tools over [`ExecutionEnv`](crate::harness::types::ExecutionEnv).
 
 mod file_mutation_queue;
+mod search;
 #[cfg(feature = "web")]
 pub mod web;
 
@@ -9,6 +10,8 @@ use std::sync::Arc;
 
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
+
+pub use search::{create_glob_tool, create_grep_tool, create_ls_tool, SEARCH_MAX_RESULTS};
 
 use crate::harness::tools::file_mutation_queue::with_file_mutation_queue;
 use crate::harness::types::{ExecutionEnv, ShellExecOptions};

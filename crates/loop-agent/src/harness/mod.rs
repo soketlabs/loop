@@ -51,8 +51,8 @@ pub use tools::web::{
     DEFAULT_WEB_SEARCH_PROVIDER, WEB_SEARCH_BACKENDS,
 };
 pub use tools::{
-    create_bash_tool, create_bash_tool_with, create_edit_tool, create_read_tool, create_write_tool,
-    BashLimits,
+    create_bash_tool, create_bash_tool_with, create_edit_tool, create_glob_tool, create_grep_tool,
+    create_ls_tool, create_read_tool, create_write_tool, BashLimits,
 };
 pub use types::{
     AgentHarnessError, AgentHarnessPhase, AgentHarnessResources, CompactResult, ExecutionEnv,

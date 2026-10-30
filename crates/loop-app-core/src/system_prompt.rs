@@ -42,6 +42,12 @@ pub struct BuildSystemPromptOptions<'a> {
 pub fn default_tool_snippets() -> Vec<(&'static str, &'static str)> {
     vec![
         ("read", "Read file contents"),
+        (
+            "grep",
+            "Search file contents with a regex (respects .gitignore)",
+        ),
+        ("glob", "Find files by name pattern (respects .gitignore)"),
+        ("ls", "List a directory"),
         ("bash", "Run shell commands"),
         ("edit", "Apply exact string replacements in a file"),
         ("write", "Create or overwrite a file"),
