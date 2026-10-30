@@ -46,6 +46,17 @@ pub struct CliRuntime {
     /// `/permissions full-access` was asked for once and needs repeating to
     /// confirm.
     pub confirm_full_access: bool,
+    /// `--resume` with no id or `--continue`: what to do once the TUI is up.
+    pub startup_sessions: Option<StartupSessions>,
+}
+
+/// Session choice to make when the TUI starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupSessions {
+    /// `--resume` with no id: open the session picker.
+    Pick,
+    /// `--continue`: resume the most recent session in this folder.
+    Latest,
 }
 
 /// An external agent to start when the surface is ready.
@@ -88,6 +99,7 @@ pub async fn bootstrap_cli(opts: BootstrapOpts) -> anyhow::Result<CliRuntime> {
         debug_log_path: None,
         pending_agent: None,
         starting_agent: None,
+        startup_sessions: None,
         signing_in: None,
         forwarded: Default::default(),
         reasoning_notices: Default::default(),

@@ -72,7 +72,18 @@ Context files are loaded automatically from the agent dir, `~/.claude/CLAUDE.md`
 
 ## Slash commands (highlights)
 
-`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/websearch`, `/new`, `/review`, `/compact`, `/resume`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
+`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/websearch`, `/new`, `/review`, `/compact`, `/sessions`, `/resume`, `/name`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
+
+## Sessions
+
+`/sessions` (or `/resume` with no id) lists this folder's earlier sessions, newest first: Loop's own and subscription ones (such as ChatGPT). Each row shows the title, the session id, the model or subscription, the number of messages and when it was last used. Type to filter by title or id; **Enter** resumes and **Esc** cancels.
+
+- **Title:** the session's `/name` when set, otherwise its first prompt.
+- **`/resume <id>`** resumes directly. A unique prefix of the id is enough.
+- **From the shell:** `loop --resume` with no id opens the picker, and `loop --continue` resumes the most recent session.
+- **Not listed:**
+  - sessions with no messages;
+  - subscription sessions from before this version, which have no recorded title. `--resume <id>` still opens those.
 
 ## Local shell (`!command`)
 
@@ -219,7 +230,7 @@ Examples under [`examples/`](examples/).
 
 ```
 loop [--provider soket] [--model qwen3-30b] [--theme dark]
-     [--resume <id>] [--print "prompt"] [--no-context-files]
+     [--resume [<id>]] [--continue] [--print "prompt"] [--no-context-files]
      [--permission-mode read-only|ask|accept-edits|full-access]
 loop config
 ```

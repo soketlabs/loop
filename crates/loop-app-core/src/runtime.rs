@@ -292,6 +292,73 @@ impl Runtime {
         self.agent_effort = None;
     }
 
+    /// Sessions opened in this folder, Loop's own and subscription ones,
+    /// most recently used first.
+    pub async fn list_sessions(&self) -> anyhow::Result<Vec<crate::sessions::SessionChoice>> {
+        let cwd = self.cwd.to_string_lossy();
+        let native = self.harness.session_summaries(Some(&cwd)).await?;
+        Ok(crate::sessions::merge(
+            native,
+            self.agents.sessions_in(&self.cwd),
+        ))
+    }
+
+    /// Switch to Loop's own session `id`, leaving any subscription, and go
+    /// back to the model it last used when one is recorded and still
+    /// available (as `--resume` does; the saved default is left alone).
+    /// The session's own "accept all" approvals replace the previous ones.
+    pub async fn open_native_session(&mut self, id: &str) -> anyhow::Result<()> {
+        if !self.is_native() {
+            self.use_native().await;
+        }
+        let id = self.harness.switch_session(id).await?;
+        self.native.adopt_session(&id);
+        self.session_id = id;
+        self.resumed = true;
+        self.active_skills.clear();
+        if let Some(bridge) = &self.tool_approval {
+            bridge.clear_session_grants();
+            if let Ok(entries) = self.harness.read_session_entries().await {
+                for group in crate::tool_approval::auto_approve_from_entries(&entries) {
+                    bridge.grant_session(&group);
+                }
+            }
+        }
+        if let Ok(ctx) = self.harness.session_context().await {
+            let recorded = ctx.model.as_ref().and_then(|(provider, model)| {
+                self.models
+                    .get_model(provider, model)
+                    .filter(|_| !self.credentials.is_logged_out(provider))
+            });
+            if let Some(model) = recorded {
+                self.harness.set_model(model.clone()).await;
+                self.selected_model = Some(model);
+                self.model_note = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Name the active session; `/sessions` shows the name as its title.
+    pub async fn rename_session(&self, name: &str) -> anyhow::Result<()> {
+        if self.is_native() {
+            self.harness.set_session_name(name).await?;
+        } else {
+            self.agents.rename(&self.session_id, name)?;
+        }
+        Ok(())
+    }
+
+    /// Note a prompt the user sent, so a subscription session gets a title.
+    pub fn note_prompt(&self, prompt: &str) {
+        if self.is_native() {
+            return;
+        }
+        if let Err(e) = self.agents.note_prompt(&self.session_id, prompt) {
+            tracing::warn!("could not record the session title: {e:#}");
+        }
+    }
+
     /// Start a new session with the active agent.
     pub async fn new_session(&mut self) -> anyhow::Result<()> {
         match self.active_agent.clone() {
