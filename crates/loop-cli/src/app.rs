@@ -5172,6 +5172,7 @@ async fn apply_effect(
                 ["off"] | ["disabled"] => {
                     let harness = Arc::clone(&runtime.harness);
                     let web = runtime.web_tools();
+                    let search = runtime.tool_gate.search_filter();
                     let bash = runtime.bash_limits();
                     let tx = tx.clone();
                     *working = true;
@@ -5186,7 +5187,7 @@ async fn apply_effect(
                                 .await
                                 .map_err(|e| format!("sandbox: {e}"))?;
                             harness
-                                .set_tools(build_tools(env, &web, bash))
+                                .set_tools(build_tools(env, &web, bash, search))
                                 .await
                                 .map_err(|e| format!("sandbox: {e}"))?;
                             Ok(SandboxDoneOk::Off)
@@ -5207,6 +5208,7 @@ async fn apply_effect(
                     let harness = Arc::clone(&runtime.harness);
                     let cwd = runtime.cwd.clone();
                     let web = runtime.web_tools();
+                    let search = runtime.tool_gate.search_filter();
                     let bash = runtime.bash_limits();
                     let tx = tx.clone();
                     let iso_s = isolation.as_str().to_string();
@@ -5225,7 +5227,7 @@ async fn apply_effect(
                             sb.start().await.map_err(|e| e.to_string())?;
                             let env = sb.env();
                             if let Err(e) = harness
-                                .set_tools(build_tools(Arc::clone(&env), &web, bash))
+                                .set_tools(build_tools(Arc::clone(&env), &web, bash, search))
                                 .await
                             {
                                 let _ = sb.destroy().await;

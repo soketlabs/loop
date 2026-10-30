@@ -98,6 +98,29 @@ fn is_search(tool: &str) -> bool {
     matches!(tool, "grep" | "glob" | "ls")
 }
 
+/// Whether a search tool (`grep`, `glob`, `ls`) may show or read the file
+/// at `path`: not when a `read` rule, or the tool's own rule, denies that
+/// path. The search root is checked separately, as the call's subject.
+pub fn search_may_show(
+    rules: &BTreeMap<String, ToolPermission>,
+    tool: &str,
+    path: &Path,
+    workspace: &Path,
+    home: Option<&Path>,
+) -> bool {
+    // Inside the workspace, relative patterns such as `secret/*` match the
+    // relative path; `path_matches` also tries it joined to the workspace.
+    let subject = path.strip_prefix(workspace).unwrap_or(path);
+    let args = serde_json::json!({ "path": subject.to_string_lossy() });
+    ["read", tool].iter().all(|tool| {
+        let call = Call {
+            home: home.map(Path::to_path_buf),
+            ..Call::new(tool, args.clone(), workspace)
+        };
+        rule_for(rules, &call).permission != ToolPermission::Deny
+    })
+}
+
 /// The parts of a shell command, split at `;`, `&&`, `||`, `|`, `&` and
 /// newlines outside quotes. `None` when it substitutes commands (`$(…)`,
 /// backticks, `<(…)`) or has unbalanced quotes.
@@ -543,6 +566,32 @@ mod tests {
         assert_eq!(
             permission("glob", json!({"pattern": "*.rs"})),
             ToolPermission::Allow
+        );
+    }
+
+    // Home patterns expand with the platform's separator, as for `read`.
+    #[cfg(unix)]
+    #[test]
+    fn search_tools_skip_files_a_read_or_search_deny_rule_refuses() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let r = rules(&[("read(~/.ssh/*)", "deny"), ("grep(~/private/*)", "deny")]);
+        let shown =
+            |tool: &str, path: &Path| search_may_show(&r, tool, path, Path::new("/ws"), Some(home));
+        let key = home.join(".ssh").join("id_rsa");
+        let diary = home.join("private").join("diary.txt");
+        let notes = home.join("notes.txt");
+        for tool in ["grep", "glob", "ls"] {
+            assert!(!shown(tool, &key), "{tool}: a read deny hides the file");
+            assert!(shown(tool, &notes), "{tool}");
+        }
+        assert!(!shown("grep", &diary), "the tool's own pattern deny");
+        assert!(shown("ls", &diary), "another tool's pattern doesn't apply");
+
+        let plain = rules(&[("read", "deny")]);
+        assert!(
+            !search_may_show(&plain, "grep", &notes, Path::new("/ws"), Some(home)),
+            "denying read denies searching file contents too"
         );
     }
 

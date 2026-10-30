@@ -6,11 +6,11 @@ use std::sync::Arc;
 use anyhow::bail;
 
 use loop_agent::harness::{
-    create_bash_tool_with, create_edit_tool, create_exit_plan_tool, create_glob_tool,
-    create_grep_tool, create_ls_tool, create_read_tool, create_session_repository,
-    create_sqlite_session_store, create_todo_tool, create_write_tool, verify_web_search_key,
-    AgentHarness, AgentHarnessOptions, AgentHarnessResources, HostExecutionEnv, KrunIsolation,
-    KrunSandbox, LocalSandboxRuntime, Sandbox, SandboxMode, WebSearchConfig,
+    create_bash_tool_with, create_edit_tool, create_exit_plan_tool, create_read_tool,
+    create_session_repository, create_sqlite_session_store, create_todo_tool, create_write_tool,
+    search_tools_with_filter, verify_web_search_key, AgentHarness, AgentHarnessOptions,
+    AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime,
+    Sandbox, SandboxMode, WebSearchConfig,
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
 use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
@@ -771,7 +771,12 @@ impl Runtime {
             .tool_env()
             .await
             .map_err(|e| anyhow::anyhow!("tool env: {e}"))?;
-        let tools = build_tools(env, &self.web_tools(), self.bash_limits());
+        let tools = build_tools(
+            env,
+            &self.web_tools(),
+            self.bash_limits(),
+            self.tool_gate.search_filter(),
+        );
         self.harness
             .set_tools(tools)
             .await
@@ -1040,23 +1045,23 @@ pub struct BootstrapOpts {
 }
 
 /// Build the standard tool set bound to an execution environment, plus the
-/// web tools `web` asks for (see [`crate::web_tools`]).
+/// web tools `web` asks for (see [`crate::web_tools`]). The search tools
+/// hide what `search` refuses ([`crate::tool_gate::ToolGate::search_filter`]).
 pub fn build_tools(
     env: Arc<dyn loop_agent::harness::ExecutionEnv>,
     web: &crate::web_tools::WebTools,
     bash: loop_agent::harness::BashLimits,
+    search: loop_agent::harness::SearchFilter,
 ) -> Vec<AgentTool> {
-    let mut tools = vec![
-        create_read_tool(Arc::clone(&env)),
-        create_grep_tool(Arc::clone(&env)),
-        create_glob_tool(Arc::clone(&env)),
-        create_ls_tool(Arc::clone(&env)),
+    let mut tools = vec![create_read_tool(Arc::clone(&env))];
+    tools.extend(search_tools_with_filter(Arc::clone(&env), search));
+    tools.extend([
         create_write_tool(Arc::clone(&env)),
         create_edit_tool(Arc::clone(&env)),
         create_bash_tool_with(env, None, bash),
         create_todo_tool(),
         create_exit_plan_tool(),
-    ];
+    ]);
     tools.extend(web.build());
     tools
 }
@@ -1455,7 +1460,15 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         opts.no_web,
     );
     let bash_limits = settings.bash.unwrap_or_default().limits();
-    let tools = build_tools(Arc::clone(&tool_env), &web, bash_limits);
+    let tool_gate = crate::tool_gate::ToolGate::new(
+        crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
+    );
+    let tools = build_tools(
+        Arc::clone(&tool_env),
+        &web,
+        bash_limits,
+        tool_gate.search_filter(),
+    );
 
     // The prompt lists the tools that were actually built (web_search may be
     // unconfigured), so it can never promise a tool the agent cannot call.
@@ -1495,9 +1508,6 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
     let backend: Arc<dyn loop_protocol::AgentBackend> = native.clone();
 
-    let tool_gate = crate::tool_gate::ToolGate::new(
-        crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
-    );
     tool_gate.install(&harness);
     agents.set_gate(Arc::clone(&tool_gate));
     let mut startup_notices =
@@ -1663,7 +1673,7 @@ mod tests {
             loop_agent::harness::HostExecutionEnv::new(std::env::temp_dir()),
         );
         let web = crate::web_tools::WebTools::from_settings(&Default::default(), None, true);
-        let tools = build_tools(env, &web, Default::default());
+        let tools = build_tools(env, &web, Default::default(), Arc::new(|_, _| true));
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         for name in [
             "read", "write", "edit", "bash", "grep", "glob", "ls", "todo",

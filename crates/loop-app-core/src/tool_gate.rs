@@ -19,8 +19,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use loop_agent::harness::{
-    AgentHarness, HarnessHookEvent, HookRegistry, ToolCallInfo, ToolDecision, ToolSource,
-    EXIT_PLAN_TOOL,
+    AgentHarness, HarnessHookEvent, HookRegistry, SearchFilter, ToolCallInfo, ToolDecision,
+    ToolSource, EXIT_PLAN_TOOL,
 };
 use loop_agent::{
     AfterToolCallFn, BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult, ToolCall,
@@ -259,6 +259,21 @@ impl ToolGate {
     /// Ask the user through `approver` (TUI, desktop); `None` runs headless.
     pub fn set_approver(&self, approver: Option<Arc<ToolApprovalBridge>>) {
         *self.approver.lock() = approver;
+    }
+
+    /// What the search tools hide: files the current `toolPermissions` deny
+    /// to `read` or to the tool itself ([`crate::permissions::search_may_show`]).
+    pub fn search_filter(self: &Arc<Self>) -> SearchFilter {
+        let gate = Arc::downgrade(self);
+        let home = dirs::home_dir();
+        Arc::new(move |tool: &str, path: &std::path::Path| {
+            let Some(gate) = gate.upgrade() else {
+                return true;
+            };
+            let workspace = gate.workspace();
+            let rules = gate.permissions.lock();
+            crate::permissions::search_may_show(&rules, tool, path, &workspace, home.as_deref())
+        })
     }
 
     /// Replace the per-tool permissions (settings changed).
@@ -892,6 +907,23 @@ mod tests {
             .expect("refused");
         assert!(blocked.reason.unwrap().contains("nobody can approve"));
         assert_eq!(gate.mode(), PermissionMode::Plan);
+    }
+
+    #[test]
+    fn the_search_filter_hides_what_the_rules_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = ToolGate::new(crate::tool_approval::permissions_from_settings(
+            &BTreeMap::from([("read(secret/*)".into(), "deny".into())]),
+        ));
+        gate.set_workspace(dir.path().to_path_buf());
+        let filter = gate.search_filter();
+        assert!(!filter("grep", &dir.path().join("secret/key")));
+        assert!(filter("grep", &dir.path().join("src/main.rs")));
+        gate.set_permissions(BTreeMap::new());
+        assert!(
+            filter("grep", &dir.path().join("secret/key")),
+            "the filter reads the rules at each call"
+        );
     }
 
     #[tokio::test]

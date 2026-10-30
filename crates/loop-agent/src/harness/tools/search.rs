@@ -3,8 +3,10 @@
 //! They walk the host filesystem under a path the [`ExecutionEnv`] resolves,
 //! so a jailed env still refuses paths outside its root. `grep` and `glob`
 //! respect `.gitignore` (in a git repo or not) and skip hidden files unless
-//! asked; `.git/` is never searched.
+//! asked; `.git/` is never searched. A [`SearchFilter`] hides the files the
+//! host's permission rules would not let the tool read.
 
+use std::cell::Cell;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,8 +29,37 @@ pub const SEARCH_MAX_RESULTS: usize = 500;
 /// Bytes read to decide whether a file is binary.
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
+/// Whether `tool` may read or list the file at an absolute path.
+pub type SearchFilter = Arc<dyn Fn(&str, &Path) -> bool + Send + Sync>;
+
+/// `grep`, `glob` and `ls` bound to `env`, hiding what `filter` refuses.
+pub fn search_tools_with_filter(
+    env: Arc<dyn ExecutionEnv>,
+    filter: SearchFilter,
+) -> [AgentTool; 3] {
+    [
+        grep_tool(Arc::clone(&env), Some(Arc::clone(&filter))),
+        glob_tool(Arc::clone(&env), Some(Arc::clone(&filter))),
+        ls_tool(env, Some(filter)),
+    ]
+}
+
 /// Create a `grep` tool bound to `env`.
 pub fn create_grep_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
+    grep_tool(env, None)
+}
+
+/// Create a `glob` tool bound to `env`.
+pub fn create_glob_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
+    glob_tool(env, None)
+}
+
+/// Create an `ls` tool bound to `env`.
+pub fn create_ls_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
+    ls_tool(env, None)
+}
+
+fn grep_tool(env: Arc<dyn ExecutionEnv>, filter: Option<SearchFilter>) -> AgentTool {
     AgentTool::simple(
         "grep",
         "Grep",
@@ -70,6 +101,7 @@ pub fn create_grep_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
         ),
         move |_id, args, cancel, _on_update| {
             let env = Arc::clone(&env);
+            let filter = filter.clone();
             async move {
                 let pattern = arg_str(&args, "pattern")?;
                 let ignore_case = args
@@ -90,13 +122,14 @@ pub fn create_grep_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         ))
                     }
                 };
-                let walk = Walk::from_args(env.as_ref(), &args).await?;
+                let walk = Walk::from_args(env.as_ref(), &args, "grep", filter).await?;
                 let glob = match args.get("glob").and_then(|v| v.as_str()) {
                     Some(glob) => Some(glob_matcher(&walk.root, glob)?),
                     None => None,
                 };
-                let search = tokio::task::spawn_blocking(move || {
-                    grep_files(&walk, &regex, mode, cancel.as_ref(), glob.as_ref())
+                let (search, hidden) = tokio::task::spawn_blocking(move || {
+                    let search = grep_files(&walk, &regex, mode, cancel.as_ref(), glob.as_ref());
+                    (search, walk.hidden_by_rules.get())
                 })
                 .await
                 .map_err(|e| e.to_string())?;
@@ -104,6 +137,7 @@ pub fn create_grep_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                 Ok(text_result(
                     search.lines,
                     search.truncated,
+                    hidden,
                     "No matches.",
                     json!({"matches": matches}),
                 ))
@@ -112,8 +146,7 @@ pub fn create_grep_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     )
 }
 
-/// Create a `glob` tool bound to `env`.
-pub fn create_glob_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
+fn glob_tool(env: Arc<dyn ExecutionEnv>, filter: Option<SearchFilter>) -> AgentTool {
     AgentTool::simple(
         "glob",
         "Glob",
@@ -141,11 +174,12 @@ pub fn create_glob_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
         ),
         move |_id, args, cancel, _on_update| {
             let env = Arc::clone(&env);
+            let filter = filter.clone();
             async move {
                 let pattern = arg_str(&args, "pattern")?;
-                let walk = Walk::from_args(env.as_ref(), &args).await?;
+                let walk = Walk::from_args(env.as_ref(), &args, "glob", filter).await?;
                 let matcher = glob_matcher(&walk.root, &pattern)?;
-                let (lines, truncated) = tokio::task::spawn_blocking(move || {
+                let (lines, truncated, hidden) = tokio::task::spawn_blocking(move || {
                     let mut lines = Vec::new();
                     let mut truncated = false;
                     for path in walk.files(cancel.as_ref()) {
@@ -159,7 +193,7 @@ pub fn create_glob_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         lines.push(walk.display(&path));
                     }
                     lines.sort();
-                    (lines, truncated)
+                    (lines, truncated, walk.hidden_by_rules.get())
                 })
                 .await
                 .map_err(|e| e.to_string())?;
@@ -167,6 +201,7 @@ pub fn create_glob_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                 Ok(text_result(
                     lines,
                     truncated,
+                    hidden,
                     "No files found.",
                     json!({"files": files}),
                 ))
@@ -175,8 +210,7 @@ pub fn create_glob_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     )
 }
 
-/// Create an `ls` tool bound to `env`.
-pub fn create_ls_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
+fn ls_tool(env: Arc<dyn ExecutionEnv>, filter: Option<SearchFilter>) -> AgentTool {
     AgentTool::simple(
         "ls",
         "List",
@@ -193,6 +227,7 @@ pub fn create_ls_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
         ),
         move |_id, args, _cancel, _on_update| {
             let env = Arc::clone(&env);
+            let filter = filter.clone();
             async move {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
                 let abs = env
@@ -202,11 +237,11 @@ pub fn create_ls_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                 if !info.is_dir {
                     return Err(format!("not a directory: {}", abs.display()));
                 }
-                let mut lines: Vec<String> = env
-                    .list_dir(&abs)
-                    .await
-                    .map_err(|e| e.to_string())?
+                let entries = env.list_dir(&abs).await.map_err(|e| e.to_string())?;
+                let total = entries.len();
+                let mut lines: Vec<String> = entries
                     .into_iter()
+                    .filter(|entry| filter.as_ref().is_none_or(|f| f("ls", &entry.path)))
                     .map(|entry| {
                         let name = entry
                             .path
@@ -220,12 +255,14 @@ pub fn create_ls_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         }
                     })
                     .collect();
+                let hidden = total - lines.len();
                 lines.sort();
                 let truncated = lines.len() > SEARCH_MAX_RESULTS;
                 lines.truncate(SEARCH_MAX_RESULTS);
                 Ok(text_result(
                     lines,
                     truncated,
+                    hidden,
                     "Empty directory.",
                     json!({"path": abs}),
                 ))
@@ -249,10 +286,20 @@ struct Walk {
     /// The working directory, which shown paths are relative to.
     cwd: PathBuf,
     hidden: bool,
+    /// The tool, for `filter`.
+    tool: &'static str,
+    filter: Option<SearchFilter>,
+    /// Files `filter` hid.
+    hidden_by_rules: Cell<usize>,
 }
 
 impl Walk {
-    async fn from_args(env: &dyn ExecutionEnv, args: &serde_json::Value) -> Result<Self, String> {
+    async fn from_args(
+        env: &dyn ExecutionEnv,
+        args: &serde_json::Value,
+        tool: &'static str,
+        filter: Option<SearchFilter>,
+    ) -> Result<Self, String> {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let root = env
             .absolute_path(Path::new(path))
@@ -267,7 +314,19 @@ impl Walk {
                 .get("hidden")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            tool,
+            filter,
+            hidden_by_rules: Cell::new(0),
         })
+    }
+
+    /// Whether the filter lets the tool read `path`; counts the ones it hides.
+    fn allowed(&self, path: &Path) -> bool {
+        let allowed = self.filter.as_ref().is_none_or(|f| f(self.tool, path));
+        if !allowed {
+            self.hidden_by_rules.set(self.hidden_by_rules.get() + 1);
+        }
+        allowed
     }
 
     /// The files under the root, in walk order, until `cancel` fires.
@@ -285,6 +344,7 @@ impl Walk {
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_some_and(|t| t.is_file()))
             .map(ignore::DirEntry::into_path)
+            .filter(move |path| self.allowed(path))
     }
 
     /// `path` relative to the working directory when inside it, with `/`
@@ -384,10 +444,12 @@ fn read_text(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&head).into_owned())
 }
 
-/// The tool result for `lines`, with a note when they were cut short.
+/// The tool result for `lines`, with notes when they were cut short or
+/// permission rules hid paths.
 fn text_result(
     lines: Vec<String>,
     truncated: bool,
+    hidden_by_rules: usize,
     empty: &str,
     mut details: serde_json::Value,
 ) -> AgentToolResult {
@@ -405,7 +467,13 @@ fn text_result(
             text.lines().count()
         ));
     }
+    if hidden_by_rules > 0 {
+        text.push_str(&format!(
+            "\n[{hidden_by_rules} paths hidden by permission rules]"
+        ));
+    }
     details["truncated"] = json!(truncated);
+    details["hiddenByRules"] = json!(hidden_by_rules);
     AgentToolResult {
         content: vec![ToolResultContent::Text(TextContent {
             text,

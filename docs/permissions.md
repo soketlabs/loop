@@ -17,7 +17,7 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 | `full-access` | allow | allow | allow | allow |
 | `plan` | as `read-only`, until you approve the plan ([below](#plan-mode)) | deny | read-only commands only | as `read-only` |
 
-- **Search tools** (`grep`, `glob` and `ls`) only read, so every mode runs them without asking. `grep` and `glob` respect `.gitignore` and skip hidden files unless the call asks for them; `.git/` is never searched.
+- **Search tools** (`grep`, `glob` and `ls`) only read, so every mode runs them without asking. `grep` and `glob` respect `.gitignore` and skip hidden files unless the call asks for them; `.git/` is never searched. They also skip every file a `read` deny rule (or the tool's own pattern deny) refuses for that file's path, so `"read(~/.ssh/*)": "deny"` keeps `~/.ssh` out of a search of your home directory; the result says how many paths were hidden.
 - **The workspace** is the git root of the directory Loop runs in, or that directory itself. Paths are resolved through symlinks, so a link that points outside the workspace counts as outside.
 - **`read-only` is a ceiling.** A hook can't allow a call that changes files or runs commands.
 - **What `read-only` turns off is taken away, not just refused.** The model isn't offered `write`, `edit`, or MCP tools that their server doesn't mark read-only, in the agent loop or through `loop mcp serve`. `bash` stays, for read-only commands. Switching mode changes the toolset from the next turn.

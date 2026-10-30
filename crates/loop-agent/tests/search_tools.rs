@@ -4,7 +4,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use loop_agent::harness::{
-    create_glob_tool, create_grep_tool, create_ls_tool, ExecutionEnv, HostExecutionEnv,
+    create_glob_tool, create_grep_tool, create_ls_tool, search_tools_with_filter, ExecutionEnv,
+    HostExecutionEnv, SearchFilter,
 };
 use loop_agent::AgentTool;
 use serde_json::{json, Value};
@@ -217,4 +218,61 @@ fn the_parameters_are_documented() {
             );
         }
     }
+}
+
+/// A home-like directory with `.ssh/id_rsa` and `notes.txt`, both
+/// mentioning "key".
+fn home() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".ssh")).unwrap();
+    std::fs::write(dir.path().join(".ssh/id_rsa"), "private key\n").unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "key ideas\n").unwrap();
+    dir
+}
+
+/// Hides what is under `.ssh`, as a `read(~/.ssh/*)` deny rule would.
+fn hide_ssh(home: &Path) -> SearchFilter {
+    let ssh = home.join(".ssh");
+    Arc::new(move |_tool: &str, path: &Path| !path.starts_with(&ssh))
+}
+
+#[tokio::test]
+async fn files_permission_rules_hide_are_not_searched_listed_or_shown() {
+    let dir = home();
+    let root = dir.path().to_string_lossy().to_string();
+    let [grep, glob, ls] = search_tools_with_filter(env(dir.path()), hide_ssh(dir.path()));
+
+    let (text, details) = call(
+        &grep,
+        json!({"pattern": "key", "path": root, "hidden": true}),
+    )
+    .await;
+    assert!(text.contains("notes.txt:1:key ideas"), "{text}");
+    assert!(!text.contains("private"), "{text}");
+    assert!(
+        text.ends_with("[1 paths hidden by permission rules]"),
+        "{text}"
+    );
+    assert_eq!(details["hiddenByRules"], 1);
+
+    let (text, _) = call(&glob, json!({"pattern": "*", "path": root, "hidden": true})).await;
+    assert!(!text.contains("id_rsa"), "{text}");
+    assert!(
+        text.contains("[1 paths hidden by permission rules]"),
+        "{text}"
+    );
+
+    let ssh = dir.path().join(".ssh").to_string_lossy().to_string();
+    let (text, _) = call(&ls, json!({"path": ssh})).await;
+    assert!(!text.contains("id_rsa"), "{text}");
+    assert!(
+        text.contains("[1 paths hidden by permission rules]"),
+        "{text}"
+    );
+
+    let (text, _) = call(&grep, json!({"pattern": "ideas", "path": root})).await;
+    assert!(
+        !text.contains("hidden by"),
+        "nothing was hidden here: {text}"
+    );
 }

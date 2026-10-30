@@ -14,7 +14,10 @@ use serde_json::json;
 use similar::{ChangeTag, TextDiff};
 
 pub use plan::{create_exit_plan_tool, EXIT_PLAN_TOOL};
-pub use search::{create_glob_tool, create_grep_tool, create_ls_tool, SEARCH_MAX_RESULTS};
+pub use search::{
+    create_glob_tool, create_grep_tool, create_ls_tool, search_tools_with_filter, SearchFilter,
+    SEARCH_MAX_RESULTS,
+};
 pub use todo::{create_todo_tool, todos_from_details};
 
 use crate::harness::tools::file_mutation_queue::with_file_mutation_queue;
