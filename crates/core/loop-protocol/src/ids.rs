@@ -8,6 +8,7 @@ macro_rules! string_id {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
         #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
         #[serde(transparent)]
         pub struct $name(pub String);
 

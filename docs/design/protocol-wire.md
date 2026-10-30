@@ -1,6 +1,6 @@
 # Phase 0 Lane B · loop-protocol on the wire: design draft
 
-Status: approved 2026-10-29 (method set, `loop-wire` crate, exit codes). Model control comes in S3. PR 1 (`--print --output-format`) is built; user docs: [Running Loop from scripts](../print-mode.md).
+Status: approved 2026-10-29 (method set, `loop-wire` crate, exit codes). Model control comes in S3. All five PRs in §9 are built. User docs: [Running Loop from scripts](../print-mode.md).
 
 Goal: `loop-protocol` runs over a real connection. This is S1, the first step
 of the spine: the Runtime (S2) and the TUI as a Runtime client (S3) build on
@@ -85,7 +85,9 @@ One constant, `PROTOCOL_VERSION`, covers the events and the methods.
 
 - A checked-in `crates/core/loop-protocol/schema/loop-protocol.json` covers every event type and every method's params and result.
 - It's generated with `schemars`, and a test fails if the file is out of date.
-- Tagged enums come out as `oneOf` with a `const` tag, so the Phase 1 TypeScript SDK generator produces discriminated unions.
+- Tagged enums come out as unions (`anyOf`) whose variants carry a `const` tag, so the Phase 1 TypeScript SDK generator produces discriminated unions. Each union also has an open variant for the lenient reader's `Unknown`.
+- `schemars` is an optional `schema` feature of `loop-protocol`, so other builds don't compile it. The freshness test lives in `loop-wire`, which turns the feature on for its tests, so it runs in normal CI.
+- The test compares JSON values, not text: some crates in the workspace turn on `serde_json`'s `preserve_order`. The file is written with keys sorted.
 
 ## 7. First consumer: `--print --output-format`
 

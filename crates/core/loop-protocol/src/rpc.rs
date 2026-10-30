@@ -44,6 +44,7 @@ pub mod methods {
 
 /// Who is on the other end, for logs. Never used for feature checks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PeerInfo {
     /// Program name, e.g. `loop`.
     pub name: String,
@@ -53,6 +54,7 @@ pub struct PeerInfo {
 
 /// What a client can do for the server.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct ClientCapabilities {
     /// Answers `host/interact` (permission prompts, questions).
@@ -61,6 +63,7 @@ pub struct ClientCapabilities {
 
 /// `initialize` params.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct InitializeParams {
     /// The highest version the client speaks.
     pub protocol_version: u32,
@@ -73,6 +76,7 @@ pub struct InitializeParams {
 
 /// `initialize` result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct InitializeResult {
     /// The version to use: the client's, when the server speaks it, or else
     /// the server's highest. A client that can't use it closes.
@@ -87,6 +91,7 @@ pub struct InitializeResult {
 
 /// Params naming one session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionParams {
     /// The session.
     pub session: SessionRef,
@@ -94,6 +99,7 @@ pub struct SessionParams {
 
 /// `session/load` params.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LoadParams {
     /// The session to reopen.
     pub session: SessionRef,
@@ -104,6 +110,7 @@ pub struct LoadParams {
 
 /// `session/prompt` params.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PromptParams {
     /// The session.
     pub session: SessionRef,
@@ -113,6 +120,7 @@ pub struct PromptParams {
 
 /// `session/prompt` result: how the turn ended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PromptResult {
     /// Why the turn ended.
     pub stop: StopReason,
@@ -177,6 +185,7 @@ pub mod error_codes {
 
 /// A JSON-RPC error: code, message and optional data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RpcErrorBody {
     /// Error code.
     pub code: i64,
@@ -240,4 +249,63 @@ pub fn negotiate(client: u32) -> u32 {
     } else {
         crate::PROTOCOL_VERSION
     }
+}
+
+/// The JSON Schema of the wire format: every type as a definition, and
+/// each method's direction, kind, params and result. The checked-in
+/// `schema/loop-protocol.json` is this value.
+#[cfg(feature = "schema")]
+pub fn json_schema() -> Value {
+    use crate::{
+        InteractionOutcome, InteractionRequest, SessionUpdate, UpdateEnvelope, PROTOCOL_VERSION,
+    };
+
+    let mut generator = schemars::generate::SchemaSettings::draft2020_12().into_generator();
+    let reference = |schema: schemars::Schema| serde_json::to_value(schema).unwrap_or_default();
+    let initialize_params = reference(generator.subschema_for::<InitializeParams>());
+    let initialize_result = reference(generator.subschema_for::<InitializeResult>());
+    let spec = reference(generator.subschema_for::<SessionSpec>());
+    let session = reference(generator.subschema_for::<SessionRef>());
+    let load = reference(generator.subschema_for::<LoadParams>());
+    let session_params = reference(generator.subschema_for::<SessionParams>());
+    let transcript = reference(generator.subschema_for::<Vec<SessionUpdate>>());
+    let prompt_params = reference(generator.subschema_for::<PromptParams>());
+    let prompt_result = reference(generator.subschema_for::<PromptResult>());
+    let envelope = reference(generator.subschema_for::<UpdateEnvelope>());
+    let interaction = reference(generator.subschema_for::<InteractionRequest>());
+    let interaction_outcome = reference(generator.subschema_for::<InteractionOutcome>());
+    let error = reference(generator.subschema_for::<RpcErrorBody>());
+    let empty = serde_json::json!({"type": "object"});
+    let method = |direction: &str, kind: &str, params: &Value, result: Option<&Value>| {
+        let mut method = serde_json::json!({
+            "direction": direction,
+            "kind": kind,
+            "params": params,
+        });
+        if let Some(result) = result {
+            method["result"] = result.clone();
+        }
+        method
+    };
+    let up = "client_to_server";
+    let down = "server_to_client";
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "loop-protocol",
+        "description": "Loop's wire format: JSON-RPC 2.0 methods and the event model. See docs/design/protocol-wire.md.",
+        "protocol_version": PROTOCOL_VERSION,
+        "methods": {
+            methods::INITIALIZE: method(up, "request", &initialize_params, Some(&initialize_result)),
+            methods::SESSION_NEW: method(up, "request", &spec, Some(&session)),
+            methods::SESSION_LOAD: method(up, "request", &load, Some(&session)),
+            methods::SESSION_TRANSCRIPT: method(up, "request", &session_params, Some(&transcript)),
+            methods::SESSION_PROMPT: method(up, "request", &prompt_params, Some(&prompt_result)),
+            methods::SESSION_CANCEL: method(up, "notification", &session_params, None),
+            methods::SESSION_UPDATE: method(down, "notification", &envelope, None),
+            methods::HOST_INTERACT: method(down, "request", &interaction, Some(&interaction_outcome)),
+            methods::SHUTDOWN: method(up, "request", &empty, Some(&empty)),
+        },
+        "error": error,
+        "$defs": generator.definitions(),
+    })
 }

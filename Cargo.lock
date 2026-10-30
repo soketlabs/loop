@@ -4734,6 +4734,7 @@ name = "loop-protocol"
 version = "0.5.0"
 dependencies = [
  "async-trait",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "tokio",
@@ -4790,6 +4791,7 @@ version = "0.5.0"
 dependencies = [
  "async-trait",
  "futures",
+ "jsonschema",
  "loop-agent",
  "loop-ai",
  "loop-protocol",

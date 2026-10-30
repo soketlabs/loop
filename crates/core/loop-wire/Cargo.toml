@@ -20,6 +20,8 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+jsonschema = { workspace = true }
+loop-protocol = { workspace = true, features = ["schema"] }
 tempfile = { workspace = true }
 loop-agent = { workspace = true }
 loop-ai = { workspace = true }

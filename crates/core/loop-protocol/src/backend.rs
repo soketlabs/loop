@@ -61,6 +61,7 @@ impl std::error::Error for BackendError {}
 
 /// How to open a session.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct SessionSpec {
     /// Absolute working directory for the session.
@@ -73,6 +74,7 @@ pub struct SessionSpec {
 
 /// A session as both Loop and the backend know it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionRef {
     /// Backend instance that owns the session.
     pub instance: BackendInstanceId,

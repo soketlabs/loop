@@ -5,6 +5,7 @@ use serde_json::Value;
 
 /// A unit of content.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     /// Plain text.
