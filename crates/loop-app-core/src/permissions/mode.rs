@@ -1,4 +1,5 @@
-//! The four permission modes, each a preset over Capabilities.
+//! The four permission modes, each a preset over Capabilities, and plan
+//! mode.
 //!
 //! | Capability | `read-only` | `ask` | `accept-edits` | `full-access` |
 //! |---|---|---|---|---|
@@ -11,12 +12,19 @@
 //!
 //! "Ask" defers to `toolPermissions`: an allow rule runs the call without
 //! asking. That is why `ask` mode reads files and calls MCP tools freely.
+//!
+//! `plan` has `read-only`'s preset. The model investigates and proposes a
+//! plan with `exit_plan`; when the user approves it, the mode goes back to
+//! the one plan mode was entered from (see [`crate::tool_gate::ToolGate`]).
 
 use super::capability::{Capability, Scope, Setting, State};
 
 /// How much Loop's own tools may do without asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum PermissionMode {
+    /// Investigate and propose a plan; nothing changes until the user
+    /// approves it. Not in [`Self::ALL`].
+    Plan,
     /// Reading, searching and the web only.
     ReadOnly,
     /// Ask before edits and commands (`toolPermissions`).
@@ -29,7 +37,8 @@ pub enum PermissionMode {
 }
 
 impl PermissionMode {
-    /// Every mode, strictest first.
+    /// The four modes `/permissions` lists, strictest first. Plan mode is
+    /// entered with `/plan` and left by approving a plan.
     pub const ALL: [Self; 4] = [
         Self::ReadOnly,
         Self::Ask,
@@ -41,6 +50,7 @@ impl PermissionMode {
     pub fn parse(value: &str) -> Option<Self> {
         Some(
             match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+                "plan" => Self::Plan,
                 "read-only" | "readonly" => Self::ReadOnly,
                 "ask" | "default" => Self::Ask,
                 "accept-edits" | "acceptedits" => Self::AcceptEdits,
@@ -53,6 +63,7 @@ impl PermissionMode {
     /// The settings and flag name.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Plan => "plan",
             Self::ReadOnly => "read-only",
             Self::Ask => "ask",
             Self::AcceptEdits => "accept-edits",
@@ -63,6 +74,7 @@ impl PermissionMode {
     /// Short label for the footer.
     pub fn label(self) -> &'static str {
         match self {
+            Self::Plan => "plan",
             Self::ReadOnly => "read-only",
             Self::Ask => "ask",
             Self::AcceptEdits => "accept edits",
@@ -76,7 +88,7 @@ impl PermissionMode {
     /// the user.
     pub fn agent_modes(self) -> &'static [&'static str] {
         match self {
-            Self::ReadOnly | Self::Ask => &["read-only"],
+            Self::Plan | Self::ReadOnly | Self::Ask => &["read-only"],
             Self::AcceptEdits => &["workspace-write"],
             Self::FullAccess => &["agent-full-access", "full-access"],
         }
@@ -85,6 +97,7 @@ impl PermissionMode {
     /// One line for the `/permissions` picker.
     pub fn description(self) -> &'static str {
         match self {
+            Self::Plan => "investigate and propose a plan; nothing changes until you approve it",
             Self::ReadOnly => "read, search and the web only; no edits or commands",
             Self::Ask => "ask before edits and commands",
             Self::AcceptEdits => "edit files in this workspace without asking; ask for commands",
@@ -97,6 +110,7 @@ impl PermissionMode {
         use Capability::*;
         use State::{Ask as AskFirst, Off, On};
         match (self, capability) {
+            (Self::Plan, _) => Self::ReadOnly.setting(capability),
             (Self::FullAccess, _) => Setting::always(On),
             (Self::Ask, _) => Setting::always(AskFirst),
             (Self::ReadOnly, WriteFiles) => Setting::always(Off),
@@ -129,6 +143,35 @@ mod tests {
         assert_eq!(PermissionMode::parse("Accept_Edits"), Some(AcceptEdits));
         assert_eq!(PermissionMode::parse("yolo"), None);
         assert!(ReadOnly < Ask && Ask < AcceptEdits && AcceptEdits < FullAccess);
+    }
+
+    #[test]
+    fn plan_is_read_only_under_its_own_name() {
+        use crate::permissions::capability::Capability::*;
+        assert_eq!(PermissionMode::parse("plan"), Some(Plan));
+        assert_eq!(Plan.as_str(), "plan");
+        assert_eq!(Plan.label(), "plan");
+        assert!(Plan < ReadOnly, "plan is the strictest");
+        assert!(
+            !PermissionMode::ALL.contains(&Plan),
+            "the four modes /permissions lists are unchanged"
+        );
+        for capability in [
+            ReadFiles,
+            WriteFiles,
+            Shell,
+            WebFetch,
+            WebSearch,
+            Mcp("github".into()),
+            Other,
+        ] {
+            assert_eq!(
+                Plan.setting(&capability),
+                ReadOnly.setting(&capability),
+                "{capability:?}"
+            );
+        }
+        assert_eq!(Plan.agent_modes(), ["read-only"]);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use loop_agent::harness::EXIT_PLAN_TOOL;
 use loop_protocol::ToolKind;
 use serde_json::Value;
 
@@ -95,6 +96,13 @@ pub fn decide(
             "Tool `{tool}` is denied by settings.toolPermissions"
         ));
     }
+    // Ending plan mode always asks the user, and only plan mode has it.
+    if tool == EXIT_PLAN_TOOL {
+        return match mode {
+            PermissionMode::Plan => Decision::Ask,
+            _ => Decision::Deny("plan mode is off; carry on with the work".into()),
+        };
+    }
     let capability = Capability::of(call);
     match mode.setting(&capability).state_for(call) {
         State::Off => Decision::Deny(off_reason(mode, &capability, tool)),
@@ -115,11 +123,23 @@ pub fn decide(
 /// Capability is off and no scope can turn it on. Only the tool's name and
 /// kind matter; `call` has no arguments yet.
 pub fn available(mode: PermissionMode, call: &Call) -> bool {
-    mode.setting(&Capability::of(call)).may_allow(call)
+    match mode {
+        // Every tool stays offered in plan mode (calls are still checked),
+        // so the work can start in the same turn once the plan is approved.
+        PermissionMode::Plan => true,
+        _ if call.tool == EXIT_PLAN_TOOL => false,
+        _ => mode.setting(&Capability::of(call)).may_allow(call),
+    }
 }
 
 /// Why a call whose Capability is off in `mode` is refused.
 fn off_reason(mode: PermissionMode, capability: &Capability, tool: &str) -> String {
+    if mode == PermissionMode::Plan {
+        return format!(
+            "`{tool}` can't run in plan mode: investigate with read-only tools, then call \
+             `{EXIT_PLAN_TOOL}` with your plan; once the user approves it you can make changes"
+        );
+    }
     let mode = mode.as_str();
     match capability {
         Capability::Shell => format!(
@@ -239,6 +259,70 @@ mod tests {
             let got = decide(*mode, &defaults(), &call(tool, (*args).clone(), true));
             want(&format!("{mode:?} {tool} {args}"), &got, expected);
         }
+    }
+
+    #[test]
+    fn plan_mode_reads_and_asks_before_it_ends() {
+        let path = json!({"path": "src/main.rs"});
+        let cmd = json!({"command": "cargo test"});
+        let ls = json!({"command": "git log | wc -l"});
+        let plan = json!({"plan": "1. edit main.rs"});
+        let rows: &[(PermissionMode, &str, &Value, &str)] = &[
+            (Plan, "read", &path, "allow"),
+            (Plan, "grep", &path, "allow"),
+            (Plan, "todo", &path, "allow"),
+            (Plan, "write", &path, "deny"),
+            (Plan, "bash", &cmd, "deny"),
+            (Plan, "bash", &ls, "allow"),
+            (Plan, "mcp__github__create_issue", &cmd, "deny"),
+            (Plan, "exit_plan", &plan, "ask"),
+            (Ask, "exit_plan", &plan, "deny"),
+            (FullAccess, "exit_plan", &plan, "deny"),
+        ];
+        for (mode, tool, args, expected) in rows {
+            let got = decide(*mode, &defaults(), &call(tool, (*args).clone(), true));
+            want(&format!("{mode:?} {tool} {args}"), &got, expected);
+        }
+        let Decision::Deny(reason) = decide(Plan, &defaults(), &call("edit", path, true)) else {
+            panic!("edits are off in plan mode");
+        };
+        assert!(reason.contains("exit_plan"), "{reason}");
+
+        let tool = |name: &str| Call::new(name, Value::Null, "/ws");
+        // Plan mode keeps every tool offered, so the work can start in the
+        // same turn once the plan is approved; calls are still checked.
+        assert!(available(Plan, &tool("write")));
+        assert!(available(Plan, &tool("exit_plan")));
+        assert!(!available(Ask, &tool("exit_plan")));
+        assert!(!available(ReadOnly, &tool("exit_plan")));
+    }
+
+    #[test]
+    fn search_tools_run_without_asking_in_every_mode() {
+        let rows = [
+            ("grep", json!({"pattern": "fn main", "path": "src"})),
+            ("glob", json!({"pattern": "*.rs"})),
+            ("ls", json!({})),
+        ];
+        for mode in PermissionMode::ALL {
+            for (tool, args) in &rows {
+                let got = decide(mode, &defaults(), &call(tool, args.clone(), false));
+                assert_eq!(got, Decision::Allow, "{mode:?} {tool}");
+                assert!(available(mode, &call(tool, Value::Null, false)));
+            }
+        }
+        let r = crate::tool_approval::permissions_from_settings(
+            &[("grep(~/secrets/*)".to_owned(), "deny".to_owned())].into(),
+        );
+        let secret = Call {
+            home: Some("/home/me".into()),
+            ..call(
+                "grep",
+                json!({"pattern": "key", "path": "~/secrets/a"}),
+                false,
+            )
+        };
+        assert!(matches!(decide(ReadOnly, &r, &secret), Decision::Deny(_)));
     }
 
     #[test]

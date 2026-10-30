@@ -149,6 +149,14 @@ async fn navigate_tree_moves_leaf() {
 
     let ctx_after = harness.create_turn_state().await.unwrap();
     assert_eq!(ctx_after.messages.len(), 1);
+
+    let rows = harness.session_tree().await.unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows[0].current, "the tree marks where the Session is");
+
+    harness.navigate_tree_to(None, false).await.unwrap();
+    let ctx_root = harness.create_turn_state().await.unwrap();
+    assert!(ctx_root.messages.is_empty(), "back before the first prompt");
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@ mod release;
 
 pub use control::{cancellable, plan, update_check_disabled, UpdatePlan};
 pub use install::{default_install_dir, Installation};
-pub use release::{is_newer, platform_target, ReleaseClient, ReleaseVersion};
+pub use release::{is_newer, platform_target, ReleaseClient, ReleaseNotes, ReleaseVersion};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

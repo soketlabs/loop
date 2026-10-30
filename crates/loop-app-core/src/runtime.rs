@@ -6,10 +6,11 @@ use std::sync::Arc;
 use anyhow::bail;
 
 use loop_agent::harness::{
-    create_bash_tool_with, create_edit_tool, create_read_tool, create_session_repository,
-    create_sqlite_session_store, create_write_tool, verify_web_search_key, AgentHarness,
-    AgentHarnessOptions, AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox,
-    LocalSandboxRuntime, Sandbox, SandboxMode, WebSearchConfig,
+    create_bash_tool_with, create_edit_tool, create_exit_plan_tool, create_read_tool,
+    create_session_repository, create_sqlite_session_store, create_todo_tool, create_write_tool,
+    search_tools_with_filter, verify_web_search_key, AgentHarness, AgentHarnessOptions,
+    AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime,
+    Sandbox, SandboxMode, WebSearchConfig,
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
 use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
@@ -290,6 +291,105 @@ impl Runtime {
         self.active_agent = None;
         self.agent_model = None;
         self.agent_effort = None;
+    }
+
+    /// Sessions opened in this folder, Loop's own and subscription ones,
+    /// most recently used first.
+    pub async fn list_sessions(&self) -> anyhow::Result<Vec<crate::sessions::SessionChoice>> {
+        let cwd = self.cwd.to_string_lossy();
+        let native = self.harness.session_summaries(Some(&cwd)).await?;
+        Ok(crate::sessions::merge(
+            native,
+            self.agents.sessions_in(&self.cwd),
+        ))
+    }
+
+    /// Write the current Session as a Markdown transcript and a session file
+    /// (see [`crate::sessions::export_paths`]); returns both paths.
+    pub async fn export_session(
+        &self,
+        path: Option<&str>,
+    ) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+        if !self.is_native() {
+            bail!("/export saves Loop's own sessions; this one runs in a subscription agent");
+        }
+        let file = self.harness.export_session().await?;
+        let (markdown, session_file) =
+            crate::sessions::export_paths(&self.cwd, &self.session_id, path);
+        if let Some(dir) = markdown.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&markdown, file.markdown())?;
+        std::fs::write(&session_file, file.to_jsonl())?;
+        Ok((markdown, session_file))
+    }
+
+    /// Read a session file written by `/export` into a new Session opened in
+    /// this folder, and return its id. The current Session stays active.
+    pub async fn import_session(&self, path: &str) -> anyhow::Result<String> {
+        let path = self.cwd.join(path);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("could not read {}: {e}", path.display()))?;
+        let file = loop_agent::harness::session::SessionFile::from_jsonl(&text)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let cwd = Some(self.cwd.to_string_lossy().into_owned());
+        Ok(self.harness.import_session(&file, cwd).await?)
+    }
+
+    /// Switch to Loop's own session `id`, leaving any subscription, and go
+    /// back to the model it last used when one is recorded and still
+    /// available (as `--resume` does; the saved default is left alone).
+    /// The session's own "accept all" approvals replace the previous ones.
+    pub async fn open_native_session(&mut self, id: &str) -> anyhow::Result<()> {
+        if !self.is_native() {
+            self.use_native().await;
+        }
+        let id = self.harness.switch_session(id).await?;
+        self.native.adopt_session(&id);
+        self.session_id = id;
+        self.resumed = true;
+        self.active_skills.clear();
+        if let Some(bridge) = &self.tool_approval {
+            bridge.clear_session_grants();
+            if let Ok(entries) = self.harness.read_session_entries().await {
+                for group in crate::tool_approval::auto_approve_from_entries(&entries) {
+                    bridge.grant_session(&group);
+                }
+            }
+        }
+        if let Ok(ctx) = self.harness.session_context().await {
+            let recorded = ctx.model.as_ref().and_then(|(provider, model)| {
+                self.models
+                    .get_model(provider, model)
+                    .filter(|_| !self.credentials.is_logged_out(provider))
+            });
+            if let Some(model) = recorded {
+                self.harness.set_model(model.clone()).await;
+                self.selected_model = Some(model);
+                self.model_note = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Name the active session; `/sessions` shows the name as its title.
+    pub async fn rename_session(&self, name: &str) -> anyhow::Result<()> {
+        if self.is_native() {
+            self.harness.set_session_name(name).await?;
+        } else {
+            self.agents.rename(&self.session_id, name)?;
+        }
+        Ok(())
+    }
+
+    /// Note a prompt the user sent, so a subscription session gets a title.
+    pub fn note_prompt(&self, prompt: &str) {
+        if self.is_native() {
+            return;
+        }
+        if let Err(e) = self.agents.note_prompt(&self.session_id, prompt) {
+            tracing::warn!("could not record the session title: {e:#}");
+        }
     }
 
     /// Start a new session with the active agent.
@@ -671,7 +771,12 @@ impl Runtime {
             .tool_env()
             .await
             .map_err(|e| anyhow::anyhow!("tool env: {e}"))?;
-        let tools = build_tools(env, &self.web_tools(), self.bash_limits());
+        let tools = build_tools(
+            env,
+            &self.web_tools(),
+            self.bash_limits(),
+            self.tool_gate.search_filter(),
+        );
         self.harness
             .set_tools(tools)
             .await
@@ -940,18 +1045,23 @@ pub struct BootstrapOpts {
 }
 
 /// Build the standard tool set bound to an execution environment, plus the
-/// web tools `web` asks for (see [`crate::web_tools`]).
+/// web tools `web` asks for (see [`crate::web_tools`]). The search tools
+/// hide what `search` refuses ([`crate::tool_gate::ToolGate::search_filter`]).
 pub fn build_tools(
     env: Arc<dyn loop_agent::harness::ExecutionEnv>,
     web: &crate::web_tools::WebTools,
     bash: loop_agent::harness::BashLimits,
+    search: loop_agent::harness::SearchFilter,
 ) -> Vec<AgentTool> {
-    let mut tools = vec![
-        create_read_tool(Arc::clone(&env)),
+    let mut tools = vec![create_read_tool(Arc::clone(&env))];
+    tools.extend(search_tools_with_filter(Arc::clone(&env), search));
+    tools.extend([
         create_write_tool(Arc::clone(&env)),
         create_edit_tool(Arc::clone(&env)),
         create_bash_tool_with(env, None, bash),
-    ];
+        create_todo_tool(),
+        create_exit_plan_tool(),
+    ]);
     tools.extend(web.build());
     tools
 }
@@ -1350,7 +1460,15 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         opts.no_web,
     );
     let bash_limits = settings.bash.unwrap_or_default().limits();
-    let tools = build_tools(Arc::clone(&tool_env), &web, bash_limits);
+    let tool_gate = crate::tool_gate::ToolGate::new(
+        crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
+    );
+    let tools = build_tools(
+        Arc::clone(&tool_env),
+        &web,
+        bash_limits,
+        tool_gate.search_filter(),
+    );
 
     // The prompt lists the tools that were actually built (web_search may be
     // unconfigured), so it can never promise a tool the agent cannot call.
@@ -1390,9 +1508,6 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
     let backend: Arc<dyn loop_protocol::AgentBackend> = native.clone();
 
-    let tool_gate = crate::tool_gate::ToolGate::new(
-        crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
-    );
     tool_gate.install(&harness);
     agents.set_gate(Arc::clone(&tool_gate));
     let mut startup_notices =
@@ -1551,6 +1666,25 @@ pub fn mcp_server_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_standard_tools_include_search_and_todo() {
+        let env: Arc<dyn loop_agent::harness::ExecutionEnv> = Arc::new(
+            loop_agent::harness::HostExecutionEnv::new(std::env::temp_dir()),
+        );
+        let web = crate::web_tools::WebTools::from_settings(&Default::default(), None, true);
+        let tools = build_tools(env, &web, Default::default(), Arc::new(|_, _| true));
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        for name in [
+            "read", "write", "edit", "bash", "grep", "glob", "ls", "todo",
+        ] {
+            assert!(names.contains(&name), "{name}: {names:?}");
+        }
+        let snippets = crate::system_prompt::default_tool_snippets();
+        for name in ["grep", "glob", "ls", "todo"] {
+            assert!(snippets.iter().any(|(n, _)| *n == name), "{name} snippet");
+        }
+    }
 
     #[test]
     fn models_json_pins_model_metadata() {

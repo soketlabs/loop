@@ -1,5 +1,6 @@
 //! Pi-style inline UI: transcript in terminal scrollback, footer redrawn in place.
 
+pub mod attachments;
 pub mod editor;
 pub mod file_mentions;
 pub mod highlight;
@@ -93,6 +94,11 @@ pub enum ChatItem {
     Error {
         text: String,
     },
+    /// The agent's checklist (the `todo` tool, or an ACP agent's plan), as
+    /// it stood after one update.
+    Plan {
+        entries: Vec<loop_protocol::PlanEntry>,
+    },
 }
 
 /// One MCP server in a [`ChatItem::Mcp`] listing.
@@ -129,6 +135,12 @@ pub enum PickerView {
         selected: usize,
         hint: String,
     },
+    /// `/sessions`: like `Models`, with room for a conversation title.
+    Sessions {
+        rows: Vec<PickerRow>,
+        selected: usize,
+        hint: String,
+    },
     Setup {
         prompt: crate::setup_prompt::SetupPrompt,
         /// First-run provider setup: esc quits instead of cancelling.
@@ -141,6 +153,7 @@ pub enum PickerView {
         selected: usize,
         accept_label: String,
         accept_all_label: String,
+        reject_label: String,
         reason: String,
         reason_focused: bool,
     },
@@ -188,6 +201,7 @@ pub fn item_is_committed(
         | ChatItem::System { .. }
         | ChatItem::Mcp { .. }
         | ChatItem::Error { .. }
+        | ChatItem::Plan { .. }
         | ChatItem::Shell { .. } => true,
         ChatItem::Queued { .. } => false,
         ChatItem::Assistant { .. } => streaming_assistant != Some(index),
@@ -703,7 +717,63 @@ pub fn format_item_lines(
             }
             lines.push(Line::from(""));
         }
+        ChatItem::Plan { entries } => lines.extend(format_plan(entries, theme, w)),
     }
+    lines
+}
+
+/// The checklist: a head with progress, then one row per step.
+fn format_plan(
+    entries: &[loop_protocol::PlanEntry],
+    theme: &Theme,
+    w: usize,
+) -> Vec<Line<'static>> {
+    use loop_protocol::PlanEntryStatus;
+    let done = entries
+        .iter()
+        .filter(|entry| entry.status == PlanEntryStatus::Completed)
+        .count();
+    let mut lines = vec![Line::from(vec![
+        Span::styled(" ● ".to_string(), theme.accent()),
+        Span::styled(
+            "Checklist".to_string(),
+            theme.style("toolTitle").add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {done}/{} done", entries.len()), theme.dim()),
+    ])];
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   (cleared)".to_string(),
+            theme.dim(),
+        )));
+    }
+    for entry in entries {
+        let (mark, style) = match entry.status {
+            PlanEntryStatus::Completed => ("✔", theme.dim().add_modifier(Modifier::CROSSED_OUT)),
+            PlanEntryStatus::InProgress => ("◼", theme.accent().add_modifier(Modifier::BOLD)),
+            _ => ("☐", theme.style("toolOutput")),
+        };
+        let mark_style = if entry.status == PlanEntryStatus::Completed {
+            theme.style("success")
+        } else {
+            style
+        };
+        for (i, row) in soft_wrap(&entry.content, w.saturating_sub(5).max(1))
+            .into_iter()
+            .enumerate()
+        {
+            let lead = if i == 0 {
+                format!("   {mark} ")
+            } else {
+                "     ".into()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(lead, mark_style),
+                Span::styled(row, style),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
     lines
 }
 
@@ -1041,7 +1111,9 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
     let lines = match picker {
         PickerView::None => Vec::new(),
         PickerView::Setup { prompt, first_run } => setup_lines(prompt, *first_run, theme),
-        PickerView::Commands { rows, selected } => picker_lines(rows, *selected, theme, false),
+        PickerView::Commands { rows, selected } => {
+            picker_lines(rows, *selected, theme, false, LABEL_MAX)
+        }
         PickerView::Models {
             rows,
             selected,
@@ -1051,7 +1123,19 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
                 hint.clone(),
                 theme.style("warning"),
             ))];
-            out.extend(picker_lines(rows, *selected, theme, true));
+            out.extend(picker_lines(rows, *selected, theme, true, LABEL_MAX));
+            out
+        }
+        PickerView::Sessions {
+            rows,
+            selected,
+            hint,
+        } => {
+            let mut out = vec![Line::from(Span::styled(
+                hint.clone(),
+                theme.style("warning"),
+            ))];
+            out.extend(picker_lines(rows, *selected, theme, true, TITLE_MAX));
             out
         }
         PickerView::FileReview {
@@ -1059,6 +1143,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
             selected,
             accept_label,
             accept_all_label,
+            reject_label,
             reason,
             reason_focused,
         } => {
@@ -1091,7 +1176,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
                 ]),
                 opt(0, accept_label, "success"),
                 opt(1, accept_all_label, "success"),
-                opt(2, "Reject", "error"),
+                opt(2, reject_label, "error"),
                 Line::from(Span::styled(reason_line, theme.muted())),
                 Line::from(Span::styled(
                     "  ↑↓ choose · tab reason · enter confirm · esc reject".to_string(),
@@ -1172,11 +1257,17 @@ fn setup_line_count(prompt: &crate::setup_prompt::SetupPrompt, _first_run: bool)
     (3 + rows + usize::from(prompt.env_hint().is_some())) as u16
 }
 
+/// Widest label column in most pickers.
+const LABEL_MAX: usize = 28;
+/// Widest title column in the session picker.
+const TITLE_MAX: usize = 60;
+
 fn picker_lines(
     rows: &[PickerRow],
     selected: usize,
     theme: &Theme,
     _show_mark: bool,
+    label_max: usize,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     if rows.is_empty() {
@@ -1198,7 +1289,7 @@ fn picker_lines(
         .map(|r| UnicodeWidthStr::width(r.label.as_str()))
         .max()
         .unwrap_or(16)
-        .clamp(16, 28);
+        .clamp(16, label_max);
     for (i, row) in rows.iter().enumerate().take(end).skip(start) {
         let active = i == selected;
         let arrow = if active { "❯" } else { " " };
@@ -1351,7 +1442,7 @@ fn picker_height(picker: &PickerView) -> u16 {
             let n = rows.len().min(PICKER_PAGE) as u16;
             n + 1 // page indicator
         }
-        PickerView::Models { rows, .. } => {
+        PickerView::Models { rows, .. } | PickerView::Sessions { rows, .. } => {
             let n = rows.len().min(PICKER_PAGE) as u16;
             n + 2 // hint + page
         }
@@ -1559,7 +1650,9 @@ fn highlight_tool_detail(
             highlight::highlight_lines(detail, None, path, theme, fallback)
         }
         // Bash stdout stays plain — coloring ls/etc would fight the existing look.
-        "bash" => highlight::highlight_lines(detail, None, None, theme, fallback),
+        "bash" | "grep" | "glob" | "ls" => {
+            highlight::highlight_lines(detail, None, None, theme, fallback)
+        }
         _ => highlight::highlight_lines(detail, Some("json"), None, theme, fallback),
     }
 }
@@ -1641,6 +1734,14 @@ pub fn tool_args_summary(name: &str, args: &serde_json::Value) -> String {
     match name {
         "read" | "write" | "edit" => pick(&["path"]).unwrap_or_else(|| "…".into()),
         "bash" => pick(&["command"]).unwrap_or_else(|| "…".into()),
+        "grep" | "glob" => {
+            let pattern = pick(&["pattern"]).unwrap_or_else(|| "…".into());
+            match pick(&["path"]) {
+                Some(path) => format!("{pattern} in {path}"),
+                None => pattern,
+            }
+        }
+        "ls" => pick(&["path"]).unwrap_or_else(|| ".".into()),
         _ => {
             let s = args.to_string();
             let mut t: String = s.chars().take(40).collect();
@@ -1660,6 +1761,23 @@ mod tests {
         AssistantContent, AssistantMessage, Message, StopReason, TextContent, ThinkingContent,
         ToolCall, ToolResultContent, ToolResultMessage, Usage, UserMessage, UserMessageContent,
     };
+
+    #[test]
+    fn search_tools_have_short_summaries() {
+        let summary = |name: &str, args: serde_json::Value| tool_args_summary(name, &args);
+        assert_eq!(
+            summary(
+                "grep",
+                serde_json::json!({"pattern": "TODO", "path": "src"})
+            ),
+            "TODO in src"
+        );
+        assert_eq!(
+            summary("glob", serde_json::json!({"pattern": "*.rs"})),
+            "*.rs"
+        );
+        assert_eq!(summary("ls", serde_json::json!({})), ".");
+    }
 
     #[test]
     fn resume_transcript_reconstructs_user_assistant_tools() {

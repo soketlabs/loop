@@ -32,4 +32,6 @@ pub use capability::{Capability, Scope, Setting, State};
 pub use layers::{Ceiling, Layer, LayerSource, Policy};
 pub use mode::PermissionMode;
 pub use policy::{available, decide, inside_workspace, workspace_root, Call, Decision};
-pub use rules::{read_only_command, rule_for, split_command, Rule, ToolPermission};
+pub use rules::{
+    read_only_command, rule_for, search_may_show, split_command, Rule, ToolPermission,
+};
