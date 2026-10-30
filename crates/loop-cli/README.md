@@ -93,6 +93,16 @@ Context files are loaded automatically from the agent dir, `~/.claude/CLAUDE.md`
   - sessions with no messages;
   - subscription sessions from before this version, which have no recorded title. `--resume <id>` still opens those.
 
+## Images
+
+When the model reads images, you can send them with a message:
+
+- **Ctrl+V** attaches the image on the clipboard (a screenshot, for example) on macOS and Linux.
+- **Drag an image file** into the terminal, or paste its path: Loop attaches the image instead of pasting the path.
+- **`@path/to/image.png`** in a message sends that file too.
+
+An attached image shows as a chip such as `[image #1]` in the input. Delete the chip to drop the image. PNG, JPEG, GIF and WebP files up to 5 MB are accepted. With a model that doesn't read images, Loop says so and pastes the path as text.
+
 ## Local shell (`!command`)
 
 Type `!ls -la` (or any shell command) to run it in the current sandbox/host environment. Output is shown in the transcript only — it is **not** sent to the model and is **not** added to session messages.

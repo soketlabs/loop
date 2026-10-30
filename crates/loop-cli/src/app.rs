@@ -51,6 +51,9 @@ use crate::tool_approval::{
 };
 #[cfg(feature = "telemetry")]
 use crate::tracing_setup::TracingSetup;
+use crate::tui::attachments::{
+    clipboard_image, image_file, mentioned_images, pasted_image_path, Attachments,
+};
 #[cfg(feature = "orchestration")]
 use crate::tui::find_workflow_task_index;
 use crate::tui::{
@@ -214,6 +217,8 @@ struct QueuedMessage {
     display: String,
     /// Sent to `harness.prompt`.
     prompt: String,
+    /// Images attached in the composer, sent after the text.
+    images: Vec<ContentBlock>,
 }
 
 /// Live token / context stats for the footer usage line.
@@ -485,6 +490,7 @@ async fn run_loop(
     let mut mcp_picker: Option<McpPickerState> = None;
     let mut session_picker: Option<SessionPickerState> = None;
     let mut tree_picker: Option<TreePickerState> = None;
+    let mut attachments = Attachments::default();
     let mut active_approval: Option<ActiveApproval> = None;
     let mut ac_selected: usize = 0;
     let mut last_ac_filter = String::new();
@@ -939,6 +945,8 @@ async fn run_loop(
                         &mut mcp_picker,
                         &mut session_picker,
                         &mut active_approval,
+                        &mut attachments,
+                        &mut chat,
                     );
                     for ev in &batch {
                         if let Event::Resize(w, _) = ev {
@@ -971,6 +979,8 @@ async fn run_loop(
                             &mut mcp_picker,
                             &mut session_picker,
                             &mut active_approval,
+                            &mut attachments,
+                            &mut chat,
                         );
                         token_bar.sync_window(runtime);
                     }
@@ -999,6 +1009,7 @@ async fn run_loop(
                             &mut mcp_picker,
                             &mut session_picker,
                             &mut tree_picker,
+                            &mut attachments,
                             &mut active_approval,
                             &mut working,
                             &mut message_queue,
@@ -1947,10 +1958,12 @@ fn enqueue_user_message(
     message_queue: &mut VecDeque<QueuedMessage>,
     display: String,
     prompt: String,
+    images: Vec<ContentBlock>,
 ) {
     message_queue.push_back(QueuedMessage {
         display: display.clone(),
         prompt,
+        images,
     });
     chat.push(ChatItem::Queued { text: display });
 }
@@ -1988,6 +2001,7 @@ fn start_user_turn(
     working: &mut bool,
     display: String,
     prompt: String,
+    images: Vec<ContentBlock>,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
     // The first prompt titles a subscription session in /sessions.
@@ -2021,7 +2035,12 @@ fn start_user_turn(
     }
     tokio::spawn(async move {
         match backend
-            .prompt(&session, vec![ContentBlock::text(prompt)])
+            .prompt(
+                &session,
+                std::iter::once(ContentBlock::text(prompt))
+                    .chain(images)
+                    .collect(),
+            )
             .await
         {
             // The update stream reports the turn, including failures.
@@ -2071,6 +2090,7 @@ fn try_drain_message_queue(
         working,
         item.display,
         item.prompt,
+        item.images,
         tx,
     );
 }
@@ -2089,6 +2109,7 @@ fn submit_user_text(
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
     text: String,
+    images: Vec<ContentBlock>,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
     if runtime.is_native() && runtime.selected_model.is_none() {
@@ -2100,7 +2121,7 @@ fn submit_user_text(
         return;
     }
     if agent_is_busy(runtime, *working) {
-        enqueue_user_message(chat, message_queue, text.clone(), text);
+        enqueue_user_message(chat, message_queue, text.clone(), text, images);
         let n = message_queue.len();
         *status = if n == 1 {
             "queued · will send when ready".into()
@@ -2118,6 +2139,7 @@ fn submit_user_text(
             working,
             text.clone(),
             text,
+            images,
             tx,
         );
     }
@@ -2255,6 +2277,8 @@ fn insert_pasted_text(
     mcp_picker: &mut Option<McpPickerState>,
     session_picker: &mut Option<SessionPickerState>,
     active_approval: &mut Option<ActiveApproval>,
+    attachments: &mut Attachments,
+    chat: &mut Vec<ChatItem>,
 ) {
     if let Some(review) = active_approval.as_mut() {
         if review.reason_focused {
@@ -2315,10 +2339,82 @@ fn insert_pasted_text(
         }
         return;
     }
+    // A dragged image file pastes as its path: attach the image instead,
+    // when the model reads images.
+    if let Some(path) = pasted_image_path(&runtime.cwd, text).filter(|_| accepts_images(runtime)) {
+        attach_image(
+            runtime,
+            input,
+            attachments,
+            chat,
+            image_file(&runtime.cwd, &path),
+        );
+        return;
+    }
     let block = normalize_pasted_text(text);
     if !block.is_empty() {
         input.insert_str(&block);
     }
+}
+
+/// Whether the model or agent in use reads images.
+fn accepts_images(runtime: &CliRuntime) -> bool {
+    if runtime.is_native() {
+        runtime
+            .selected_model
+            .as_ref()
+            .is_some_and(|model| model.supports_images())
+    } else {
+        runtime.backend.capabilities().images
+    }
+}
+
+/// Attach `image` to the message being written, as a chip in the input.
+fn attach_image(
+    runtime: &CliRuntime,
+    input: &mut InputBuffer,
+    attachments: &mut Attachments,
+    chat: &mut Vec<ChatItem>,
+    image: Result<ContentBlock, String>,
+) {
+    if !accepts_images(runtime) {
+        chat.push(sys(
+            "this model doesn't read images · pick one that does with /model",
+        ));
+        return;
+    }
+    match image {
+        Ok(image) => {
+            let chip = attachments.add(image);
+            input.insert_str(&format!("{chip} "));
+        }
+        Err(e) => chat.push(error_item(format!("could not attach the image: {e}"))),
+    }
+}
+
+/// The images to send with `line`: its chips' images, then image files it
+/// names with `@path`.
+fn images_for(
+    runtime: &CliRuntime,
+    attachments: &mut Attachments,
+    chat: &mut Vec<ChatItem>,
+    line: &str,
+) -> Vec<ContentBlock> {
+    let mut images = attachments.take_used(line);
+    let mentioned = mentioned_images(&runtime.cwd, line);
+    if !mentioned.is_empty() && !accepts_images(runtime) {
+        chat.push(sys(
+            "this model doesn't read images · the @ image files are sent as names only",
+        ));
+        return images;
+    }
+    for path in mentioned {
+        match image_file(&runtime.cwd, &path) {
+            Ok(image) => images.push(image),
+            Err(e) => chat.push(error_item(format!("could not attach the image: {e}"))),
+        }
+    }
+    images
 }
 
 #[allow(
@@ -2349,6 +2445,7 @@ async fn handle_key(
     mcp_picker: &mut Option<McpPickerState>,
     session_picker: &mut Option<SessionPickerState>,
     tree_picker: &mut Option<TreePickerState>,
+    attachments: &mut Attachments,
     active_approval: &mut Option<ActiveApproval>,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
@@ -2959,6 +3056,16 @@ async fn handle_key(
         return Ok(());
     }
 
+    // Ctrl+V attaches a copied image; text pastes arrive as paste events.
+    if key.code == KeyCode::Char('v') && key.modifiers == KeyModifiers::CONTROL {
+        match clipboard_image() {
+            Ok(Some(image)) => attach_image(runtime, input, attachments, chat, Ok(image)),
+            Ok(None) => *status = "no image on the clipboard".into(),
+            Err(e) => chat.push(error_item(format!("could not read the clipboard: {e}"))),
+        }
+        return Ok(());
+    }
+
     if let Some(action) = runtime.keybindings.resolve(key) {
         match action {
             Action::Exit if input.is_empty() => {
@@ -3082,6 +3189,7 @@ async fn handle_key(
                         .await?;
                     }
                 } else {
+                    let images = images_for(runtime, attachments, chat, &line);
                     submit_user_text(
                         runtime,
                         chat,
@@ -3092,6 +3200,7 @@ async fn handle_key(
                         working,
                         message_queue,
                         line,
+                        images,
                         tx,
                     );
                 }
@@ -3240,6 +3349,7 @@ async fn handle_key(
                 if !line.is_empty() {
                     history.push(&line);
                     input.clear();
+                    let images = images_for(runtime, attachments, chat, &line);
                     submit_user_text(
                         runtime,
                         chat,
@@ -3250,6 +3360,7 @@ async fn handle_key(
                         working,
                         message_queue,
                         line,
+                        images,
                         tx,
                     );
                 }
@@ -5710,7 +5821,7 @@ async fn apply_effect(
                 let prompt = format_prompt_template_invocation(tmpl, &args);
                 let display = format!("/{name} {args}");
                 if agent_is_busy(runtime, *working) {
-                    enqueue_user_message(chat, message_queue, display, prompt);
+                    enqueue_user_message(chat, message_queue, display, prompt, Vec::new());
                     *status = format!("{} messages queued", message_queue.len());
                 } else {
                     start_user_turn(
@@ -5723,6 +5834,7 @@ async fn apply_effect(
                         working,
                         display,
                         prompt,
+                        Vec::new(),
                         tx,
                     );
                 }
