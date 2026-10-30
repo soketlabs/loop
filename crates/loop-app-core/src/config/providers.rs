@@ -42,7 +42,7 @@ impl CustomProviderEntry {
 /// What `/login` collected.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ProviderLoginRequest {
-    /// A built-in provider (Soket, OpenRouter, OpenAI, Anthropic).
+    /// A built-in provider (Soket, OpenRouter, OpenAI, Anthropic, Gemini).
     Preset {
         /// Preset id.
         id: String,
@@ -431,7 +431,7 @@ mod tests {
                 base_url: "http://localhost:1/v1".into(),
             }],
         );
-        for id in ["soket", "openrouter", "openai", "anthropic", "g"] {
+        for id in ["soket", "openrouter", "openai", "anthropic", "gemini", "g"] {
             assert!(models.get_provider(id).is_some(), "{id}");
         }
     }

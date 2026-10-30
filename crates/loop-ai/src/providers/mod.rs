@@ -3,6 +3,7 @@
 pub mod anthropic;
 pub mod custom;
 pub mod faux;
+pub mod gemini;
 pub mod native;
 pub mod openai_compatible;
 pub mod presets;
@@ -14,6 +15,10 @@ pub use anthropic::{
 };
 pub use custom::{custom_provider, CustomModelSpec, CustomProviderConfig};
 pub use faux::{faux_provider, FauxResponse, FauxScript};
+pub use gemini::{
+    gemini_models, gemini_provider, gemini_seed_models, list_gemini_models, GEMINI_API_KEY_ENVS,
+    GEMINI_BASE_URL, GEMINI_PROVIDER_ID,
+};
 pub use native::{native_provider, ListModelsFn, NativeProviderConfig};
 pub use openai_compatible::{
     openai_compatible_provider, ModelDefaults, ModelFilter, OpenAiCompatibleConfig,

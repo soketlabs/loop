@@ -7,6 +7,10 @@ use super::anthropic::{
     anthropic_provider, anthropic_seed_models, ANTHROPIC_API_KEY_ENVS, ANTHROPIC_BASE_URL,
     ANTHROPIC_PROVIDER_ID, ANTHROPIC_PROVIDER_NAME,
 };
+use super::gemini::{
+    gemini_provider, gemini_seed_models, GEMINI_API_KEY_ENVS, GEMINI_BASE_URL, GEMINI_PROVIDER_ID,
+    GEMINI_PROVIDER_NAME,
+};
 use super::openai_compatible::{
     openai_compatible_provider, ModelDefaults, ModelFilter, ModelTraits, OpenAiCompatibleConfig,
 };
@@ -31,6 +35,8 @@ pub enum PresetWire {
     OpenAiResponses,
     /// Anthropic Messages.
     Anthropic,
+    /// Gemini API (API key only).
+    Gemini,
 }
 
 /// A provider Loop knows how to connect to with just an API key.
@@ -77,6 +83,7 @@ impl ProviderPreset {
                 openai_compatible_provider(self.compatible_config())
             }
             PresetWire::Anthropic => anthropic_provider(self.base_url),
+            PresetWire::Gemini => gemini_provider(self.base_url),
         }
     }
 
@@ -243,6 +250,28 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         // Listing models needs the key, so the listing checks it.
         key_check_path: None,
     },
+    ProviderPreset {
+        id: GEMINI_PROVIDER_ID,
+        name: GEMINI_PROVIDER_NAME,
+        description: "Gemini models with thinking, by API key",
+        wire: PresetWire::Gemini,
+        base_url: GEMINI_BASE_URL,
+        api_key_envs: GEMINI_API_KEY_ENVS,
+        headers: &[],
+        key_hint: "AIza…",
+        key_cta: "get one at",
+        key_url: "https://aistudio.google.com/apikey",
+        defaults: ModelDefaults {
+            context_window: 1_048_576,
+            max_tokens: 65_536,
+            reasoning: true,
+        },
+        model_filter: None,
+        model_traits: None,
+        fallback_models: Some(gemini_seed_models),
+        // Listing models needs the key, so the listing checks it.
+        key_check_path: None,
+    },
 ];
 
 /// Look up a preset by id (case-insensitive).
@@ -259,7 +288,20 @@ mod tests {
     #[test]
     fn presets_in_login_order_with_soket_first() {
         let ids: Vec<_> = PROVIDER_PRESETS.iter().map(|p| p.id).collect();
-        assert_eq!(ids, ["soket", "openrouter", "openai", "anthropic"]);
+        assert_eq!(
+            ids,
+            ["soket", "openrouter", "openai", "anthropic", "gemini"]
+        );
+    }
+
+    #[test]
+    fn gemini_speaks_its_own_api_with_a_key() {
+        let preset = provider_preset("gemini").unwrap();
+        assert_eq!(preset.api_key_envs, ["GEMINI_API_KEY", "GOOGLE_API_KEY"]);
+        let models = preset.provider().get_models();
+        assert!(models
+            .iter()
+            .all(|m| m.api == crate::types::API_GOOGLE_GENERATIVE_AI));
     }
 
     #[test]

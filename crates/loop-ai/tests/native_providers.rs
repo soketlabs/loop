@@ -4,12 +4,13 @@
 use std::sync::Arc;
 
 use loop_ai::providers::{
-    anthropic_provider, openai_compatible_provider, provider_preset, OpenAiCompatibleConfig,
+    anthropic_provider, gemini_provider, openai_compatible_provider, provider_preset,
+    OpenAiCompatibleConfig,
 };
 use loop_ai::{
     Context, CreateModelsOptions, Credential, CredentialStore, InMemoryCredentialStore,
     InMemoryModelsStore, Message, Models, ModelsRefreshOptions, SimpleStreamOptions, StopReason,
-    API_ANTHROPIC_MESSAGES, API_OPENAI_COMPLETIONS, API_OPENAI_RESPONSES,
+    API_ANTHROPIC_MESSAGES, API_GOOGLE_GENERATIVE_AI, API_OPENAI_COMPLETIONS, API_OPENAI_RESPONSES,
 };
 use loop_test_support::{FakeHttpServer, FakeResponse, RecordedRequest};
 
@@ -177,4 +178,77 @@ async fn openai_preset_models_use_responses_and_pinned_completions_still_route()
         reply.error_message
     );
     assert_eq!(reply.api, API_OPENAI_RESPONSES);
+}
+
+fn gemini_route(req: &RecordedRequest) -> FakeResponse {
+    assert!(!req.path.contains("key="), "the key never goes in the URL");
+    if req.header("x-goog-api-key") != Some("AIza-good") {
+        return FakeResponse::new(
+            400,
+            "application/json",
+            r#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT"}}"#,
+        );
+    }
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/v1beta/models?pageSize=1000") => FakeResponse::json(
+            r#"{"models":[
+                {"name":"models/gemini-2.5-pro","displayName":"Gemini 2.5 Pro","inputTokenLimit":1048576,
+                 "outputTokenLimit":65536,"thinking":true,"supportedGenerationMethods":["generateContent"]},
+                {"name":"models/gemini-next","displayName":"Gemini Next","inputTokenLimit":2000000,
+                 "outputTokenLimit":65536,"thinking":true,"supportedGenerationMethods":["generateContent"]},
+                {"name":"models/text-embedding-004","supportedGenerationMethods":["embedContent"]}
+            ]}"#,
+        ),
+        ("POST", "/v1beta/models/gemini-next:streamGenerateContent?alt=sse") => FakeResponse::new(
+            200,
+            "text/event-stream",
+            concat!(
+                "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hi there\"}]},\"finishReason\":\"STOP\"}],",
+                "\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":3}}\n\n",
+            ),
+        ),
+        _ => FakeResponse::new(404, "text/plain", "not found"),
+    }
+}
+
+#[tokio::test]
+async fn gemini_lists_models_and_answers_a_prompt() {
+    let server = FakeHttpServer::start(gemini_route);
+    let base = format!("{}/v1beta", server.base_url());
+    let models = models_with(gemini_provider(&base), "gemini", "AIza-good");
+    assert!(refresh(&models, "gemini").await.errors.is_empty());
+    let listed = models.get_models(Some("gemini"));
+    let ids: Vec<_> = listed.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["gemini-2.5-pro", "gemini-next"]);
+    assert!(
+        listed[0].cost.input > 0.0,
+        "known models keep catalog pricing"
+    );
+    assert!(listed.iter().all(|m| m.api == API_GOOGLE_GENERATIVE_AI));
+
+    let model = models.get_model("gemini", "gemini-next").unwrap();
+    let context = Context {
+        messages: vec![Message::user_text("hi")],
+        ..Default::default()
+    };
+    let reply = models
+        .complete_simple(&model, &context, SimpleStreamOptions::default())
+        .await;
+    assert_eq!(
+        reply.stop_reason,
+        StopReason::Stop,
+        "{:?}",
+        reply.error_message
+    );
+    assert_eq!(reply.usage.output, 3);
+}
+
+#[tokio::test]
+async fn gemini_rejects_a_bad_key_when_listing() {
+    let server = FakeHttpServer::start(gemini_route);
+    let base = format!("{}/v1beta", server.base_url());
+    let models = models_with(gemini_provider(&base), "gemini", "AIza-bad");
+    let error = refresh(&models, "gemini").await.errors["gemini"].clone();
+    assert!(error.contains("API key not valid"), "{error}");
+    assert!(!error.contains("AIza-bad"));
 }

@@ -473,6 +473,7 @@ mod tests {
                 "OpenRouter · api key",
                 "OpenAI · api key",
                 "Anthropic · api key",
+                "Gemini · api key",
                 "Tavily · web search",
                 "TinyFish · web search",
                 "Brave Search · web search",
@@ -494,7 +495,7 @@ mod tests {
         assert_eq!(
             step,
             ProviderSetup::Choose {
-                selected: 7,
+                selected: 8,
                 agents: Vec::new(),
                 connected: Vec::new(),
             }
@@ -503,9 +504,9 @@ mod tests {
 
     #[test]
     fn tavily_flow_from_picker_and_argument() {
-        // From the picker (row 4).
+        // From the picker (row 5).
         let mut step = ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap();
-        step.move_selection(4);
+        step.move_selection(5);
         let key = next(step.submit(""));
         assert!(key.masked());
         assert_eq!(key.title(), "Connect Tavily");
@@ -571,7 +572,7 @@ mod tests {
         let err = ProviderSetup::start(Some("groq"), Vec::new(), Vec::new()).unwrap_err();
         assert!(
             err.contains(
-                "Usage: /login [soket|openrouter|openai|anthropic|tavily|tinyfish|brave|custom]"
+                "Usage: /login [soket|openrouter|openai|anthropic|gemini|tavily|tinyfish|brave|custom]"
             ),
             "{err}"
         );
@@ -620,11 +621,11 @@ mod tests {
         assert_eq!(rows[2].0, "OpenAI · api key");
         assert!(rows[2].1.starts_with("configured"));
         assert_eq!(
-            rows[4].0,
+            rows[5].0,
             "ChatGPT Plus/Pro (Codex subscription) · subscription"
         );
-        assert_eq!(rows[4].1, "not configured");
-        assert_eq!(rows[5].0, "Tavily · web search");
+        assert_eq!(rows[5].1, "not configured");
+        assert_eq!(rows[6].0, "Tavily · web search");
         assert_eq!(rows.last().unwrap().0, "Custom");
 
         let step = ProviderSetup::start(Some("chatgpt"), vec![chatgpt(false)], Vec::new()).unwrap();
@@ -633,7 +634,7 @@ mod tests {
             Transition::Done(LoginChoice::Subscription(chatgpt(false)))
         );
         let err = ProviderSetup::start(Some("nope"), vec![chatgpt(true)], Vec::new()).unwrap_err();
-        assert!(err.contains("anthropic|chatgpt|tavily"), "{err}");
+        assert!(err.contains("gemini|chatgpt|tavily"), "{err}");
     }
 
     #[test]
