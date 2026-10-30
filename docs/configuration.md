@@ -43,7 +43,8 @@ Environment variables:
 
 | Variable | Purpose |
 |---|---|
-| `SOKET_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | Provider API keys |
+| `SOKET_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | Provider API keys |
+| `GEMINI_API_KEY`, `GOOGLE_API_KEY` | Gemini API key (the first one set wins) |
 | `LOOP_CODING_AGENT_DIR` | Use a different config directory |
 | `LOOP_CODING_AGENT_SESSION_DIR` | Use a different directory for `sessions.db` |
 | `LOOP_DEBUG=1` | Write debug logs (same as `--debug`) |
