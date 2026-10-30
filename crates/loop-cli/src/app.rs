@@ -3117,7 +3117,7 @@ async fn handle_key(
                 } else if last_escape.elapsed() < Duration::from_millis(500) {
                     match runtime.settings.double_escape_action.as_str() {
                         "tree" => {
-                            chat.push(sys("session tree: use /tree (branch nav in session store)"));
+                            open_tree_picker(runtime, tree_picker, chat, status, *working).await;
                         }
                         "fork" => {
                             open_fork_picker(runtime, fork_picker, model_picker, chat, status)
