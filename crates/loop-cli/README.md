@@ -97,7 +97,7 @@ Context files are loaded automatically from the agent dir, `~/.claude/CLAUDE.md`
 
 When the model reads images, you can send them with a message:
 
-- **Ctrl+V** attaches the image on the clipboard (a screenshot, for example) on macOS and Linux.
+- **Ctrl+V** attaches the image on the clipboard (a screenshot, for example) on macOS and on Linux under X11. Wayland isn't supported yet; use a file path there.
 - **Drag an image file** into the terminal, or paste its path: Loop attaches the image instead of pasting the path.
 - **`@path/to/image.png`** in a message sends that file too.
 

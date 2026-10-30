@@ -538,6 +538,7 @@ mod tests {
             ToolPermission::Allow
         );
         // No `path` searches the working directory.
+        #[cfg(unix)]
         assert_eq!(permission("ls", json!({})), ToolPermission::Deny);
         assert_eq!(
             permission("glob", json!({"pattern": "*.rs"})),

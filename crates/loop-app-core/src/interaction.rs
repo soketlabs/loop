@@ -142,7 +142,6 @@ pub fn approval_kind(kind: Option<ToolKind>) -> ApprovalKind {
     match kind {
         Some(ToolKind::Execute) => ApprovalKind::Bash,
         Some(ToolKind::Fetch) => ApprovalKind::Web,
-        Some(ToolKind::Think) => ApprovalKind::Plan,
         _ => ApprovalKind::FileEdit,
     }
 }

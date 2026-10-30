@@ -185,6 +185,13 @@ impl ActiveApproval {
             .as_ref()
             .and_then(|c| c.title.clone())
             .unwrap_or_default();
+        // Loop's own plan approval, by name: an agent's request of another
+        // kind keeps its own meaning.
+        let kind = if tool_name == loop_agent::harness::EXIT_PLAN_TOOL {
+            ApprovalKind::Plan
+        } else {
+            kind
+        };
         Some(Self {
             kind,
             tool_name,

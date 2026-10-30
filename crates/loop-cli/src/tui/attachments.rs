@@ -127,7 +127,19 @@ pub fn png_block(width: u32, height: u32, rgba: &[u8]) -> Result<ContentBlock, S
 pub fn clipboard_image() -> Result<Option<ContentBlock>, String> {
     let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
     match clipboard.get_image() {
-        Ok(image) => png_block(image.width as u32, image.height as u32, &image.bytes).map(Some),
+        Ok(image) => {
+            let block = png_block(image.width as u32, image.height as u32, &image.bytes)?;
+            if let ContentBlock::Image { data, .. } = &block {
+                // Base64 is 4/3 of the PNG's size.
+                if data.len() as u64 / 4 * 3 > MAX_IMAGE_BYTES {
+                    return Err(format!(
+                        "the clipboard image is over {} MB as PNG",
+                        MAX_IMAGE_BYTES / (1024 * 1024)
+                    ));
+                }
+            }
+            Ok(Some(block))
+        }
         Err(arboard::Error::ContentNotAvailable) => Ok(None),
         Err(e) => Err(e.to_string()),
     }

@@ -15,6 +15,7 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 | `ask` (default) | per `toolPermissions` | ask | ask | per `toolPermissions` |
 | `accept-edits` | allow | allow inside the workspace; ask outside it and for `.git/`, `.loop/`, `.env*` | per `toolPermissions` | per `toolPermissions` |
 | `full-access` | allow | allow | allow | allow |
+| `plan` | as `read-only`, until you approve the plan ([below](#plan-mode)) | deny | read-only commands only | as `read-only` |
 
 - **Search tools** (`grep`, `glob` and `ls`) only read, so every mode runs them without asking. `grep` and `glob` respect `.gitignore` and skip hidden files unless the call asks for them; `.git/` is never searched.
 - **The workspace** is the git root of the directory Loop runs in, or that directory itself. Paths are resolved through symlinks, so a link that points outside the workspace counts as outside.
@@ -79,7 +80,7 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
   - An `allow` pattern applies only if **every** part matches an `allow` pattern. So `git status && rm -rf x` still asks.
   - A command that uses `$(…)`, backticks or `<(…)` never matches an `allow` pattern.
 - **A pattern `ask` still asks in `accept-edits`.**
-- **Loop has an approval prompt only for `write`, `edit`, `bash`, `web_fetch` and `web_search`.** An `ask` rule on any other tool (for example `read(~/.ssh/*)` or an MCP tool) refuses the call. Use `allow` or `deny` for those.
+- **Loop has an approval prompt only for `write`, `edit`, `bash`, `web_fetch`, `web_search` and plan mode's `exit_plan`.** An `ask` rule on any other tool (for example `read(~/.ssh/*)` or an MCP tool) refuses the call. Use `allow` or `deny` for those.
 - **A project's `.loop/settings.json`** can add `ask` and `deny` rules or make a rule stricter. It can't add `allow` rules or loosen a global rule.
 
 ## Subscription agents
