@@ -88,7 +88,14 @@ pub fn merge_default_tool_permissions(map: &mut BTreeMap<String, String>) {
 
 /// Tools that currently have an interactive approval workflow.
 pub fn interactive_tools() -> &'static [&'static str] {
-    &["write", "edit", "bash", "web_fetch", "web_search"]
+    &[
+        "write",
+        "edit",
+        "bash",
+        "web_fetch",
+        "web_search",
+        loop_agent::harness::EXIT_PLAN_TOOL,
+    ]
 }
 
 /// Map a tool name to its session auto-approve group.
@@ -121,6 +128,8 @@ pub enum ApprovalKind {
     Bash,
     /// Before web_fetch / web_search — approve the outbound request.
     Web,
+    /// `exit_plan` — approve the plan and leave plan mode.
+    Plan,
 }
 
 impl ApprovalKind {
@@ -130,6 +139,7 @@ impl ApprovalKind {
             Self::FileEdit => "file edit",
             Self::Bash => "bash",
             Self::Web => "web",
+            Self::Plan => "plan",
         }
     }
 
@@ -139,6 +149,23 @@ impl ApprovalKind {
             Self::FileEdit => "Accept all file changes for this session",
             Self::Bash => "Accept all bash for this session",
             Self::Web => "Accept all web requests for this session",
+            Self::Plan => "Approve and accept edits from now on",
+        }
+    }
+
+    /// Accept-once option text.
+    pub fn accept_label(self) -> &'static str {
+        match self {
+            Self::Plan => "Approve the plan",
+            _ => "Accept",
+        }
+    }
+
+    /// Reject option text.
+    pub fn reject_label(self) -> &'static str {
+        match self {
+            Self::Plan => "Keep planning",
+            _ => "Reject",
         }
     }
 
@@ -148,8 +175,22 @@ impl ApprovalKind {
             Self::FileEdit => GROUP_FILE,
             Self::Bash => GROUP_BASH,
             Self::Web => GROUP_WEB,
+            // Never granted: approving a plan is not remembered.
+            Self::Plan => "plan",
         }
     }
+}
+
+/// The user's answer to a plan (`exit_plan`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanReview {
+    /// Approved; with `accept_edits`, also switch to `accept-edits`.
+    Approved {
+        /// The user chose "Approve and accept edits".
+        accept_edits: bool,
+    },
+    /// The user wants changes; the reason, if they gave one.
+    KeepPlanning(Option<String>),
 }
 
 /// Prompt shown in the TUI while the agent waits.
@@ -405,6 +446,36 @@ impl ToolApprovalBridge {
                     block: true,
                     reason: Some(msg),
                 })
+            }
+        }
+    }
+
+    /// Ask the user to approve `plan`; `then` names the mode approving it
+    /// returns to.
+    pub(crate) async fn review_plan(
+        &self,
+        plan: &str,
+        then: &str,
+        cancel: Option<CancellationToken>,
+    ) -> PlanReview {
+        let _lock = self.gate.lock().await;
+        let summary = format!("approve to continue in {then} mode");
+        let decision = self
+            .ask_user(
+                ApprovalKind::Plan,
+                loop_agent::harness::EXIT_PLAN_TOOL,
+                summary,
+                plan.to_owned(),
+                cancel.as_ref(),
+            )
+            .await;
+        match decision {
+            ApprovalDecision::Accept => PlanReview::Approved {
+                accept_edits: false,
+            },
+            ApprovalDecision::AcceptSession => PlanReview::Approved { accept_edits: true },
+            ApprovalDecision::Reject { reason } => {
+                PlanReview::KeepPlanning(reason.filter(|r| !r.trim().is_empty()))
             }
         }
     }

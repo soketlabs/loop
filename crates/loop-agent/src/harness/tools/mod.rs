@@ -1,6 +1,7 @@
 //! Built-in coding tools over [`ExecutionEnv`](crate::harness::types::ExecutionEnv).
 
 mod file_mutation_queue;
+mod plan;
 mod search;
 mod todo;
 #[cfg(feature = "web")]
@@ -12,6 +13,7 @@ use std::sync::Arc;
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
 
+pub use plan::{create_exit_plan_tool, EXIT_PLAN_TOOL};
 pub use search::{create_glob_tool, create_grep_tool, create_ls_tool, SEARCH_MAX_RESULTS};
 pub use todo::{create_todo_tool, todos_from_details};
 

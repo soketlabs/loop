@@ -152,6 +152,7 @@ pub enum PickerView {
         selected: usize,
         accept_label: String,
         accept_all_label: String,
+        reject_label: String,
         reason: String,
         reason_focused: bool,
     },
@@ -1141,6 +1142,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
             selected,
             accept_label,
             accept_all_label,
+            reject_label,
             reason,
             reason_focused,
         } => {
@@ -1173,7 +1175,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
                 ]),
                 opt(0, accept_label, "success"),
                 opt(1, accept_all_label, "success"),
-                opt(2, "Reject", "error"),
+                opt(2, reject_label, "error"),
                 Line::from(Span::styled(reason_line, theme.muted())),
                 Line::from(Span::styled(
                     "  ↑↓ choose · tab reason · enter confirm · esc reject".to_string(),

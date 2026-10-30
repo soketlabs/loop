@@ -437,7 +437,7 @@ pub fn tool_kind(tool_name: &str) -> ToolKind {
         "bash" => ToolKind::Execute,
         "grep" | "find" | "ls" | "glob" => ToolKind::Search,
         "fetch" | "web_fetch" | "web_search" => ToolKind::Fetch,
-        "todo" => ToolKind::Think,
+        "todo" | "exit_plan" => ToolKind::Think,
         _ => ToolKind::Other,
     }
 }

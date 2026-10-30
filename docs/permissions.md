@@ -32,6 +32,18 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 - **One run:** `loop --permission-mode read-only`.
 - **This session:** `/permissions` lists the modes; `/permissions accept-edits` switches. The footer shows the current mode.
 
+### Plan mode
+
+- **Turning it on:** `/plan` (or `/permissions plan`, `--permission-mode plan`). The footer shows `plan`.
+- **While on:** the agent works as in `read-only`: it reads, searches and runs read-only commands, but can't edit files or run commands that change things. It writes its plan and calls `exit_plan` to ask you to approve it. The plan shows in the transcript.
+- **Approving:**
+  - **Approve the plan:** plan mode ends and the mode goes back to the one you had before `/plan`. The agent starts the work in the same turn.
+  - **Approve and accept edits from now on:** the same, but the mode becomes `accept-edits`.
+  - **Keep planning** (add a reason with **Tab**): the agent stays in plan mode and revises the plan.
+- **Unattended runs** (`--print`): nobody can approve, so the agent gives the plan as its answer and changes nothing.
+- **Subscription agents** get their `read-only` mode in plan mode; `exit_plan` is Loop's own tool.
+- Plan mode isn't one of the four modes `/permissions` switches between; it's listed after them.
+
 ### `full-access`
 
 - **Switching:** `/permissions full-access` asks you to repeat the command before it switches.

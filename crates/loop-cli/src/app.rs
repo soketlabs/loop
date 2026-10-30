@@ -200,6 +200,7 @@ impl ActiveApproval {
             selected: self.selected,
             accept_label: self.reply.accept_label(),
             accept_all_label: self.reply.accept_session_label(),
+            reject_label: self.reply.reject_label(),
             reason: self.reason.clone(),
             reason_focused: self.reason_focused,
         }
@@ -2399,6 +2400,22 @@ async fn handle_key(
                         ApprovalDecision::Accept
                     };
                     match &decision {
+                        _ if r.kind == ApprovalKind::Plan => {
+                            let note = match &decision {
+                                ApprovalDecision::Accept => "plan approved · plan mode off".into(),
+                                ApprovalDecision::AcceptSession => {
+                                    "plan approved · accept edits on".into()
+                                }
+                                ApprovalDecision::Reject { reason: Some(why) } => {
+                                    format!("keep planning · {why}")
+                                }
+                                ApprovalDecision::Reject { reason: None } => {
+                                    "keep planning".to_string()
+                                }
+                            };
+                            chat.push(sys(note));
+                            *status = "continuing".into();
+                        }
                         ApprovalDecision::Accept => {
                             chat.push(sys(format!("accepted {} · {}", r.kind.label(), r.summary)));
                             *status = "accepted · continuing".into();
@@ -4240,6 +4257,24 @@ fn handle_update(
             if source.is_none() && raw_name == "todo" {
                 return;
             }
+            // A plan to approve reads as the agent's message.
+            if source.is_none() && raw_name == loop_agent::harness::EXIT_PLAN_TOOL {
+                *streaming_assistant = None;
+                finish_thinking(chat, streaming_thinking);
+                let plan = call
+                    .raw_input
+                    .as_ref()
+                    .and_then(|input| input.get("plan"))
+                    .and_then(|plan| plan.as_str())
+                    .unwrap_or_default();
+                push_before_queued(
+                    chat,
+                    ChatItem::Assistant {
+                        text: format!("**Plan**\n\n{plan}"),
+                    },
+                );
+                return;
+            }
             let name = tool_display_name(source, raw_name);
             if live {
                 *turn_step = format!("tool · {name}");
@@ -4273,7 +4308,10 @@ fn handle_update(
         }
         SessionUpdate::ToolCallUpdate(mut update) => {
             let todo_done = source.is_none()
-                && update.name.as_deref() == Some("todo")
+                && matches!(
+                    update.name.as_deref(),
+                    Some("todo" | loop_agent::harness::EXIT_PLAN_TOOL)
+                )
                 && update.status != Some(ToolCallStatus::Failed);
             if todo_done {
                 return;
@@ -4887,7 +4925,10 @@ async fn apply_effect(
                 "permission mode: {} — /permissions <mode> to switch",
                 current.as_str()
             )];
-            for mode in PermissionMode::ALL {
+            for mode in PermissionMode::ALL
+                .into_iter()
+                .chain([PermissionMode::Plan])
+            {
                 let mark = if mode == current { "●" } else { " " };
                 lines.push(format!(
                     "  {mark} {:<13} {}",
@@ -4909,6 +4950,14 @@ async fn apply_effect(
                      /permissions full-access again to confirm.",
                 ));
             }
+            Some(PermissionMode::Plan) => {
+                runtime.confirm_full_access = false;
+                runtime.set_permission_mode(PermissionMode::Plan).await;
+                chat.push(sys(
+                    "plan mode · the agent investigates and proposes a plan; nothing changes \
+                     until you approve it, then work continues in the mode you had",
+                ));
+            }
             Some(mode) => {
                 runtime.confirm_full_access = false;
                 runtime.set_permission_mode(mode).await;
@@ -4919,7 +4968,7 @@ async fn apply_effect(
                 )));
             }
             None => chat.push(error_item(format!(
-                "unknown mode `{arg}`: use read-only, ask, accept-edits or full-access"
+                "unknown mode `{arg}`: use read-only, ask, accept-edits, full-access or plan"
             ))),
         },
         CommandEffect::WebSearch(arg) => {
@@ -6275,6 +6324,23 @@ mod plan_tests {
         assert!(text.contains("✔ read the code"), "{text}");
         assert!(text.contains("◼ fix it"), "{text}");
         assert!(text.contains("☐ test"), "{text}");
+    }
+
+    #[test]
+    fn a_plan_to_approve_reads_as_the_agents_message() {
+        let mut call = todo_call("p1");
+        if let SessionUpdate::ToolCall(call) = &mut call {
+            call.name = Some("exit_plan".into());
+            call.raw_input = Some(serde_json::json!({"plan": "1. Edit main.rs"}));
+        }
+        let mut done = ToolCallUpdate::new(ToolCallId("p1".into()));
+        done.name = Some("exit_plan".into());
+        done.status = Some(ToolCallStatus::Completed);
+        let chat = chat_from_transcript(vec![call, SessionUpdate::ToolCallUpdate(done)]);
+        assert!(
+            matches!(&chat[..], [ChatItem::Assistant { text }] if text.contains("1. Edit main.rs")),
+            "{chat:?}"
+        );
     }
 
     #[test]

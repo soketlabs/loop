@@ -6,11 +6,11 @@ use std::sync::Arc;
 use anyhow::bail;
 
 use loop_agent::harness::{
-    create_bash_tool_with, create_edit_tool, create_glob_tool, create_grep_tool, create_ls_tool,
-    create_read_tool, create_session_repository, create_sqlite_session_store, create_todo_tool,
-    create_write_tool, verify_web_search_key, AgentHarness, AgentHarnessOptions,
-    AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime,
-    Sandbox, SandboxMode, WebSearchConfig,
+    create_bash_tool_with, create_edit_tool, create_exit_plan_tool, create_glob_tool,
+    create_grep_tool, create_ls_tool, create_read_tool, create_session_repository,
+    create_sqlite_session_store, create_todo_tool, create_write_tool, verify_web_search_key,
+    AgentHarness, AgentHarnessOptions, AgentHarnessResources, HostExecutionEnv, KrunIsolation,
+    KrunSandbox, LocalSandboxRuntime, Sandbox, SandboxMode, WebSearchConfig,
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
 use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
@@ -1055,6 +1055,7 @@ pub fn build_tools(
         create_edit_tool(Arc::clone(&env)),
         create_bash_tool_with(env, None, bash),
         create_todo_tool(),
+        create_exit_plan_tool(),
     ];
     tools.extend(web.build());
     tools

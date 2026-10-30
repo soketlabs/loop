@@ -20,15 +20,19 @@ use std::sync::{Arc, Weak};
 
 use loop_agent::harness::{
     AgentHarness, HarnessHookEvent, HookRegistry, ToolCallInfo, ToolDecision, ToolSource,
+    EXIT_PLAN_TOOL,
 };
-use loop_agent::{AfterToolCallFn, BeforeToolCallFn, BeforeToolCallResult, ToolCall};
+use loop_agent::{
+    AfterToolCallFn, BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult, ToolCall,
+};
 use loop_ai::{TextContent, ToolResultContent};
 use parking_lot::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use loop_protocol::ToolKind;
 
 use crate::permissions::{Call, Decision, PermissionMode, Policy};
-use crate::tool_approval::{ToolApprovalBridge, ToolPermission};
+use crate::tool_approval::{PlanReview, ToolApprovalBridge, ToolPermission};
 
 /// Why a call that needs approval is refused when nobody can approve it,
 /// naming a mode that would allow it.
@@ -63,6 +67,9 @@ pub struct ToolGate {
     hooks: Mutex<Option<HookRegistry>>,
     harness: Mutex<Weak<AgentHarness>>,
     mode: Mutex<PermissionMode>,
+    /// The mode plan mode was entered from, which approving a plan returns
+    /// to.
+    plan_return: Mutex<PermissionMode>,
     policy: Mutex<Policy>,
     workspace: Mutex<Option<PathBuf>>,
     /// Calls allowed without asking, counted by [`call_key`]; their
@@ -151,7 +158,10 @@ impl ToolGate {
 
     /// Switch the permission mode; applies to the next call.
     pub fn set_mode(&self, mode: PermissionMode) {
-        *self.mode.lock() = mode;
+        let before = std::mem::replace(&mut *self.mode.lock(), mode);
+        if mode == PermissionMode::Plan && before != PermissionMode::Plan {
+            *self.plan_return.lock() = before;
+        }
         // A call allowed under the old mode is reviewed under the new one.
         self.allowed.lock().clear();
     }
@@ -282,6 +292,55 @@ impl ToolGate {
         }
     }
 
+    /// Ask the user to approve the plan in an `exit_plan` call. Approved,
+    /// the call runs and the mode goes back to the one plan mode was entered
+    /// from (or to `accept-edits`, if the user chose that).
+    async fn review_plan(
+        &self,
+        ctx: &BeforeToolCallContext,
+        cancel: Option<CancellationToken>,
+    ) -> Option<BeforeToolCallResult> {
+        let block = |reason: String| {
+            Some(BeforeToolCallResult {
+                block: true,
+                reason: Some(reason),
+            })
+        };
+        let Some(approver) = self.approver() else {
+            return block(
+                "Plan mode ends when the user approves the plan, and nobody can approve it in \
+                 this run. Give the plan as your answer instead."
+                    .into(),
+            );
+        };
+        let plan = ctx
+            .args
+            .get("plan")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let back = *self.plan_return.lock();
+        match approver.review_plan(plan, back.as_str(), cancel).await {
+            PlanReview::Approved { accept_edits } => {
+                self.set_mode(if accept_edits {
+                    PermissionMode::AcceptEdits
+                } else {
+                    back
+                });
+                None
+            }
+            PlanReview::KeepPlanning(reason) => block(match reason {
+                Some(reason) => format!(
+                    "The user wants changes to the plan: {reason}. Stay in plan mode, revise the \
+                     plan and call {EXIT_PLAN_TOOL} again."
+                ),
+                None => format!(
+                    "The user did not approve the plan. Stay in plan mode: ask what to change, \
+                     or revise the plan and call {EXIT_PLAN_TOOL} again."
+                ),
+            }),
+        }
+    }
+
     /// The gate's before-call check, for callers outside the harness
     /// (`mcp serve`).
     pub fn before_hook(self: &Arc<Self>) -> BeforeToolCallFn {
@@ -298,6 +357,10 @@ impl ToolGate {
                 let decision = gate.decide(&ctx.tool_call.name, &ctx.args).await;
                 if let Decision::Deny(reason) = decision {
                     return block(reason);
+                }
+                // Only the user ends plan mode: hooks don't decide this one.
+                if ctx.tool_call.name == EXIT_PLAN_TOOL {
+                    return gate.review_plan(&ctx, cancel).await;
                 }
                 if let Some(hooks) = gate.hooks() {
                     let info = gate.call_info(&ctx.tool_call, &ctx.args).await;
@@ -759,6 +822,76 @@ mod tests {
         assert_eq!(prompt.tool_name, "bash");
         drop(prompt);
         let _ = bash.await;
+    }
+
+    fn exit_plan() -> BeforeToolCallContext {
+        let mut ctx = call("exit_plan");
+        ctx.args = serde_json::json!({"plan": "1. Edit main.rs\n2. Run the tests"});
+        ctx.tool_call.arguments = ctx.args.clone();
+        ctx
+    }
+
+    #[tokio::test]
+    async fn the_user_approves_the_plan_to_leave_plan_mode() {
+        use crate::tool_approval::{ApprovalDecision, ApprovalKind};
+        let (gate, mut prompts) = gate_with_approver(&[]);
+        for (decision, then) in [
+            (ApprovalDecision::Accept, PermissionMode::Ask),
+            (ApprovalDecision::AcceptSession, PermissionMode::AcceptEdits),
+        ] {
+            gate.set_mode(PermissionMode::Ask);
+            gate.set_mode(PermissionMode::Plan);
+            let before = gate.before_hook();
+            let pending = tokio::spawn(async move { before(exit_plan(), None).await });
+            let prompt = prompts.recv().await.unwrap();
+            assert_eq!(prompt.kind, ApprovalKind::Plan);
+            assert!(prompt.detail.contains("Run the tests"), "{}", prompt.detail);
+            prompt.response_tx.send(decision).unwrap();
+            assert!(pending.await.unwrap().is_none(), "approved: the call runs");
+            assert_eq!(gate.mode(), then);
+        }
+
+        gate.set_mode(PermissionMode::Plan);
+        let before = gate.before_hook();
+        let pending = tokio::spawn(async move { before(exit_plan(), None).await });
+        let prompt = prompts.recv().await.unwrap();
+        prompt
+            .response_tx
+            .send(ApprovalDecision::Reject {
+                reason: Some("also update the docs".into()),
+            })
+            .unwrap();
+        let blocked = pending.await.unwrap().expect("kept planning");
+        assert!(blocked.reason.unwrap().contains("also update the docs"));
+        assert_eq!(gate.mode(), PermissionMode::Plan);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_returns_to_the_mode_it_was_entered_from() {
+        let (gate, mut prompts) = gate_with_approver(&[]);
+        gate.set_mode(PermissionMode::FullAccess);
+        gate.set_mode(PermissionMode::Plan);
+        gate.set_mode(PermissionMode::Plan);
+        let before = gate.before_hook();
+        let pending = tokio::spawn(async move { before(exit_plan(), None).await });
+        let prompt = prompts.recv().await.unwrap();
+        prompt
+            .response_tx
+            .send(crate::tool_approval::ApprovalDecision::Accept)
+            .unwrap();
+        assert!(pending.await.unwrap().is_none());
+        assert_eq!(gate.mode(), PermissionMode::FullAccess);
+    }
+
+    #[tokio::test]
+    async fn nobody_can_approve_a_plan_headless() {
+        let gate = ToolGate::new(BTreeMap::new());
+        gate.set_mode(PermissionMode::Plan);
+        let blocked = gate.before_hook()(exit_plan(), None)
+            .await
+            .expect("refused");
+        assert!(blocked.reason.unwrap().contains("nobody can approve"));
+        assert_eq!(gate.mode(), PermissionMode::Plan);
     }
 
     #[tokio::test]

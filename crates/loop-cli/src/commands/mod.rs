@@ -45,7 +45,12 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand {
             name: "permissions",
             description: "Show or set what tools may do without asking",
-            args_hint: Some("[read-only|ask|accept-edits|full-access]"),
+            args_hint: Some("[read-only|ask|accept-edits|full-access|plan]"),
+        },
+        SlashCommand {
+            name: "plan",
+            description: "Plan first: investigate and propose a plan to approve before changes",
+            args_hint: None,
         },
         SlashCommand {
             name: "websearch",
@@ -557,6 +562,7 @@ pub fn dispatch(
         } else {
             Some(cmd.args.trim().to_owned())
         }),
+        "plan" => CommandEffect::Permissions(Some("plan".into())),
         "websearch" => CommandEffect::WebSearch(if cmd.args.is_empty() {
             None
         } else {
@@ -746,6 +752,15 @@ mod tests {
         assert!(matches!(
             run("/resume 01a15e8f"),
             CommandEffect::Resume(Some(id)) if id == "01a15e8f"
+        ));
+    }
+
+    #[test]
+    fn plan_switches_to_plan_mode() {
+        let run = |line: &str| dispatch(&parse_command(line).unwrap(), &[], &[]);
+        assert!(matches!(
+            run("/plan"),
+            CommandEffect::Permissions(Some(mode)) if mode == "plan"
         ));
     }
 }

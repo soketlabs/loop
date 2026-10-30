@@ -84,6 +84,7 @@ pub fn native_permission_request(
         ApprovalKind::FileEdit => ToolKind::Edit,
         ApprovalKind::Bash => ToolKind::Execute,
         ApprovalKind::Web => ToolKind::Fetch,
+        ApprovalKind::Plan => ToolKind::Think,
     });
     if !detail.is_empty() {
         tool_call.content = Some(vec![ToolContent::text(detail)]);
@@ -97,13 +98,21 @@ pub fn native_permission_request(
         id: InteractionId(format!("approval-{n}")),
         tool_call: Some(tool_call),
         options: vec![
-            option(native_options::ACCEPT, "Accept", PermissionKind::AllowOnce),
+            option(
+                native_options::ACCEPT,
+                kind.accept_label(),
+                PermissionKind::AllowOnce,
+            ),
             option(
                 native_options::ACCEPT_SESSION,
                 kind.accept_all_label(),
                 PermissionKind::AllowAlways,
             ),
-            option(native_options::REJECT, "Reject", PermissionKind::RejectOnce),
+            option(
+                native_options::REJECT,
+                kind.reject_label(),
+                PermissionKind::RejectOnce,
+            ),
         ],
     }
 }
@@ -133,6 +142,7 @@ pub fn approval_kind(kind: Option<ToolKind>) -> ApprovalKind {
     match kind {
         Some(ToolKind::Execute) => ApprovalKind::Bash,
         Some(ToolKind::Fetch) => ApprovalKind::Web,
+        Some(ToolKind::Think) => ApprovalKind::Plan,
         _ => ApprovalKind::FileEdit,
     }
 }
@@ -165,6 +175,11 @@ impl ApprovalReply {
     /// Label for the "accept" row.
     pub fn accept_label(&self) -> String {
         label(&self.accept, "Accept (not offered)")
+    }
+
+    /// Label for the "reject" row.
+    pub fn reject_label(&self) -> String {
+        label(&self.reject, "Reject")
     }
 
     /// Label for the "accept for this session" row.
