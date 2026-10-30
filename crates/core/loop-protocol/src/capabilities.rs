@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Features a backend declares. Each must match what the backend can actually
 /// do: a surface hides or rejects an operation whose capability is false.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Capabilities {
     /// Can reopen a past session, replaying its history.

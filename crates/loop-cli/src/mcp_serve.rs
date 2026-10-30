@@ -85,7 +85,8 @@ pub async fn run_mcp_server(
 
     let service = StreamableHttpService::new(
         move || {
-            let tools = harness.tools_snapshot();
+            let mut tools = harness.tools_snapshot();
+            tools.retain(|tool| gate.available(&tool.name));
             // Calls from MCP clients pass the same checks as the agent's.
             let provider = Arc::new(
                 LoopToolProvider::new(tools)

@@ -293,9 +293,6 @@ name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
-dependencies = [
- "derive_arbitrary",
-]
 
 [[package]]
 name = "arboard"
@@ -1873,6 +1870,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-encoding"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
+
+[[package]]
 name = "data-url"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1922,17 +1925,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "serde_core",
-]
-
-[[package]]
-name = "derive_arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -4511,6 +4503,7 @@ dependencies = [
  "agent-client-protocol-schema",
  "async-trait",
  "loop-protocol",
+ "loop-wire",
  "serde",
  "serde_json",
  "tempfile",
@@ -4741,6 +4734,7 @@ name = "loop-protocol"
 version = "0.5.0"
 dependencies = [
  "async-trait",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "tokio",
@@ -4790,6 +4784,26 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "zip",
+]
+
+[[package]]
+name = "loop-wire"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "jsonschema",
+ "loop-agent",
+ "loop-ai",
+ "loop-protocol",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -7971,6 +7985,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "sha1_smol"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8979,6 +9004,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9383,6 +9420,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tungstenite"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.9.5",
+ "sha1",
+ "thiserror 2.0.20",
+ "utf-8",
+]
+
+[[package]]
 name = "two-face"
 version = "0.5.2+bat-0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9392,6 +9446,12 @@ dependencies = [
  "serde_derive",
  "syntect",
 ]
+
+[[package]]
+name = "typed-path"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
 
 [[package]]
 name = "typeid"
@@ -11390,18 +11450,18 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "2.4.2"
+version = "9.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
+checksum = "1156b39d142a34b999c2310a50455e0cb3760bf7efad0122f796d813bee26ccb"
 dependencies = [
- "arbitrary",
  "crc32fast",
- "crossbeam-utils",
- "displaydoc",
  "flate2",
+ "getrandom 0.4.3",
  "indexmap 2.14.1",
  "memchr",
- "thiserror 2.0.20",
+ "nix 0.31.3",
+ "typed-path",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -11,6 +11,7 @@ use crate::update::ToolCallUpdate;
 
 /// Something the backend needs from the user before it can continue.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InteractionRequest {
     /// Approve or reject a tool call.
@@ -79,6 +80,7 @@ impl InteractionRequest {
 
 /// One choice in a permission prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PermissionOption {
     /// The backend's own option id, sent back unchanged.
     pub native_id: String,
@@ -91,6 +93,7 @@ pub struct PermissionOption {
 
 /// The meaning of a permission option, as a presentation hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionKind {
     /// Allow this call.
@@ -108,6 +111,7 @@ pub enum PermissionKind {
 
 /// One choice in a question.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Choice {
     /// The backend's own choice id.
     pub native_id: String,
@@ -121,6 +125,7 @@ pub const DECLINE_CHOICE: &str = "decline";
 
 /// The user's answer to an interaction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum InteractionOutcome {
     /// A permission option or question choice, by its native id.

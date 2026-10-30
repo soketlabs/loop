@@ -94,6 +94,9 @@ pub struct TurnSnapshot {
     pub tool_env: Arc<dyn ExecutionEnv>,
 }
 
+/// Whether a tool is offered to the model ([`AgentHarness::set_tool_filter`]).
+pub type ToolFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// Agent harness.
 pub struct AgentHarness {
     #[allow(dead_code)]
@@ -107,6 +110,7 @@ pub struct AgentHarness {
     /// Tokio worker, and `tokio::sync::RwLock::blocking_read` panics there.
     tools: parking_lot::RwLock<Vec<AgentTool>>,
     active_tool_names: RwLock<Option<Vec<String>>>,
+    tool_filter: parking_lot::RwLock<Option<ToolFilter>>,
     system_prompt: RwLock<String>,
     resources: RwLock<AgentHarnessResources>,
     /// Skills activated via `/skill:name` (included in `<available_skills>` even
@@ -153,6 +157,7 @@ impl AgentHarness {
             thinking_level: RwLock::new(AgentThinkingLevel::Off),
             tools: parking_lot::RwLock::new(options.tools),
             active_tool_names: RwLock::new(None),
+            tool_filter: parking_lot::RwLock::new(None),
             system_prompt: RwLock::new(options.system_prompt),
             resources: RwLock::new(options.resources),
             active_skill_names: RwLock::new(Vec::new()),
@@ -542,6 +547,13 @@ impl AgentHarness {
     /// Set active tool names filter.
     pub async fn set_active_tools(&self, names: Option<Vec<String>>) {
         *self.active_tool_names.write().await = names;
+    }
+
+    /// Offer the model only the tools `filter` keeps, from the next turn or
+    /// workflow on.
+    /// Unlike [`Self::set_active_tools`], this is not saved with the session.
+    pub fn set_tool_filter(&self, filter: Option<ToolFilter>) {
+        *self.tool_filter.write() = filter;
     }
 
     /// Set resources.
@@ -1051,7 +1063,7 @@ impl AgentHarness {
         let resources = self.resources.read().await.clone();
         let all_tools = self.tools.read().clone();
         let active = self.active_tool_names.read().await.clone();
-        let tools = if let Some(names) = active {
+        let mut tools: Vec<AgentTool> = if let Some(names) = active {
             all_tools
                 .into_iter()
                 .filter(|t| names.iter().any(|n| n == &t.name))
@@ -1059,6 +1071,9 @@ impl AgentHarness {
         } else {
             all_tools
         };
+        if let Some(filter) = self.tool_filter.read().clone() {
+            tools.retain(|t| filter(&t.name));
+        }
 
         // Progressive disclosure (pi): only advertise skills when `read` is available
         // so the model can load SKILL.md on demand. User-activated skills
@@ -1389,7 +1404,10 @@ impl AgentHarness {
 
         let model = self.require_model().await?;
         let system_prompt = self.system_prompt.read().await.clone();
-        let tools = self.tools.read().clone();
+        let mut tools = self.tools.read().clone();
+        if let Some(filter) = self.tool_filter.read().clone() {
+            tools.retain(|t| filter(&t.name));
+        }
         let host_env = Arc::clone(&self.host_env);
         // Workflow tasks get the same tool checks as the chat.
         let hooks = WorkflowToolHooks {

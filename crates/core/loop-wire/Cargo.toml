@@ -1,0 +1,28 @@
+[package]
+name = "loop-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "loop-protocol over a real connection: JSON-RPC 2.0 and its transports"
+readme = "README.md"
+
+[dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+loop-protocol = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+jsonschema = { workspace = true }
+loop-protocol = { workspace = true, features = ["schema"] }
+tempfile = { workspace = true }
+loop-agent = { workspace = true }
+loop-ai = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

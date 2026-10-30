@@ -14,6 +14,7 @@ use crate::PROTOCOL_VERSION;
 /// A backend publishes one stream of envelopes for all its sessions; readers
 /// route by `session` and discard envelopes from an older `generation`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateEnvelope {
     /// Protocol version of this envelope.
     pub v: u32,
@@ -59,6 +60,7 @@ impl UpdateEnvelope {
 
 /// Where an update comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
     /// Produced by the running session.
@@ -70,6 +72,7 @@ pub enum Origin {
 
 /// One change in a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionUpdate {
     /// A turn began.
@@ -152,6 +155,7 @@ pub enum SessionUpdate {
 
 /// Who wrote a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     /// The person using Loop.
@@ -162,6 +166,7 @@ pub enum Role {
 
 /// Why a turn ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     /// The agent finished.
@@ -183,6 +188,7 @@ pub enum StopReason {
 
 /// A tool call as first reported.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ToolCall {
     /// Tool call id.
     pub id: ToolCallId,
@@ -208,6 +214,7 @@ pub struct ToolCall {
 
 /// Changed fields of a tool call. `content`, when set, replaces the earlier content.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ToolCallUpdate {
     /// Tool call id.
     pub id: ToolCallId,
@@ -256,6 +263,7 @@ impl ToolCallUpdate {
 
 /// What kind of action a tool performs. Used for icons and approval policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
     /// Reads files or data.
@@ -281,6 +289,7 @@ pub enum ToolKind {
 
 /// Progress of a tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallStatus {
     /// Waiting to start, for example for approval.
@@ -295,6 +304,7 @@ pub enum ToolCallStatus {
 
 /// Output of a tool call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolContent {
     /// Ordinary content: text, an image or a resource link.
@@ -340,6 +350,7 @@ impl ToolContent {
 
 /// A file location a tool call touches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ToolLocation {
     /// File path.
     pub path: String,
@@ -350,6 +361,7 @@ pub struct ToolLocation {
 
 /// One step of the agent's plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PlanEntry {
     /// What the step does.
     pub content: String,
@@ -359,6 +371,7 @@ pub struct PlanEntry {
 
 /// Progress of a plan step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PlanEntryStatus {
     /// Not started.
@@ -374,6 +387,7 @@ pub enum PlanEntryStatus {
 
 /// Token usage reported by a backend.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Usage {
     /// Prompt tokens of the latest request.
     pub input_tokens: u64,
@@ -400,6 +414,7 @@ pub struct Usage {
 
 /// Severity of a notice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NoticeLevel {
     /// Status or progress.

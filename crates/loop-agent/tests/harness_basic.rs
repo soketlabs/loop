@@ -300,3 +300,47 @@ async fn tools_snapshot_from_runtime_worker() {
     .expect("tools_snapshot panicked on a runtime worker");
     assert!(snapshot.is_empty());
 }
+
+#[tokio::test]
+async fn the_tool_filter_hides_tools_from_the_turn() {
+    let models = Arc::new(Models::new());
+    models.set_provider(faux_provider(FauxScript::new()));
+    let model = models.get_model("faux", "faux-model").unwrap();
+    let store = create_in_memory_session_store();
+    let repo = create_session_repository(store, None);
+    let session = repo.create(None, Some("h".into())).await.unwrap();
+    let host: Arc<dyn loop_agent::harness::ExecutionEnv> =
+        Arc::new(HostExecutionEnv::new(std::env::temp_dir()));
+    let harness = AgentHarness::new(AgentHarnessOptions {
+        models,
+        model: Some(model),
+        session,
+        host_env: Arc::clone(&host),
+        tools: vec![
+            loop_agent::harness::tools::create_read_tool(Arc::clone(&host)),
+            loop_agent::harness::tools::create_write_tool(host),
+        ],
+        system_prompt: "sys".into(),
+        sandbox: SandboxMode::Disabled,
+        resources: Default::default(),
+    });
+    let names = |turn: loop_agent::harness::TurnSnapshot| -> Vec<String> {
+        turn.tools.into_iter().map(|t| t.name).collect()
+    };
+    assert_eq!(
+        names(harness.create_turn_state().await.unwrap()),
+        ["read", "write"]
+    );
+    harness.set_tool_filter(Some(Arc::new(|name: &str| name != "write")));
+    assert_eq!(names(harness.create_turn_state().await.unwrap()), ["read"]);
+    assert_eq!(
+        harness.tools_snapshot().len(),
+        2,
+        "the filter hides tools without removing them"
+    );
+    harness.set_tool_filter(None);
+    assert_eq!(
+        names(harness.create_turn_state().await.unwrap()),
+        ["read", "write"]
+    );
+}

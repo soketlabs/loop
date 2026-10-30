@@ -12,6 +12,7 @@ mod content;
 mod error;
 mod ids;
 mod interaction;
+pub mod rpc;
 mod update;
 
 pub use backend::{

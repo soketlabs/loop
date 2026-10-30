@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// Why a turn failed, as far as Loop can tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCategory {
     /// Sign-in missing, expired or rejected.
@@ -31,6 +32,7 @@ pub enum ErrorCategory {
 
 /// A failure with enough structure for a surface to decide what to do next.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ErrorInfo {
     /// Failure category.
     pub category: ErrorCategory,

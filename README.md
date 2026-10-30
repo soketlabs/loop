@@ -26,6 +26,7 @@ loop is a **developer preview (alpha)**. Settings, session files and CLI flags c
 | **loop-cli** | [`crates/loop-cli`](crates/loop-cli) | Interactive `loop` TUI (ratatui) |
 | **loop-update** | [`crates/ops/loop-update`](crates/ops/loop-update) | Release checks, verified updates, rollback and uninstall |
 | **loop-protocol** | [`crates/core/loop-protocol`](crates/core/loop-protocol) | Versioned event model and backend interface shared by every agent and surface |
+| **loop-wire** | [`crates/core/loop-wire`](crates/core/loop-wire) | JSON-RPC 2.0 and the transports that carry `loop-protocol` over a real connection |
 | **loop-acp** | [`crates/extend/loop-acp`](crates/extend/loop-acp) | Run any Agent Client Protocol agent (Codex, Claude, Gemini, …) as a backend |
 | **loop-dashboard** | [`crates/extend/loop-dashboard`](crates/extend/loop-dashboard) | Terminal usage view (`/usage`, `loop usage`) built from the anonymous usage log |
 
@@ -110,6 +111,8 @@ loop connects to model providers through an OpenAI-compatible Chat Completions A
 The model list comes from each provider's `/models` endpoint. Use `/model` to select a model.
 
 Not supported yet: the native Anthropic Messages API and the OpenAI Responses API.
+
+To run one prompt from a script, use `loop --print "<prompt>"`. Add `--output-format json` or `stream-json` for machine-readable output; see [Running Loop from scripts](docs/print-mode.md) for the formats and exit codes.
 
 ## Configuration
 

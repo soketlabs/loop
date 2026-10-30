@@ -18,6 +18,7 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 
 - **The workspace** is the git root of the directory Loop runs in, or that directory itself. Paths are resolved through symlinks, so a link that points outside the workspace counts as outside.
 - **`read-only` is a ceiling.** A hook can't allow a call that changes files or runs commands.
+- **What `read-only` turns off is taken away, not just refused.** The model isn't offered `write`, `edit`, or MCP tools that their server doesn't mark read-only, in the agent loop or through `loop mcp serve`. `bash` stays, for read-only commands. Switching mode changes the toolset from the next turn.
 - **Bash in `read-only`** runs a command only when every part of it reads: `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `tree`, `file`, `stat`, `du`, `which`, `echo`, `sort`, `uniq`, `diff`, and `git status`, `log`, `diff`, `show`, `blame`, `ls-files`, `rev-parse`, and `branch` when it only lists. Output redirects (`>`), `$(…)`, backticks, variable assignments, and options that write or run programs (`find -exec`/`-delete`, `sort -o`, `rg --pre`, `git --output`) are refused.
 - **MCP tools in `read-only`** run when their server marks them read-only (`readOnlyHint`). The server sets that hint, so deny a tool in `toolPermissions` if you don't trust it.
 - **Session approvals:** "Accept all … for this session" in a prompt stops further prompts for that group (file edits, bash or web) in this session, including after `--resume`.
