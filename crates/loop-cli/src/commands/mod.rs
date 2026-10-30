@@ -70,7 +70,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand {
             name: "export",
             description: "Save this session as Markdown and a session file",
-            args_hint: Some("[path]"),
+            args_hint: Some("[--force] [path]"),
         },
         SlashCommand {
             name: "import",

@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -4608,6 +4608,48 @@ fn apply_tool_update(
     }
 }
 
+/// `/export`'s argument: `--force` (before or after) and the path.
+fn export_args(arg: Option<&str>) -> (bool, Option<String>) {
+    let mut force = false;
+    let words: Vec<&str> = arg
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter(|word| {
+            let flag = *word == "--force";
+            force |= flag;
+            !flag
+        })
+        .collect();
+    let path = (!words.is_empty()).then(|| words.join(" "));
+    (force, path)
+}
+
+/// The export files that are already there.
+fn existing_export_files(markdown: &Path, session_file: &Path) -> Vec<PathBuf> {
+    [markdown, session_file]
+        .into_iter()
+        .filter(|path| path.exists())
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+/// Whether `/export` may write: nothing would be overwritten, `--force` was
+/// given, or this is the same `/export` (`key`) repeated to confirm, as
+/// `/permissions full-access` is. Otherwise it remembers `key` and asks.
+fn export_may_write(
+    existing: &[PathBuf],
+    force: bool,
+    pending: &mut Option<String>,
+    key: &str,
+) -> bool {
+    let confirmed = pending.take().is_some_and(|asked| asked == key);
+    if existing.is_empty() || force || confirmed {
+        return true;
+    }
+    *pending = Some(key.to_owned());
+    false
+}
+
 /// Where every release's notes are published.
 const RELEASES_URL: &str = "https://github.com/soketlabs/loop/releases";
 
@@ -5658,14 +5700,35 @@ async fn apply_effect(
             Ok(()) => chat.push(sys(format!("session name → {}", name.trim()))),
             Err(e) => chat.push(error_item(format!("could not name the session: {e:#}"))),
         },
-        CommandEffect::Export(path) => match runtime.export_session(path.as_deref()).await {
-            Ok((markdown, session_file)) => chat.push(sys(format!(
-                "exported\n  transcript    {}\n  session file  {} (open it with /import)",
-                markdown.display(),
-                session_file.display()
-            ))),
-            Err(e) => chat.push(error_item(format!("could not export: {e:#}"))),
-        },
+        CommandEffect::Export(arg) => {
+            let (force, path) = export_args(arg.as_deref());
+            let (markdown, session_file) = loop_app_core::sessions::export_paths(
+                &runtime.cwd,
+                &runtime.session_id,
+                path.as_deref(),
+            );
+            let existing = existing_export_files(&markdown, &session_file);
+            let key = path.clone().unwrap_or_default();
+            if !export_may_write(&existing, force, &mut runtime.confirm_export, &key) {
+                let names: Vec<String> = existing.iter().map(|p| p.display().to_string()).collect();
+                let again = format!("/export {key}").trim_end().to_owned();
+                let exist = if names.len() == 1 { "exists" } else { "exist" };
+                chat.push(error_item(format!(
+                    "{} already {exist}. Run {again} again to overwrite, or /export --force \
+                     {key} to skip this check. Nothing was written.",
+                    names.join(" and ")
+                )));
+                return Ok(false);
+            }
+            match runtime.export_session(path.as_deref()).await {
+                Ok((markdown, session_file)) => chat.push(sys(format!(
+                    "exported\n  transcript    {}\n  session file  {} (open it with /import)",
+                    markdown.display(),
+                    session_file.display()
+                ))),
+                Err(e) => chat.push(error_item(format!("could not export: {e:#}"))),
+            }
+        }
         CommandEffect::Import(path) => {
             if *working {
                 chat.push(sys("wait for the current turn to finish, then /import"));
@@ -6717,5 +6780,72 @@ mod tree_picker_tests {
         );
         let answer = row("a3", "u1", SessionTreeRowKind::Assistant, 1);
         assert_eq!(tree_target(&answer), (Some("a3".into()), None));
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    #[test]
+    fn force_is_a_flag_before_or_after_the_path() {
+        assert_eq!(export_args(None), (false, None));
+        assert_eq!(
+            export_args(Some("notes/a")),
+            (false, Some("notes/a".into()))
+        );
+        assert_eq!(
+            export_args(Some("--force notes/a")),
+            (true, Some("notes/a".into()))
+        );
+        assert_eq!(
+            export_args(Some("notes/a --force")),
+            (true, Some("notes/a".into()))
+        );
+        assert_eq!(export_args(Some("--force")), (true, None));
+    }
+
+    #[test]
+    fn overwriting_needs_the_same_export_twice_or_force() {
+        let mut pending = None;
+        let existing = vec![std::path::PathBuf::from("/w/a.md")];
+        assert!(
+            !export_may_write(&existing, false, &mut pending, "a"),
+            "asks first"
+        );
+        assert_eq!(pending.as_deref(), Some("a"));
+        assert!(
+            export_may_write(&existing, false, &mut pending, "a"),
+            "repeated: confirmed"
+        );
+        assert!(pending.is_none());
+
+        assert!(!export_may_write(&existing, false, &mut pending, "a"));
+        assert!(
+            !export_may_write(&existing, false, &mut pending, "b"),
+            "another path asks again"
+        );
+        assert!(
+            export_may_write(&existing, true, &mut pending, "c"),
+            "--force"
+        );
+        assert!(pending.is_none());
+        assert!(
+            export_may_write(&[], false, &mut pending, "d"),
+            "nothing to overwrite"
+        );
+    }
+
+    #[test]
+    fn a_declined_export_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (markdown, file) = loop_app_core::sessions::export_paths(dir.path(), "s1", Some("a"));
+        std::fs::write(&markdown, "keep").unwrap();
+        let existing = existing_export_files(&markdown, &file);
+        assert_eq!(existing, vec![markdown.clone()]);
+        let mut pending = None;
+        assert!(!export_may_write(&existing, false, &mut pending, "a"));
+        assert_eq!(std::fs::read_to_string(&markdown).unwrap(), "keep");
+        assert!(!file.exists());
     }
 }

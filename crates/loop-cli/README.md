@@ -87,7 +87,7 @@ Context files are loaded automatically from the agent dir, `~/.claude/CLAUDE.md`
   - **Enter on a prompt** goes back to just before it and puts it in the input box. Edit it and send to start a new branch; the old branch stays in `/tree`.
   - **Enter on an answer** goes back to that point; your next prompt continues from there.
   - **Enter on a `⑂` row** switches to that session.
-- **`/export [path]`** saves the current session twice, side by side: a Markdown transcript (`path.md`) and a session file (`path.loop.jsonl`). With no path they are `loop-<id>.md` and `loop-<id>.loop.jsonl` in this folder. The transcript leaves out thinking and images and keeps the first 20 lines of each tool result. Only the active branch is saved. Subscription sessions can't be exported.
+- **`/export [path]`** saves the current session twice, side by side: a Markdown transcript (`path.md`) and a session file (`path.loop.jsonl`). With no path they are `loop-<id>.md` and `loop-<id>.loop.jsonl` in this folder. The transcript leaves out thinking and images and keeps the first 20 lines of each tool result. Only the active branch is saved. Subscription sessions can't be exported. If either file already exists, Loop asks first and writes nothing: run the same `/export` again to overwrite, or add `--force` to skip the check.
 - **`/import <file.loop.jsonl>`** opens an exported session file as a new session in this folder and switches to it, so you can continue it. "Accept all … for this session" approvals in the file are not imported.
 - **Not listed:**
   - sessions with no messages;

@@ -46,6 +46,9 @@ pub struct CliRuntime {
     /// `/permissions full-access` was asked for once and needs repeating to
     /// confirm.
     pub confirm_full_access: bool,
+    /// `/export` was asked to overwrite files with this path argument and
+    /// needs repeating to confirm.
+    pub confirm_export: Option<String>,
     /// `--resume` with no id or `--continue`: what to do once the TUI is up.
     pub startup_sessions: Option<StartupSessions>,
 }
@@ -104,5 +107,6 @@ pub async fn bootstrap_cli(opts: BootstrapOpts) -> anyhow::Result<CliRuntime> {
         forwarded: Default::default(),
         reasoning_notices: Default::default(),
         confirm_full_access: false,
+        confirm_export: None,
     })
 }
