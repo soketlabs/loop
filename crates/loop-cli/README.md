@@ -164,6 +164,12 @@ In `ask` mode (the default), `write` / `edit` / `bash` pause for approval, per `
 - Interactive workflows are wired for `write`, `edit`, `bash`, `web_fetch`, and `web_search`
 - `/review` shows the session's approvals and `toolPermissions`
 
+## Built-in tools
+
+- **`read`, `write`, `edit`, `bash`:** files and the shell, under the permission mode.
+- **`grep`, `glob`, `ls`:** search file contents, find files by pattern, and list a directory. They only read, so every mode runs them without asking. `grep` and `glob` respect `.gitignore` and skip hidden files unless the call asks for them; output stops at 500 lines with a truncated note.
+- **`todo`:** the model's checklist for multi-step work. Each update shows in the transcript as a checklist (`☐` pending, `◼` in progress, `✔` done). The checklist is part of the session, so `/resume`, `/fork` and `/clone` keep it.
+
 ## Web tools
 
 `web_fetch` is built in: it fetches an http(s) URL and returns the body as text

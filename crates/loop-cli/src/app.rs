@@ -3984,6 +3984,10 @@ fn handle_update(
         }
         SessionUpdate::ToolCall(call) => {
             let raw_name = call.name.as_deref().unwrap_or(&call.title);
+            // Loop's `todo` shows as the checklist its Plan update brings.
+            if source.is_none() && raw_name == "todo" {
+                return;
+            }
             let name = tool_display_name(source, raw_name);
             if live {
                 *turn_step = format!("tool · {name}");
@@ -4016,6 +4020,12 @@ fn handle_update(
             );
         }
         SessionUpdate::ToolCallUpdate(mut update) => {
+            let todo_done = source.is_none()
+                && update.name.as_deref() == Some("todo")
+                && update.status != Some(ToolCallStatus::Failed);
+            if todo_done {
+                return;
+            }
             update.name = update.name.map(|name| tool_display_name(source, &name));
             apply_tool_update(update, live, chat, turn_step);
         }
@@ -4047,11 +4057,15 @@ fn handle_update(
                 *refresh_token_bar = true;
             }
         }
-        // Approvals arrive through HostServices, not the update stream; plans
-        // are not shown yet; unknown updates come from newer backends.
+        SessionUpdate::Plan { entries } => {
+            *streaming_assistant = None;
+            finish_thinking(chat, streaming_thinking);
+            push_before_queued(chat, ChatItem::Plan { entries });
+        }
+        // Approvals arrive through HostServices, not the update stream;
+        // unknown updates come from newer backends.
         SessionUpdate::InteractionRequested { .. }
         | SessionUpdate::InteractionResolved { .. }
-        | SessionUpdate::Plan { .. }
         | SessionUpdate::Unknown(_) => {}
     }
 }
@@ -5851,6 +5865,97 @@ mod session_picker_tests {
         assert_eq!(
             session_row_details(&choice("b", "t", None), 0),
             "b · just now"
+        );
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use loop_protocol::{
+        PlanEntry, PlanEntryStatus, ToolCall, ToolCallId, ToolCallUpdate, ToolKind,
+    };
+
+    fn todo_call(id: &str) -> SessionUpdate {
+        SessionUpdate::ToolCall(ToolCall {
+            id: ToolCallId(id.into()),
+            name: Some("todo".into()),
+            title: "todo".into(),
+            kind: ToolKind::Think,
+            status: ToolCallStatus::InProgress,
+            content: vec![],
+            locations: vec![],
+            raw_input: Some(serde_json::json!({"todos": []})),
+        })
+    }
+
+    fn todo_done(id: &str, status: ToolCallStatus) -> SessionUpdate {
+        let mut done = ToolCallUpdate::new(ToolCallId(id.into()));
+        done.name = Some("todo".into());
+        done.status = Some(status);
+        SessionUpdate::ToolCallUpdate(done)
+    }
+
+    fn plan(entries: &[(&str, PlanEntryStatus)]) -> SessionUpdate {
+        SessionUpdate::Plan {
+            entries: entries
+                .iter()
+                .map(|(content, status)| PlanEntry {
+                    content: (*content).into(),
+                    status: *status,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_plan_shows_as_a_checklist_instead_of_a_todo_card() {
+        use PlanEntryStatus::*;
+        let chat = chat_from_transcript(vec![
+            todo_call("t1"),
+            todo_done("t1", ToolCallStatus::Completed),
+            plan(&[
+                ("read the code", Completed),
+                ("fix it", InProgress),
+                ("test", Pending),
+            ]),
+        ]);
+        assert_eq!(chat.len(), 1, "{chat:?}");
+        let ChatItem::Plan { entries } = &chat[0] else {
+            panic!("expected a plan: {chat:?}");
+        };
+        assert_eq!(entries.len(), 3);
+        let text = crate::tui::format_item_lines(&chat[0], &Theme::dark(), false, false, 80)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("1/3 done"), "{text}");
+        assert!(text.contains("✔ read the code"), "{text}");
+        assert!(text.contains("◼ fix it"), "{text}");
+        assert!(text.contains("☐ test"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_todo_call_still_shows_its_error() {
+        let chat = chat_from_transcript(vec![
+            todo_call("t1"),
+            todo_done("t1", ToolCallStatus::Failed),
+        ]);
+        assert!(
+            matches!(
+                &chat[..],
+                [ChatItem::Tool {
+                    status: CardStatus::Error,
+                    ..
+                }]
+            ),
+            "{chat:?}"
         );
     }
 }

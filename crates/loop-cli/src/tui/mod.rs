@@ -93,6 +93,11 @@ pub enum ChatItem {
     Error {
         text: String,
     },
+    /// The agent's checklist (the `todo` tool, or an ACP agent's plan), as
+    /// it stood after one update.
+    Plan {
+        entries: Vec<loop_protocol::PlanEntry>,
+    },
 }
 
 /// One MCP server in a [`ChatItem::Mcp`] listing.
@@ -194,6 +199,7 @@ pub fn item_is_committed(
         | ChatItem::System { .. }
         | ChatItem::Mcp { .. }
         | ChatItem::Error { .. }
+        | ChatItem::Plan { .. }
         | ChatItem::Shell { .. } => true,
         ChatItem::Queued { .. } => false,
         ChatItem::Assistant { .. } => streaming_assistant != Some(index),
@@ -709,7 +715,63 @@ pub fn format_item_lines(
             }
             lines.push(Line::from(""));
         }
+        ChatItem::Plan { entries } => lines.extend(format_plan(entries, theme, w)),
     }
+    lines
+}
+
+/// The checklist: a head with progress, then one row per step.
+fn format_plan(
+    entries: &[loop_protocol::PlanEntry],
+    theme: &Theme,
+    w: usize,
+) -> Vec<Line<'static>> {
+    use loop_protocol::PlanEntryStatus;
+    let done = entries
+        .iter()
+        .filter(|entry| entry.status == PlanEntryStatus::Completed)
+        .count();
+    let mut lines = vec![Line::from(vec![
+        Span::styled(" ● ".to_string(), theme.accent()),
+        Span::styled(
+            "Checklist".to_string(),
+            theme.style("toolTitle").add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {done}/{} done", entries.len()), theme.dim()),
+    ])];
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   (cleared)".to_string(),
+            theme.dim(),
+        )));
+    }
+    for entry in entries {
+        let (mark, style) = match entry.status {
+            PlanEntryStatus::Completed => ("✔", theme.dim().add_modifier(Modifier::CROSSED_OUT)),
+            PlanEntryStatus::InProgress => ("◼", theme.accent().add_modifier(Modifier::BOLD)),
+            _ => ("☐", theme.style("toolOutput")),
+        };
+        let mark_style = if entry.status == PlanEntryStatus::Completed {
+            theme.style("success")
+        } else {
+            style
+        };
+        for (i, row) in soft_wrap(&entry.content, w.saturating_sub(5).max(1))
+            .into_iter()
+            .enumerate()
+        {
+            let lead = if i == 0 {
+                format!("   {mark} ")
+            } else {
+                "     ".into()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(lead, mark_style),
+                Span::styled(row, style),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
     lines
 }
 

@@ -7,10 +7,10 @@ use anyhow::bail;
 
 use loop_agent::harness::{
     create_bash_tool_with, create_edit_tool, create_glob_tool, create_grep_tool, create_ls_tool,
-    create_read_tool, create_session_repository, create_sqlite_session_store, create_write_tool,
-    verify_web_search_key, AgentHarness, AgentHarnessOptions, AgentHarnessResources,
-    HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime, Sandbox, SandboxMode,
-    WebSearchConfig,
+    create_read_tool, create_session_repository, create_sqlite_session_store, create_todo_tool,
+    create_write_tool, verify_web_search_key, AgentHarness, AgentHarnessOptions,
+    AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime,
+    Sandbox, SandboxMode, WebSearchConfig,
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
 use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
@@ -1022,6 +1022,7 @@ pub fn build_tools(
         create_write_tool(Arc::clone(&env)),
         create_edit_tool(Arc::clone(&env)),
         create_bash_tool_with(env, None, bash),
+        create_todo_tool(),
     ];
     tools.extend(web.build());
     tools
@@ -1624,18 +1625,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_standard_tools_include_search() {
+    fn the_standard_tools_include_search_and_todo() {
         let env: Arc<dyn loop_agent::harness::ExecutionEnv> = Arc::new(
             loop_agent::harness::HostExecutionEnv::new(std::env::temp_dir()),
         );
         let web = crate::web_tools::WebTools::from_settings(&Default::default(), None, true);
         let tools = build_tools(env, &web, Default::default());
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        for name in ["read", "write", "edit", "bash", "grep", "glob", "ls"] {
+        for name in [
+            "read", "write", "edit", "bash", "grep", "glob", "ls", "todo",
+        ] {
             assert!(names.contains(&name), "{name}: {names:?}");
         }
         let snippets = crate::system_prompt::default_tool_snippets();
-        for name in ["grep", "glob", "ls"] {
+        for name in ["grep", "glob", "ls", "todo"] {
             assert!(snippets.iter().any(|(n, _)| *n == name), "{name} snippet");
         }
     }

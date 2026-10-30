@@ -52,6 +52,10 @@ pub fn default_tool_snippets() -> Vec<(&'static str, &'static str)> {
         ("edit", "Apply exact string replacements in a file"),
         ("write", "Create or overwrite a file"),
         (
+            "todo",
+            "Keep a checklist for multi-step work; send the whole list each time",
+        ),
+        (
             "web_fetch",
             "Fetch a URL and return its text content (HTML becomes plain text)",
         ),
