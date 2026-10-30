@@ -26,3 +26,4 @@ loop-test-support = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true }
 opentelemetry = { workspace = true }
+tempfile = { workspace = true }

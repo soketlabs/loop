@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -629,6 +630,28 @@ pub struct AgentLoopConfig {
     pub stream_options: SimpleStreamOptions,
     /// Thinking budgets.
     pub thinking_budgets: Option<ThinkingBudgets>,
+    /// Labels recorded on the run's trace.
+    pub run_labels: RunLabels,
+}
+
+/// Labels on a run's trace, for usage views. Names only, never user content, so they are
+/// kept in anonymous traces.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunLabels {
+    /// Which agent ran: [`RunLabels::MAIN`] or [`RunLabels::SUB_AGENT`].
+    pub agent: Option<&'static str>,
+    /// Skills the user activated for this run.
+    pub skills: Vec<String>,
+    /// The `SKILL.md` file of each registered skill, with the skill's name, so a `read`
+    /// of one is counted as that skill being loaded.
+    pub skill_files: Vec<(PathBuf, String)>,
+}
+
+impl RunLabels {
+    /// The chat's own agent.
+    pub const MAIN: &'static str = "main";
+    /// An agent started for a workflow task.
+    pub const SUB_AGENT: &'static str = "subagent";
 }
 
 impl AgentLoopConfig {
@@ -650,6 +673,7 @@ impl AgentLoopConfig {
             after_tool_call: None,
             stream_options: SimpleStreamOptions::default(),
             thinking_budgets: None,
+            run_labels: RunLabels::default(),
         }
     }
 }

@@ -92,6 +92,11 @@ impl ExporterSlot {
         state.last_error = None;
     }
 
+    /// Resource applied to exporters installed from now on.
+    pub(crate) fn set_resource(&self, resource: &Resource) {
+        self.inner.write().resource = Some(resource.clone());
+    }
+
     /// Error from the most recent failed export, cleared by the next success.
     pub(crate) fn last_error(&self) -> Option<String> {
         self.inner.read().last_error.clone()
@@ -157,6 +162,6 @@ impl SpanExporter for SlotExporter {
     }
 
     fn set_resource(&mut self, resource: &Resource) {
-        self.0.inner.write().resource = Some(resource.clone());
+        self.0.set_resource(resource);
     }
 }

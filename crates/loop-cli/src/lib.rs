@@ -51,6 +51,8 @@ pub struct CliRuntime {
     pub confirm_export: Option<String>,
     /// `--resume` with no id or `--continue`: what to do once the TUI is up.
     pub startup_sessions: Option<StartupSessions>,
+    /// `/usage` asked for the usage view; the chat loop opens it.
+    pub usage_requested: bool,
 }
 
 /// Session choice to make when the TUI starts.
@@ -108,5 +110,6 @@ pub async fn bootstrap_cli(opts: BootstrapOpts) -> anyhow::Result<CliRuntime> {
         reasoning_notices: Default::default(),
         confirm_full_access: false,
         confirm_export: None,
+        usage_requested: false,
     })
 }

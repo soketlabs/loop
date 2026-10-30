@@ -22,6 +22,25 @@ fn tracing_is_a_builtin_command() {
         .any(|c| c.name == "tracing"));
 }
 
+#[cfg(feature = "usage")]
+#[test]
+fn usage_is_a_builtin_command() {
+    assert!(commands::builtin_commands()
+        .iter()
+        .any(|c| c.name == "usage"));
+    assert!(matches!(dispatch("/usage"), CommandEffect::Usage));
+}
+
+#[test]
+fn usage_log_has_no_tracing_switch() {
+    for line in ["/tracing local off", "/tracing anonymous on"] {
+        match dispatch(line) {
+            CommandEffect::Status(usage) => assert!(usage.starts_with("Usage: /tracing"), "{line}"),
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn bare_and_status_show_status() {
     assert_eq!(tracing("/tracing"), TracingCommand::Status);

@@ -13,6 +13,7 @@ members = [
     "crates/core/loop-protocol",
     "crates/core/loop-wire",
     "crates/extend/loop-acp",
+    "crates/extend/loop-dashboard",
     "crates/loop-desktop"
 ]
 
@@ -29,6 +30,7 @@ default-members = [
     "crates/core/loop-protocol",
     "crates/core/loop-wire",
     "crates/extend/loop-acp",
+    "crates/extend/loop-dashboard",
 ]
 
 [workspace.package]
@@ -50,6 +52,7 @@ loop-update = { path = "crates/ops/loop-update" }
 loop-protocol = { path = "crates/core/loop-protocol" }
 loop-wire = { path = "crates/core/loop-wire" }
 loop-acp = { path = "crates/extend/loop-acp" }
+loop-dashboard = { path = "crates/extend/loop-dashboard" }
 agent-client-protocol-schema = { version = "1.11", default-features = false }
 sha2 = "0.10"
 semver = "1"
