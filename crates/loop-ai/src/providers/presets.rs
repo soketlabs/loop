@@ -1,7 +1,12 @@
-//! Built-in OpenAI-compatible providers offered by `/login`.
+//! Built-in providers offered by `/login`: OpenAI-compatible endpoints and
+//! providers with their own wire API.
 
 use std::collections::HashMap;
 
+use super::anthropic::{
+    anthropic_provider, anthropic_seed_models, ANTHROPIC_API_KEY_ENVS, ANTHROPIC_BASE_URL,
+    ANTHROPIC_PROVIDER_ID, ANTHROPIC_PROVIDER_NAME,
+};
 use super::openai_compatible::{
     openai_compatible_provider, ModelDefaults, ModelFilter, OpenAiCompatibleConfig,
 };
@@ -16,6 +21,15 @@ pub const OPENROUTER_PROVIDER_ID: &str = "openrouter";
 /// OpenAI provider id.
 pub const OPENAI_PROVIDER_ID: &str = "openai";
 
+/// The wire API a preset speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetWire {
+    /// OpenAI Chat Completions, for any compatible server.
+    OpenAiCompatible,
+    /// Anthropic Messages.
+    Anthropic,
+}
+
 /// A provider Loop knows how to connect to with just an API key.
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderPreset {
@@ -25,7 +39,9 @@ pub struct ProviderPreset {
     pub name: &'static str,
     /// One-line description for the `/login` picker.
     pub description: &'static str,
-    /// OpenAI-compatible base URL.
+    /// Wire API.
+    pub wire: PresetWire,
+    /// Base URL including the version path.
     pub base_url: &'static str,
     /// Env vars checked for the API key, first wins.
     pub api_key_envs: &'static [&'static str],
@@ -51,7 +67,10 @@ pub struct ProviderPreset {
 impl ProviderPreset {
     /// Build the provider.
     pub fn provider(&self) -> Provider {
-        openai_compatible_provider(self.config())
+        match self.wire {
+            PresetWire::OpenAiCompatible => openai_compatible_provider(self.config()),
+            PresetWire::Anthropic => anthropic_provider(self.base_url),
+        }
     }
 
     /// Reject a key the provider doesn't accept, where `/models` can't tell.
@@ -107,6 +126,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         id: SOKET_PROVIDER_ID,
         name: SOKET_PROVIDER_NAME,
         description: "Soket's inference Studio",
+        wire: PresetWire::OpenAiCompatible,
         base_url: SOKET_BASE_URL,
         api_key_envs: SOKET_API_KEY_ENVS,
         headers: &[],
@@ -126,6 +146,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         id: OPENROUTER_PROVIDER_ID,
         name: "OpenRouter",
         description: "Hundreds of models with one key",
+        wire: PresetWire::OpenAiCompatible,
         base_url: "https://openrouter.ai/api/v1",
         api_key_envs: &["OPENROUTER_API_KEY"],
         headers: &[
@@ -148,6 +169,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         id: OPENAI_PROVIDER_ID,
         name: "OpenAI",
         description: "Chat models",
+        wire: PresetWire::OpenAiCompatible,
         base_url: "https://api.openai.com/v1",
         api_key_envs: &["OPENAI_API_KEY"],
         headers: &[],
@@ -161,6 +183,27 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         },
         model_filter: Some(openai_chat_model),
         fallback_models: None,
+        key_check_path: None,
+    },
+    ProviderPreset {
+        id: ANTHROPIC_PROVIDER_ID,
+        name: ANTHROPIC_PROVIDER_NAME,
+        description: "Claude models with prompt caching and extended thinking",
+        wire: PresetWire::Anthropic,
+        base_url: ANTHROPIC_BASE_URL,
+        api_key_envs: ANTHROPIC_API_KEY_ENVS,
+        headers: &[],
+        key_hint: "sk-ant-…",
+        key_cta: "get one at",
+        key_url: "https://console.anthropic.com/settings/keys",
+        defaults: ModelDefaults {
+            context_window: 200_000,
+            max_tokens: 64_000,
+            reasoning: true,
+        },
+        model_filter: None,
+        fallback_models: Some(anthropic_seed_models),
+        // Listing models needs the key, so the listing checks it.
         key_check_path: None,
     },
 ];
@@ -179,7 +222,18 @@ mod tests {
     #[test]
     fn presets_in_login_order_with_soket_first() {
         let ids: Vec<_> = PROVIDER_PRESETS.iter().map(|p| p.id).collect();
-        assert_eq!(ids, ["soket", "openrouter", "openai"]);
+        assert_eq!(ids, ["soket", "openrouter", "openai", "anthropic"]);
+    }
+
+    #[test]
+    fn anthropic_speaks_messages_natively() {
+        let provider = provider_preset("anthropic").unwrap().provider();
+        assert!(provider.is_dynamic());
+        let models = provider.get_models();
+        assert_eq!(models[0].id, "claude-opus-5-5");
+        assert!(models
+            .iter()
+            .all(|m| m.api == crate::types::API_ANTHROPIC_MESSAGES));
     }
 
     #[test]
