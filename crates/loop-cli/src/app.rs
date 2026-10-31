@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,8 +18,9 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
 use loop_agent::harness::{
-    format_prompt_template_invocation, KrunSandbox, Sandbox, SandboxMode, SessionForkPoint,
-    SessionForkSelection,
+    format_prompt_template_invocation,
+    session::{SessionTreeRow, SessionTreeRowKind},
+    KrunSandbox, Sandbox, SandboxMode, SessionForkPoint, SessionForkSelection,
 };
 use loop_ai::providers::SOKET_BASE_URL;
 use loop_ai::{calculate_context_tokens, CredentialStore, ModelsRefreshOptions, Usage};
@@ -27,8 +28,9 @@ use loop_app_core::interaction::{
     approval_kind, ApprovalReply, InteractionQueue, PendingInteraction,
 };
 use loop_protocol::{
-    AgentBackend, ContentBlock, InteractionOutcome, InteractionRequest, NoticeLevel, Origin, Role,
-    SessionUpdate, StopReason, ToolCallStatus, ToolContent, TurnOutcome, UpdateEnvelope,
+    AgentBackend, ContentBlock, InteractionOutcome, InteractionRequest, NoticeLevel, Origin,
+    PlanEntry, Role, SessionUpdate, StopReason, ToolCallStatus, ToolContent, TurnOutcome,
+    UpdateEnvelope,
 };
 
 #[cfg(feature = "usage")]
@@ -53,6 +55,9 @@ use crate::tool_approval::{
 };
 #[cfg(feature = "telemetry")]
 use crate::tracing_setup::TracingSetup;
+use crate::tui::attachments::{
+    clipboard_image, image_file, mentioned_images, pasted_image_path, Attachments,
+};
 #[cfg(feature = "orchestration")]
 use crate::tui::find_workflow_task_index;
 use crate::tui::{
@@ -62,11 +67,13 @@ use crate::tui::{
     CardStatus, ChatItem, CommandHistory, FileEntry, FooterOpts, InputBuffer, McpServerListing,
     PickerRow, PickerView, FOOTER_HEIGHT,
 };
-use crate::{build_tools, CliRuntime, PendingAgent};
+use crate::{build_tools, CliRuntime, PendingAgent, StartupSessions};
 use loop_app_core::permissions::PermissionMode;
 
 enum UiEvent {
     UpdateAvailable(String),
+    /// `/changelog` loaded the running version's release notes (or failed).
+    Changelog(Result<String, String>),
     /// An update from the agent backend.
     Update(Box<UpdateEnvelope>),
     /// The backend refused to start a turn (no update was emitted for it).
@@ -182,6 +189,13 @@ impl ActiveApproval {
             .as_ref()
             .and_then(|c| c.title.clone())
             .unwrap_or_default();
+        // Loop's own plan approval, by name: an agent's request of another
+        // kind keeps its own meaning.
+        let kind = if tool_name == loop_agent::harness::EXIT_PLAN_TOOL {
+            ApprovalKind::Plan
+        } else {
+            kind
+        };
         Some(Self {
             kind,
             tool_name,
@@ -200,6 +214,7 @@ impl ActiveApproval {
             selected: self.selected,
             accept_label: self.reply.accept_label(),
             accept_all_label: self.reply.accept_session_label(),
+            reject_label: self.reply.reject_label(),
             reason: self.reason.clone(),
             reason_focused: self.reason_focused,
         }
@@ -213,6 +228,8 @@ struct QueuedMessage {
     display: String,
     /// Sent to `harness.prompt`.
     prompt: String,
+    /// Images attached in the composer, sent after the text.
+    images: Vec<ContentBlock>,
 }
 
 /// Live token / context stats for the footer usage line.
@@ -482,6 +499,12 @@ async fn run_loop(
     let mut fork_picker: Option<ForkPickerState> = None;
     let mut skill_picker: Option<SkillPickerState> = None;
     let mut mcp_picker: Option<McpPickerState> = None;
+    let mut session_picker: Option<SessionPickerState> = None;
+    let mut tree_picker: Option<TreePickerState> = None;
+    let mut attachments = Attachments::default();
+    // This turn's checklist: shown live under the transcript and updated in
+    // place; it lands in the transcript when the turn ends.
+    let mut live_plan: Option<Vec<PlanEntry>> = None;
     let mut active_approval: Option<ActiveApproval> = None;
     let mut ac_selected: usize = 0;
     let mut last_ac_filter = String::new();
@@ -507,6 +530,41 @@ async fn run_loop(
             ));
             render_lines_to_buffer(&[line], buf, &runtime.theme);
         })?;
+    }
+
+    // `loop --resume` with no id opens the picker; `--continue` resumes the
+    // most recent session.
+    if let Some(start) = runtime.startup_sessions.take() {
+        match runtime.list_sessions().await {
+            Ok(choices) if choices.is_empty() => {
+                chat.push(sys("no earlier sessions in this folder"));
+            }
+            Ok(choices) => match start {
+                StartupSessions::Pick => {
+                    session_picker = Some(SessionPickerState::new(choices));
+                    status = "sessions · pick one to resume".into();
+                }
+                StartupSessions::Latest => {
+                    resume_session(
+                        choices[0].clone(),
+                        runtime,
+                        &mut chat,
+                        &mut status,
+                        &mut working,
+                        &mut message_queue,
+                        &mut streaming_assistant,
+                        &mut streaming_thinking,
+                        &mut redraw_request,
+                        &mut purge_ui_events,
+                        &tx,
+                        &mut token_bar,
+                        &mut refresh_token_bar,
+                    )
+                    .await;
+                }
+            },
+            Err(e) => chat.push(error_item(format!("could not list sessions: {e:#}"))),
+        }
     }
 
     let tick = Duration::from_millis(33);
@@ -549,6 +607,7 @@ async fn run_loop(
                     &mut message_queue,
                     &mut token_bar,
                     &mut refresh_token_bar,
+                    &mut live_plan,
                     &tx,
                 )
                 .await;
@@ -616,6 +675,8 @@ async fn run_loop(
             && fork_picker.is_none()
             && skill_picker.is_none()
             && mcp_picker.is_none()
+            && session_picker.is_none()
+            && tree_picker.is_none()
             && active_approval.is_none()
         {
             let extra = dynamic_command_entries(runtime);
@@ -629,6 +690,8 @@ async fn run_loop(
             && fork_picker.is_none()
             && skill_picker.is_none()
             && mcp_picker.is_none()
+            && session_picker.is_none()
+            && tree_picker.is_none()
             && active_approval.is_none()
         {
             find_at_mention(input.as_str(), input.cursor())
@@ -743,6 +806,35 @@ async fn run_loop(
                 selected: p.selected,
                 hint: "MCP: [x] enabled · [ ] disabled. Changes are saved to settings.json.".into(),
             }
+        } else if let Some(p) = &session_picker {
+            let now = now_ms();
+            PickerView::Sessions {
+                rows: p
+                    .filtered
+                    .iter()
+                    .filter_map(|&i| p.choices.get(i))
+                    .map(|c| PickerRow {
+                        label: c.title.clone(),
+                        description: session_row_details(c, now),
+                        mark: (c.id == runtime.session_id).then(|| "✓".into()),
+                    })
+                    .collect(),
+                selected: p.selected,
+                hint: if p.query.is_empty() {
+                    "Sessions in this folder, most recent first. Type to filter by title or id."
+                        .into()
+                } else {
+                    format!("Sessions matching \"{}\"", p.query)
+                },
+            }
+        } else if let Some(p) = &tree_picker {
+            PickerView::Sessions {
+                rows: p.rows(),
+                selected: p.selected,
+                hint: "Session tree: ❯ prompts, answers, ⑂ forks and clones. Choosing a prompt \
+                       goes back to just before it, to edit."
+                    .into(),
+            }
         } else if let Some(prompt) = &pending_setup {
             PickerView::Setup {
                 prompt: prompt.clone(),
@@ -782,6 +874,10 @@ async fn run_loop(
             "↑↓ select · enter confirm · esc cancel".into()
         } else if fork_picker.is_some() {
             "↑↓ select · enter edit · esc cancel".into()
+        } else if session_picker.is_some() {
+            "↑↓ select · enter resume · type to filter · esc cancel".into()
+        } else if tree_picker.is_some() {
+            "↑↓ select · enter go there · esc cancel".into()
         } else if skill_picker.is_some() || mcp_picker.is_some() {
             "↑↓ select · space/enter toggle · type to filter · esc close".into()
         } else if let Some(prompt) = &pending_setup {
@@ -827,7 +923,12 @@ async fn run_loop(
             status.clone()
         };
 
-        let live: Vec<ChatItem> = chat[flushed..].to_vec();
+        let mut live: Vec<ChatItem> = chat[flushed..].to_vec();
+        if let Some(entries) = &live_plan {
+            live.push(ChatItem::Plan {
+                entries: entries.clone(),
+            });
+        }
         let setup_mode = pending_setup.is_some();
         if refresh_token_bar {
             token_bar.refresh(runtime).await;
@@ -902,6 +1003,7 @@ async fn run_loop(
                 &mut message_queue,
                 &mut token_bar,
                 &mut refresh_token_bar,
+                &mut live_plan,
                 &tx,
             )
             .await;
@@ -924,7 +1026,10 @@ async fn run_loop(
                         &mut fork_picker,
                         &mut skill_picker,
                         &mut mcp_picker,
+                        &mut session_picker,
                         &mut active_approval,
+                        &mut attachments,
+                        &mut chat,
                     );
                     for ev in &batch {
                         if let Event::Resize(w, _) = ev {
@@ -955,7 +1060,10 @@ async fn run_loop(
                             &mut fork_picker,
                             &mut skill_picker,
                             &mut mcp_picker,
+                            &mut session_picker,
                             &mut active_approval,
+                            &mut attachments,
+                            &mut chat,
                         );
                         token_bar.sync_window(runtime);
                     }
@@ -982,6 +1090,9 @@ async fn run_loop(
                             &mut fork_picker,
                             &mut skill_picker,
                             &mut mcp_picker,
+                            &mut session_picker,
+                            &mut tree_picker,
+                            &mut attachments,
                             &mut active_approval,
                             &mut working,
                             &mut message_queue,
@@ -1021,6 +1132,7 @@ async fn run_loop(
                 });
             }
             purge_ui_events = false;
+            live_plan = None;
             working = false;
             turn_step.clear();
             streaming_assistant = None;
@@ -1062,6 +1174,7 @@ async fn run_loop(
             &mut message_queue,
             &mut token_bar,
             &mut refresh_token_bar,
+            &mut live_plan,
             &tx,
         )
         .await;
@@ -1409,12 +1522,25 @@ async fn drain_ui_events(
     message_queue: &mut VecDeque<QueuedMessage>,
     token_bar: &mut TokenBarState,
     refresh_token_bar: &mut bool,
+    live_plan: &mut Option<Vec<PlanEntry>>,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
     while let Ok(ev) = rx.try_recv() {
         match ev {
             UiEvent::UpdateAvailable(message) => {
                 push_before_queued(chat, sys(message));
+            }
+            UiEvent::Changelog(text) => {
+                if !*working {
+                    *status = "ready".into();
+                }
+                push_before_queued(
+                    chat,
+                    match text {
+                        Ok(text) => sys(text),
+                        Err(err) => error_item(err),
+                    },
+                );
             }
             UiEvent::Update(envelope) => {
                 // Updates for another session (for example one just left with
@@ -1463,6 +1589,7 @@ async fn drain_ui_events(
                     token_bar,
                     refresh_token_bar,
                     active_agent_name(runtime),
+                    live_plan,
                 );
             }
             UiEvent::AgentReady { id, model, result } => {
@@ -1918,10 +2045,12 @@ fn enqueue_user_message(
     message_queue: &mut VecDeque<QueuedMessage>,
     display: String,
     prompt: String,
+    images: Vec<ContentBlock>,
 ) {
     message_queue.push_back(QueuedMessage {
         display: display.clone(),
         prompt,
+        images,
     });
     chat.push(ChatItem::Queued { text: display });
 }
@@ -1959,8 +2088,11 @@ fn start_user_turn(
     working: &mut bool,
     display: String,
     prompt: String,
+    images: Vec<ContentBlock>,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
+    // The first prompt titles a subscription session in /sessions.
+    runtime.note_prompt(&display);
     // Keep prior turn output above this user message.
     settle_queue_at_end(chat, streaming_assistant, streaming_thinking);
 
@@ -1990,7 +2122,12 @@ fn start_user_turn(
     }
     tokio::spawn(async move {
         match backend
-            .prompt(&session, vec![ContentBlock::text(prompt)])
+            .prompt(
+                &session,
+                std::iter::once(ContentBlock::text(prompt))
+                    .chain(images)
+                    .collect(),
+            )
             .await
         {
             // The update stream reports the turn, including failures.
@@ -2040,6 +2177,7 @@ fn try_drain_message_queue(
         working,
         item.display,
         item.prompt,
+        item.images,
         tx,
     );
 }
@@ -2058,6 +2196,7 @@ fn submit_user_text(
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
     text: String,
+    images: Vec<ContentBlock>,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
     if runtime.is_native() && runtime.selected_model.is_none() {
@@ -2069,7 +2208,7 @@ fn submit_user_text(
         return;
     }
     if agent_is_busy(runtime, *working) {
-        enqueue_user_message(chat, message_queue, text.clone(), text);
+        enqueue_user_message(chat, message_queue, text.clone(), text, images);
         let n = message_queue.len();
         *status = if n == 1 {
             "queued · will send when ready".into()
@@ -2087,6 +2226,7 @@ fn submit_user_text(
             working,
             text.clone(),
             text,
+            images,
             tx,
         );
     }
@@ -2222,7 +2362,10 @@ fn insert_pasted_text(
     fork_picker: &mut Option<ForkPickerState>,
     skill_picker: &mut Option<SkillPickerState>,
     mcp_picker: &mut Option<McpPickerState>,
+    session_picker: &mut Option<SessionPickerState>,
     active_approval: &mut Option<ActiveApproval>,
+    attachments: &mut Attachments,
+    chat: &mut Vec<ChatItem>,
 ) {
     if let Some(review) = active_approval.as_mut() {
         if review.reason_focused {
@@ -2257,6 +2400,14 @@ fn insert_pasted_text(
         }
         return;
     }
+    if let Some(picker) = session_picker.as_mut() {
+        let line = pasted_single_line(text);
+        if !line.is_empty() {
+            picker.query.push_str(&line);
+            picker.refilter();
+        }
+        return;
+    }
     if let Some(picker) = mcp_picker.as_mut() {
         let line = pasted_single_line(text);
         if !line.is_empty() {
@@ -2275,10 +2426,82 @@ fn insert_pasted_text(
         }
         return;
     }
+    // A dragged image file pastes as its path: attach the image instead,
+    // when the model reads images.
+    if let Some(path) = pasted_image_path(&runtime.cwd, text).filter(|_| accepts_images(runtime)) {
+        attach_image(
+            runtime,
+            input,
+            attachments,
+            chat,
+            image_file(&runtime.cwd, &path),
+        );
+        return;
+    }
     let block = normalize_pasted_text(text);
     if !block.is_empty() {
         input.insert_str(&block);
     }
+}
+
+/// Whether the model or agent in use reads images.
+fn accepts_images(runtime: &CliRuntime) -> bool {
+    if runtime.is_native() {
+        runtime
+            .selected_model
+            .as_ref()
+            .is_some_and(|model| model.supports_images())
+    } else {
+        runtime.backend.capabilities().images
+    }
+}
+
+/// Attach `image` to the message being written, as a chip in the input.
+fn attach_image(
+    runtime: &CliRuntime,
+    input: &mut InputBuffer,
+    attachments: &mut Attachments,
+    chat: &mut Vec<ChatItem>,
+    image: Result<ContentBlock, String>,
+) {
+    if !accepts_images(runtime) {
+        chat.push(sys(
+            "this model doesn't read images · pick one that does with /model",
+        ));
+        return;
+    }
+    match image {
+        Ok(image) => {
+            let chip = attachments.add(image);
+            input.insert_str(&format!("{chip} "));
+        }
+        Err(e) => chat.push(error_item(format!("could not attach the image: {e}"))),
+    }
+}
+
+/// The images to send with `line`: its chips' images, then image files it
+/// names with `@path`.
+fn images_for(
+    runtime: &CliRuntime,
+    attachments: &mut Attachments,
+    chat: &mut Vec<ChatItem>,
+    line: &str,
+) -> Vec<ContentBlock> {
+    let mut images = attachments.take_used(line);
+    let mentioned = mentioned_images(&runtime.cwd, line);
+    if !mentioned.is_empty() && !accepts_images(runtime) {
+        chat.push(sys(
+            "this model doesn't read images · the @ image files are sent as names only",
+        ));
+        return images;
+    }
+    for path in mentioned {
+        match image_file(&runtime.cwd, &path) {
+            Ok(image) => images.push(image),
+            Err(e) => chat.push(error_item(format!("could not attach the image: {e}"))),
+        }
+    }
+    images
 }
 
 #[allow(
@@ -2307,6 +2530,9 @@ async fn handle_key(
     fork_picker: &mut Option<ForkPickerState>,
     skill_picker: &mut Option<SkillPickerState>,
     mcp_picker: &mut Option<McpPickerState>,
+    session_picker: &mut Option<SessionPickerState>,
+    tree_picker: &mut Option<TreePickerState>,
+    attachments: &mut Attachments,
     active_approval: &mut Option<ActiveApproval>,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
@@ -2358,6 +2584,22 @@ async fn handle_key(
                         ApprovalDecision::Accept
                     };
                     match &decision {
+                        _ if r.kind == ApprovalKind::Plan => {
+                            let note = match &decision {
+                                ApprovalDecision::Accept => "plan approved · plan mode off".into(),
+                                ApprovalDecision::AcceptSession => {
+                                    "plan approved · accept edits on".into()
+                                }
+                                ApprovalDecision::Reject { reason: Some(why) } => {
+                                    format!("keep planning · {why}")
+                                }
+                                ApprovalDecision::Reject { reason: None } => {
+                                    "keep planning".to_string()
+                                }
+                            };
+                            chat.push(sys(note));
+                            *status = "continuing".into();
+                        }
                         ApprovalDecision::Accept => {
                             chat.push(sys(format!("accepted {} · {}", r.kind.label(), r.summary)));
                             *status = "accepted · continuing".into();
@@ -2524,6 +2766,149 @@ async fn handle_key(
                 if let Some(name) = picker.selected_name().map(str::to_string) {
                     let enabled = !runtime.resources.skills.iter().any(|s| s.name == name);
                     set_skill_enabled(runtime, &name, enabled, chat, status).await;
+                }
+            }
+            KeyCode::Char(c) => {
+                picker.query.push(c);
+                picker.refilter();
+            }
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.refilter();
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if let Some(picker) = tree_picker.as_mut() {
+        match key.code {
+            KeyCode::Esc => {
+                *tree_picker = None;
+                *status = "ready".into();
+            }
+            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Down => {
+                if picker.selected + 1 < picker.choices.len() {
+                    picker.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let choice = picker.choices.get(picker.selected).cloned();
+                *tree_picker = None;
+                match choice {
+                    Some(TreeChoice::Session { id, .. }) => {
+                        let choice = runtime
+                            .list_sessions()
+                            .await
+                            .ok()
+                            .and_then(|choices| choices.into_iter().find(|c| c.id == id));
+                        match choice {
+                            Some(choice) => {
+                                resume_session(
+                                    choice,
+                                    runtime,
+                                    chat,
+                                    status,
+                                    working,
+                                    message_queue,
+                                    streaming_assistant,
+                                    streaming_thinking,
+                                    redraw_request,
+                                    purge_ui_events,
+                                    tx,
+                                    token_bar,
+                                    refresh_token_bar,
+                                )
+                                .await
+                            }
+                            None => chat.push(sys(format!("session {id} has no messages"))),
+                        }
+                    }
+                    Some(TreeChoice::Entry(row)) => {
+                        let (target, draft) = tree_target(&row);
+                        match runtime
+                            .harness
+                            .navigate_tree_to(target.as_deref(), false)
+                            .await
+                        {
+                            Ok(_) => {
+                                *chat = match runtime
+                                    .backend
+                                    .transcript(&runtime.session_ref())
+                                    .await
+                                {
+                                    Ok(updates) => chat_from_transcript(updates),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "failed to load the session transcript: {e}"
+                                        );
+                                        Vec::new()
+                                    }
+                                };
+                                *redraw_request = true;
+                                *purge_ui_events = true;
+                                *refresh_token_bar = true;
+                                match draft {
+                                    Some(text) => {
+                                        input.set(text);
+                                        chat.push(sys(
+                                            "moved to just before this prompt · edit it and send \
+                                             to start a new branch (the old one stays in /tree)",
+                                        ));
+                                    }
+                                    None => chat.push(sys(
+                                        "moved here · your next prompt continues from this point \
+                                         (the other branches stay in /tree)",
+                                    )),
+                                }
+                                *status = "ready".into();
+                            }
+                            Err(e) => chat.push(error_item(format!("could not move there: {e}"))),
+                        }
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if let Some(picker) = session_picker.as_mut() {
+        match key.code {
+            KeyCode::Esc => {
+                *session_picker = None;
+                *status = "ready".into();
+            }
+            KeyCode::Up => {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if picker.selected + 1 < picker.filtered.len() {
+                    picker.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let choice = picker.selected_choice().cloned();
+                *session_picker = None;
+                if let Some(choice) = choice {
+                    resume_session(
+                        choice,
+                        runtime,
+                        chat,
+                        status,
+                        working,
+                        message_queue,
+                        streaming_assistant,
+                        streaming_thinking,
+                        redraw_request,
+                        purge_ui_events,
+                        tx,
+                        token_bar,
+                        refresh_token_bar,
+                    )
+                    .await;
                 }
             }
             KeyCode::Char(c) => {
@@ -2758,6 +3143,16 @@ async fn handle_key(
         return Ok(());
     }
 
+    // Ctrl+V attaches a copied image; text pastes arrive as paste events.
+    if key.code == KeyCode::Char('v') && key.modifiers == KeyModifiers::CONTROL {
+        match clipboard_image() {
+            Ok(Some(image)) => attach_image(runtime, input, attachments, chat, Ok(image)),
+            Ok(None) => *status = "no image on the clipboard".into(),
+            Err(e) => chat.push(error_item(format!("could not read the clipboard: {e}"))),
+        }
+        return Ok(());
+    }
+
     if let Some(action) = runtime.keybindings.resolve(key) {
         match action {
             Action::Exit if input.is_empty() => {
@@ -2809,7 +3204,7 @@ async fn handle_key(
                 } else if last_escape.elapsed() < Duration::from_millis(500) {
                     match runtime.settings.double_escape_action.as_str() {
                         "tree" => {
-                            chat.push(sys("session tree: use /tree (branch nav in session store)"));
+                            open_tree_picker(runtime, tree_picker, chat, status, *working).await;
                         }
                         "fork" => {
                             open_fork_picker(runtime, fork_picker, model_picker, chat, status)
@@ -2864,6 +3259,8 @@ async fn handle_key(
                             fork_picker,
                             skill_picker,
                             mcp_picker,
+                            session_picker,
+                            tree_picker,
                             hide_thinking,
                             working,
                             message_queue,
@@ -2879,6 +3276,7 @@ async fn handle_key(
                         .await?;
                     }
                 } else {
+                    let images = images_for(runtime, attachments, chat, &line);
                     submit_user_text(
                         runtime,
                         chat,
@@ -2889,6 +3287,7 @@ async fn handle_key(
                         working,
                         message_queue,
                         line,
+                        images,
                         tx,
                     );
                 }
@@ -2978,6 +3377,10 @@ async fn handle_key(
                 open_fork_picker(runtime, fork_picker, model_picker, chat, status).await;
                 return Ok(());
             }
+            Action::SessionTree => {
+                open_tree_picker(runtime, tree_picker, chat, status, *working).await;
+                return Ok(());
+            }
             Action::ModelCycleForward | Action::ModelCycleBackward => {
                 cycle_model(
                     runtime,
@@ -3033,6 +3436,7 @@ async fn handle_key(
                 if !line.is_empty() {
                     history.push(&line);
                     input.clear();
+                    let images = images_for(runtime, attachments, chat, &line);
                     submit_user_text(
                         runtime,
                         chat,
@@ -3043,6 +3447,7 @@ async fn handle_key(
                         working,
                         message_queue,
                         line,
+                        images,
                         tx,
                     );
                 }
@@ -3124,6 +3529,260 @@ impl ModelPickerState {
             self.selected = self.filtered.len().saturating_sub(1);
         }
     }
+}
+
+/// `/sessions`: earlier sessions in this folder, newest first.
+struct SessionPickerState {
+    choices: Vec<loop_app_core::sessions::SessionChoice>,
+    /// Indices into `choices` after filter.
+    filtered: Vec<usize>,
+    selected: usize,
+    query: String,
+}
+
+impl SessionPickerState {
+    fn new(choices: Vec<loop_app_core::sessions::SessionChoice>) -> Self {
+        let filtered = (0..choices.len()).collect();
+        Self {
+            choices,
+            filtered,
+            selected: 0,
+            query: String::new(),
+        }
+    }
+
+    fn refilter(&mut self) {
+        let q = self.query.to_lowercase();
+        self.filtered = self
+            .choices
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.title.to_lowercase().contains(&q) || c.id.contains(&q))
+            .map(|(i, _)| i)
+            .collect();
+        self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+    }
+
+    fn selected_choice(&self) -> Option<&loop_app_core::sessions::SessionChoice> {
+        self.filtered
+            .get(self.selected)
+            .and_then(|&i| self.choices.get(i))
+    }
+}
+
+/// The picker's second column: id, what ran it, size and age.
+fn session_row_details(choice: &loop_app_core::sessions::SessionChoice, now: i64) -> String {
+    let mut parts = vec![choice.id.clone()];
+    if let Some(source) = &choice.source {
+        parts.push(source.clone());
+    }
+    if let Some(n) = choice.message_count {
+        parts.push(format!("{n} messages"));
+    }
+    parts.push(loop_app_core::sessions::ago(now, choice.updated_at));
+    parts.join(" · ")
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+/// Switch to `choice`: Loop's own sessions in place, with their transcript;
+/// subscription sessions by restarting the agent on them, which replays it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "follows the other session switches in this file"
+)]
+async fn resume_session(
+    choice: loop_app_core::sessions::SessionChoice,
+    runtime: &mut CliRuntime,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    working: &mut bool,
+    message_queue: &mut VecDeque<QueuedMessage>,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
+    redraw_request: &mut bool,
+    purge_ui_events: &mut bool,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+    token_bar: &mut TokenBarState,
+    refresh_token_bar: &mut bool,
+) {
+    if *working {
+        chat.push(sys("stop the current turn first (esc), then resume"));
+        return;
+    }
+    if let Some(agent) = &runtime.starting_agent {
+        chat.push(sys(format!(
+            "{agent} is still starting; resume once it is ready"
+        )));
+        return;
+    }
+    if choice.id == runtime.session_id {
+        chat.push(sys(format!("already in session {}", choice.id)));
+        return;
+    }
+    message_queue.clear();
+    *streaming_assistant = None;
+    *streaming_thinking = None;
+    match choice.agent {
+        Some(record) => {
+            // Approvals accepted in the previous session don't carry over.
+            if let Some(bridge) = &runtime.tool_approval {
+                bridge.clear_session_grants();
+            }
+            chat.clear();
+            *redraw_request = true;
+            *purge_ui_events = true;
+            let note = start_agent(runtime, PendingAgent::Resume(record), tx);
+            chat.push(sys(note));
+            *status = format!("resuming · {}", choice.title);
+        }
+        None => match runtime.open_native_session(&choice.id).await {
+            Ok(()) => {
+                *chat = match runtime.backend.transcript(&runtime.session_ref()).await {
+                    Ok(updates) => chat_from_transcript(updates),
+                    Err(e) => {
+                        tracing::warn!("failed to load the session transcript: {e}");
+                        Vec::new()
+                    }
+                };
+                chat.push(sys(format!("resumed {} · {}", choice.id, choice.title)));
+                *status = "ready · resumed".into();
+                *redraw_request = true;
+                *purge_ui_events = true;
+                *refresh_token_bar = true;
+                token_bar.sync_window(runtime);
+            }
+            Err(e) => chat.push(error_item(format!("could not resume {}: {e:#}", choice.id))),
+        },
+    }
+}
+
+/// One `/tree` row: a point in this Session, or a related Session.
+#[derive(Debug, Clone)]
+enum TreeChoice {
+    Entry(SessionTreeRow),
+    /// The Session this one was forked or cloned from, or one forked or
+    /// cloned from it.
+    Session {
+        id: String,
+        label: String,
+    },
+}
+
+struct TreePickerState {
+    choices: Vec<TreeChoice>,
+    selected: usize,
+}
+
+impl TreePickerState {
+    /// The rows with the current one selected, then the related Sessions.
+    fn new(rows: Vec<SessionTreeRow>, sessions: Vec<(String, String)>) -> Self {
+        let selected = rows.iter().position(|row| row.current).unwrap_or(0);
+        let mut choices: Vec<TreeChoice> = rows.into_iter().map(TreeChoice::Entry).collect();
+        choices.extend(
+            sessions
+                .into_iter()
+                .map(|(id, label)| TreeChoice::Session { id, label }),
+        );
+        Self { choices, selected }
+    }
+
+    fn rows(&self) -> Vec<PickerRow> {
+        self.choices
+            .iter()
+            .map(|choice| match choice {
+                TreeChoice::Entry(row) => {
+                    let icon = match row.kind {
+                        SessionTreeRowKind::User => "❯",
+                        SessionTreeRowKind::Assistant => " ",
+                        SessionTreeRowKind::Summary => "≡",
+                    };
+                    PickerRow {
+                        label: format!("{}{icon} {}", "  ".repeat(row.depth), row.preview),
+                        description: if row.current {
+                            "you are here".into()
+                        } else if row.on_branch {
+                            "this branch".into()
+                        } else {
+                            String::new()
+                        },
+                        mark: row.current.then(|| "●".into()),
+                    }
+                }
+                TreeChoice::Session { label, id } => PickerRow {
+                    label: format!("⑂ {label}"),
+                    description: id.clone(),
+                    mark: None,
+                },
+            })
+            .collect()
+    }
+}
+
+/// Where choosing `row` moves the Session, and the prompt to edit: a
+/// prompt goes back to just before it, any other row to itself.
+fn tree_target(row: &SessionTreeRow) -> (Option<String>, Option<String>) {
+    match row.kind {
+        SessionTreeRowKind::User => (row.parent_id.clone(), row.text.clone()),
+        _ => (Some(row.entry_id.clone()), None),
+    }
+}
+
+async fn open_tree_picker(
+    runtime: &CliRuntime,
+    tree_picker: &mut Option<TreePickerState>,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    working: bool,
+) {
+    if working {
+        chat.push(sys("wait for the current turn to finish, then /tree"));
+        return;
+    }
+    if !runtime.is_native() {
+        chat.push(sys(
+            "/tree shows Loop's own sessions · pick a Loop model with /model first",
+        ));
+        return;
+    }
+    let rows = match runtime.harness.session_tree().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            chat.push(error_item(format!("could not read the session tree: {e}")));
+            return;
+        }
+    };
+    let titles: std::collections::HashMap<String, String> = runtime
+        .list_sessions()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| (c.id, c.title))
+        .collect();
+    let title = |id: &str| titles.get(id).cloned().unwrap_or_else(|| id.to_owned());
+    let mut sessions = Vec::new();
+    if let Ok((parent, children)) = runtime.harness.session_family().await {
+        if let Some(parent) = parent {
+            sessions.push((
+                parent.id.clone(),
+                format!("forked from · {}", title(&parent.id)),
+            ));
+        }
+        for child in children {
+            sessions.push((child.id.clone(), format!("fork · {}", title(&child.id))));
+        }
+    }
+    if rows.is_empty() && sessions.is_empty() {
+        chat.push(sys("nothing in this session yet"));
+        return;
+    }
+    *tree_picker = Some(TreePickerState::new(rows, sessions));
+    *status = "tree · pick a point or a session".into();
 }
 
 struct ForkPickerState {
@@ -3679,6 +4338,7 @@ fn handle_update(
     token_bar: &mut TokenBarState,
     refresh_token_bar: &mut bool,
     source: Option<&str>,
+    live_plan: &mut Option<Vec<PlanEntry>>,
 ) {
     let live = origin == Origin::Live;
     match update {
@@ -3703,6 +4363,10 @@ fn handle_update(
             }
         }
         SessionUpdate::MessageStarted { role, .. } => {
+            // A prompt starts a new turn (a replay has no turn ends).
+            if role == Role::User {
+                land_plan(chat, live_plan);
+            }
             // Agent items are created lazily on the first chunk so that
             // thinking and tool items land in true stream order.
             if role == Role::Agent {
@@ -3792,6 +4456,28 @@ fn handle_update(
         }
         SessionUpdate::ToolCall(call) => {
             let raw_name = call.name.as_deref().unwrap_or(&call.title);
+            // Loop's `todo` shows as the checklist its Plan update brings.
+            if source.is_none() && raw_name == "todo" {
+                return;
+            }
+            // A plan to approve reads as the agent's message.
+            if source.is_none() && raw_name == loop_agent::harness::EXIT_PLAN_TOOL {
+                *streaming_assistant = None;
+                finish_thinking(chat, streaming_thinking);
+                let plan = call
+                    .raw_input
+                    .as_ref()
+                    .and_then(|input| input.get("plan"))
+                    .and_then(|plan| plan.as_str())
+                    .unwrap_or_default();
+                push_before_queued(
+                    chat,
+                    ChatItem::Assistant {
+                        text: format!("**Plan**\n\n{plan}"),
+                    },
+                );
+                return;
+            }
             let name = tool_display_name(source, raw_name);
             if live {
                 *turn_step = format!("tool · {name}");
@@ -3824,6 +4510,15 @@ fn handle_update(
             );
         }
         SessionUpdate::ToolCallUpdate(mut update) => {
+            let todo_done = source.is_none()
+                && matches!(
+                    update.name.as_deref(),
+                    Some("todo" | loop_agent::harness::EXIT_PLAN_TOOL)
+                )
+                && update.status != Some(ToolCallStatus::Failed);
+            if todo_done {
+                return;
+            }
             update.name = update.name.map(|name| tool_display_name(source, &name));
             apply_tool_update(update, live, chat, turn_step);
         }
@@ -3833,6 +4528,7 @@ fn handle_update(
             }
         }
         SessionUpdate::TurnEnded { stop, error, .. } => {
+            land_plan(chat, live_plan);
             if let Some(error) = error {
                 push_before_queued(chat, error_item(format!("error: {}", error.message)));
             } else if live && stop == StopReason::Cancelled {
@@ -3855,12 +4551,28 @@ fn handle_update(
                 *refresh_token_bar = true;
             }
         }
-        // Approvals arrive through HostServices, not the update stream; plans
-        // are not shown yet; unknown updates come from newer backends.
+        // Within a turn only the latest checklist shows, in place.
+        SessionUpdate::Plan { entries } => *live_plan = Some(entries),
+        // Approvals arrive through HostServices, not the update stream;
+        // unknown updates come from newer backends.
         SessionUpdate::InteractionRequested { .. }
         | SessionUpdate::InteractionResolved { .. }
-        | SessionUpdate::Plan { .. }
         | SessionUpdate::Unknown(_) => {}
+    }
+}
+
+/// Put the turn's checklist in the transcript, unless it is the one shown
+/// last.
+fn land_plan(chat: &mut Vec<ChatItem>, live_plan: &mut Option<Vec<PlanEntry>>) {
+    let Some(entries) = live_plan.take() else {
+        return;
+    };
+    let last = chat.iter().rev().find_map(|item| match item {
+        ChatItem::Plan { entries } => Some(entries),
+        _ => None,
+    });
+    if last != Some(&entries) {
+        push_before_queued(chat, ChatItem::Plan { entries });
     }
 }
 
@@ -3962,6 +4674,75 @@ fn apply_tool_update(
     }
 }
 
+/// `/export`'s argument: `--force` (before or after) and the path.
+fn export_args(arg: Option<&str>) -> (bool, Option<String>) {
+    let mut force = false;
+    let words: Vec<&str> = arg
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter(|word| {
+            let flag = *word == "--force";
+            force |= flag;
+            !flag
+        })
+        .collect();
+    let path = (!words.is_empty()).then(|| words.join(" "));
+    (force, path)
+}
+
+/// The export files that are already there.
+fn existing_export_files(markdown: &Path, session_file: &Path) -> Vec<PathBuf> {
+    [markdown, session_file]
+        .into_iter()
+        .filter(|path| path.exists())
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+/// Whether `/export` may write: nothing would be overwritten, `--force` was
+/// given, or this is the same `/export` (`key`) repeated to confirm, as
+/// `/permissions full-access` is. Otherwise it remembers `key` and asks.
+fn export_may_write(
+    existing: &[PathBuf],
+    force: bool,
+    pending: &mut Option<String>,
+    key: &str,
+) -> bool {
+    let confirmed = pending.take().is_some_and(|asked| asked == key);
+    if existing.is_empty() || force || confirmed {
+        return true;
+    }
+    *pending = Some(key.to_owned());
+    false
+}
+
+/// Where every release's notes are published.
+const RELEASES_URL: &str = "https://github.com/soketlabs/loop/releases";
+
+/// What `/changelog` shows for `version`: the notes published with its
+/// release, never text of Loop's own.
+fn changelog_text(
+    version: &str,
+    notes: Result<loop_update::ReleaseNotes, String>,
+) -> Result<String, String> {
+    let notes = notes.map_err(|e| {
+        format!(
+            "no release notes for Loop {version} ({e}). A build from source may not be a \
+             release; all notes are at {RELEASES_URL}"
+        )
+    })?;
+    let body = notes.body.trim();
+    let body = if body.is_empty() {
+        "This release has no notes."
+    } else {
+        body
+    };
+    Ok(format!(
+        "Loop {} release notes\n{}\n\n{body}",
+        notes.tag, notes.url
+    ))
+}
+
 /// Text of tool output, one block per line. Diffs and other non-text content
 /// are left to dedicated views.
 fn tool_text(content: &[ToolContent]) -> String {
@@ -4034,6 +4815,7 @@ fn chat_from_agent_transcript(updates: Vec<SessionUpdate>, source: Option<&str>)
         context_tokens: None,
         context_window: 0,
     };
+    let mut live_plan = None;
     for update in updates {
         handle_update(
             update,
@@ -4047,8 +4829,10 @@ fn chat_from_agent_transcript(updates: Vec<SessionUpdate>, source: Option<&str>)
             &mut token_bar,
             &mut refresh,
             source,
+            &mut live_plan,
         );
     }
+    land_plan(&mut chat, &mut live_plan);
     chat
 }
 
@@ -4316,6 +5100,8 @@ async fn apply_effect(
     fork_picker: &mut Option<ForkPickerState>,
     skill_picker: &mut Option<SkillPickerState>,
     mcp_picker: &mut Option<McpPickerState>,
+    session_picker: &mut Option<SessionPickerState>,
+    tree_picker: &mut Option<TreePickerState>,
     hide_thinking: &mut bool,
     working: &mut bool,
     message_queue: &mut VecDeque<QueuedMessage>,
@@ -4400,7 +5186,10 @@ async fn apply_effect(
                 "permission mode: {} — /permissions <mode> to switch",
                 current.as_str()
             )];
-            for mode in PermissionMode::ALL {
+            for mode in PermissionMode::ALL
+                .into_iter()
+                .chain([PermissionMode::Plan])
+            {
                 let mark = if mode == current { "●" } else { " " };
                 lines.push(format!(
                     "  {mark} {:<13} {}",
@@ -4422,6 +5211,14 @@ async fn apply_effect(
                      /permissions full-access again to confirm.",
                 ));
             }
+            Some(PermissionMode::Plan) => {
+                runtime.confirm_full_access = false;
+                runtime.set_permission_mode(PermissionMode::Plan).await;
+                chat.push(sys(
+                    "plan mode · the agent investigates and proposes a plan; nothing changes \
+                     until you approve it, then work continues in the mode you had",
+                ));
+            }
             Some(mode) => {
                 runtime.confirm_full_access = false;
                 runtime.set_permission_mode(mode).await;
@@ -4432,7 +5229,7 @@ async fn apply_effect(
                 )));
             }
             None => chat.push(error_item(format!(
-                "unknown mode `{arg}`: use read-only, ask, accept-edits or full-access"
+                "unknown mode `{arg}`: use read-only, ask, accept-edits, full-access or plan"
             ))),
         },
         CommandEffect::WebSearch(arg) => {
@@ -4483,6 +5280,7 @@ async fn apply_effect(
                 ["off"] | ["disabled"] => {
                     let harness = Arc::clone(&runtime.harness);
                     let web = runtime.web_tools();
+                    let search = runtime.tool_gate.search_filter();
                     let bash = runtime.bash_limits();
                     let tx = tx.clone();
                     *working = true;
@@ -4497,7 +5295,7 @@ async fn apply_effect(
                                 .await
                                 .map_err(|e| format!("sandbox: {e}"))?;
                             harness
-                                .set_tools(build_tools(env, &web, bash))
+                                .set_tools(build_tools(env, &web, bash, search))
                                 .await
                                 .map_err(|e| format!("sandbox: {e}"))?;
                             Ok(SandboxDoneOk::Off)
@@ -4518,6 +5316,7 @@ async fn apply_effect(
                     let harness = Arc::clone(&runtime.harness);
                     let cwd = runtime.cwd.clone();
                     let web = runtime.web_tools();
+                    let search = runtime.tool_gate.search_filter();
                     let bash = runtime.bash_limits();
                     let tx = tx.clone();
                     let iso_s = isolation.as_str().to_string();
@@ -4536,7 +5335,7 @@ async fn apply_effect(
                             sb.start().await.map_err(|e| e.to_string())?;
                             let env = sb.env();
                             if let Err(e) = harness
-                                .set_tools(build_tools(Arc::clone(&env), &web, bash))
+                                .set_tools(build_tools(Arc::clone(&env), &web, bash, search))
                                 .await
                             {
                                 let _ = sb.destroy().await;
@@ -4896,32 +5695,168 @@ async fn apply_effect(
                 chat.push(sys(text));
             }
         }
-        CommandEffect::Resume => {
-            chat.push(sys(
-                "resume: restart with `loop --resume <session-id>` (picker UI forthcoming)",
-            ));
-            if !runtime.session_id.is_empty() {
-                chat.push(sys(format!("current session id: {}", runtime.session_id)));
+        CommandEffect::Resume(id) => {
+            let choices = match runtime.list_sessions().await {
+                Ok(choices) => choices,
+                Err(e) => {
+                    chat.push(error_item(format!("could not list sessions: {e:#}")));
+                    return Ok(false);
+                }
+            };
+            match id {
+                Some(id) => {
+                    // Ids start with a timestamp, so a short prefix can match
+                    // several sessions: resume only an exact or unique match.
+                    let matching: Vec<_> = match choices.iter().find(|c| c.id == id) {
+                        Some(exact) => vec![exact.clone()],
+                        None => choices
+                            .iter()
+                            .filter(|c| c.id.starts_with(&id))
+                            .cloned()
+                            .collect(),
+                    };
+                    match <[_; 1]>::try_from(matching) {
+                        Ok([choice]) => {
+                            resume_session(
+                                choice,
+                                runtime,
+                                chat,
+                                status,
+                                working,
+                                message_queue,
+                                streaming_assistant,
+                                streaming_thinking,
+                                redraw_request,
+                                purge_ui_events,
+                                tx,
+                                token_bar,
+                                refresh_token_bar,
+                            )
+                            .await
+                        }
+                        Err(matching) if matching.is_empty() => chat.push(sys(format!(
+                            "no session `{id}` in this folder; /sessions lists them"
+                        ))),
+                        Err(matching) => {
+                            let mut picker = SessionPickerState::new(matching);
+                            picker.query = id;
+                            *session_picker = Some(picker);
+                            *status = "several sessions match · pick one".into();
+                        }
+                    }
+                }
+                None if choices.is_empty() => {
+                    chat.push(sys("no earlier sessions in this folder"));
+                }
+                None => {
+                    *model_picker = None;
+                    *fork_picker = None;
+                    *skill_picker = None;
+                    *mcp_picker = None;
+                    *session_picker = Some(SessionPickerState::new(choices));
+                    *status = "sessions · pick one to resume".into();
+                }
             }
         }
         CommandEffect::Tree => {
-            chat.push(sys(
-                "session tree stored in SQLite — use /fork /clone; full tree UI forthcoming",
-            ));
+            open_tree_picker(runtime, tree_picker, chat, status, *working).await;
         }
-        CommandEffect::SetName(name) => {
-            chat.push(sys(format!("session name → {name}")));
+        CommandEffect::SetName(name) if name.trim().is_empty() => {
+            chat.push(sys("Usage: /name <name>"));
         }
-        CommandEffect::Export(path) => {
-            chat.push(sys(format!("export: path {:?}", path)));
+        CommandEffect::SetName(name) => match runtime.rename_session(name.trim()).await {
+            Ok(()) => chat.push(sys(format!("session name → {}", name.trim()))),
+            Err(e) => chat.push(error_item(format!("could not name the session: {e:#}"))),
+        },
+        CommandEffect::Export(arg) => {
+            let (force, path) = export_args(arg.as_deref());
+            let (markdown, session_file) = loop_app_core::sessions::export_paths(
+                &runtime.cwd,
+                &runtime.session_id,
+                path.as_deref(),
+            );
+            let existing = existing_export_files(&markdown, &session_file);
+            let key = path.clone().unwrap_or_default();
+            if !export_may_write(&existing, force, &mut runtime.confirm_export, &key) {
+                let names: Vec<String> = existing.iter().map(|p| p.display().to_string()).collect();
+                let again = format!("/export {key}").trim_end().to_owned();
+                let exist = if names.len() == 1 { "exists" } else { "exist" };
+                chat.push(error_item(format!(
+                    "{} already {exist}. Run {again} again to overwrite, or /export --force \
+                     {key} to skip this check. Nothing was written.",
+                    names.join(" and ")
+                )));
+                return Ok(false);
+            }
+            match runtime.export_session(path.as_deref()).await {
+                Ok((markdown, session_file)) => chat.push(sys(format!(
+                    "exported\n  transcript    {}\n  session file  {} (open it with /import)",
+                    markdown.display(),
+                    session_file.display()
+                ))),
+                Err(e) => chat.push(error_item(format!("could not export: {e:#}"))),
+            }
         }
         CommandEffect::Import(path) => {
-            chat.push(sys(format!("import not yet wired: {path}")));
+            if *working {
+                chat.push(sys("wait for the current turn to finish, then /import"));
+                return Ok(false);
+            }
+            let id = match runtime.import_session(path.trim()).await {
+                Ok(id) => id,
+                Err(e) => {
+                    chat.push(error_item(format!("could not import: {e:#}")));
+                    return Ok(false);
+                }
+            };
+            let choice = runtime
+                .list_sessions()
+                .await
+                .ok()
+                .and_then(|choices| choices.into_iter().find(|c| c.id == id));
+            match choice {
+                Some(choice) => {
+                    chat.push(sys(format!("imported {} as a new session", path.trim())));
+                    resume_session(
+                        choice,
+                        runtime,
+                        chat,
+                        status,
+                        working,
+                        message_queue,
+                        streaming_assistant,
+                        streaming_thinking,
+                        redraw_request,
+                        purge_ui_events,
+                        tx,
+                        token_bar,
+                        refresh_token_bar,
+                    )
+                    .await
+                }
+                // `/sessions` lists only Sessions with messages.
+                None => chat.push(sys(format!(
+                    "imported as {id}, but the file has no messages to continue"
+                ))),
+            }
         }
         CommandEffect::Changelog => {
-            chat.push(sys(
-                "Loop 0.1.0 — interactive coding agent by Soket AI\n- Soket dynamic models\n- ratatui CLI\n- skills, themes, sandbox",
-            ));
+            if !*working {
+                *status = "changelog · loading the release notes…".into();
+            }
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let version = env!("CARGO_PKG_VERSION");
+                let notes = async {
+                    let client = loop_update::ReleaseClient::github(Duration::from_secs(10))?;
+                    client
+                        .notes(&loop_update::ReleaseVersion::parse(version)?)
+                        .await
+                }
+                .await
+                .map_err(|e| e.to_string());
+                let _ = tx.send(UiEvent::Changelog(changelog_text(version, notes)));
+            });
         }
         CommandEffect::ScopedModels => {
             chat.push(sys(format!(
@@ -5061,7 +5996,7 @@ async fn apply_effect(
                 let prompt = format_prompt_template_invocation(tmpl, &args);
                 let display = format!("/{name} {args}");
                 if agent_is_busy(runtime, *working) {
-                    enqueue_user_message(chat, message_queue, display, prompt);
+                    enqueue_user_message(chat, message_queue, display, prompt, Vec::new());
                     *status = format!("{} messages queued", message_queue.len());
                 } else {
                     start_user_turn(
@@ -5074,6 +6009,7 @@ async fn apply_effect(
                         working,
                         display,
                         prompt,
+                        Vec::new(),
                         tx,
                     );
                 }
@@ -5347,6 +6283,7 @@ mod tests {
                 &mut token_bar,
                 &mut refresh,
                 None,
+                &mut None,
             );
         }
         (chat, status)
@@ -5390,6 +6327,7 @@ mod tests {
                 &mut token_bar,
                 &mut refresh,
                 None,
+                &mut None,
             );
         }
         chat
@@ -5558,5 +6496,424 @@ mod reasoning_notice_tests {
             take_reasoning_notice(&model, &mut reported).is_none(),
             "one notice per model"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_picker_tests {
+    use super::*;
+    use loop_app_core::sessions::SessionChoice;
+
+    fn choice(id: &str, title: &str, source: Option<&str>) -> SessionChoice {
+        SessionChoice {
+            id: id.into(),
+            title: title.into(),
+            source: source.map(str::to_owned),
+            message_count: source.is_some().then_some(6),
+            updated_at: 0,
+            agent: None,
+        }
+    }
+
+    #[test]
+    fn typing_filters_by_title_or_id() {
+        let mut picker = SessionPickerState::new(vec![
+            choice("aaa-111", "Fix the login bug", Some("soket/qwen")),
+            choice("bbb-222", "Write release notes", None),
+        ]);
+        picker.query = "LOGIN".into();
+        picker.refilter();
+        assert_eq!(picker.selected_choice().unwrap().id, "aaa-111");
+        picker.query = "bbb".into();
+        picker.refilter();
+        assert_eq!(picker.selected_choice().unwrap().id, "bbb-222");
+        picker.query = "nothing".into();
+        picker.refilter();
+        assert!(picker.selected_choice().is_none());
+    }
+
+    #[test]
+    fn rows_show_id_source_size_and_age() {
+        let row = session_row_details(&choice("aaa-111", "t", Some("soket/qwen")), 3_600_000);
+        assert_eq!(row, "aaa-111 · soket/qwen · 6 messages · 1h ago");
+        assert_eq!(
+            session_row_details(&choice("b", "t", None), 0),
+            "b · just now"
+        );
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use loop_protocol::{
+        PlanEntry, PlanEntryStatus, ToolCall, ToolCallId, ToolCallUpdate, ToolKind,
+    };
+
+    fn todo_call(id: &str) -> SessionUpdate {
+        SessionUpdate::ToolCall(ToolCall {
+            id: ToolCallId(id.into()),
+            name: Some("todo".into()),
+            title: "todo".into(),
+            kind: ToolKind::Think,
+            status: ToolCallStatus::InProgress,
+            content: vec![],
+            locations: vec![],
+            raw_input: Some(serde_json::json!({"todos": []})),
+        })
+    }
+
+    fn todo_done(id: &str, status: ToolCallStatus) -> SessionUpdate {
+        let mut done = ToolCallUpdate::new(ToolCallId(id.into()));
+        done.name = Some("todo".into());
+        done.status = Some(status);
+        SessionUpdate::ToolCallUpdate(done)
+    }
+
+    fn plan(entries: &[(&str, PlanEntryStatus)]) -> SessionUpdate {
+        SessionUpdate::Plan {
+            entries: entries
+                .iter()
+                .map(|(content, status)| PlanEntry {
+                    content: (*content).into(),
+                    status: *status,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_plan_shows_as_a_checklist_instead_of_a_todo_card() {
+        use PlanEntryStatus::*;
+        let chat = chat_from_transcript(vec![
+            todo_call("t1"),
+            todo_done("t1", ToolCallStatus::Completed),
+            plan(&[
+                ("read the code", Completed),
+                ("fix it", InProgress),
+                ("test", Pending),
+            ]),
+        ]);
+        assert_eq!(chat.len(), 1, "{chat:?}");
+        let ChatItem::Plan { entries } = &chat[0] else {
+            panic!("expected a plan: {chat:?}");
+        };
+        assert_eq!(entries.len(), 3);
+        let text = crate::tui::format_item_lines(&chat[0], &Theme::dark(), false, false, 80)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("1/3 done"), "{text}");
+        assert!(text.contains("✔ read the code"), "{text}");
+        assert!(text.contains("◼ fix it"), "{text}");
+        assert!(text.contains("☐ test"), "{text}");
+    }
+
+    #[test]
+    fn a_plan_to_approve_reads_as_the_agents_message() {
+        let mut call = todo_call("p1");
+        if let SessionUpdate::ToolCall(call) = &mut call {
+            call.name = Some("exit_plan".into());
+            call.raw_input = Some(serde_json::json!({"plan": "1. Edit main.rs"}));
+        }
+        let mut done = ToolCallUpdate::new(ToolCallId("p1".into()));
+        done.name = Some("exit_plan".into());
+        done.status = Some(ToolCallStatus::Completed);
+        let chat = chat_from_transcript(vec![call, SessionUpdate::ToolCallUpdate(done)]);
+        assert!(
+            matches!(&chat[..], [ChatItem::Assistant { text }] if text.contains("1. Edit main.rs")),
+            "{chat:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_todo_call_still_shows_its_error() {
+        let chat = chat_from_transcript(vec![
+            todo_call("t1"),
+            todo_done("t1", ToolCallStatus::Failed),
+        ]);
+        assert!(
+            matches!(
+                &chat[..],
+                [ChatItem::Tool {
+                    status: CardStatus::Error,
+                    ..
+                }]
+            ),
+            "{chat:?}"
+        );
+    }
+
+    fn user(text: &str, n: u32) -> Vec<SessionUpdate> {
+        let id = loop_protocol::MessageId(format!("u{n}"));
+        vec![
+            SessionUpdate::MessageStarted {
+                message_id: id.clone(),
+                role: loop_protocol::Role::User,
+            },
+            SessionUpdate::MessageChunk {
+                message_id: id.clone(),
+                role: loop_protocol::Role::User,
+                content: loop_protocol::ContentBlock::text(text),
+            },
+            SessionUpdate::MessageEnded { message_id: id },
+        ]
+    }
+
+    fn turn_ended() -> SessionUpdate {
+        SessionUpdate::TurnEnded {
+            turn_id: loop_protocol::TurnId("t".into()),
+            stop: StopReason::EndTurn,
+            error: None,
+        }
+    }
+
+    fn plans(chat: &[ChatItem]) -> Vec<Vec<PlanEntryStatus>> {
+        chat.iter()
+            .filter_map(|item| match item {
+                ChatItem::Plan { entries } => Some(entries.iter().map(|e| e.status).collect()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn within_a_turn_the_checklist_updates_in_place_and_lands_once() {
+        use PlanEntryStatus::*;
+        let mut chat = Vec::new();
+        let mut live_plan = None;
+        let (mut status, mut step) = (String::new(), String::new());
+        let (mut assistant, mut thinking, mut working, mut refresh) = (None, None, true, false);
+        let mut token_bar = TokenBarState {
+            total_tokens: 0,
+            context_tokens: None,
+            context_window: 0,
+        };
+        let mut feed = |update, chat: &mut Vec<ChatItem>, live_plan: &mut _| {
+            handle_update(
+                update,
+                Origin::Live,
+                chat,
+                &mut status,
+                &mut step,
+                &mut assistant,
+                &mut thinking,
+                &mut working,
+                &mut token_bar,
+                &mut refresh,
+                None,
+                live_plan,
+            )
+        };
+        feed(
+            plan(&[("a", InProgress), ("b", Pending)]),
+            &mut chat,
+            &mut live_plan,
+        );
+        feed(
+            plan(&[("a", Completed), ("b", InProgress)]),
+            &mut chat,
+            &mut live_plan,
+        );
+        assert!(plans(&chat).is_empty(), "nothing lands mid-turn");
+        assert_eq!(
+            live_plan.as_ref().map(|e: &Vec<PlanEntry>| e[1].status),
+            Some(InProgress),
+            "the live checklist is the latest one"
+        );
+        feed(turn_ended(), &mut chat, &mut live_plan);
+        assert_eq!(plans(&chat), [vec![Completed, InProgress]]);
+        assert!(live_plan.is_none());
+
+        // The next turn sends the same checklist: it is not shown again.
+        feed(
+            plan(&[("a", Completed), ("b", InProgress)]),
+            &mut chat,
+            &mut live_plan,
+        );
+        feed(turn_ended(), &mut chat, &mut live_plan);
+        assert_eq!(plans(&chat).len(), 1);
+    }
+
+    #[test]
+    fn replay_shows_one_checklist_per_turn_like_live() {
+        use PlanEntryStatus::*;
+        let mut updates = user("go", 1);
+        updates.push(plan(&[("a", InProgress), ("b", Pending)]));
+        updates.push(plan(&[("a", Completed), ("b", Completed)]));
+        updates.extend(user("again", 2));
+        updates.push(plan(&[("a", Completed), ("b", Completed)]));
+        updates.extend(user("more", 3));
+        updates.push(plan(&[("c", Pending)]));
+        let chat = chat_from_transcript(updates);
+        assert_eq!(plans(&chat), [vec![Completed, Completed], vec![Pending]]);
+        let first = chat
+            .iter()
+            .position(|item| matches!(item, ChatItem::Plan { .. }))
+            .unwrap();
+        assert!(
+            matches!(&chat[first + 1], ChatItem::User { text } if text == "again"),
+            "the checklist closes its turn: {chat:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod changelog_tests {
+    use super::*;
+
+    #[test]
+    fn the_changelog_is_the_published_release_notes() {
+        let notes = loop_update::ReleaseNotes {
+            tag: "v0.5.0".into(),
+            body: "## What's Changed\n* grep tool".into(),
+            url: "https://github.com/soketlabs/loop/releases/tag/v0.5.0".into(),
+        };
+        assert_eq!(
+            changelog_text("0.5.0", Ok(notes)).unwrap(),
+            "Loop v0.5.0 release notes\nhttps://github.com/soketlabs/loop/releases/tag/v0.5.0\n\n\
+             ## What's Changed\n* grep tool"
+        );
+    }
+
+    #[test]
+    fn missing_notes_say_so_and_point_to_the_releases() {
+        let empty = loop_update::ReleaseNotes {
+            tag: "v0.5.0".into(),
+            body: "  ".into(),
+            url: "https://github.com/soketlabs/loop/releases/tag/v0.5.0".into(),
+        };
+        let text = changelog_text("0.5.0", Ok(empty)).unwrap();
+        assert!(text.ends_with("This release has no notes."), "{text}");
+
+        let err =
+            changelog_text("0.6.0-dev", Err("HTTP status client error (404)".into())).unwrap_err();
+        assert!(err.contains("no release notes for Loop 0.6.0-dev"), "{err}");
+        assert!(err.contains("404"), "{err}");
+        assert!(err.contains(RELEASES_URL), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod tree_picker_tests {
+    use super::*;
+
+    fn row(id: &str, parent: &str, kind: SessionTreeRowKind, depth: usize) -> SessionTreeRow {
+        SessionTreeRow {
+            entry_id: id.into(),
+            parent_id: Some(parent.into()),
+            depth,
+            kind,
+            preview: format!("{id} text"),
+            text: (kind == SessionTreeRowKind::User).then(|| format!("{id} full")),
+            on_branch: id != "u2",
+            current: id == "a3",
+        }
+    }
+
+    #[test]
+    fn rows_indent_mark_the_current_point_and_list_related_sessions() {
+        use SessionTreeRowKind::*;
+        let picker = TreePickerState::new(
+            vec![
+                row("u1", "m", User, 0),
+                row("u2", "u1", User, 1),
+                row("a3", "u1", Assistant, 1),
+            ],
+            vec![("s-1".into(), "fork · try again".into())],
+        );
+        assert_eq!(picker.selected, 2, "starts at the current point");
+        let rows = picker.rows();
+        assert_eq!(rows[0].label, "❯ u1 text");
+        assert_eq!(rows[0].description, "this branch");
+        assert_eq!(rows[1].label, "  ❯ u2 text");
+        assert_eq!(rows[1].description, "");
+        assert_eq!(rows[2].description, "you are here");
+        assert_eq!(rows[2].mark.as_deref(), Some("●"));
+        assert_eq!(rows[3].label, "⑂ fork · try again");
+    }
+
+    #[test]
+    fn a_prompt_goes_back_to_just_before_it_and_other_rows_to_themselves() {
+        let prompt = row("u2", "a1", SessionTreeRowKind::User, 1);
+        assert_eq!(
+            tree_target(&prompt),
+            (Some("a1".into()), Some("u2 full".into()))
+        );
+        let answer = row("a3", "u1", SessionTreeRowKind::Assistant, 1);
+        assert_eq!(tree_target(&answer), (Some("a3".into()), None));
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    #[test]
+    fn force_is_a_flag_before_or_after_the_path() {
+        assert_eq!(export_args(None), (false, None));
+        assert_eq!(
+            export_args(Some("notes/a")),
+            (false, Some("notes/a".into()))
+        );
+        assert_eq!(
+            export_args(Some("--force notes/a")),
+            (true, Some("notes/a".into()))
+        );
+        assert_eq!(
+            export_args(Some("notes/a --force")),
+            (true, Some("notes/a".into()))
+        );
+        assert_eq!(export_args(Some("--force")), (true, None));
+    }
+
+    #[test]
+    fn overwriting_needs_the_same_export_twice_or_force() {
+        let mut pending = None;
+        let existing = vec![std::path::PathBuf::from("/w/a.md")];
+        assert!(
+            !export_may_write(&existing, false, &mut pending, "a"),
+            "asks first"
+        );
+        assert_eq!(pending.as_deref(), Some("a"));
+        assert!(
+            export_may_write(&existing, false, &mut pending, "a"),
+            "repeated: confirmed"
+        );
+        assert!(pending.is_none());
+
+        assert!(!export_may_write(&existing, false, &mut pending, "a"));
+        assert!(
+            !export_may_write(&existing, false, &mut pending, "b"),
+            "another path asks again"
+        );
+        assert!(
+            export_may_write(&existing, true, &mut pending, "c"),
+            "--force"
+        );
+        assert!(pending.is_none());
+        assert!(
+            export_may_write(&[], false, &mut pending, "d"),
+            "nothing to overwrite"
+        );
+    }
+
+    #[test]
+    fn a_declined_export_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (markdown, file) = loop_app_core::sessions::export_paths(dir.path(), "s1", Some("a"));
+        std::fs::write(&markdown, "keep").unwrap();
+        let existing = existing_export_files(&markdown, &file);
+        assert_eq!(existing, vec![markdown.clone()]);
+        let mut pending = None;
+        assert!(!export_may_write(&existing, false, &mut pending, "a"));
+        assert_eq!(std::fs::read_to_string(&markdown).unwrap(), "keep");
+        assert!(!file.exists());
     }
 }

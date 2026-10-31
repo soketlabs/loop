@@ -6,8 +6,10 @@ use crate::types::{AssistantMessage, Model, StopReason};
 pub fn is_context_overflow(model: &Model, message: &AssistantMessage) -> bool {
     if message.stop_reason != StopReason::Error {
         // Silent overflow: input beyond context window with length stop and tiny output.
+        let u = &message.usage;
+        let prompt = u.input + u.cache_read + u.cache_write;
         if message.stop_reason == StopReason::Length
-            && message.usage.input > model.context_window
+            && prompt > model.context_window
             && message.usage.output == 0
         {
             return true;
@@ -37,6 +39,7 @@ const OVERFLOW_PATTERNS: &[&str] = &[
     "string_above_max_length",
     "input is too long",
     "request too large",
+    "exceeds the maximum number of tokens",
 ];
 
 #[cfg(test)]
@@ -78,6 +81,32 @@ mod tests {
             input: 2000,
             output: 0,
             total_tokens: 2000,
+            ..Usage::empty()
+        };
+        assert!(is_context_overflow(&model(), &msg));
+    }
+
+    #[test]
+    fn detects_gemini_and_responses_wording() {
+        let mut msg = AssistantMessage::pending(&model());
+        msg.stop_reason = StopReason::Error;
+        for text in [
+            "HTTP 400 Bad Request: The input token count (1200000) exceeds the maximum number of tokens allowed (1048576).",
+            "HTTP 400 Bad Request: Your input exceeds the context window of this model.",
+        ] {
+            msg.error_message = Some(text.into());
+            assert!(is_context_overflow(&model(), &msg), "{text}");
+        }
+    }
+
+    #[test]
+    fn silent_overflow_counts_cached_input() {
+        let mut msg = AssistantMessage::pending(&model());
+        msg.stop_reason = StopReason::Length;
+        msg.usage = Usage {
+            input: 100,
+            cache_read: 1500,
+            output: 0,
             ..Usage::empty()
         };
         assert!(is_context_overflow(&model(), &msg));

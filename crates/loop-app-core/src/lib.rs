@@ -11,6 +11,7 @@ pub mod model_selection;
 pub mod permissions;
 pub mod resources;
 pub mod runtime;
+pub mod sessions;
 pub mod system_prompt;
 pub mod theme;
 pub mod tool_approval;

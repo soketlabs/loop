@@ -28,6 +28,9 @@ flate2.workspace = true
 flate2.workspace = true
 tar.workspace = true
 
+[dev-dependencies]
+loop-test-support.workspace = true
+
 [[test]]
 name = "lifecycle"
 path = "tests/lifecycle.rs"

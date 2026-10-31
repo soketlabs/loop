@@ -42,9 +42,14 @@ struct Cli {
     #[arg(long, short = 'c', global = true)]
     no_context_files: bool,
 
-    /// Resume a session by id (Loop's own or an external agent's).
-    #[arg(long, global = true)]
+    /// Resume a session by id (Loop's own or an external agent's). With no
+    /// id, pick one from this folder's sessions.
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
     resume: Option<String>,
+
+    /// Resume the most recent session in this folder.
+    #[arg(long = "continue", global = true, conflicts_with = "resume")]
+    continue_last: bool,
 
     /// Run without the web_search and web_fetch tools.
     #[arg(long, global = true)]
@@ -132,7 +137,7 @@ async fn main() {
 }
 
 async fn real_main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     // Distribution commands do not load agent settings, providers or sessions.
     if let Some(command) = &cli.command {
         match command {
@@ -262,6 +267,20 @@ async fn real_main() -> anyhow::Result<()> {
     }
 
     let interactive = cli.print.is_none() && !cli.serve_mcp;
+    // `--resume` with no id and `--continue` choose a session in the TUI.
+    let startup_sessions = match cli.resume.as_deref() {
+        Some("") => Some(loop_cli::StartupSessions::Pick),
+        _ if cli.continue_last => Some(loop_cli::StartupSessions::Latest),
+        _ => None,
+    };
+    if startup_sessions.is_some() && !interactive {
+        anyhow::bail!(
+            "--resume without an id and --continue need the terminal UI; pass --resume <session-id>"
+        );
+    }
+    if startup_sessions.is_some() {
+        cli.resume = None;
+    }
     let agent_dir = config::paths::get_agent_dir();
     // `--resume` may name a session Loop opened with a subscription, and
     // `--provider` may name a subscription (such as `chatgpt`).
@@ -286,7 +305,8 @@ async fn real_main() -> anyhow::Result<()> {
     } else {
         (cli.provider, cli.model)
     };
-    let explicit_model = provider.is_some() || model.is_some() || cli.resume.is_some();
+    let explicit_model =
+        provider.is_some() || model.is_some() || cli.resume.is_some() || startup_sessions.is_some();
     if cli.serve_mcp && pending_agent.is_some() {
         anyhow::bail!("--serve-mcp serves Loop's own tools; it cannot run with an external agent");
     }
@@ -326,6 +346,7 @@ async fn real_main() -> anyhow::Result<()> {
         })
         .flatten();
     runtime.pending_agent = pending_agent.or(saved_subscription);
+    runtime.startup_sessions = startup_sessions;
     runtime.debug = debug;
     runtime.debug_log_path = debug_log_path;
     #[cfg(feature = "telemetry")]

@@ -2,7 +2,7 @@
 //! splitting.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -76,8 +76,13 @@ fn split_key(key: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The call argument patterns match: the command, path, URL or query.
+/// The call argument patterns match: the command, path, URL or query. A
+/// search tool's subject is its search root, `.` when it names none.
 fn subject(tool: &str, args: &Value) -> Option<String> {
+    if is_search(tool) {
+        let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        return Some(path.to_owned());
+    }
     let key = match tool {
         "bash" => "command",
         "read" | "write" | "edit" => "path",
@@ -86,6 +91,34 @@ fn subject(tool: &str, args: &Value) -> Option<String> {
         _ => return Some(args.to_string()),
     };
     args.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// Loop's read-only search tools, whose patterns match a path.
+fn is_search(tool: &str) -> bool {
+    matches!(tool, "grep" | "glob" | "ls")
+}
+
+/// Whether a search tool (`grep`, `glob`, `ls`) may show or read the file
+/// at `path`: not when a `read` rule, or the tool's own rule, denies that
+/// path. The search root is checked separately, as the call's subject.
+pub fn search_may_show(
+    rules: &BTreeMap<String, ToolPermission>,
+    tool: &str,
+    path: &Path,
+    workspace: &Path,
+    home: Option<&Path>,
+) -> bool {
+    // Inside the workspace, relative patterns such as `secret/*` match the
+    // relative path; `path_matches` also tries it joined to the workspace.
+    let subject = path.strip_prefix(workspace).unwrap_or(path);
+    let args = serde_json::json!({ "path": subject.to_string_lossy() });
+    ["read", tool].iter().all(|tool| {
+        let call = Call {
+            home: home.map(Path::to_path_buf),
+            ..Call::new(tool, args.clone(), workspace)
+        };
+        rule_for(rules, &call).permission != ToolPermission::Deny
+    })
 }
 
 /// The parts of a shell command, split at `;`, `&&`, `||`, `|`, `&` and
@@ -262,7 +295,9 @@ fn path_matches(pattern: &str, path: &str, workspace: &Path, home: Option<&Path>
     };
     let pattern = expand(pattern);
     let path = expand(path);
-    let absolute = workspace.join(&path).to_string_lossy().into_owned();
+    // Components drop `.` parts, so `.` is the workspace itself.
+    let absolute: PathBuf = workspace.join(&path).components().collect();
+    let absolute = absolute.to_string_lossy().into_owned();
     glob_match(&pattern, &path) || glob_match(&pattern, &absolute)
 }
 
@@ -294,7 +329,7 @@ pub fn rule_for(rules: &BTreeMap<String, ToolPermission>, call: &Call) -> Rule {
                     }
                 }
             }
-        } else if matches!(tool, "read" | "write" | "edit") {
+        } else if matches!(tool, "read" | "write" | "edit") || is_search(tool) {
             path_matches(pattern, subject, &call.workspace, call.home.as_deref())
         } else {
             glob_match(pattern, subject)
@@ -510,6 +545,53 @@ mod tests {
         assert_eq!(
             permission("mcp__slack__post", json!({})),
             ToolPermission::Allow
+        );
+    }
+
+    #[test]
+    fn search_tool_rules_match_the_search_root() {
+        let r = rules(&[("grep(~/secrets/*)", "deny"), ("ls(/ws)", "deny")]);
+        let permission = |tool: &str, args: Value| rule_for(&r, &call(tool, args)).permission;
+        assert_eq!(
+            permission("grep", json!({"pattern": "key", "path": "~/secrets/a"})),
+            ToolPermission::Deny
+        );
+        assert_eq!(
+            permission("grep", json!({"pattern": "key", "path": "src"})),
+            ToolPermission::Allow
+        );
+        // No `path` searches the working directory.
+        #[cfg(unix)]
+        assert_eq!(permission("ls", json!({})), ToolPermission::Deny);
+        assert_eq!(
+            permission("glob", json!({"pattern": "*.rs"})),
+            ToolPermission::Allow
+        );
+    }
+
+    // Home patterns expand with the platform's separator, as for `read`.
+    #[cfg(unix)]
+    #[test]
+    fn search_tools_skip_files_a_read_or_search_deny_rule_refuses() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let r = rules(&[("read(~/.ssh/*)", "deny"), ("grep(~/private/*)", "deny")]);
+        let shown =
+            |tool: &str, path: &Path| search_may_show(&r, tool, path, Path::new("/ws"), Some(home));
+        let key = home.join(".ssh").join("id_rsa");
+        let diary = home.join("private").join("diary.txt");
+        let notes = home.join("notes.txt");
+        for tool in ["grep", "glob", "ls"] {
+            assert!(!shown(tool, &key), "{tool}: a read deny hides the file");
+            assert!(shown(tool, &notes), "{tool}");
+        }
+        assert!(!shown("grep", &diary), "the tool's own pattern deny");
+        assert!(shown("ls", &diary), "another tool's pattern doesn't apply");
+
+        let plain = rules(&[("read", "deny")]);
+        assert!(
+            !search_may_show(&plain, "grep", &notes, Path::new("/ws"), Some(home)),
+            "denying read denies searching file contents too"
         );
     }
 

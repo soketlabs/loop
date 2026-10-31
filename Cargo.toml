@@ -105,6 +105,7 @@ ansi-to-tui = { version = "8", default-features = false }
 syntect = { version = "5", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy", "dump-load"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 arboard = "3"
+png = "0.18"
 rhai = { version = "1.21", default-features = false, features = ["std", "sync"] }
 rustyline = "15"
 unicode-width = "0.2"

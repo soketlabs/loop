@@ -63,6 +63,45 @@ fn text(s: &str) -> Vec<ContentBlock> {
     vec![ContentBlock::text(s)]
 }
 
+/// The composer sends an attached image as an image block after the text;
+/// it reaches the Session's user message.
+#[tokio::test]
+async fn a_prompt_with_an_image_sends_it_with_the_text() {
+    use loop_agent::harness::SessionTreeEntry;
+    use loop_ai::{Message, UserContent, UserMessageContent};
+    let harness = harness(vec![FauxResponse::Text("a red square".into())], vec![]).await;
+    let backend = NativeBackend::new(Arc::clone(&harness)).await;
+    let session = backend.current_session().await;
+    let image = ContentBlock::Image {
+        data: "iVBORw0KGgo=".into(),
+        mime_type: "image/png".into(),
+    };
+    let handle = backend
+        .prompt(
+            &session,
+            vec![ContentBlock::text("what is [image #1]"), image],
+        )
+        .await
+        .unwrap();
+    handle.outcome().await;
+    let entries = harness.read_session_entries().await.unwrap();
+    let user = entries
+        .iter()
+        .find_map(|entry| match entry {
+            SessionTreeEntry::Message { message, .. } => match message.as_llm() {
+                Some(Message::User(user)) => Some(user.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("the prompt is saved");
+    let UserMessageContent::Blocks(blocks) = &user.content else {
+        panic!("text and image blocks: {:?}", user.content);
+    };
+    assert!(matches!(&blocks[0], UserContent::Text(t) if t.text == "what is [image #1]"));
+    assert!(matches!(&blocks[1], UserContent::Image(i) if i.mime_type == "image/png"));
+}
+
 #[tokio::test]
 async fn prompt_streams_envelopes_and_resolves_once() {
     let backend = backend(vec![FauxResponse::Text("hello".into())], vec![]).await;

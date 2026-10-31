@@ -51,7 +51,12 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand {
             name: "permissions",
             description: "Show or set what tools may do without asking",
-            args_hint: Some("[read-only|ask|accept-edits|full-access]"),
+            args_hint: Some("[read-only|ask|accept-edits|full-access|plan]"),
+        },
+        SlashCommand {
+            name: "plan",
+            description: "Plan first: investigate and propose a plan to approve before changes",
+            args_hint: None,
         },
         SlashCommand {
             name: "websearch",
@@ -70,12 +75,12 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "export",
-            description: "Export session to JSONL/HTML path",
-            args_hint: Some("[path]"),
+            description: "Save this session as Markdown and a session file",
+            args_hint: Some("[--force] [path]"),
         },
         SlashCommand {
             name: "import",
-            description: "Import a JSONL session",
+            description: "Open an exported session file as a new session",
             args_hint: Some("<path>"),
         },
         SlashCommand {
@@ -95,7 +100,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "changelog",
-            description: "Show changelog",
+            description: "Show the release notes for this version",
             args_hint: None,
         },
         SlashCommand {
@@ -155,7 +160,12 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "resume",
-            description: "Resume a previous session",
+            description: "Resume a session: pick one, or give its id",
+            args_hint: Some("[session-id]"),
+        },
+        SlashCommand {
+            name: "sessions",
+            description: "Pick a session from this folder to resume",
             args_hint: None,
         },
         SlashCommand {
@@ -378,8 +388,8 @@ pub enum CommandEffect {
     Reload,
     /// `/skills` sub-command.
     Skills(SkillsCommand),
-    /// Resume picker.
-    Resume,
+    /// Resume the session with this id, or open the session picker.
+    Resume(Option<String>),
     /// Tree view.
     Tree,
     /// Set session name.
@@ -563,6 +573,7 @@ pub fn dispatch(
         } else {
             Some(cmd.args.trim().to_owned())
         }),
+        "plan" => CommandEffect::Permissions(Some("plan".into())),
         "websearch" => CommandEffect::WebSearch(if cmd.args.is_empty() {
             None
         } else {
@@ -614,7 +625,10 @@ pub fn dispatch(
             Ok(command) => CommandEffect::Skills(command),
             Err(usage) => CommandEffect::Status(usage),
         },
-        "resume" => CommandEffect::Resume,
+        "resume" => {
+            CommandEffect::Resume(Some(cmd.args.trim().to_owned()).filter(|id| !id.is_empty()))
+        }
+        "sessions" => CommandEffect::Resume(None),
         "tree" => CommandEffect::Tree,
         "name" => CommandEffect::SetName(cmd.args.clone()),
         "export" => CommandEffect::Export(if cmd.args.is_empty() {
@@ -624,7 +638,7 @@ pub fn dispatch(
         }),
         "import" => {
             if cmd.args.is_empty() {
-                CommandEffect::Status("Usage: /import <path.jsonl>".into())
+                CommandEffect::Status("Usage: /import <file.loop.jsonl>".into())
             } else {
                 CommandEffect::Import(cmd.args.clone())
             }
@@ -739,5 +753,25 @@ mod tests {
         assert!(parse_mcp("enable").is_err());
         assert!(parse_mcp("login").is_err());
         assert!(parse_mcp("nope").is_err());
+    }
+
+    #[test]
+    fn resume_takes_an_optional_id_and_sessions_opens_the_picker() {
+        let run = |line: &str| dispatch(&parse_command(line).unwrap(), &[], &[]);
+        assert!(matches!(run("/resume"), CommandEffect::Resume(None)));
+        assert!(matches!(run("/sessions"), CommandEffect::Resume(None)));
+        assert!(matches!(
+            run("/resume 01a15e8f"),
+            CommandEffect::Resume(Some(id)) if id == "01a15e8f"
+        ));
+    }
+
+    #[test]
+    fn plan_switches_to_plan_mode() {
+        let run = |line: &str| dispatch(&parse_command(line).unwrap(), &[], &[]);
+        assert!(matches!(
+            run("/plan"),
+            CommandEffect::Permissions(Some(mode)) if mode == "plan"
+        ));
     }
 }

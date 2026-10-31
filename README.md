@@ -74,7 +74,7 @@ Build from source:
 cargo run -p loop-cli
 ```
 
-First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, or any OpenAI-compatible API (`/login` later to add more). `/login` also signs in to a **ChatGPT Plus/Pro subscription** (served by Codex through `codex-acp`, which needs Node.js); its models then appear in `/model` as `chatgpt/<model>`. Alternatively set `SOKET_API_KEY`, `OPENROUTER_API_KEY` or `OPENAI_API_KEY`. Config lives under `~/.loop/agent/`. See [`crates/loop-cli/README.md`](crates/loop-cli/README.md).
+First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, Anthropic, Gemini, or any OpenAI-compatible API (`/login` later to add more). `/login` also signs in to a **ChatGPT Plus/Pro subscription** (served by Codex through `codex-acp`, which needs Node.js); its models then appear in `/model` as `chatgpt/<model>`. Alternatively set `SOKET_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` or `GEMINI_API_KEY`. Config lives under `~/.loop/agent/`. See [`crates/loop-cli/README.md`](crates/loop-cli/README.md).
 
 ### Supported platforms
 
@@ -99,18 +99,24 @@ The installer detects your OS and CPU, downloads the latest matching release fro
 
 ## Supported models
 
-loop connects to model providers through an OpenAI-compatible Chat Completions API. Connect a provider on first run or with `/login`.
+Connect a provider on first run or with `/login`. Anthropic, OpenAI and Gemini use each provider's own API, so you get its prompt caching and keep the model's reasoning across tool calls. Every other provider uses an OpenAI-compatible Chat Completions API.
 
-| Provider | Connect | API key variable |
-|---|---|---|
-| Soket | `/login soket` | `SOKET_API_KEY` |
-| OpenRouter | `/login openrouter` | `OPENROUTER_API_KEY` |
-| OpenAI | `/login openai` | `OPENAI_API_KEY` |
-| Any OpenAI-compatible API (for example Together, Groq, vLLM, Ollama, LM Studio) | `/login custom` (name, base URL, optional key) | none |
+| Provider | Connect | API key variable | API |
+|---|---|---|---|
+| Soket | `/login soket` | `SOKET_API_KEY` | Chat Completions |
+| OpenRouter | `/login openrouter` | `OPENROUTER_API_KEY` | Chat Completions |
+| OpenAI | `/login openai` | `OPENAI_API_KEY` | Responses |
+| Anthropic | `/login anthropic` | `ANTHROPIC_API_KEY` | Messages |
+| Gemini | `/login gemini` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | Gemini API (API key only) |
+| Any OpenAI-compatible API (for example Together, Groq, vLLM, Ollama, LM Studio) | `/login custom` (name, base URL, optional key) | none | Chat Completions |
 
-The model list comes from each provider's `/models` endpoint. Use `/model` to select a model.
+The model list comes from each provider's model listing. Use `/model` to select a model.
 
-Not supported yet: the native Anthropic Messages API and the OpenAI Responses API.
+What the native APIs add:
+
+- **Anthropic** (`/v1/messages`): prompt caching on the system prompt, tools and conversation, with cache reads and writes in usage; extended thinking, with thinking blocks sent back unchanged during a tool loop.
+- **OpenAI** (`/v1/responses`): stateless requests (`store: false`) that carry the model's encrypted reasoning from one tool call to the next; cached and reasoning tokens in usage.
+- **Gemini** (`streamGenerateContent`): thinking with thought signatures sent back on later requests; cached tokens in usage. Gemini connects with an API key from Google AI Studio only.
 
 To run one prompt from a script, use `loop --print "<prompt>"`. Add `--output-format json` or `stream-json` for machine-readable output; see [Running Loop from scripts](docs/print-mode.md) for the formats and exit codes.
 

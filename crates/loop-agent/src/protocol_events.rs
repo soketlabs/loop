@@ -111,14 +111,16 @@ impl NativeEventMapper {
             }
             AgentEvent::ToolExecutionEnd {
                 tool_call_id,
+                tool_name,
                 result,
                 is_error,
-                ..
-            } => vec![SessionUpdate::ToolCallUpdate(tool_call_end(
-                tool_call_id,
-                result,
-                *is_error,
-            ))],
+            } => {
+                let mut update = tool_call_end(tool_call_id, result, *is_error);
+                update.name = Some(tool_name.clone());
+                let mut updates = vec![SessionUpdate::ToolCallUpdate(update)];
+                updates.extend(plan_update(tool_name, &result.details, *is_error));
+                updates
+            }
         }
     }
 
@@ -372,6 +374,9 @@ pub fn replay(messages: &[AgentMessage]) -> Vec<SessionUpdate> {
                 });
                 update.content = Some(text_content(&result.content));
                 updates.push(SessionUpdate::ToolCallUpdate(update));
+                if let Some(details) = &result.details {
+                    updates.extend(plan_update(&result.tool_name, details, result.is_error));
+                }
             }
             AgentMessage::Custom(custom) => updates.push(match custom {
                 CustomAgentMessage::CompactionSummary { summary, .. } => {
@@ -416,6 +421,14 @@ fn info(text: String) -> SessionUpdate {
     }
 }
 
+/// The Plan a successful `todo` call sets.
+fn plan_update(tool_name: &str, details: &Value, is_error: bool) -> Option<SessionUpdate> {
+    if tool_name != "todo" || is_error {
+        return None;
+    }
+    crate::harness::todos_from_details(details).map(|entries| SessionUpdate::Plan { entries })
+}
+
 /// The protocol kind for one of Loop's tools.
 pub fn tool_kind(tool_name: &str) -> ToolKind {
     match tool_name {
@@ -424,6 +437,7 @@ pub fn tool_kind(tool_name: &str) -> ToolKind {
         "bash" => ToolKind::Execute,
         "grep" | "find" | "ls" | "glob" => ToolKind::Search,
         "fetch" | "web_fetch" | "web_search" => ToolKind::Fetch,
+        "todo" | "exit_plan" => ToolKind::Think,
         _ => ToolKind::Other,
     }
 }
@@ -432,6 +446,14 @@ fn tool_call(id: &str, name: &str, args: &Value) -> ToolCall {
     let path = args.get("path").and_then(Value::as_str);
     let title = match (name, path) {
         ("read" | "write" | "edit", Some(path)) => format!("{name} {path}"),
+        ("grep" | "glob", _) => {
+            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
+            match path {
+                Some(path) => format!("{name} {pattern} in {path}"),
+                None => format!("{name} {pattern}"),
+            }
+        }
+        ("ls", _) => format!("ls {}", path.unwrap_or(".")),
         ("bash", _) => args
             .get("command")
             .and_then(Value::as_str)
@@ -595,5 +617,80 @@ mod tests {
         assert_eq!(tool_kind("edit"), ToolKind::Edit);
         assert_eq!(tool_kind("bash"), ToolKind::Execute);
         assert_eq!(tool_kind("mcp__github__create_issue"), ToolKind::Other);
+    }
+
+    fn todo_result(entries: Value) -> AgentToolResult {
+        AgentToolResult {
+            content: Vec::new(),
+            details: serde_json::json!({ "todos": entries }),
+            usage: None,
+            added_tool_names: None,
+            terminate: None,
+        }
+    }
+
+    #[test]
+    fn a_todo_result_becomes_the_plan() {
+        let mut mapper = NativeEventMapper::new();
+        let entries = serde_json::json!([
+            {"content": "read", "status": "completed"},
+            {"content": "fix", "status": "in_progress"}
+        ]);
+        let updates = mapper.map(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "t1".into(),
+            tool_name: "todo".into(),
+            result: todo_result(entries.clone()),
+            is_error: false,
+        });
+        assert!(
+            matches!(&updates[0], SessionUpdate::ToolCallUpdate(u) if u.name.as_deref() == Some("todo"))
+        );
+        let SessionUpdate::Plan { entries: plan } = &updates[1] else {
+            panic!("expected a plan: {updates:?}");
+        };
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[1].status, loop_protocol::PlanEntryStatus::InProgress);
+
+        let failed = mapper.map(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "t2".into(),
+            tool_name: "todo".into(),
+            result: todo_result(entries.clone()),
+            is_error: true,
+        });
+        assert_eq!(failed.len(), 1, "a failed call changes no plan");
+
+        let replayed = replay(&[AgentMessage::Llm(Message::ToolResult(
+            loop_ai::ToolResultMessage {
+                tool_call_id: "t1".into(),
+                tool_name: "todo".into(),
+                content: Vec::new(),
+                details: Some(serde_json::json!({ "todos": entries })),
+                usage: None,
+                added_tool_names: None,
+                is_error: false,
+                timestamp: 1,
+            },
+        ))]);
+        assert!(
+            replayed
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::Plan { entries } if entries.len() == 2)),
+            "a resumed Session shows its checklist: {replayed:?}"
+        );
+    }
+
+    #[test]
+    fn search_calls_are_titled_by_what_they_look_for() {
+        let grep = tool_call(
+            "1",
+            "grep",
+            &serde_json::json!({"pattern": "fn main", "path": "src"}),
+        );
+        assert_eq!(grep.title, "grep fn main in src");
+        assert_eq!(grep.kind, ToolKind::Search);
+        assert_eq!(grep.locations[0].path, "src");
+        let glob = tool_call("2", "glob", &serde_json::json!({"pattern": "*.rs"}));
+        assert_eq!(glob.title, "glob *.rs");
+        assert_eq!(tool_call("3", "ls", &serde_json::json!({})).title, "ls .");
     }
 }

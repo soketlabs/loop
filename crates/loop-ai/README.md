@@ -11,6 +11,11 @@ This crate is designed for agentic workflows: tool calling, thinking/reasoning b
 - [`Provider`](crate::Provider) + [`Models`](crate::Models) collection with auth resolution
 - **Soket** built-in provider (`https://api.soket.ai/v1`) with dynamic `GET /v1/models` refresh + models-store cache
 - OpenAI Chat Completions–compatible custom providers (Ollama, vLLM, LiteLLM, gateways, …)
+- Native wire APIs, selected by each model's `api`:
+  - `openai-completions`: Chat Completions (Soket, OpenRouter, custom endpoints)
+  - `openai-responses`: OpenAI Responses, stateless with encrypted reasoning carried across tool calls (the `openai` preset)
+  - `anthropic-messages`: Anthropic Messages with prompt-cache breakpoints and extended thinking (the `anthropic` preset)
+  - `google-generative-ai`: the Gemini API by API key, with thought signatures (the `gemini` preset)
 - Compat auto-detect + overrides ([`OpenAICompletionsCompat`](crate::OpenAICompletionsCompat))
 - [`transform_messages`](crate::transform_messages) for mid-session hand-off
 - Token cost calculation, rough context estimate, overflow heuristics
@@ -59,10 +64,11 @@ async fn main() {
 ## Adding a new wire API
 
 1. Implement [`ApiAdapter`](crate::ApiAdapter) under `src/api/<name>.rs` (`stream` + `stream_simple`).
-2. Emit the same [`AssistantMessageEvent`](crate::AssistantMessageEvent) protocol; encode failures as `error` events (do not panic the stream after invoke).
+2. Emit the same [`AssistantMessageEvent`](crate::AssistantMessageEvent) protocol; encode failures as `error` events (do not panic the stream after invoke). The helpers in `src/api/sse.rs` send the request and build the message for you.
 3. Call [`transform_messages`](crate::transform_messages) before building the provider payload.
 4. Add a provider factory under `src/providers/` that wires models + auth + the adapter via [`create_provider`](crate::create_provider).
 5. Keep `lib.rs` free of heavy provider catalogs — consumers import the factories they need.
+6. Add a fixture under `tests/conformance/` and one `conformance_suite!` line. The suite checks the shared contract: event order, stop reasons, usage (`input` is uncached input only; `total_tokens` is the sum of the parts), error categories, cancellation and malformed chunks.
 
 ## Auth resolution order
 
@@ -86,6 +92,8 @@ Integration tests live under `tests/`:
 
 | File | Coverage |
 |------|----------|
+| `conformance/` | The same scenarios for every adapter (Chat Completions, Responses, Anthropic, Gemini) and faux |
+| `native_providers.rs` | Anthropic, OpenAI (Responses) and Gemini presets: listing, auth headers, a prompt end to end |
 | `handoff.rs` | `transform_messages` (thinking, orphans, image downgrade) |
 | `cost_compat.rs` | `calculate_cost`, `detect_compat` |
 | `validate_tools.rs` | JSON Schema tool arg validation / coerce |

@@ -276,3 +276,33 @@ async fn a_failed_turn_exits_1_with_the_error_in_the_result() {
         "{result}"
     );
 }
+
+/// `--print` exits right after it prints, so the turn must be saved by
+/// then, or `--resume` finds only the prompt. The real binary runs on
+/// several threads, where the turn's task may still be saving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_turn_is_saved_before_print_returns() {
+    use loop_agent::harness::SessionTreeEntry;
+    let (backend, harness) =
+        backend_with(vec![FauxResponse::Text("saved".into())], true, vec![]).await;
+    let session = backend.current_session().await;
+    print_turn(backend.as_ref(), &session, "hi".into())
+        .await
+        .unwrap();
+    // The harness saves the turn, then goes idle.
+    assert_eq!(
+        harness.phase(),
+        loop_agent::harness::AgentHarnessPhase::Idle
+    );
+    let roles: Vec<String> = harness
+        .read_session_entries()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionTreeEntry::Message { message, .. } => Some(message.role().to_owned()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(roles, ["user", "assistant"]);
+}

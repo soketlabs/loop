@@ -9,6 +9,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT
 use serde_json::{json, Value};
 
 use crate::api::detect_compat::resolve_compat;
+use crate::api::sse::{send_request, StreamFail};
 use crate::api::transform_messages::transform_messages;
 use crate::auth::ModelAuth;
 use crate::models::ApiAdapter;
@@ -17,7 +18,7 @@ use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, Context, MaxTokensField, Message,
     Model, ProviderResponse, ResolvedOpenAICompletionsCompat, SimpleStreamOptions, StopReason,
     StreamOptions, TextContent, ThinkingContent, ThinkingFormat, ThinkingLevel, ToolCall,
-    ToolResultContent, Usage, UserContent, UserMessageContent, API_OPENAI_COMPLETIONS,
+    ToolResultContent, Usage, UserContent, UserMessageContent,
 };
 use crate::utils::{calculate_cost, parse_streaming_json};
 
@@ -121,84 +122,6 @@ impl OpenAICompletionsAdapter {
 
         stream
     }
-}
-
-struct StreamFail {
-    message: String,
-    aborted: bool,
-}
-
-/// Send one chat completions request, bounded by the time-to-first-byte
-/// limit and the caller's cancellation.
-async fn send_request(
-    client: &reqwest::Client,
-    url: &str,
-    headers: HeaderMap,
-    payload: &Value,
-    options: &StreamOptions,
-) -> Result<reqwest::Response, StreamFail> {
-    let req = client.post(url).headers(headers).json(payload);
-    // Do not set an overall reqwest timeout here — it would abort long SSE bodies.
-    // Bound only time-to-first-byte (headers) via `response_header_timeout_ms`.
-
-    let cancel = options.cancel.clone();
-    let response_fut = req.send();
-    // None => default 60s; Some(0) => no limit; Some(n) => n ms.
-    const DEFAULT_TTFB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-    let ttfb: Option<std::time::Duration> = match options.response_header_timeout_ms {
-        None => Some(DEFAULT_TTFB_TIMEOUT),
-        Some(0) => None,
-        Some(ms) => Some(std::time::Duration::from_millis(ms)),
-    };
-
-    match (cancel.as_ref(), ttfb) {
-        (Some(token), Some(bound)) => {
-            tokio::select! {
-                _ = token.cancelled() => {
-                    return Err(StreamFail { message: "aborted".into(), aborted: true });
-                }
-                res = tokio::time::timeout(bound, response_fut) => {
-                    match res {
-                        Ok(inner) => inner,
-                        Err(_) => {
-                            return Err(StreamFail {
-                                message: format!(
-                                    "timed out waiting for model response ({}s); set responseHeaderTimeoutMs to 0 for long-running waits",
-                                    bound.as_secs()
-                                ),
-                                aborted: false,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        (Some(token), None) => {
-            tokio::select! {
-                _ = token.cancelled() => {
-                    return Err(StreamFail { message: "aborted".into(), aborted: true });
-                }
-                res = response_fut => res,
-            }
-        }
-        (None, Some(bound)) => match tokio::time::timeout(bound, response_fut).await {
-            Ok(inner) => inner,
-            Err(_) => {
-                return Err(StreamFail {
-                    message: format!(
-                        "timed out waiting for model response ({}s); set responseHeaderTimeoutMs to 0 for long-running waits",
-                        bound.as_secs()
-                    ),
-                    aborted: false,
-                });
-            }
-        },
-        (None, None) => response_fut.await,
-    }
-    .map_err(|e| StreamFail {
-        message: e.to_string(),
-        aborted: false,
-    })
 }
 
 async fn run_stream(
@@ -583,7 +506,9 @@ async fn run_stream(
             partial: partial.clone(),
         });
     }
-    for (_stream_idx, content_index) in tool_map {
+    let mut tool_indexes: Vec<usize> = tool_map.into_values().collect();
+    tool_indexes.sort_unstable();
+    for content_index in tool_indexes {
         if let AssistantContent::ToolCall(call) = &partial.content[content_index] {
             let finalized = {
                 let raw = tool_args.get(&content_index).cloned().unwrap_or_default();
@@ -607,14 +532,10 @@ async fn run_stream(
     }
 
     calculate_cost(&model, &mut partial.usage);
-    if partial.usage.total_tokens == 0 {
-        partial.usage.total_tokens = partial.usage.input + partial.usage.output;
-    }
 
     let reason = map_finish_reason(finish_reason.as_deref(), &partial, &compat);
     partial.stop_reason = reason;
     partial.raw_stop_reason = finish_reason;
-    partial.api = API_OPENAI_COMPLETIONS.to_string();
 
     if reason.is_error() {
         handle.push(AssistantMessageEvent::Error {
@@ -655,7 +576,9 @@ fn close_open_blocks(
             partial: partial.clone(),
         });
     }
-    for (_k, content_index) in tool_map.drain() {
+    let mut tool_indexes: Vec<usize> = tool_map.drain().map(|(_, i)| i).collect();
+    tool_indexes.sort_unstable();
+    for content_index in tool_indexes {
         if let AssistantContent::ToolCall(call) = &partial.content[content_index] {
             let mut finalized = call.clone();
             if let Some(raw) = tool_args.get(&content_index) {
@@ -699,26 +622,28 @@ fn extract_reasoning_delta(delta: &Value) -> Option<String> {
     None
 }
 
+/// `prompt_tokens` includes cached tokens; [`Usage::input`] counts only the uncached ones.
 fn apply_usage(usage: &mut Usage, value: &Value) {
-    if let Some(v) = value.get("prompt_tokens").and_then(|v| v.as_u64()) {
-        usage.input = v;
+    let prompt = value.get("prompt_tokens").and_then(|v| v.as_u64());
+    let cached = value
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(|v| v.as_u64());
+    if let Some(v) = cached {
+        usage.cache_read = v;
+    }
+    if let Some(v) = prompt {
+        usage.input = v.saturating_sub(usage.cache_read);
     }
     if let Some(v) = value.get("completion_tokens").and_then(|v| v.as_u64()) {
         usage.output = v;
     }
-    if let Some(v) = value.get("total_tokens").and_then(|v| v.as_u64()) {
-        usage.total_tokens = v;
+    if let Some(v) = value
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(|v| v.as_u64())
+    {
+        usage.reasoning = Some(v);
     }
-    if let Some(details) = value.get("prompt_tokens_details") {
-        if let Some(v) = details.get("cached_tokens").and_then(|v| v.as_u64()) {
-            usage.cache_read = v;
-        }
-    }
-    if let Some(details) = value.get("completion_tokens_details") {
-        if let Some(v) = details.get("reasoning_tokens").and_then(|v| v.as_u64()) {
-            usage.reasoning = Some(v);
-        }
-    }
+    usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
 
 fn map_finish_reason(
