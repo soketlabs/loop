@@ -4498,7 +4498,7 @@ dependencies = [
 
 [[package]]
 name = "loop-acp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agent-client-protocol-schema",
  "async-trait",
@@ -4514,7 +4514,7 @@ dependencies = [
 
 [[package]]
 name = "loop-agent"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4554,7 +4554,7 @@ dependencies = [
 
 [[package]]
 name = "loop-ai"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4578,7 +4578,7 @@ dependencies = [
 
 [[package]]
 name = "loop-app-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4606,7 +4606,7 @@ dependencies = [
 
 [[package]]
 name = "loop-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
@@ -4659,7 +4659,7 @@ dependencies = [
 
 [[package]]
 name = "loop-dashboard"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "crossterm 0.28.1",
@@ -4672,7 +4672,7 @@ dependencies = [
 
 [[package]]
 name = "loop-desktop"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4697,7 +4697,7 @@ dependencies = [
 
 [[package]]
 name = "loop-mcp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -4715,7 +4715,7 @@ dependencies = [
 
 [[package]]
 name = "loop-orchestration"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4733,7 +4733,7 @@ dependencies = [
 
 [[package]]
 name = "loop-protocol"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "schemars 1.2.2",
@@ -4744,7 +4744,7 @@ dependencies = [
 
 [[package]]
 name = "loop-telemetry"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4766,11 +4766,11 @@ dependencies = [
 
 [[package]]
 name = "loop-test-support"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "loop-update"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "dirs",
  "flate2",
@@ -4791,7 +4791,7 @@ dependencies = [
 
 [[package]]
 name = "loop-wire"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "futures",
