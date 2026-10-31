@@ -514,10 +514,22 @@ impl AgentHarness {
         *self.thinking_level.write().await = level;
     }
 
+    /// Set native streaming deadline settings.
+    pub async fn set_timeouts(
+        &self,
+        policy: loop_ai::TimeoutPolicy,
+        overrides: loop_ai::TimeoutOverrides,
+    ) {
+        let mut options = self.stream_options.write().await;
+        options.base.timeouts = policy;
+        options.base.timeout_overrides = overrides;
+    }
+
     /// Set max wait for model response headers (`0` = wait indefinitely).
     pub async fn set_response_header_timeout_ms(&self, ms: u64) {
         let mut opts = self.stream_options.write().await;
         opts.base.response_header_timeout_ms = Some(ms);
+        opts.base.timeouts.response_header_ms = Some(ms);
     }
 
     /// Current response-header timeout in ms (`0` = disabled / unlimited).
@@ -527,7 +539,7 @@ impl AgentHarness {
             .await
             .base
             .response_header_timeout_ms
-            .unwrap_or(60_000)
+            .unwrap_or(120_000)
     }
 
     /// Set tools (rejects duplicate names).

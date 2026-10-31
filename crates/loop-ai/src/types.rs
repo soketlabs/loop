@@ -718,9 +718,69 @@ pub struct ProviderResponse {
 /// Header map; `None` value suppresses a default header.
 pub type ProviderHeaders = HashMap<String, Option<String>>;
 
+/// Optional deadline overrides in milliseconds. Zero disables a deadline.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeoutPolicy {
+    /// Connection establishment.
+    pub connection_ms: Option<u64>,
+    /// HTTP response headers.
+    pub response_header_ms: Option<u64>,
+    /// Incoming body bytes.
+    pub transport_idle_ms: Option<u64>,
+    /// Semantic generation progress.
+    pub model_progress_idle_ms: Option<u64>,
+    /// Total generation duration.
+    pub generation_budget_ms: Option<u64>,
+    /// Total run duration, including tools.
+    pub run_budget_ms: Option<u64>,
+}
+
+impl TimeoutPolicy {
+    /// Overlay explicitly configured fields.
+    pub fn overlay(&mut self, other: &Self) {
+        if other.run_budget_ms.is_some() {
+            self.run_budget_ms = other.run_budget_ms;
+        }
+        if other.connection_ms.is_some() {
+            self.connection_ms = other.connection_ms;
+        }
+        if other.response_header_ms.is_some() {
+            self.response_header_ms = other.response_header_ms;
+        }
+        if other.transport_idle_ms.is_some() {
+            self.transport_idle_ms = other.transport_idle_ms;
+        }
+        if other.model_progress_idle_ms.is_some() {
+            self.model_progress_idle_ms = other.model_progress_idle_ms;
+        }
+        if other.generation_budget_ms.is_some() {
+            self.generation_budget_ms = other.generation_budget_ms;
+        }
+    }
+}
+
+/// Provider and model deadline overrides.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeoutOverrides {
+    /// Overrides keyed by provider ID.
+    #[serde(default)]
+    pub providers: HashMap<String, TimeoutPolicy>,
+    /// Overrides keyed by provider/model.
+    #[serde(default)]
+    pub models: HashMap<String, TimeoutPolicy>,
+}
+
 /// Shared stream options.
 #[derive(Clone, Default)]
 pub struct StreamOptions {
+    /// Internal generation origin, retained across protocol fallback requests.
+    #[doc(hidden)]
+    pub generation_started_at: Option<tokio::time::Instant>,
+    /// Provider and model overrides.
+    pub timeout_overrides: TimeoutOverrides,
+    /// Streaming deadline overrides.
+    pub timeouts: TimeoutPolicy,
     /// Sampling temperature.
     pub temperature: Option<f64>,
     /// Max output tokens.
@@ -737,11 +797,11 @@ pub struct StreamOptions {
     pub session_id: Option<String>,
     /// Extra / overriding headers (`None` value suppresses).
     pub headers: Option<ProviderHeaders>,
-    /// Overall request timeout in milliseconds (avoid for long SSE streams).
+    /// Legacy alias for the total generation budget in milliseconds.
     pub timeout_ms: Option<u64>,
     /// Max wait for HTTP response headers (time-to-first-byte) in milliseconds.
     ///
-    /// - `None` — use the library default (60s hang protection)
+    /// - `None` — use the library default (120s hang protection)
     /// - `Some(0)` — disabled; wait indefinitely (still abortable via cancel)
     /// - `Some(n)` — wait up to `n` ms for headers
     pub response_header_timeout_ms: Option<u64>,
@@ -753,6 +813,22 @@ pub struct StreamOptions {
     pub on_payload: Option<OnPayload>,
     /// Called after HTTP response headers are received.
     pub on_response: Option<OnResponse>,
+}
+
+impl StreamOptions {
+    /// Resolve provider and model overrides for this generation.
+    pub fn resolve_timeouts(&mut self, model: &Model) {
+        if let Some(p) = self.timeout_overrides.providers.get(&model.provider) {
+            self.timeouts.overlay(p);
+        }
+        if let Some(p) = self
+            .timeout_overrides
+            .models
+            .get(&format!("{}/{}", model.provider, model.id))
+        {
+            self.timeouts.overlay(p);
+        }
+    }
 }
 
 /// Callback that may rewrite the outbound JSON payload.

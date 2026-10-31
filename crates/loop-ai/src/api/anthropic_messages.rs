@@ -10,7 +10,6 @@
 
 use std::sync::Arc;
 
-use eventsource_stream::Eventsource;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Map, Value};
 
@@ -121,11 +120,14 @@ async fn run_stream(
     client: reqwest::Client,
     model: Model,
     context: Context,
-    options: StreamOptions,
+    mut options: StreamOptions,
     auth: ModelAuth,
     thinking: Thinking,
     handle: AssistantMessageEventStreamHandle,
 ) -> Result<(), StreamFail> {
+    options
+        .generation_started_at
+        .get_or_insert_with(tokio::time::Instant::now);
     check_cancelled(&options)?;
 
     let base_url = auth
@@ -158,10 +160,16 @@ async fn run_stream(
     let mut blocks: Vec<Option<usize>> = Vec::new();
     let mut stop_reason: Option<String> = None;
     let mut refusal: Option<String> = None;
-    let mut events = response.bytes_stream().eventsource();
+    let mut events = super::sse::tracked_events(response, &options);
 
     loop {
-        let (name, data) = match next_event(&mut events, options.cancel.as_ref()).await? {
+        let (name, data) = match match next_event(&mut events, options.cancel.as_ref()).await {
+            Ok(next) => next,
+            Err(err) => {
+                out.fail(err.message, None);
+                return Ok(());
+            }
+        } {
             Next::Event { name, data } => (name, data),
             Next::End => break,
             Next::Cancelled => {
@@ -278,6 +286,10 @@ async fn run_stream(
 
     if let Some(message) = refusal {
         out.fail(message, stop_reason);
+        return Ok(());
+    }
+    if stop_reason.is_none() {
+        out.fail("stream ended before completion".into(), None);
         return Ok(());
     }
     let reason = map_stop_reason(stop_reason.as_deref(), &out.partial.content);
