@@ -218,3 +218,35 @@ fn messages(body: &Value) -> impl Iterator<Item = &Value> {
 }
 
 crate::conformance_suite!(Completions);
+
+#[tokio::test]
+async fn premature_eof_keeps_reasoning_and_fails() {
+    let rig = harness::Rig::sse(
+        &Completions,
+        chunk(json!({"reasoning_content":"partial"}), None),
+    );
+    let run = rig
+        .run(
+            &loop_ai::Context::default(),
+            loop_ai::SimpleStreamOptions::default(),
+        )
+        .await;
+    assert_eq!(run.message.stop_reason, loop_ai::StopReason::Error);
+    assert_eq!(run.message.content.len(), 1);
+}
+
+#[tokio::test]
+async fn incomplete_tool_arguments_are_never_successful() {
+    let body = chunk(
+        json!({"tool_calls":[{"index":0,"id":"t","function":{"name":"noop","arguments":"{\"x\":1"}}]}),
+        Some("tool_calls"),
+    ) + DONE;
+    let rig = harness::Rig::sse(&Completions, body);
+    let run = rig
+        .run(
+            &loop_ai::Context::default(),
+            loop_ai::SimpleStreamOptions::default(),
+        )
+        .await;
+    assert_eq!(run.message.stop_reason, loop_ai::StopReason::Error);
+}

@@ -321,7 +321,11 @@ impl Scheduler {
                     return;
                 }
                 Err(e) => {
-                    let retryable = !matches!(e, WorkerError::Blocked(_));
+                    // Agent tasks may already have executed side effects. A task retry
+                    // cannot resume their conversation or safely replay those tools.
+                    let retryable = !matches!(e, WorkerError::Blocked(_))
+                        && !(matches!(e, WorkerError::TimedOut)
+                            && matches!(task_node.kind, TaskKind::AgentTurn { .. }));
                     if retryable && attempt < max_retries && !cancel.is_cancelled() {
                         attempt += 1;
                         tracing::warn!(

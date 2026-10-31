@@ -1519,6 +1519,12 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     harness
         .set_response_header_timeout_ms(settings.response_header_timeout_ms)
         .await;
+    harness
+        .set_timeouts(
+            settings.timeouts.clone(),
+            settings.timeout_overrides.clone(),
+        )
+        .await;
 
     let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
     let backend: Arc<dyn loop_protocol::AgentBackend> = native.clone();

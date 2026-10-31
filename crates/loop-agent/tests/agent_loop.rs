@@ -203,3 +203,26 @@ async fn abort_cancels() {
     );
     while let Some(_ev) = stream.next().await {}
 }
+
+#[tokio::test(start_paused = true)]
+async fn run_budget_ends_a_stalled_generation_without_user_abort() {
+    let (_, model) = setup_faux(FauxScript::new());
+    let mut config = AgentLoopConfig::new(model);
+    config.stream_options.base.timeouts.run_budget_ms = Some(10);
+    let stream_fn: loop_agent::StreamFn = Arc::new(|_, _, _| {
+        Box::pin(async {
+            // An unresponsive generation, with no terminal event.
+            loop_ai::create_assistant_message_event_stream()
+        })
+    });
+    let events = collect_agent_events(agent_loop(
+        vec![AgentMessage::user_text("hi")],
+        AgentContext::default(),
+        config,
+        None,
+        Some(stream_fn),
+    ))
+    .await;
+    assert!(events.iter().any(|event| matches!(event, AgentEvent::MessageEnd { message } if message.as_assistant().is_some_and(|m| m.stop_reason == loop_ai::StopReason::Error && m.error_message.as_deref().is_some_and(|e| e.contains("run_budget"))))));
+    assert!(matches!(events.last(), Some(AgentEvent::AgentEnd { .. })));
+}
