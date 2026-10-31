@@ -193,16 +193,84 @@ async fn run_loop_observed(
         config.stream_options.base.session_id.as_deref(),
         &config.run_labels,
     );
-    let result = run_loop(
-        current_context,
-        new_messages,
-        config,
-        cancel,
-        emit,
-        stream_fn,
-    )
-    .instrument(run.span().clone())
-    .await;
+    let mut options = config.stream_options.base.clone();
+    options.resolve_timeouts(&config.model);
+    let budget = options.timeouts.run_budget_ms.unwrap_or(0);
+    let child = cancel
+        .map(CancellationToken::child_token)
+        .unwrap_or_default();
+    let model = config.model.clone();
+    let result = {
+        let work = run_loop(
+            current_context,
+            new_messages,
+            config,
+            Some(&child),
+            emit,
+            stream_fn,
+        )
+        .instrument(run.span().clone());
+        if budget == 0 {
+            Some(work.await)
+        } else {
+            tokio::time::timeout(std::time::Duration::from_millis(budget), work)
+                .await
+                .ok()
+        }
+    };
+    let result = match result {
+        Some(result) => result,
+        None => {
+            child.cancel();
+            let mut message = current_context
+                .messages
+                .last()
+                .and_then(|m| m.as_assistant())
+                .filter(|m| m.stop_reason == StopReason::Pending)
+                .cloned()
+                .unwrap_or_else(|| AssistantMessage::pending(&model));
+            message.stop_reason = StopReason::Error;
+            message.error_message = Some(format!("run_budget timeout after {budget}ms"));
+            let message = AgentMessage::assistant(message);
+            if current_context
+                .messages
+                .last()
+                .and_then(|m| m.as_assistant())
+                .is_some_and(|m| m.stop_reason == StopReason::Pending)
+            {
+                *current_context
+                    .messages
+                    .last_mut()
+                    .expect("pending message") = message.clone();
+            } else {
+                current_context.messages.push(message.clone());
+            }
+            new_messages.push(message.clone());
+            emit_ev(
+                emit,
+                AgentEvent::MessageEnd {
+                    message: message.clone(),
+                },
+            )
+            .await;
+            emit_ev(
+                emit,
+                AgentEvent::TurnEnd {
+                    message,
+                    tool_results: vec![],
+                },
+            )
+            .await;
+            emit_ev(
+                emit,
+                AgentEvent::AgentEnd {
+                    messages: new_messages.clone(),
+                },
+            )
+            .await;
+            Ok(())
+        }
+    };
     run.finish(new_messages);
     result
 }

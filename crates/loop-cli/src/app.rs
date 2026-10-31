@@ -6195,7 +6195,7 @@ fn external_edit(current: &str) -> anyhow::Result<String> {
     Ok(std::fs::read_to_string(path)?)
 }
 
-/// Parse `/ttfb` args: `off`/`0` → unlimited; `on` → 60s; `60s` / `120000` → ms.
+/// Parse `/ttfb` args: `off`/`0` → unlimited; `on` → 120s; `60s` / `120000` → ms.
 fn parse_response_header_timeout(raw: &str) -> Result<u64, String> {
     let s = raw.trim().to_ascii_lowercase();
     if s.is_empty() {
@@ -6203,7 +6203,7 @@ fn parse_response_header_timeout(raw: &str) -> Result<u64, String> {
     }
     match s.as_str() {
         "off" | "disable" | "disabled" | "unlimited" | "none" => Ok(0),
-        "on" | "default" => Ok(60_000),
+        "on" | "default" => Ok(120_000),
         _ => {
             if let Some(secs) = s.strip_suffix('s') {
                 let secs: u64 = secs

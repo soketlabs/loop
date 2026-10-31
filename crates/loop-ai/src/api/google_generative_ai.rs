@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use eventsource_stream::Eventsource;
 use reqwest::header::{HeaderMap, HeaderName};
 use serde_json::{json, Value};
 
@@ -116,11 +115,14 @@ async fn run_stream(
     client: reqwest::Client,
     model: Model,
     context: Context,
-    options: StreamOptions,
+    mut options: StreamOptions,
     auth: ModelAuth,
     thinking: Option<(ThinkingLevel, ThinkingBudgets)>,
     handle: AssistantMessageEventStreamHandle,
 ) -> Result<(), StreamFail> {
+    options
+        .generation_started_at
+        .get_or_insert_with(tokio::time::Instant::now);
     check_cancelled(&options)?;
 
     let base_url = auth
@@ -154,10 +156,16 @@ async fn run_stream(
     let mut open: Option<Open> = None;
     let mut finish: Option<String> = None;
     let mut calls = 0usize;
-    let mut events = response.bytes_stream().eventsource();
+    let mut events = super::sse::tracked_events(response, &options);
 
     loop {
-        let data = match next_event(&mut events, options.cancel.as_ref()).await? {
+        let data = match match next_event(&mut events, options.cancel.as_ref()).await {
+            Ok(next) => next,
+            Err(err) => {
+                out.fail(err.message, None);
+                return Ok(());
+            }
+        } {
             Next::Event { data, .. } => data,
             Next::End => break,
             Next::Cancelled => {
@@ -266,7 +274,7 @@ async fn run_stream(
 
     let has_calls = calls > 0;
     match finish.as_deref() {
-        Some("STOP") | Some("FINISH_REASON_UNSPECIFIED") | None if has_calls => {
+        Some("STOP") | Some("FINISH_REASON_UNSPECIFIED") if has_calls => {
             out.finish(StopReason::ToolUse, finish)
         }
         Some("STOP") => out.finish(StopReason::Stop, finish),
