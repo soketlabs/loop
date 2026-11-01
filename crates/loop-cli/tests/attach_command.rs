@@ -142,7 +142,23 @@ async fn list_and_ambiguous_prefix_show_session_details_newest_first() {
             .await;
             assert_eq!(result.is_err(), id.is_some());
             let text = output.lock().unwrap().clone();
-            assert!(text.contains("FOLDER\tTITLE\tBUSY\tLAST ACTIVE (ms)\tPARENT"));
+            let header = text.lines().next().unwrap();
+            let columns: Vec<_> = header.split_whitespace().collect();
+            assert_eq!(
+                columns,
+                ["ID", "FOLDER", "TITLE", "BUSY", "LAST", "ACTIVE", "PARENT"],
+                "{text}"
+            );
+            let row = text.lines().find(|l| l.contains("First")).unwrap();
+            assert!(row.contains(" no ") && row.contains("just now"), "{text}");
+            // Columns line up: every row puts BUSY where the header does.
+            let busy = header.find("BUSY").unwrap();
+            assert!(
+                text.lines()
+                    .skip(1)
+                    .all(|l| matches!(&l[busy..busy + 3], "no " | "yes")),
+                "{text}"
+            );
             assert!(
                 text.find(&second.key.to_string()).unwrap()
                     < text.find(&first.key.to_string()).unwrap()

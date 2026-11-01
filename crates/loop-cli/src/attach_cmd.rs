@@ -223,19 +223,68 @@ mod unix {
         if sessions.is_empty() {
             return "No Sessions. Use `loop attach --new` to create one.\n".into();
         }
-        let mut text = String::from("ID\tFOLDER\tTITLE\tBUSY\tLAST ACTIVE (ms)\tPARENT\n");
-        for s in sessions {
-            text.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\n",
-                s.r#ref.key,
-                s.cwd.display(),
-                s.name.as_deref().unwrap_or("(untitled)"),
-                s.busy,
-                s.last_active_ms,
-                s.parent.as_ref().map(|p| p.key.as_str()).unwrap_or("-")
-            ));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let mut rows =
+            vec![["ID", "FOLDER", "TITLE", "BUSY", "LAST ACTIVE", "PARENT"].map(String::from)];
+        for s in sessions.iter() {
+            rows.push([
+                s.r#ref.key.to_string(),
+                s.cwd.display().to_string(),
+                clip(s.name.as_deref().unwrap_or("(untitled)"), 40),
+                if s.busy { "yes" } else { "no" }.into(),
+                ago(now, s.last_active_ms),
+                s.parent
+                    .as_ref()
+                    .map_or("-".into(), |p| p.key.as_str().chars().take(8).collect()),
+            ]);
+        }
+        let mut widths = [0; 6];
+        for row in &rows {
+            for (width, cell) in widths.iter_mut().zip(row) {
+                *width = (*width).max(cell.chars().count());
+            }
+        }
+        let mut text = String::new();
+        for row in rows {
+            let mut line = String::new();
+            for (i, cell) in row.iter().enumerate() {
+                if i + 1 == row.len() {
+                    line.push_str(cell);
+                } else {
+                    line.push_str(cell);
+                    let pad = widths[i] - cell.chars().count() + 2;
+                    line.extend(std::iter::repeat_n(' ', pad));
+                }
+            }
+            text.push_str(line.trim_end());
+            text.push('\n');
         }
         text
+    }
+
+    /// At most `max` characters, marking a cut with an ellipsis.
+    fn clip(text: &str, max: usize) -> String {
+        let line = text.lines().next().unwrap_or_default();
+        if line.chars().count() <= max && line.len() == text.len() {
+            return line.into();
+        }
+        let mut clipped: String = line.chars().take(max - 1).collect();
+        clipped.push('…');
+        clipped
+    }
+
+    /// How long ago `then_ms` was, for a person: "just now", "42s ago", "2m ago".
+    pub(super) fn ago(now_ms: u64, then_ms: u64) -> String {
+        let secs = now_ms.saturating_sub(then_ms) / 1000;
+        match secs {
+            0..10 => "just now".into(),
+            10..60 => format!("{secs}s ago"),
+            60..3600 => format!("{}m ago", secs / 60),
+            3600..86400 => format!("{}h ago", secs / 3600),
+            _ => format!("{}d ago", secs / 86400),
+        }
     }
 
     fn matches(sessions: &[SessionInfo], id: &str) -> Vec<SessionInfo> {
@@ -548,6 +597,23 @@ mod unix {
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::ago;
+
+        #[test]
+        fn last_activity_reads_as_a_relative_time() {
+            let now = 10_000_000_000;
+            assert_eq!(ago(now, now), "just now");
+            assert_eq!(ago(now, now + 5_000), "just now");
+            assert_eq!(ago(now, now - 9_000), "just now");
+            assert_eq!(ago(now, now - 42_000), "42s ago");
+            assert_eq!(ago(now, now - 2 * 60_000 - 5_000), "2m ago");
+            assert_eq!(ago(now, now - 3 * 3_600_000), "3h ago");
+            assert_eq!(ago(now, now - 49 * 3_600_000), "2d ago");
         }
     }
 }

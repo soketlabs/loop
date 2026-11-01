@@ -314,20 +314,16 @@ impl Fixture {
     /// The only Session's id, from `loop attach` listing.
     async fn only_session(&self) -> String {
         let listing = self.attach(&[]).finish().await;
-        let rows: Vec<_> = listing.lines().skip(1).collect();
+        let rows = rows(&listing);
         assert_eq!(rows.len(), 1, "{listing}");
-        rows[0].split('\t').next().unwrap().to_owned()
+        rows[0][0].clone()
     }
     /// The id of the only Session without a parent.
     async fn only_parent(&self) -> String {
         let listing = self.attach(&[]).finish().await;
-        let roots: Vec<_> = listing
-            .lines()
-            .skip(1)
-            .filter(|l| l.ends_with("\t-"))
-            .collect();
+        let roots: Vec<_> = rows(&listing).into_iter().filter(|r| r[5] == "-").collect();
         assert_eq!(roots.len(), 1, "{listing}");
-        roots[0].split('\t').next().unwrap().to_owned()
+        roots[0][0].clone()
     }
     async fn client(&self) -> Arc<loop_wire::RemoteBackend> {
         let stream = tokio::net::UnixStream::connect(&self.socket).await.unwrap();
@@ -772,11 +768,33 @@ async fn wait_events(
     .await
     .unwrap_or_else(|_| panic!("never saw {what}"));
 }
+/// Cells of `loop attach` listing rows, cut at the header's column starts.
 fn rows(listing: &str) -> Vec<Vec<String>> {
-    listing
-        .lines()
-        .skip(1)
-        .map(|l| l.split('\t').map(str::to_owned).collect())
+    let mut lines = listing.lines();
+    let header: Vec<char> = lines.next().unwrap_or_default().chars().collect();
+    let starts: Vec<usize> = (0..header.len())
+        .filter(|&i| header[i] != ' ' && (i == 0 || (i >= 2 && header[i - 2..i] == [' ', ' '][..])))
+        .collect();
+    lines
+        .map(|line| {
+            let line: Vec<char> = line.chars().collect();
+            starts
+                .iter()
+                .enumerate()
+                .map(|(n, &start)| {
+                    let end = starts
+                        .get(n + 1)
+                        .copied()
+                        .unwrap_or(line.len())
+                        .min(line.len());
+                    line[start.min(end)..end]
+                        .iter()
+                        .collect::<String>()
+                        .trim()
+                        .to_owned()
+                })
+                .collect()
+        })
         .collect()
 }
 
@@ -825,7 +843,7 @@ async fn finished_children_stay_listed_under_their_parent_in_loop_attach() {
         assert_eq!(rows.len(), 2, "{listing}");
         let root = rows.iter().find(|r| r[5] == "-").expect("root row");
         let child = rows.iter().find(|r| r[5] != "-").expect("child row");
-        assert_eq!(child[5], root[0], "{listing}");
+        assert!(root[0].starts_with(&child[5]), "{listing}");
         // The child's log stays; attaching replays its answer.
         let output = fx.attach(&[&child[0]]).finish().await;
         assert!(output.contains("reply kid"), "{output}");
