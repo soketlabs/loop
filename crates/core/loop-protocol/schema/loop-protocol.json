@@ -1,5 +1,46 @@
 {
   "$defs": {
+    "AttachParams": {
+      "description": "`session/attach` params.",
+      "properties": {
+        "after_seq": {
+          "description": "Last processed update sequence; zero replays from the beginning.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session to attach."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "AttachResult": {
+      "description": "`session/attach` result, sent before replay and live updates.",
+      "properties": {
+        "generation": {
+          "description": "Runtime generation of the snapshot.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "latest_seq": {
+          "description": "Last update sequence in the replay snapshot, not an audit cursor.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "latest_seq",
+        "generation"
+      ],
+      "type": "object"
+    },
     "BackendInstanceId": {
       "description": "One configured backend: an agent kind plus its account and settings.",
       "type": "string"
@@ -7,6 +48,11 @@
     "Capabilities": {
       "description": "Features a backend declares. Each must match what the backend can actually\ndo: a surface hides or rejects an operation whose capability is false.",
       "properties": {
+        "attach": {
+          "default": false,
+          "description": "Supports attach, cursor replay and detach.",
+          "type": "boolean"
+        },
         "fs_client": {
           "default": false,
           "description": "Sends file reads and writes to Loop instead of touching disk itself.",
@@ -25,6 +71,11 @@
         "modes": {
           "default": false,
           "description": "Has selectable session modes.",
+          "type": "boolean"
+        },
+        "multi_session": {
+          "default": false,
+          "description": "Manages several Sessions through list and close requests.",
           "type": "boolean"
         },
         "resume_session": {
@@ -82,6 +133,23 @@
           "type": "boolean"
         }
       },
+      "type": "object"
+    },
+    "CloseParams": {
+      "description": "`session/close` params. Closing a busy Session requires `force`.",
+      "properties": {
+        "force": {
+          "description": "Cancel a running turn before closing. Defaults to false.",
+          "type": "boolean"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session to close."
+        }
+      },
+      "required": [
+        "session"
+      ],
       "type": "object"
     },
     "ContentBlock": {
@@ -285,6 +353,197 @@
         "server_info",
         "instance",
         "capabilities"
+      ],
+      "type": "object"
+    },
+    "InteractParams": {
+      "description": "`host/interact` params, preserving the v1 interaction shape.\n\nRouting lives at the wire boundary so local backends can continue producing\nSession-independent requests. Flattening keeps old v1 messages compatible.",
+      "oneOf": [
+        {
+          "description": "Approve or reject a tool call.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "permission",
+              "type": "string"
+            },
+            "options": {
+              "description": "The choices the backend offers, in its order.",
+              "items": {
+                "$ref": "#/$defs/PermissionOption"
+              },
+              "type": "array"
+            },
+            "tool_call": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolCallUpdate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The tool call awaiting approval, when the backend names one."
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "options"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A free-text or multiple-choice question.",
+          "properties": {
+            "choices": {
+              "description": "Offered answers. `None` means free text.",
+              "items": {
+                "$ref": "#/$defs/Choice"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "question",
+              "type": "string"
+            },
+            "prompt": {
+              "description": "Question text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "prompt"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A structured form. The answer is a JSON value matching `schema`.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "form",
+              "type": "string"
+            },
+            "schema": {
+              "description": "JSON Schema of the expected answer."
+            },
+            "title": {
+              "description": "Form title.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "schema"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The user must open a URL, for example to sign in.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "url",
+              "type": "string"
+            },
+            "purpose": {
+              "description": "Why the backend needs it.",
+              "type": "string"
+            },
+            "url": {
+              "description": "URL to open.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "url",
+            "purpose"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A request this Loop version cannot present. It is answered with an\nexplicit error, never left pending.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "unsupported",
+              "type": "string"
+            },
+            "method": {
+              "description": "The backend's method or request type.",
+              "type": "string"
+            },
+            "raw": {
+              "description": "The raw request."
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "method",
+            "raw"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The Session awaiting an answer. Absent on single-Session v1 peers."
+        }
+      },
+      "type": "object"
+    },
+    "InteractWithdrawnParams": {
+      "description": "`host/interact_withdrawn` notification params.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/InteractionId",
+          "description": "The original interaction id, not a connection's JSON-RPC request id."
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session whose Escalation is no longer pending."
+        }
+      },
+      "required": [
+        "session",
+        "id"
       ],
       "type": "object"
     },
@@ -791,6 +1050,68 @@
       ],
       "type": "object"
     },
+    "SessionInfo": {
+      "description": "One Session in the Runtime's list, including closed Sessions.",
+      "properties": {
+        "busy": {
+          "description": "Whether a turn is running.",
+          "type": "boolean"
+        },
+        "created_ms": {
+          "description": "Creation time in milliseconds since the Unix epoch.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cwd": {
+          "description": "Working directory.",
+          "type": "string"
+        },
+        "last_active_ms": {
+          "description": "Last activity time in milliseconds since the Unix epoch.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "live": {
+          "description": "Whether the Runtime currently holds this Session open.",
+          "type": "boolean"
+        },
+        "name": {
+          "default": null,
+          "description": "Display name, when set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Parent Session, when this is a Subagent."
+        },
+        "ref": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The full Session reference."
+        }
+      },
+      "required": [
+        "ref",
+        "cwd",
+        "live",
+        "busy",
+        "created_ms",
+        "last_active_ms"
+      ],
+      "type": "object"
+    },
     "SessionKey": {
       "description": "A conversation as Loop knows it. Stable across process restarts.",
       "type": "string"
@@ -1161,6 +1482,11 @@
         {
           "const": "error",
           "description": "The turn failed. `TurnEnded::error` says why.",
+          "type": "string"
+        },
+        {
+          "const": "runtime_restarted",
+          "description": "Interrupted by a Runtime restart; effects are uncertain. Never retry automatically.",
           "type": "string"
         },
         {
@@ -1643,10 +1969,17 @@
       "direction": "server_to_client",
       "kind": "request",
       "params": {
-        "$ref": "#/$defs/InteractionRequest"
+        "$ref": "#/$defs/InteractParams"
       },
       "result": {
         "$ref": "#/$defs/InteractionOutcome"
+      }
+    },
+    "host/interact_withdrawn": {
+      "direction": "server_to_client",
+      "kind": "notification",
+      "params": {
+        "$ref": "#/$defs/InteractWithdrawnParams"
       }
     },
     "initialize": {
@@ -1659,11 +1992,54 @@
         "$ref": "#/$defs/InitializeResult"
       }
     },
+    "session/attach": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/AttachParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AttachResult"
+      }
+    },
     "session/cancel": {
       "direction": "client_to_server",
       "kind": "notification",
       "params": {
         "$ref": "#/$defs/SessionParams"
+      }
+    },
+    "session/close": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/CloseParams"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "session/detach": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "session/list": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "type": "object"
+      },
+      "result": {
+        "items": {
+          "$ref": "#/$defs/SessionInfo"
+        },
+        "type": "array"
       }
     },
     "session/load": {

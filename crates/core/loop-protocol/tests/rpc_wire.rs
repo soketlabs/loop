@@ -163,3 +163,134 @@ fn negotiation_picks_a_version_both_speak() {
         "a version that never existed"
     );
 }
+
+#[test]
+fn session_list_info_wire() {
+    use loop_protocol::rpc::SessionInfo;
+    roundtrip(
+        &vec![SessionInfo {
+            r#ref: session(),
+            cwd: "/work/repo".into(),
+            name: Some("Review".into()),
+            parent: Some(session()),
+            live: true,
+            busy: false,
+            created_ms: 1793400000000,
+            last_active_ms: 1793400001000,
+        }],
+        json!([{"ref": {"instance":"native","key":"s1","native_id":"n1"},
+            "cwd":"/work/repo", "name":"Review", "parent":{"instance":"native","key":"s1","native_id":"n1"},
+            "live":true,"busy":false,"created_ms":1793400000000u64,"last_active_ms":1793400001000u64}]),
+    );
+    let minimal: SessionInfo = serde_json::from_value(json!({
+        "ref":session(),"cwd":"/work","live":false,"busy":false,
+        "created_ms":0,"last_active_ms":0,"future":true
+    }))
+    .unwrap();
+    assert_eq!(minimal.name, None);
+    assert_eq!(minimal.parent, None);
+    assert_eq!(
+        serde_json::to_value(minimal).unwrap()["parent"],
+        Value::Null
+    );
+}
+
+#[test]
+fn session_control_wire_and_defaults() {
+    use loop_protocol::rpc::{AttachParams, AttachResult, CloseParams, SessionParams};
+    let reference = json!({"instance":"native","key":"s1","native_id":"n1"});
+    roundtrip(
+        &CloseParams {
+            session: session(),
+            force: true,
+        },
+        json!({"session":reference,"force":true}),
+    );
+    let close: CloseParams =
+        serde_json::from_value(json!({"session":reference,"future":true})).unwrap();
+    assert!(!close.force);
+    roundtrip(&close, json!({"session":reference}));
+    roundtrip(
+        &AttachParams {
+            session: session(),
+            after_seq: 40,
+        },
+        json!({"session":reference,"after_seq":40}),
+    );
+    let attach: AttachParams =
+        serde_json::from_value(json!({"session":reference,"future":true})).unwrap();
+    assert_eq!(attach.after_seq, 0);
+    roundtrip(&attach, json!({"session":reference}));
+    roundtrip(
+        &AttachResult {
+            latest_seq: 42,
+            generation: 3,
+        },
+        json!({"latest_seq":42,"generation":3}),
+    );
+    roundtrip(
+        &SessionParams { session: session() },
+        json!({"session":reference}),
+    );
+}
+
+#[test]
+fn runtime_capabilities_are_opt_in() {
+    let old: Capabilities = serde_json::from_value(json!({"usage":true,"future":true})).unwrap();
+    assert!(!old.multi_session);
+    assert!(!old.attach);
+    let capabilities = Capabilities {
+        multi_session: true,
+        attach: true,
+        ..Default::default()
+    };
+    roundtrip(
+        &capabilities,
+        json!({"load_session":false,"resume_session":false,"set_model":false,
+        "modes":false,"usage":false,"images":false,"steering":false,"fs_client":false,
+        "terminal_client":false,"multi_session":true,"attach":true}),
+    );
+}
+
+#[test]
+fn interactions_route_to_a_session_and_withdraw_by_native_id() {
+    use loop_protocol::rpc::{InteractParams, InteractWithdrawnParams};
+    use loop_protocol::InteractionRequest;
+    let cases = [
+        json!({"kind":"permission","id":"p1","options":[]}),
+        json!({"kind":"question","id":"p1","prompt":"Which?"}),
+        json!({"kind":"form","id":"p1","schema":{"type":"object"}}),
+        json!({"kind":"url","id":"p1","url":"https://example.com","purpose":"Sign in"}),
+        json!({"kind":"unsupported","id":"p1","method":"future","raw":{}}),
+    ];
+    for legacy in cases {
+        let request: InteractionRequest = serde_json::from_value(legacy.clone()).unwrap();
+        let old: InteractParams = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(old.session, None);
+        roundtrip(&old, legacy.clone());
+        let mut routed = legacy;
+        routed["session"] = serde_json::to_value(session()).unwrap();
+        roundtrip(
+            &InteractParams {
+                session: Some(session()),
+                request: request.clone(),
+            },
+            routed.clone(),
+        );
+        routed["future"] = json!(true);
+        let extended: InteractParams = serde_json::from_value(routed.clone()).unwrap();
+        assert_eq!(extended.request, request);
+        // Old v1 readers still understand the interaction and ignore routing.
+        assert_eq!(
+            serde_json::from_value::<InteractionRequest>(routed).unwrap(),
+            request
+        );
+    }
+    roundtrip(
+        &InteractWithdrawnParams {
+            session: session(),
+            id: "p1".into(),
+        },
+        json!({"session":{"instance":"native","key":"s1","native_id":"n1"},"id":"p1"}),
+    );
+}
