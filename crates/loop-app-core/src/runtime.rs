@@ -29,13 +29,18 @@ use crate::config::trust::TrustStore;
 use crate::model_selection::StartupModel;
 use crate::resources::{load_resources, LoadedResources};
 use crate::system_prompt::{
-    build_system_prompt, default_tool_snippets, load_context_files, resolve_system_prompt_files,
-    BuildSystemPromptOptions, ContextFile,
+    build_system_prompt, default_tool_snippets, load_context_files, BuildSystemPromptOptions,
+    ContextFile,
 };
 use crate::theme::{theme_search_dirs, Theme};
 use loop_ai::CredentialStore;
 
-/// Fully constructed interactive runtime.
+#[path = "session_factory.rs"]
+mod session_factory;
+pub use session_factory::{GlobalResources, OpenedSession, SessionFactory, WorkspaceResources};
+
+/// Fully constructed application bootstrap result.
+/// The multi-Session owner is the future `loop_runtime::Runtime`.
 pub struct Runtime {
     /// Agent config dir.
     pub agent_dir: PathBuf,
@@ -1288,8 +1293,9 @@ fn thinking_label(level: AgentThinkingLevel) -> &'static str {
     }
 }
 
-/// Bootstrap the full runtime.
-pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
+/// Bootstrap the full application Runtime, preserving interactive trust and sandbox fallback.
+pub async fn bootstrap(mut opts: BootstrapOpts) -> anyhow::Result<Runtime> {
+    opts.cwd = opts.cwd.canonicalize()?;
     let agent_dir = get_agent_dir();
     ensure_agent_dirs(&agent_dir)?;
     std::env::set_var("LOOP_CODING_AGENT", "true");
@@ -1322,232 +1328,34 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         && !subscribed
         && ensure_provider_connected(&credentials, &settings.providers, opts.interactive)?;
 
-    let models = build_models(&agent_dir, Arc::clone(&credentials), &settings.providers)?;
-    // Hydrate every provider from models-store.json before resolving a model. Without
-    // this, `--print` races the background `/v1/models` refresh.
-    let _ = models
-        .refresh(ModelsRefreshOptions {
-            allow_network: Some(false),
-            force: false,
-            provider_id: None,
-        })
-        .await;
-    if !needs_provider_setup {
-        // Network catalog refresh in the background so interactive startup
-        // isn't blocked by a slow API. Cached models are already in memory.
-        let bg_models = Arc::clone(&models);
-        tokio::spawn(async move {
-            let refresh = bg_models
-                .refresh(ModelsRefreshOptions {
-                    allow_network: Some(true),
-                    force: true,
-                    // Providers without a key stay on their cache (see the fetcher).
-                    provider_id: None,
-                })
-                .await;
-            for (pid, err) in &refresh.errors {
-                tracing::warn!("model refresh {pid}: {err}");
-            }
-        });
-    }
-
-    // A saved subscription model is started by the surface, not Loop's agent.
-    let saved = settings
-        .selected_model()
-        .filter(|(provider, _)| agents.entry(provider).is_none());
-    let (mut model, mut model_note) = match crate::model_selection::resolve_startup_model(
-        &models,
-        saved,
-        opts.provider.as_deref(),
-        opts.model.as_deref(),
-    )? {
-        StartupModel::Selected(model) => (Some(*model), None),
-        StartupModel::NotSelected { reason } => (None, reason),
-    };
-    if model
-        .as_ref()
-        .is_some_and(|m| credentials.is_logged_out(&m.provider))
-    {
-        if opts.provider.is_some() || opts.model.is_some() {
-            bail!("selected provider is logged out; run /login before selecting its model");
-        }
-        model = None;
-        model_note = Some("saved provider is logged out; use /login or /model".into());
-    }
-    if let Some(m) = &model {
-        settings.set_selected_model(&m.provider, &m.id);
-    }
-
-    let resources = load_resources(&agent_dir, &opts.cwd, project_trusted, &settings);
-    let context_files = if opts.no_context_files {
-        vec![]
-    } else {
-        load_context_files(&opts.cwd, &agent_dir)
-    };
-    let (custom, append) = resolve_system_prompt_files(
-        &opts.cwd,
-        project_trusted,
-        opts.system_prompt.as_deref(),
-        opts.append_system_prompt.as_deref(),
-    );
-
-    let sessions_db = sessions_db_path(&agent_dir);
-    let store = create_sqlite_session_store(&sessions_db)
-        .map_err(|e| anyhow::anyhow!("sqlite session store: {e}"))?;
-    let repo = create_session_repository(store, None);
-    let resumed = opts.session_id.is_some();
-    let session = if let Some(id) = &opts.session_id {
-        repo.open(id)
-            .await
-            .map_err(|e| anyhow::anyhow!("load session: {e}"))?
-    } else {
-        repo.create(Some(opts.cwd.to_string_lossy().into_owned()), None)
-            .await
-            .map_err(|e| anyhow::anyhow!("create session: {e}"))?
-    };
-
-    // Restore model from the session branch when resuming (unless CLI overrides).
-    if resumed {
-        if let Ok(ctx) = session.build_context().await {
-            if opts.provider.is_none() && opts.model.is_none() {
-                if let Some((p, m)) = &ctx.model {
-                    if let Some(resolved) = models
-                        .get_model(p, m)
-                        .filter(|_| !credentials.is_logged_out(p))
-                    {
-                        settings.set_selected_model(p, m);
-                        model = Some(resolved);
-                        model_note = None;
-                    }
-                }
-            }
-            // Thinking-level changes are recorded on the branch when present.
-            if !matches!(ctx.thinking_level, AgentThinkingLevel::Off) {
-                settings.default_thinking_level = thinking_label(ctx.thinking_level).into();
-            }
-        }
-    }
-
-    let host: Arc<dyn loop_agent::harness::ExecutionEnv> =
-        Arc::new(HostExecutionEnv::new(&opts.cwd));
-
-    let (sandbox, tool_env): (SandboxMode, Arc<dyn loop_agent::harness::ExecutionEnv>) =
-        match settings.sandbox.mode.as_str() {
-            "local" => {
-                let isolation = KrunIsolation::parse(&settings.sandbox.isolation)
-                    .unwrap_or(KrunIsolation::Full);
-                let oci_runtime = LocalSandboxRuntime::parse(&settings.sandbox.runtime)
-                    .unwrap_or(LocalSandboxRuntime::Runc);
-                settings.sandbox.isolation = isolation.as_str().into();
-                settings.sandbox.runtime = oci_runtime.as_str().into();
-                let sb = KrunSandbox::new(KrunSandbox::config_for(
-                    opts.cwd.clone(),
-                    isolation,
-                    oci_runtime,
-                ));
-                match sb.start().await {
-                    Ok(()) => {
-                        let env = sb.env();
-                        (
-                            SandboxMode::Enabled {
-                                sandbox: Arc::new(sb),
-                            },
-                            env,
-                        )
-                    }
-                    Err(e) => {
-                        tracing::warn!("local sandbox disabled at startup: {e}");
-                        eprintln!("warning: local sandbox not enabled:\n{e}");
-                        settings.sandbox.mode = "off".into();
-                        (SandboxMode::Disabled, Arc::clone(&host))
-                    }
-                }
-            }
-            _ => {
-                settings.sandbox.mode = "off".into();
-                (SandboxMode::Disabled, Arc::clone(&host))
-            }
-        };
-
-    let web = crate::web_tools::WebTools::from_settings(
-        &settings,
-        Some(Arc::clone(&credentials)),
-        opts.no_web,
-    );
-    let bash_limits = settings.bash.unwrap_or_default().limits();
-    let tool_gate = crate::tool_gate::ToolGate::new(
-        crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
-    );
-    let tools = build_tools(
-        Arc::clone(&tool_env),
-        &web,
-        bash_limits,
-        tool_gate.search_filter(),
-    );
-
-    // The prompt lists the tools that were actually built (web_search may be
-    // unconfigured), so it can never promise a tool the agent cannot call.
-    let snippets = default_tool_snippets();
-    let selected: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-    let system_prompt = build_system_prompt(BuildSystemPromptOptions {
-        custom_prompt: custom.as_deref(),
-        append_system_prompt: append.as_deref(),
-        cwd: &opts.cwd,
-        selected_tools: &selected,
-        tool_snippets: &snippets,
-        context_files: &context_files,
-    });
-
-    let session_id = session.metadata().id.clone();
-    let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
-        models: Arc::clone(&models),
-        model: model.clone(),
-        session,
-        host_env: host,
-        tools,
-        system_prompt,
-        sandbox,
-        resources: AgentHarnessResources {
-            skills: resources.skills.clone(),
-            prompt_templates: resources.prompts.clone(),
-        },
-    }));
-    harness
-        .set_thinking_level(parse_thinking(&settings.default_thinking_level))
-        .await;
-    harness.set_bash_limits(bash_limits);
-    harness
-        .set_response_header_timeout_ms(settings.response_header_timeout_ms)
-        .await;
-    harness
-        .set_timeouts(
-            settings.timeouts.clone(),
-            settings.timeout_overrides.clone(),
+    let globals = Arc::new(
+        GlobalResources::load(
+            agent_dir.clone(),
+            &settings.providers,
+            !needs_provider_setup,
         )
-        .await;
-
-    let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
-    let backend: Arc<dyn loop_protocol::AgentBackend> = native.clone();
-
-    tool_gate.install(&harness);
+        .await?,
+    );
+    let workspace = Arc::new(
+        WorkspaceResources::load_resolved(&globals, &opts, project_trusted, settings, true).await?,
+    );
+    let factory = SessionFactory::new(Arc::clone(&globals));
+    let opened = factory.open(Arc::clone(&workspace), &opts).await?;
+    let OpenedSession {
+        harness,
+        native,
+        tool_gate,
+        settings,
+        session_id,
+        selected_model,
+        model_note,
+        startup_notices,
+        ..
+    } = opened;
+    // Standalone Surfaces install their own approval transport, as before.
+    tool_gate.set_approver(None);
     agents.set_gate(Arc::clone(&tool_gate));
-    let mut startup_notices =
-        crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
-    let (mode, mode_notice) = startup_permission_mode(
-        opts.permission_mode.as_deref(),
-        settings.permission_mode.as_deref(),
-        &settings.file_edit_review,
-        opts.interactive,
-    )?;
-    tool_gate.set_mode(mode);
-    startup_notices.extend(mode_notice);
-    if mode == crate::permissions::PermissionMode::FullAccess {
-        startup_notices.push(
-            "⚠ full access: every tool call runs without asking, including shell commands \
-             and file deletion (deny rules and hooks still apply)"
-                .into(),
-        );
-    }
+    let resources = workspace.resources.clone();
     let ext = crate::extensions::load_extensions(&resources.extension_paths);
     for n in &ext.notices {
         tracing::info!("extension: {n}");
@@ -1561,42 +1369,16 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     );
     let theme = Theme::load(&settings.theme, &theme_dirs).unwrap_or_else(|_| Theme::dark());
 
-    let mcp_client = Arc::new(loop_mcp::McpClientManager::with_oauth_dir(
-        agent_dir.join("mcp-auth"),
-    ));
-    tool_gate.set_mcp(Arc::clone(&mcp_client));
-    let entries = enabled_mcp_server_entries(&settings.mcp_servers, &settings.disabled_mcp_servers);
-    if !entries.is_empty() {
-        let results = mcp_client.connect_all(&entries).await;
-        for (name, result) in &results {
-            match result {
-                Ok(count) => tracing::info!("mcp: connected to '{name}' ({count} tools)"),
-                Err(e) => tracing::warn!("mcp: failed to connect to '{name}': {e}"),
-            }
-        }
-        let mcp_tools = loop_agent::harness::mcp::bridge::mcp_tools_to_agent_tools_async(
-            mcp_client.connections(),
-        )
-        .await;
-        if !mcp_tools.is_empty() {
-            let mut all_tools = harness.get_tools().await;
-            all_tools.extend(mcp_tools);
-            harness
-                .set_tools(all_tools)
-                .await
-                .map_err(|e| anyhow::anyhow!("set MCP tools: {e}"))?;
-        }
-    }
-
+    let backend: Arc<dyn loop_protocol::AgentBackend> = native.clone();
     Ok(Runtime {
         agent_dir,
-        cwd: opts.cwd,
-        custom_system_prompt: custom,
-        append_system_prompt: append,
-        context_files,
+        cwd: workspace.cwd.clone(),
+        custom_system_prompt: workspace.custom_system_prompt.clone(),
+        append_system_prompt: workspace.append_system_prompt.clone(),
+        context_files: workspace.context_files.clone(),
         settings,
-        models,
-        credentials,
+        models: Arc::clone(&globals.models),
+        credentials: Arc::clone(&globals.credentials),
         harness,
         backend,
         native,
@@ -1608,16 +1390,16 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         resources,
         project_trusted,
         trust,
-        sessions_db,
+        sessions_db: globals.sessions_db.clone(),
         session_id,
-        resumed,
+        resumed: opts.session_id.is_some(),
         needs_provider_setup,
-        selected_model: model,
+        selected_model,
         model_note,
         tool_approval: None,
         tool_gate,
         startup_notices,
-        mcp_client,
+        mcp_client: Arc::clone(&workspace.mcp_client),
         active_skills: Vec::new(),
         web_disabled_for_run: opts.no_web,
         #[cfg(feature = "telemetry")]

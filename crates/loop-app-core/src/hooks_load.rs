@@ -162,6 +162,7 @@ impl On {
 #[derive(Debug, Clone)]
 struct Hook {
     label: String,
+    workspace: Option<PathBuf>,
     on: On,
     rules: MatchRules,
     action: HookAction,
@@ -247,6 +248,7 @@ impl Hook {
         let cwd = call
             .map(|c| c.cwd.clone())
             .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| self.workspace.clone())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
         let env = [
@@ -413,7 +415,7 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 /// Hooks read from disk, plus what to tell the user about them.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LoadedHooks {
     hooks: Vec<Hook>,
     /// Problems and warnings, one line each, for the TUI or stderr.
@@ -507,6 +509,7 @@ pub fn load_hooks(paths: &[PathBuf]) -> LoadedHooks {
         }
         loaded.hooks.push(Hook {
             label,
+            workspace: None,
             on,
             rules,
             action: file.action,
@@ -540,7 +543,18 @@ pub fn register_json_hooks(
     harness: &loop_agent::harness::AgentHarness,
     paths: &[PathBuf],
 ) -> Vec<String> {
-    let mut loaded = load_hooks(paths);
+    register_workspace_hooks(harness, load_hooks(paths), &harness.cwd())
+}
+
+/// Register shared definitions with the owning Session's explicit workspace.
+pub fn register_workspace_hooks(
+    harness: &loop_agent::harness::AgentHarness,
+    mut loaded: LoadedHooks,
+    workspace: &Path,
+) -> Vec<String> {
+    for hook in &mut loaded.hooks {
+        hook.workspace = Some(workspace.to_path_buf());
+    }
     let notices = std::mem::take(&mut loaded.notices);
     for notice in &notices {
         tracing::warn!("{notice}");
