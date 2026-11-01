@@ -291,6 +291,11 @@ impl ToolApprovalBridge {
         }
     }
 
+    /// Replace the Surface transport while preserving the execution environment.
+    pub fn set_host(&mut self, host: Arc<dyn HostServices>) {
+        self.prompts = PromptSink::Host(host);
+    }
+
     /// Whether file-edit review should spawn an external editor with `--diff`.
     /// Desktop disables this and shows diffs in its own panel instead.
     pub fn set_open_external_diff(&self, open: bool) {

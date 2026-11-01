@@ -21,6 +21,7 @@ use loop_protocol::{
     ContentBlock, ErrorCategory, Origin, SessionKey, SessionRef, SessionSpec, SessionUpdate,
     TurnHandle, TurnOutcome, UpdateEnvelope,
 };
+use loop_wire::control::EscalationRecipient;
 use serde_json::json;
 use std::{
     collections::{HashMap, VecDeque},
@@ -59,6 +60,7 @@ pub struct Runtime {
     defaults: BootstrapOpts,
     sessions: Mutex<HashMap<SessionKey, Arc<LiveSession>>>,
     workspaces: Mutex<HashMap<PathBuf, WorkspaceState>>,
+    recipients: AsyncMutex<HashMap<SessionKey, Recipients>>,
     admission: AsyncMutex<()>,
     stopped: AtomicBool,
     log: Arc<dyn EventLog>,
@@ -73,6 +75,7 @@ pub struct Runtime {
 }
 /// Newest event timestamp per Session, kept in memory so listing never scans the log.
 type Activity = Arc<Mutex<HashMap<SessionKey, i64>>>;
+type Recipients = HashMap<u64, Arc<dyn EscalationRecipient>>;
 fn touch(activity: &Activity, key: &SessionKey, ts_ms: i64) {
     let mut map = activity.lock().unwrap();
     let slot = map.entry(key.clone()).or_insert(ts_ms);
@@ -135,6 +138,7 @@ struct WorkspaceState {
 }
 struct LiveSession {
     opened: OpenedSession,
+    escalations: crate::EscalationHost,
     reference: SessionRef,
     busy: AtomicBool,
     closing: AtomicBool,
@@ -152,7 +156,7 @@ enum Command {
     Barrier(oneshot::Sender<()>),
     Stop(oneshot::Sender<()>),
 }
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -213,6 +217,7 @@ impl Runtime {
             defaults,
             sessions: Mutex::new(HashMap::new()),
             workspaces: Mutex::new(HashMap::new()),
+            recipients: AsyncMutex::new(HashMap::new()),
             admission: AsyncMutex::new(()),
             stopped: AtomicBool::new(false),
             log,
@@ -337,7 +342,7 @@ impl Runtime {
         };
         opts.session_id = Some(id.clone());
         let result = async {
-            let opened = self.factory.open(workspace, &opts).await.map_err(failed)?;
+            let mut opened = self.factory.open(workspace, &opts).await.map_err(failed)?;
             let sandbox = opened
                 .harness
                 .ensure_sandbox_ready()
@@ -351,6 +356,14 @@ impl Runtime {
                 },
             );
             let reference = opened.native.current_session().await;
+            let escalations =
+                crate::EscalationHost::new(reference.clone(), self.log.clone(), self.generation);
+            // Runtime grants are live Session state, never restored after a crash.
+            opened.approval_bridge.clear_session_grants();
+            Arc::make_mut(&mut opened.approval_bridge).set_host(Arc::new(escalations.clone()));
+            opened
+                .tool_gate
+                .set_approver(Some(opened.approval_bridge.clone()));
             let receiver = opened.native.subscribe();
             let (commands, rx) = mpsc::unbounded_channel();
             let (cancel, _) = watch::channel(0);
@@ -368,6 +381,7 @@ impl Runtime {
             touch(&self.activity, &reference.key, ts_ms);
             let live = Arc::new(LiveSession {
                 opened,
+                escalations,
                 reference: reference.clone(),
                 busy: AtomicBool::new(false),
                 closing: AtomicBool::new(false),
@@ -380,6 +394,14 @@ impl Runtime {
                 activity: Arc::clone(&self.activity),
                 tail: Mutex::new(VecDeque::new()),
             });
+            // Attachments outlive unloading. Serialize restoration with new
+            // registration and disconnect, so none can miss this host.
+            let recipients = self.recipients.lock().await;
+            if let Some(attached) = recipients.get(&reference.key) {
+                for (&connection, recipient) in attached {
+                    live.escalations.attach(connection, recipient.clone()).await;
+                }
+            }
             let task = tokio::spawn(pump(
                 Arc::clone(&live),
                 receiver,
@@ -521,6 +543,15 @@ impl Runtime {
             }
             return Ok(());
         }
+        if force {
+            live.cancel.send_modify(|n| *n += 1);
+            live.opened.native.cancel(&live.reference);
+        }
+        let withdrawal = live
+            .escalations
+            .withdraw("Session closed", true)
+            .await
+            .map_err(failed);
         let grace = self.close_grace;
         if force && live.commands.send(Command::Cancel).is_err() {
             live.cancel.send_modify(|n| *n += 1);
@@ -583,6 +614,7 @@ impl Runtime {
         if let Some(error) = pump_error {
             return Err(error);
         }
+        withdrawal?;
         logged?;
         released?;
         if let Some(error) = live.failure.lock().unwrap().clone() {
@@ -642,6 +674,49 @@ impl Runtime {
 }
 #[async_trait]
 impl loop_wire::RuntimeControl for Runtime {
+    async fn recipient(
+        &self,
+        session: &SessionRef,
+        connection: u64,
+        recipient: Option<Arc<dyn loop_wire::control::EscalationRecipient>>,
+    ) -> BackendResult<()> {
+        if session.instance != self.instance || session.key.0 != session.native_id {
+            return Err(BackendError::SessionNotFound(session.key.clone()));
+        }
+        let mut recipients = self.recipients.lock().await;
+        match &recipient {
+            Some(recipient) => {
+                recipients
+                    .entry(session.key.clone())
+                    .or_default()
+                    .insert(connection, recipient.clone());
+            }
+            None => {
+                if let Some(attached) = recipients.get_mut(&session.key) {
+                    attached.remove(&connection);
+                }
+            }
+        }
+        if let Ok(live) = self.route(session) {
+            match recipient {
+                Some(recipient) => live.escalations.attach(connection, recipient).await,
+                None => live.escalations.detach(connection).await,
+            }
+        }
+        Ok(())
+    }
+    async fn disconnected(&self, connection: u64) {
+        let mut recipients = self.recipients.lock().await;
+        recipients.retain(|_, attached| {
+            attached.remove(&connection);
+            !attached.is_empty()
+        });
+        let sessions: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
+        for live in sessions {
+            live.escalations.detach(connection).await;
+        }
+    }
+
     async fn list(&self) -> BackendResult<Vec<SessionInfo>> {
         Runtime::list(self).await
     }
@@ -789,7 +864,13 @@ impl AgentBackend for Runtime {
                 if let Some(error) = live.failure.lock().unwrap().clone() {
                     return Err(failed(error));
                 }
-                Ok(outcome)
+                // Native cancellation while awaiting a tool can return its last
+                // tool-use message. Runtime cancellation remains authoritative.
+                Ok(if cancelled.has_changed().unwrap_or(true) {
+                    TurnOutcome::Cancelled
+                } else {
+                    outcome
+                })
             }
             .await;
             live.permit.lock().await.take();
@@ -956,7 +1037,8 @@ async fn pump(
                         let result = log.append_batch(vec![Event { generation, session_key: Some(live.reference.key.clone()), turn: None, ts_ms: now(), kind: EventKind::Cancelled(json!({})) }]).await.map_err(failed);
                         live.cancel.send_modify(|n| *n += 1);
                         live.opened.native.cancel(&live.reference);
-                        result.map(|_| ())
+                        let withdrawn = live.escalations.withdraw("turn cancelled", false).await.map_err(failed);
+                        result.map(|_| ()).and(withdrawn)
                     }
                     Some(Command::Barrier(tx) | Command::Stop(tx)) => {
                         let result = async {

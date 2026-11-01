@@ -2,3 +2,6 @@
 pub mod log;
 mod runtime;
 pub use runtime::{Runtime, RuntimeLimits};
+
+mod escalation;
+pub use escalation::EscalationHost;
