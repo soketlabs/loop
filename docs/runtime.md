@@ -46,6 +46,7 @@ Session database is shared.
 
 ```bash
 loop attach                  # list Sessions: id, folder, title, busy, last activity, parent
+loop attach --all            # also list finished Subagent Sessions
 loop attach 3f2a             # attach to a Session by id or unique id prefix
 loop attach --new            # create a Session in the current folder and attach
 loop attach --new --cwd DIR  # create a Session in DIR and attach
@@ -53,9 +54,11 @@ loop attach --new --cwd DIR  # create a Session in DIR and attach
 
 When you attach, the Surface replays the Session's history and then follows it
 live. A Session that is not loaded, for example after the Runtime restarted, is
-loaded when you attach. Child Sessions started by a Subagent show their parent
-in the list. A finished child is never loaded again: attaching replays its
-output, but you cannot prompt it.
+loaded when you attach. Child Sessions started by a Subagent are named after
+their task and show their parent in the list. Once the parent has its answer,
+a finished child is closed: it frees its slot and is listed only with
+`--all`. It is never loaded again: attaching replays its output, but you
+cannot prompt it.
 
 `--socket PATH` connects to a Runtime that was started with a custom socket.
 

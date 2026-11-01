@@ -117,6 +117,9 @@ enum Commands {
         /// Runtime socket path.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Also list finished Subagent Sessions.
+        #[arg(long, conflicts_with_all = ["id", "new"])]
+        all: bool,
     },
     /// Show config directory paths.
     Config,
@@ -259,12 +262,14 @@ async fn real_main() -> anyhow::Result<()> {
                 new,
                 cwd,
                 socket,
+                all,
             } => {
                 return loop_cli::attach_cmd::run(loop_cli::attach_cmd::AttachArgs {
                     id: id.clone(),
                     new: *new,
                     cwd: cwd.clone().or(cli.cwd.clone()),
                     socket: socket.clone(),
+                    all: *all,
                 })
                 .await;
             }
@@ -489,6 +494,12 @@ mod tests {
         assert_eq!(cwd, Some(PathBuf::from("/tmp")));
         assert_eq!(socket, Some(PathBuf::from("/tmp/r.sock")));
         assert!(Cli::try_parse_from(["loop", "attach", "abc", "--new"]).is_err());
+        let cli = Cli::try_parse_from(["loop", "attach", "--all"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attach { all: true, .. })
+        ));
+        assert!(Cli::try_parse_from(["loop", "attach", "abc", "--all"]).is_err());
         let cli = Cli::try_parse_from(["loop", "attach"]).unwrap();
         assert!(matches!(
             cli.command,

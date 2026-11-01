@@ -7,6 +7,8 @@ pub struct AttachArgs {
     pub new: bool,
     pub cwd: Option<PathBuf>,
     pub socket: Option<PathBuf>,
+    /// List finished Subagent children too.
+    pub all: bool,
 }
 
 #[cfg(not(unix))]
@@ -406,7 +408,20 @@ mod unix {
         } else {
             let mut sessions = backend.list().await?;
             let Some(id) = args.id else {
-                terminal.write(&list_text(&mut sessions))?;
+                let hidden = if args.all {
+                    0
+                } else {
+                    let before = sessions.len();
+                    sessions.retain(|s| s.live || s.parent.is_none());
+                    before - sessions.len()
+                };
+                let mut text = list_text(&mut sessions);
+                if hidden > 0 {
+                    text.push_str(&format!(
+                        "\n{hidden} finished Subagent Session(s) not shown; `loop attach --all` lists them.\n"
+                    ));
+                }
+                terminal.write(&text)?;
                 client.shutdown().await;
                 return Ok(());
             };

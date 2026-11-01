@@ -776,6 +776,7 @@ fn rows(listing: &str) -> Vec<Vec<String>> {
         .filter(|&i| header[i] != ' ' && (i == 0 || (i >= 2 && header[i - 2..i] == [' ', ' '][..])))
         .collect();
     lines
+        .take_while(|line| !line.is_empty())
         .map(|line| {
             let line: Vec<char> = line.chars().collect();
             starts
@@ -828,7 +829,7 @@ async fn a_parent_runs_two_subagents_in_parallel_and_gets_both_answers() {
 }
 
 #[tokio::test]
-async fn finished_children_stay_listed_under_their_parent_in_loop_attach() {
+async fn finished_children_are_hidden_unless_all_and_stay_attachable() {
     bounded(async {
         let fx = Fixture::new();
         let serve = fx.serve().await;
@@ -838,7 +839,10 @@ async fn finished_children_stay_listed_under_their_parent_in_loop_attach() {
         parent.wait_text("tool done: kid").await;
         parent.finish().await;
 
+        // A finished child is closed: hidden unless asked for.
         let listing = fx.attach(&[]).finish().await;
+        assert_eq!(rows(&listing).len(), 1, "{listing}");
+        let listing = fx.attach(&["--all"]).finish().await;
         let rows = rows(&listing);
         assert_eq!(rows.len(), 2, "{listing}");
         let root = rows.iter().find(|r| r[5] == "-").expect("root row");
@@ -983,7 +987,7 @@ async fn a_finished_child_frees_its_session_slot() {
         assert_eq!(ended.len(), 2, "{ended:?}");
         assert!(ended
             .iter()
-            .all(|(_, p)| p["status"] == "completed" && p["closed"].is_null()));
+            .all(|(_, p)| p["status"] == "completed" && p["closed"] == true));
         let client = fx.client().await;
         let live = client
             .list()

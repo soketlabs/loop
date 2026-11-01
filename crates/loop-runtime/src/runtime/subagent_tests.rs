@@ -259,6 +259,15 @@ async fn parallel_children_complete_and_the_parent_gets_both_answers() {
         let after = children(&rt.list().await.unwrap(), &root);
         assert_eq!(after.len(), 2);
         assert!(after.iter().all(|c| !c.live), "finished children close");
+        assert_eq!(
+            rt.sessions.lock().unwrap().len(),
+            1,
+            "only the root stays loaded"
+        );
+        for child in &after {
+            let lease = rt.store.lease(&child.r#ref.native_id).await.unwrap();
+            assert!(lease.is_none(), "a finished child releases its lease");
+        }
 
         let events = log.read_runtime_after(0).await.unwrap();
         let parent = kinds(&events, &root.key);
@@ -518,6 +527,7 @@ fn payload<'a>(events: &'a [LoggedEvent], key: &SessionKey, kind: &str) -> Optio
         }
         match (&e.event.kind, kind) {
             (EventKind::SessionClosed(p), "session_closed") => Some(p),
+            (EventKind::SubagentEnded(p), "subagent_ended") => Some(p),
             _ => None,
         }
     })
@@ -935,6 +945,52 @@ async fn a_closed_child_cannot_be_reopened_as_an_unrestricted_root() {
         rt.load_session(&fork, SessionSpec::default())
             .await
             .unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_subagent_children_list_a_parent_and_their_end_says_they_closed() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let script: Script = Arc::new(|turn: Turn| match (turn.task.as_str(), turn.call) {
+            ("root", 1) => ready(calls(vec![spawn("kid")])),
+            ("root", _) => ready(text("root done")),
+            _ => ready(text("kid done")),
+        });
+        let (rt, log, _) =
+            runtime(dir.path(), "full-access", RuntimeLimits::default(), script).await;
+        let root = rt.new_session(SessionSpec::default()).await.unwrap();
+        // A fork made elsewhere also records a parent, but it is no Subagent.
+        let fork = rt
+            .store
+            .create_child(None, Some("fork".into()), &root.native_id)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        assert!(matches!(
+            run(&rt, &root, "root").await,
+            TurnOutcome::Completed(_)
+        ));
+        let list = rt.list().await.unwrap();
+        let fork = list.iter().find(|s| s.r#ref.native_id == fork).unwrap();
+        assert_eq!(fork.parent, None, "{fork:?}");
+        let kids = children(&list, &root);
+        assert_eq!(kids.len(), 1);
+        assert_eq!(
+            kids[0].name.as_deref(),
+            Some("kid"),
+            "the task names the child"
+        );
+
+        let events = log.read_runtime_after(0).await.unwrap();
+        let ended = payload(&events, &root.key, "subagent_ended").unwrap();
+        assert_eq!(ended["closed"], json!(true), "{ended}");
+        assert!(ended.get("close_error").is_none(), "{ended}");
         rt.shutdown().await;
     })
     .await

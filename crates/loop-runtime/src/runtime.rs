@@ -25,7 +25,7 @@ use loop_protocol::{
 use loop_wire::control::EscalationRecipient;
 use serde_json::json;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     path::PathBuf,
     sync::{
@@ -80,6 +80,8 @@ pub struct Runtime {
     /// Set by [`Runtime::into_shared`]; the `subagent` tool calls back through it.
     me: OnceLock<Weak<Runtime>>,
     subagent_depth: u32,
+    /// Sessions the Runtime opened as Subagents, read from the Event Log once.
+    subagents: AsyncMutex<Option<HashSet<SessionKey>>>,
 }
 /// Newest event timestamp per Session, kept in memory so listing never scans the log.
 type Activity = Arc<Mutex<HashMap<SessionKey, i64>>>;
@@ -251,6 +253,7 @@ impl Runtime {
             close_grace: CLOSE_GRACE,
             me: OnceLock::new(),
             subagent_depth: subagent::DEFAULT_DEPTH,
+            subagents: AsyncMutex::new(None),
         })
     }
     /// Share the Runtime. Only a shared Runtime offers its Sessions the
@@ -557,6 +560,11 @@ impl Runtime {
                 .await
                 .map_err(failed)?;
             touch(&self.activity, &reference.key, ts_ms);
+            if parent.is_some() {
+                if let Some(keys) = self.subagents.lock().await.as_mut() {
+                    keys.insert(reference.key.clone());
+                }
+            }
             let live = Arc::new(LiveSession {
                 opened,
                 escalations,
@@ -646,13 +654,28 @@ impl Runtime {
         else {
             return Ok(None);
         };
-        let events = self.log.read_runtime_after(0).await.map_err(failed)?;
-        let child = events.iter().any(|record| {
-            record.event.session_key.as_ref() == Some(&session.key)
-                && matches!(&record.event.kind, EventKind::SessionOpened(payload)
-                    if !payload["parent"].is_null())
-        });
+        let child = self.subagent_keys().await?.contains(&session.key);
         Ok(child.then_some(parent))
+    }
+    /// Keys of every Session opened as a Subagent. The Event Log is scanned
+    /// once; children opened later are added as they open.
+    async fn subagent_keys(&self) -> BackendResult<HashSet<SessionKey>> {
+        let mut known = self.subagents.lock().await;
+        if let Some(keys) = known.as_ref() {
+            return Ok(keys.clone());
+        }
+        let events = self.log.read_runtime_after(0).await.map_err(failed)?;
+        let keys: HashSet<_> = events
+            .into_iter()
+            .filter_map(|record| match &record.event.kind {
+                EventKind::SessionOpened(payload) if !payload["parent"].is_null() => {
+                    record.event.session_key
+                }
+                _ => None,
+            })
+            .collect();
+        *known = Some(keys.clone());
+        Ok(keys)
     }
     // A failed open of a Session this call created must not leave an empty row.
     async fn discard_new_row(&self, created: bool, id: &str) {
@@ -671,12 +694,15 @@ impl Runtime {
             .list(None)
             .await
             .map_err(failed)?;
+        // Forks also record a parent; only Subagents report one here.
+        let subagents = self.subagent_keys().await?;
         let activity = self.activity.lock().unwrap().clone();
         let sessions = self.sessions.lock().unwrap();
         Ok(known
             .into_iter()
             .map(|meta| {
                 let r = reference(&meta.id);
+                let subagent = subagents.contains(&r.key);
                 let live = sessions.get(&r.key);
                 let last_active_ms = activity
                     .get(&r.key)
@@ -687,7 +713,10 @@ impl Runtime {
                     r#ref: r,
                     cwd: meta.cwd.map(PathBuf::from).unwrap_or_default(),
                     name: meta.name,
-                    parent: meta.parent_session_id.map(|s| reference(&s)),
+                    parent: meta
+                        .parent_session_id
+                        .filter(|_| subagent)
+                        .map(|s| reference(&s)),
                     live: live.is_some(),
                     busy: live.is_some_and(|s| s.busy.load(Ordering::Acquire)),
                     created_ms: meta.created_at.max(0) as u64,
