@@ -13,8 +13,9 @@ use loop_agent::{
     },
     native_backend::NATIVE_INSTANCE,
 };
-use loop_app_core::runtime::{
-    BootstrapOpts, GlobalResources, OpenedSession, SessionFactory, WorkspaceResources,
+use loop_app_core::{
+    permissions::workspace_root,
+    runtime::{BootstrapOpts, GlobalResources, OpenedSession, SessionFactory, WorkspaceResources},
 };
 use loop_protocol::{
     rpc::SessionInfo, AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities,
@@ -29,7 +30,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock, Weak,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -53,6 +54,10 @@ impl Default for RuntimeLimits {
     }
 }
 
+mod subagent;
+#[cfg(test)]
+mod subagent_tests;
+
 /// One Runtime owns all live native Sessions and their durable update streams.
 pub struct Runtime {
     instance: BackendInstanceId,
@@ -72,6 +77,9 @@ pub struct Runtime {
     updates: broadcast::Sender<UpdateEnvelope>,
     activity: Activity,
     close_grace: Duration,
+    /// Set by [`Runtime::into_shared`]; the `subagent` tool calls back through it.
+    me: OnceLock<Weak<Runtime>>,
+    subagent_depth: u32,
 }
 /// Newest event timestamp per Session, kept in memory so listing never scans the log.
 type Activity = Arc<Mutex<HashMap<SessionKey, i64>>>;
@@ -150,6 +158,14 @@ struct LiveSession {
     turn_task: Mutex<Option<AbortHandle>>,
     activity: Activity,
     tail: Mutex<VecDeque<UpdateEnvelope>>,
+    /// Subagent nesting: 0 for a Session a Surface opened.
+    depth: u32,
+    /// The directory the gate treats as this Session's workspace.
+    workspace: PathBuf,
+    /// Present on a Subagent: its answer and model-call count.
+    child: Option<Arc<subagent::ChildState>>,
+    /// Subagent calls of the current turn that are waiting on a child.
+    waiting: AsyncMutex<usize>,
 }
 enum Command {
     Cancel,
@@ -229,7 +245,23 @@ impl Runtime {
             updates,
             activity,
             close_grace: CLOSE_GRACE,
+            me: OnceLock::new(),
+            subagent_depth: subagent::DEFAULT_DEPTH,
         })
+    }
+    /// Share the Runtime. Only a shared Runtime offers its Sessions the
+    /// `subagent` tool, because the tool opens child Sessions through it.
+    pub fn into_shared(self) -> Arc<Self> {
+        Arc::new_cyclic(|me| {
+            let _ = self.me.set(me.clone());
+            self
+        })
+    }
+    /// The deepest Subagent level (the root is 0); Sessions at it cannot
+    /// spawn another child. Defaults to 2.
+    pub fn with_subagent_depth(mut self, depth: u32) -> Self {
+        self.subagent_depth = depth;
+        self
     }
     /// Bound each step of closing a Session whose turn ignores cancellation.
     pub fn with_close_grace(mut self, grace: Duration) -> Self {
@@ -257,6 +289,7 @@ impl Runtime {
         &self,
         existing: Option<&SessionRef>,
         spec: SessionSpec,
+        child: Option<subagent::ChildOpen>,
     ) -> BackendResult<SessionRef> {
         let _admission = self.admission.lock().await;
         if self.stopped.load(Ordering::Acquire) {
@@ -291,7 +324,9 @@ impl Runtime {
             permission_mode: d.permission_mode.clone(),
             agent: d.agent.clone(),
         };
-        if let Some(cwd) = spec.cwd {
+        if let Some(child) = &child {
+            opts.cwd = child.cwd.clone();
+        } else if let Some(cwd) = spec.cwd {
             opts.cwd = cwd;
         } else if let Some(session) = existing {
             let known = self
@@ -313,6 +348,18 @@ impl Runtime {
         let created = existing.is_none();
         let id = match existing {
             Some(session) => session.native_id.clone(),
+            None if child.is_some() => self
+                .store
+                .create_child(
+                    Some(workspace.cwd.to_string_lossy().into_owned()),
+                    spec.name,
+                    &child.as_ref().unwrap().parent.reference.native_id,
+                )
+                .await
+                .map_err(failed)?
+                .metadata()
+                .id
+                .clone(),
             None => self
                 .factory
                 .globals
@@ -364,6 +411,15 @@ impl Runtime {
             opened
                 .tool_gate
                 .set_approver(Some(opened.approval_bridge.clone()));
+            let (depth, workspace, child_state) = match &child {
+                Some(child) => (
+                    child.parent.depth + 1,
+                    subagent::confine(&child.parent, &opened).await,
+                    Some(subagent::ChildState::install(&opened, child.max_turns)),
+                ),
+                None => (0, workspace_root(&opened.workspace.cwd), None),
+            };
+            let parent = child.as_ref().map(|c| c.parent.reference.key.clone());
             let receiver = opened.native.subscribe();
             let (commands, rx) = mpsc::unbounded_channel();
             let (cancel, _) = watch::channel(0);
@@ -374,7 +430,9 @@ impl Runtime {
                     session_key: Some(reference.key.clone()),
                     turn: None,
                     ts_ms,
-                    kind: EventKind::SessionOpened(json!({"cwd": opened.workspace.cwd})),
+                    kind: EventKind::SessionOpened(
+                        json!({"cwd": opened.workspace.cwd, "parent": parent, "depth": depth}),
+                    ),
                 }])
                 .await
                 .map_err(failed)?;
@@ -393,7 +451,16 @@ impl Runtime {
                 turn_task: Mutex::new(None),
                 activity: Arc::clone(&self.activity),
                 tail: Mutex::new(VecDeque::new()),
+                depth,
+                workspace,
+                child: child_state,
+                waiting: AsyncMutex::new(0),
             });
+            if depth < self.subagent_depth {
+                if let Some(me) = self.me.get() {
+                    subagent::offer(me.clone(), &live).await.map_err(failed)?;
+                }
+            }
             // Attachments outlive unloading. Serialize restoration with new
             // registration and disconnect, so none can miss this host.
             let recipients = self.recipients.lock().await;
@@ -805,14 +872,14 @@ impl AgentBackend for Runtime {
         self.updates.subscribe()
     }
     async fn new_session(&self, spec: SessionSpec) -> BackendResult<SessionRef> {
-        self.open(None, spec).await
+        self.open(None, spec, None).await
     }
     async fn load_session(
         &self,
         session: &SessionRef,
         spec: SessionSpec,
     ) -> BackendResult<SessionRef> {
-        self.open(Some(session), spec).await
+        self.open(Some(session), spec, None).await
     }
     async fn transcript(&self, session: &SessionRef) -> BackendResult<Vec<SessionUpdate>> {
         self.route(session)?.opened.native.transcript(session).await
