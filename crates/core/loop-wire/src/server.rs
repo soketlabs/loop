@@ -793,6 +793,12 @@ async fn register_recipient(
 
 #[async_trait]
 impl crate::control::EscalationRecipient for ClientHost {
+    fn withdraw(&self, params: loop_protocol::rpc::InteractWithdrawnParams) {
+        let _ = self
+            .conn
+            .notify(methods::HOST_INTERACT_WITHDRAWN, to_value(&params));
+    }
+
     async fn interact(
         &self,
         params: loop_protocol::rpc::InteractParams,

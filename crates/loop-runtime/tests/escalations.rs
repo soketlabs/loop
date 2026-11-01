@@ -18,6 +18,7 @@ struct Surface(
 );
 #[async_trait::async_trait]
 impl EscalationRecipient for Surface {
+    fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
     async fn interact(
         &self,
         params: InteractParams,
@@ -522,16 +523,20 @@ async fn disconnecting_one_recipient_keeps_the_other_answer_valid() {
 }
 
 /// Simulates a committed write whose acknowledgement has not reached the caller.
-struct DelayedRaise(MemoryEventLog);
+struct DelayedDecision(MemoryEventLog, bool);
 #[async_trait::async_trait]
-impl EventLog for DelayedRaise {
+impl EventLog for DelayedDecision {
     async fn append_batch(
         &self,
         events: Vec<loop_runtime::log::Event>,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
-        let raised = events
-            .iter()
-            .any(|e| matches!(e.kind, EventKind::EscalationRaised(_)));
+        let raised = events.iter().any(|e| {
+            if self.1 {
+                matches!(e.kind, EventKind::EscalationAnswered(_))
+            } else {
+                matches!(e.kind, EventKind::EscalationRaised(_))
+            }
+        });
         let records = self.0.append_batch(events).await?;
         if raised {
             std::future::pending::<()>().await;
@@ -573,7 +578,7 @@ impl EventLog for DelayedRaise {
 #[tokio::test]
 async fn cancellation_during_raised_commit_still_logs_withdrawal() {
     tokio::time::timeout(Duration::from_secs(2), async {
-        let log = Arc::new(DelayedRaise(MemoryEventLog::new()));
+        let log = Arc::new(DelayedDecision(MemoryEventLog::new(), false));
         let host = EscalationHost::new(
             SessionRef {
                 instance: "loop".into(),
@@ -632,6 +637,134 @@ async fn attaching_to_an_unloaded_session_routes_escalations_when_it_is_loaded()
             .unwrap();
         turn.outcome().await;
         rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn detach_queues_withdrawal_before_ack_and_reissuing_the_same_escalation() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        use loop_protocol::{AgentBackend, ContentBlock, SessionSpec};
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime_with_approval(dir.path(), Arc::new(MemoryEventLog::new())).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let mut client = peer(&rt, true).await;
+        attach(&mut client, &session).await;
+        let turn = rt.prompt(&session, vec![ContentBlock::text("run")]).await.unwrap();
+        let old = interaction(&mut client).await;
+        client.outgoing.send(serde_json::json!({"jsonrpc":"2.0", "id":3, "method":"session/detach", "params":{"session":session}}).to_string()).unwrap();
+        loop {
+            let m = message(&mut client).await;
+            assert_ne!(m["id"], 3, "detach was acknowledged before withdrawal was queued");
+            if m["method"] == "host/interact_withdrawn" {
+                assert_eq!(m["params"]["id"], old["params"]["id"]);
+                break;
+            }
+        }
+        loop { if message(&mut client).await["id"] == 3 { break; } }
+        attach(&mut client, &session).await;
+        let replacement = interaction(&mut client).await;
+        assert_ne!(replacement["id"], old["id"]);
+        assert_eq!(replacement["params"], old["params"]);
+        client.outgoing.send(serde_json::json!({"jsonrpc":"2.0", "id":replacement["id"], "result":selected("accept")}).to_string()).unwrap();
+        turn.outcome().await;
+        tokio::task::yield_now().await;
+        while let Ok(m) = client.incoming.try_recv() {
+            let m: serde_json::Value = serde_json::from_str(&m).unwrap();
+            assert_ne!(m["method"], "host/interact_withdrawn", "stale withdrawal cleared replacement");
+        }
+        rt.shutdown().await;
+    }).await.unwrap();
+}
+
+async fn close_with_delayed_decision(answer: bool, shutdown: bool) {
+    use loop_protocol::{AgentBackend, ContentBlock, SessionSpec};
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(DelayedDecision(MemoryEventLog::new(), answer));
+    let rt = Arc::new(
+        Arc::try_unwrap(runtime_with_approval(dir.path(), log.clone()).await)
+            .ok()
+            .unwrap()
+            .with_close_grace(Duration::from_millis(10)),
+    );
+    let session = rt.new_session(SessionSpec::default()).await.unwrap();
+    let mut client = peer(&rt, true).await;
+    attach(&mut client, &session).await;
+    let turn = rt
+        .prompt(&session, vec![ContentBlock::text("run")])
+        .await
+        .unwrap();
+    if answer {
+        let asked = interaction(&mut client).await;
+        client.outgoing.send(serde_json::json!({"jsonrpc":"2.0", "id":asked["id"], "result":selected("accept_session")}).to_string()).unwrap();
+        loop {
+            if log
+                .read_runtime_after(0)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e.event.kind, EventKind::EscalationAnswered(_)))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    } else {
+        wait_raised(&log.0).await;
+    }
+    tokio::time::timeout(Duration::from_millis(250), async {
+        if shutdown {
+            rt.shutdown().await;
+        } else {
+            rt.close(&session.key, true).await.unwrap();
+        }
+    })
+    .await
+    .expect("Escalation acknowledgement bypassed close grace");
+    assert!(
+        !rt.list()
+            .await
+            .unwrap()
+            .iter()
+            .find(|s| s.r#ref == session)
+            .unwrap()
+            .live
+    );
+    let store = loop_agent::harness::session::sqlite::SqliteSessionStore::open(
+        dir.path().join("agent/sessions.db"),
+    )
+    .unwrap();
+    assert!(store.lease(&session.native_id).await.unwrap().is_none());
+    let records = log.read_runtime_after(0).await.unwrap();
+    let withdrawn = records
+        .iter()
+        .position(|e| matches!(e.event.kind, EventKind::EscalationWithdrawn(_)))
+        .expect("missing durable withdrawal");
+    let closed = records
+        .iter()
+        .position(|e| matches!(e.event.kind, EventKind::SessionClosed(_)))
+        .unwrap();
+    assert!(withdrawn < closed);
+    turn.outcome().await;
+    rt.shutdown().await;
+}
+#[tokio::test]
+async fn forced_close_bounds_stalled_raised_and_answered_acknowledgements() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for answer in [false, true] {
+            close_with_delayed_decision(answer, false).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test]
+async fn shutdown_bounds_stalled_raised_and_answered_acknowledgements() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for answer in [false, true] {
+            close_with_delayed_decision(answer, true).await;
+        }
     })
     .await
     .unwrap();

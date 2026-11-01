@@ -180,10 +180,11 @@ impl Connection {
         params: loop_protocol::rpc::InteractParams,
         mut withdrawn: oneshot::Receiver<()>,
     ) -> Result<Value, RpcError> {
-        let session = params
-            .session
-            .clone()
-            .ok_or_else(|| RpcError::Invalid("Runtime interaction requires a Session".into()))?;
+        if params.session.is_none() {
+            return Err(RpcError::Invalid(
+                "Runtime interaction requires a Session".into(),
+            ));
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         let mut pending = self.pending.lock().await;
@@ -203,14 +204,8 @@ impl Connection {
         drop(pending);
         let conn = self.clone();
         tokio::spawn(async move {
-            let notify = withdrawn.await.is_ok();
+            let _ = withdrawn.await;
             conn.pending.lock().await.remove(&id);
-            if notify {
-                let _ = conn.notify(
-                    loop_protocol::rpc::methods::HOST_INTERACT_WITHDRAWN,
-                    json!({"session":session, "id": params.request.id()}),
-                );
-            }
         });
         rx.await.unwrap_or(Err(RpcError::Closed))
     }

@@ -7,7 +7,7 @@ use loop_protocol::{
 use loop_wire::control::EscalationRecipient;
 use serde_json::json;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, watch, Mutex};
 
 /// The approver host of one live Session. Disconnected Surfaces never decide a request.
 #[derive(Clone)]
@@ -17,6 +17,7 @@ struct Inner {
     log: Arc<dyn EventLog>,
     generation: u64,
     state: Mutex<State>,
+    interrupted: watch::Sender<bool>,
 }
 #[derive(Default)]
 struct State {
@@ -34,6 +35,17 @@ struct Pending {
 struct Delivery {
     token: u64,
     withdrawn: oneshot::Sender<()>,
+    recipient: Arc<dyn EscalationRecipient>,
+}
+impl Delivery {
+    fn withdraw(self, session: &SessionRef, id: &loop_protocol::InteractionId) {
+        self.recipient
+            .withdraw(loop_protocol::rpc::InteractWithdrawnParams {
+                session: session.clone(),
+                id: id.clone(),
+            });
+        let _ = self.withdrawn.send(());
+    }
 }
 struct WaitingTool {
     host: EscalationHost,
@@ -55,7 +67,7 @@ impl Drop for WaitingTool {
                     eprintln!("Runtime: could not log Escalation withdrawal: {error}");
                 }
                 for (_, delivery) in pending.deliveries {
-                    let _ = delivery.withdrawn.send(());
+                    delivery.withdraw(&host.0.session, pending.request.id());
                 }
             }
         });
@@ -69,20 +81,34 @@ impl EscalationHost {
             log,
             generation,
             state: Mutex::new(State::default()),
+            interrupted: watch::channel(false).0,
         }))
     }
+    /// Stop in-flight decision waits after close grace expires. The Event Log
+    /// writer may already have committed; pending requests must still withdraw.
+    pub(crate) fn interrupt_decisions(&self) {
+        self.0.interrupted.send_replace(true);
+    }
     async fn record(&self, kind: EventKind) -> crate::log::Result<()> {
-        self.0
-            .log
-            .append_batch(vec![Event {
-                generation: self.0.generation,
-                session_key: Some(self.0.session.key.clone()),
-                turn: None,
-                ts_ms: crate::runtime::now(),
-                kind,
-            }])
-            .await
-            .map(|_| ())
+        let decision = matches!(
+            kind,
+            EventKind::EscalationRaised(_) | EventKind::EscalationAnswered(_)
+        );
+        let events = vec![Event {
+            generation: self.0.generation,
+            session_key: Some(self.0.session.key.clone()),
+            turn: None,
+            ts_ms: crate::runtime::now(),
+            kind,
+        }];
+        let mut interrupted = self.0.interrupted.subscribe();
+        tokio::select! {
+            biased;
+            _ = interrupted.wait_for(|stop| *stop), if decision => {
+                Err(crate::log::EventLogError::Storage("Escalation decision interrupted by Session close".into()))
+            }
+            result = self.0.log.append_batch(events) => result.map(|_| ()),
+        }
     }
     /// Attach a Surface and send any parked requests exactly once to it.
     pub async fn attach(&self, connection: u64, recipient: Arc<dyn EscalationRecipient>) {
@@ -106,7 +132,7 @@ impl EscalationHost {
         state.recipients.remove(&connection);
         for pending in state.pending.values_mut() {
             if let Some(withdrawn) = pending.deliveries.remove(&connection) {
-                let _ = withdrawn.withdrawn.send(());
+                withdrawn.withdraw(&self.0.session, pending.request.id());
             }
         }
     }
@@ -124,6 +150,7 @@ impl EscalationHost {
             Delivery {
                 token,
                 withdrawn: tx,
+                recipient: recipient.clone(),
             },
         );
         let params = InteractParams {
@@ -164,6 +191,11 @@ impl EscalationHost {
                 "id": pending.request.id(), "answer": answer, "grant": grant,
             })))
             .await;
+        if result.is_err() && *self.0.interrupted.borrow() {
+            // Close owns the terminal withdrawal, even if this write committed
+            // before its acknowledgement stalled. Never resume the gate here.
+            return;
+        }
         let mut pending = state.pending.remove(&ticket).unwrap();
         // The winner already completed its JSON-RPC request. Only other original recipients withdraw.
         pending.deliveries.remove(&connection);
@@ -174,7 +206,7 @@ impl EscalationHost {
             },
         };
         for (_, withdrawn) in pending.deliveries {
-            let _ = withdrawn.withdrawn.send(());
+            withdrawn.withdraw(&self.0.session, pending.request.id());
         }
         let _ = pending.answer.send(outcome);
     }
@@ -194,7 +226,7 @@ impl EscalationHost {
                 error = Some(e);
             }
             for (_, withdrawn) in pending.deliveries {
-                let _ = withdrawn.withdrawn.send(());
+                withdrawn.withdraw(&self.0.session, pending.request.id());
             }
             let _ = pending.answer.send(InteractionOutcome::Cancelled);
         }
@@ -257,7 +289,9 @@ impl HostServices for EscalationHost {
                 ))
                 .await
             {
-                state.pending.remove(&ticket);
+                if !*self.0.interrupted.borrow() {
+                    state.pending.remove(&ticket);
+                }
                 return InteractionOutcome::Rejected {
                     reason: e.to_string(),
                 };

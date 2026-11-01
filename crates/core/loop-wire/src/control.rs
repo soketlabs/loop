@@ -45,8 +45,11 @@ pub trait RuntimeControl: Send + Sync {
 /// An interactive connection that can receive a Session's Escalations.
 #[async_trait]
 pub trait EscalationRecipient: Send + Sync {
-    /// Ask the Surface, or return an error when it disconnects. A withdrawal
-    /// must clear the connection's pending JSON-RPC request and notify the Surface.
+    /// Queue withdrawal synchronously in the connection's ordered output.
+    /// The Runtime calls this before removing the recipient or redispatching.
+    fn withdraw(&self, params: loop_protocol::rpc::InteractWithdrawnParams);
+    /// Ask the Surface, or return an error when it disconnects. The signal
+    /// clears pending JSON-RPC bookkeeping; notification is queued by `withdraw`.
     /// Receiving `Ok(())` withdraws; a dropped sender means this recipient won.
     async fn interact(
         &self,

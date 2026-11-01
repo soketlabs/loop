@@ -547,12 +547,25 @@ impl Runtime {
             live.cancel.send_modify(|n| *n += 1);
             live.opened.native.cancel(&live.reference);
         }
-        let withdrawal = live
-            .escalations
-            .withdraw("Session closed", true)
-            .await
-            .map_err(failed);
         let grace = self.close_grace;
+        // The host may be holding its decision mutex while an Event Log
+        // acknowledgement stalls. Bound that wait too, then interrupt decisions
+        // without discarding the independent durable withdrawal task.
+        let escalations = live.escalations.clone();
+        let mut withdrawing =
+            tokio::spawn(async move { escalations.withdraw("Session closed", true).await });
+        let withdrawal = match tokio::time::timeout(grace, &mut withdrawing).await {
+            Ok(result) => result
+                .map_err(failed)
+                .and_then(|result| result.map_err(failed)),
+            Err(_) => {
+                live.escalations.interrupt_decisions();
+                match tokio::time::timeout(grace, &mut withdrawing).await {
+                    Ok(result) => result.map_err(failed).and_then(|result| result.map_err(failed)),
+                    Err(_) => Err(failed("Session Escalation withdrawal exceeded close grace; durable cleanup continues")),
+                }
+            }
+        };
         if force && live.commands.send(Command::Cancel).is_err() {
             live.cancel.send_modify(|n| *n += 1);
             live.opened.native.cancel(&live.reference);
@@ -591,9 +604,9 @@ impl Runtime {
             }
         }
         let ts_ms = now();
-        let logged = self
-            .log
-            .append_batch(vec![Event {
+        let logged = tokio::time::timeout(
+            grace,
+            self.log.append_batch(vec![Event {
                 generation: self.generation,
                 session_key: Some(key.clone()),
                 turn: None,
@@ -601,9 +614,11 @@ impl Runtime {
                 kind: EventKind::SessionClosed(
                     json!({"force": force, "aborted": !settled || !stopped}),
                 ),
-            }])
-            .await
-            .map_err(failed);
+            }]),
+        )
+        .await
+        .map_err(failed)
+        .and_then(|result| result.map_err(failed));
         touch(&self.activity, key, ts_ms);
         let released = self
             .store
