@@ -317,6 +317,17 @@ mod unix {
         })
     }
 
+    /// The lease refusal suggests `loop attach`, which is what just failed.
+    fn load_error(error: loop_protocol::BackendError) -> anyhow::Error {
+        let text = error.to_string();
+        match text.split_once(" Use `loop attach") {
+            Some((held, _)) if text.contains(" is in use by ") => anyhow::anyhow!(
+                "{held} Close it there, or wait until that process has exited for 30 s, then attach again."
+            ),
+            _ => error.into(),
+        }
+    }
+
     pub async fn drive(
         client: AttachClient,
         mut events: mpsc::UnboundedReceiver<HostEvent>,
@@ -345,7 +356,27 @@ mod unix {
                     client.shutdown().await;
                     anyhow::bail!("No Session matches `{id}`");
                 }
-                1 => found.remove(0).r#ref,
+                1 => {
+                    let found = found.remove(0);
+                    // A Subagent runs only for its parent and is never reloaded;
+                    // its Event Log stays readable.
+                    if found.live || found.parent.is_some() {
+                        found.r#ref
+                    } else {
+                        // Not loaded (e.g. after a Runtime restart). Loading takes
+                        // its lease, so prompts typed here can run.
+                        match backend
+                            .load_session(&found.r#ref, SessionSpec::default())
+                            .await
+                        {
+                            Ok(session) => session,
+                            Err(error) => {
+                                client.shutdown().await;
+                                return Err(load_error(error));
+                            }
+                        }
+                    }
+                }
                 _ => {
                     terminal.write(&list_text(&mut found))?;
                     client.shutdown().await;
@@ -439,8 +470,11 @@ mod unix {
                     if envelope.session != session.key { continue; }
                     last_seq = envelope.seq;
                     if let Some(text) = crate::print_mode::agent_text_chunk(&envelope.update) { terminal.write(text)?; }
-                    if let loop_protocol::SessionUpdate::TurnEnded { error, .. } = envelope.update {
+                    if let loop_protocol::SessionUpdate::TurnEnded { error, stop, .. } = envelope.update {
                         terminal.write("\n")?;
+                        if stop == loop_protocol::StopReason::RuntimeRestarted {
+                            terminal.write("Turn ended uncertain — Runtime restarted. Its tools may or may not have run; nothing was retried.\n")?;
+                        }
                         if let Some(error) = error { terminal.write(&format!("loop: {}\n", error.message))?; }
                     }
                 },

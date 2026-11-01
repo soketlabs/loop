@@ -8,6 +8,25 @@ use crate::types::{
 const NON_VISION_USER_IMAGE_PLACEHOLDER: &str = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE_PLACEHOLDER: &str =
     "(tool image omitted: model does not support images)";
+/// Result for a tool call that has none, e.g. after a Runtime restart mid-turn.
+const INTERRUPTED_TOOL_RESULT: &str = "Interrupted: no result was recorded for this tool call. \
+     It may or may not have run; check its effects before repeating it.";
+
+fn interrupted_result(tool_call_id: String, tool_name: String) -> Message {
+    Message::ToolResult(ToolResultMessage {
+        tool_call_id,
+        tool_name,
+        content: vec![ToolResultContent::Text(TextContent {
+            text: INTERRUPTED_TOOL_RESULT.into(),
+            text_signature: None,
+        })],
+        details: None,
+        usage: None,
+        added_tool_names: None,
+        is_error: true,
+        timestamp: crate::utils::id::now_ms(),
+    })
+}
 
 /// Normalize messages for the target model (thinking strip, image downgrade, orphans).
 pub fn transform_messages(messages: &[Message], model: &Model) -> Vec<Message> {
@@ -22,21 +41,9 @@ pub fn transform_messages(messages: &[Message], model: &Model) -> Vec<Message> {
     for msg in image_aware {
         match msg {
             Message::User(u) => {
-                // Synthesize empty tool results for orphaned tool calls before a new user turn.
+                // Orphaned tool calls before a new user turn were interrupted.
                 for (id, name) in pending_tool_calls.drain(..) {
-                    transformed.push(Message::ToolResult(ToolResultMessage {
-                        tool_call_id: id,
-                        tool_name: name,
-                        content: vec![ToolResultContent::Text(TextContent {
-                            text: String::new(),
-                            text_signature: None,
-                        })],
-                        details: None,
-                        usage: None,
-                        added_tool_names: None,
-                        is_error: false,
-                        timestamp: crate::utils::id::now_ms(),
-                    }));
+                    transformed.push(interrupted_result(id, name));
                 }
                 transformed.push(Message::User(u));
             }
@@ -118,21 +125,9 @@ pub fn transform_messages(messages: &[Message], model: &Model) -> Vec<Message> {
         }
     }
 
-    // Trailing orphaned tool calls → empty results.
+    // Trailing orphaned tool calls were interrupted too.
     for (id, name) in pending_tool_calls {
-        transformed.push(Message::ToolResult(ToolResultMessage {
-            tool_call_id: id,
-            tool_name: name,
-            content: vec![ToolResultContent::Text(TextContent {
-                text: String::new(),
-                text_signature: None,
-            })],
-            details: None,
-            usage: None,
-            added_tool_names: None,
-            is_error: false,
-            timestamp: crate::utils::id::now_ms(),
-        }));
+        transformed.push(interrupted_result(id, name));
     }
 
     transformed

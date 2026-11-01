@@ -9,6 +9,7 @@ struct State {
     events: Vec<LoggedEvent>,
     latest: HashMap<SessionKey, u64>,
     generations: Vec<Option<i64>>,
+    recovered: u64,
 }
 
 /// In-memory implementation with the same atomic append and cursor semantics.
@@ -76,6 +77,17 @@ impl EventLog for MemoryEventLog {
         let mut state = self.state.lock().await;
         state.generations.push(None);
         Ok(state.generations.len() as u64)
+    }
+    async fn last_recovered_generation(&self) -> Result<u64> {
+        Ok(self.state.lock().await.recovered)
+    }
+    async fn mark_recovered(&self, generation: u64, _recovered_ms: i64) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if generation == 0 || generation > state.generations.len() as u64 {
+            return Err(EventLogError::Invalid("unknown Runtime generation".into()));
+        }
+        state.recovered = state.recovered.max(generation);
+        Ok(())
     }
     async fn finish_generation(&self, generation: u64, stopped_ms: i64) -> Result<()> {
         let mut state = self.state.lock().await;

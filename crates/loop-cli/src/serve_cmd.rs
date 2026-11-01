@@ -27,10 +27,6 @@ pub async fn run(_args: ServeArgs) -> anyhow::Result<()> {
 #[cfg(unix)]
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     use anyhow::Context;
-    use loop_agent::harness::session::{
-        sqlite::{LeaseIdentity, SqliteSessionStore},
-        SessionStore,
-    };
     use loop_app_core::{
         config::{paths, Settings},
         permissions::PermissionMode,
@@ -82,7 +78,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // The Session database may live outside this agent directory and be shared
     // with another Runtime; its ownership domain needs its own Lock.
     let sessions_db = paths::sessions_db_path(&agent_dir);
-    let _sessions_lock = lock_session_database(&sessions_db)?;
+    let sessions_lock = loop_app_core::runtime_instance::SessionDatabaseLock::acquire(&sessions_db)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let settings = Settings::load_file(&paths::settings_path(&agent_dir)).unwrap_or_default();
     let globals = GlobalResources::load(agent_dir.clone(), &settings.providers, true).await?;
@@ -119,39 +116,18 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // Shared, so its Sessions are offered the `subagent` tool.
     let runtime = runtime.into_shared();
 
-    // Holding runtime.lock proves the previous Runtime is dead: free its leases.
-    let store = SqliteSessionStore::open(&sessions_db)
-        .map_err(|e| anyhow::anyhow!("sqlite session store: {e}"))?;
-    let ours = LeaseIdentity {
-        owner: "runtime".into(),
-        pid: std::process::id(),
-        generation: i64::try_from(runtime.generation())?,
-    };
-    let mut reclaimed = 0usize;
-    for meta in store
-        .list(None)
+    // Recover before accepting clients. Holding runtime.lock (and the Session
+    // database lock) proves the previous Runtime is dead.
+    let recovered = runtime
+        .recover(Some(&sessions_lock))
         .await
-        .map_err(|e| anyhow::anyhow!("listing Sessions: {e}"))?
-    {
-        let Ok(Some(lease)) = store.lease(&meta.id).await else {
-            continue;
-        };
-        if lease.identity.owner != "runtime" || lease.identity == ours {
-            continue;
-        }
-        match store.takeover_lease(&meta.id, &ours, true).await {
-            Ok(()) => {
-                reclaimed += 1;
-                if let Err(e) = store.release_lease(&meta.id, &ours).await {
-                    tracing::warn!(session = %meta.id, error = %e, "could not release reclaimed lease");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(session = %meta.id, error = %e, "could not reclaim lease")
-            }
-        }
+        .map_err(|e| anyhow::anyhow!("Runtime recovery failed: {e}"))?;
+    if recovered != loop_runtime::Recovery::default() {
+        eprintln!(
+            "loop serve: recovered {} interrupted turn(s), withdrew {} Escalation(s), reclaimed {} lease(s)",
+            recovered.turns_ended, recovered.escalations_withdrawn, recovered.leases_reclaimed
+        );
     }
-    drop(store);
 
     let socket = match &args.socket {
         Some(path) => path.clone(),
@@ -163,7 +139,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     tracing::info!(
         socket = %socket.display(),
         generation = runtime.generation(),
-        reclaimed,
+        turns_ended = recovered.turns_ended,
+        escalations_withdrawn = recovered.escalations_withdrawn,
+        leases_reclaimed = recovered.leases_reclaimed,
         "Runtime listening"
     );
     eprintln!("loop serve: listening on {}", socket.display());
@@ -250,35 +228,6 @@ where
             Registered::Pending(future)
         }
     })
-}
-
-/// Exclusive flock on `runtime.lock` beside the Session database, held for the
-/// Runtime's lifetime. Leases in that database are only reclaimed under it.
-#[cfg(unix)]
-fn lock_session_database(sessions_db: &std::path::Path) -> anyhow::Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
-    let dir = sessions_db
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(dir.join("runtime.lock"))?;
-    // SAFETY: the fd is valid for this call; flock does not retain it.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        anyhow::bail!(
-            "another Runtime already owns the Session database at {}",
-            sessions_db.display()
-        );
-    }
-    Ok(file)
 }
 
 #[cfg(all(test, unix))]

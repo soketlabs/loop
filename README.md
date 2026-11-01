@@ -97,6 +97,21 @@ First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, Anthr
 
 The installer detects your OS and CPU, downloads the latest matching release from GitHub, verifies its SHA-256 checksum, installs to `~/.loop/bin`, and adds that directory to your `PATH`. Re-running it is safe: it skips the download if you already have the latest version (use `--force` to reinstall).
 
+### Shared Runtime (Linux and macOS)
+
+Run one long-lived Runtime and attach to its Sessions from any terminal. Work
+keeps running when you detach, and approvals wait until a Surface answers.
+
+```bash
+loop serve                 # start the Runtime (foreground; Ctrl+C stops it)
+loop attach --new          # new Session in this folder, then follow it live
+loop attach                # list Sessions
+loop attach <id>           # replay a Session and follow it
+```
+
+After a crash, restarting `loop serve` marks interrupted turns as uncertain
+instead of retrying them. See [The Runtime](docs/runtime.md).
+
 ## Supported models
 
 Connect a provider on first run or with `/login`. Anthropic, OpenAI and Gemini use each provider's own API, so you get its prompt caching and keep the model's reasoning across tool calls. Every other provider uses an OpenAI-compatible Chat Completions API.

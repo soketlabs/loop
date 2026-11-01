@@ -693,3 +693,50 @@ async fn interrupts_cancel_and_detach_before_gated_replay_finishes() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn attaching_to_a_session_held_by_another_loop_says_what_to_do() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        use loop_agent::harness::session::sqlite::{LeaseIdentity, SqliteSessionStore};
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        rt.close(&session.key, false).await.unwrap();
+        // A terminal `loop` (alive: pid 1) now holds the Session.
+        SqliteSessionStore::open(dir.path().join("agent/sessions.db"))
+            .unwrap()
+            .acquire_lease(
+                &session.native_id,
+                &LeaseIdentity {
+                    owner: "standalone".into(),
+                    pid: 1,
+                    generation: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let (server, client) = loop_wire::transport::memory();
+        let served = serve(rt.clone(), server);
+        let (backend, events) = connect(client).await.unwrap();
+        let (_tx, mut terminal, _output) = script();
+        let error = drive(
+            backend,
+            events,
+            AttachArgs {
+                id: Some(session.key.to_string()),
+                ..Default::default()
+            },
+            &mut terminal,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("in use"), "{error}");
+        assert!(!error.contains("loop attach"), "circular hint: {error}");
+        assert!(error.contains("Close it there"), "{error}");
+        served.done.await.unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

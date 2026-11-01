@@ -62,6 +62,62 @@ impl RuntimeInstanceLock {
     }
 }
 
+/// Exclusive lock on `runtime.lock` beside a Session database, held for the
+/// Runtime's lifetime. Holding it proves no other Runtime owns that database, so
+/// `owner = "runtime"` leases recorded there belong to a dead Runtime. This is
+/// the only way to obtain that proof.
+#[derive(Debug)]
+pub struct SessionDatabaseLock {
+    sessions_db: std::path::PathBuf,
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
+
+impl SessionDatabaseLock {
+    /// Lock without waiting. Fails when another Runtime owns the database.
+    pub fn acquire(sessions_db: &Path) -> io::Result<Self> {
+        let sessions_db = std::path::absolute(sessions_db)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let dir = sessions_db.parent().unwrap_or(Path::new("/"));
+            std::fs::create_dir_all(dir)?;
+            let file = private_file(&dir.join("runtime.lock"))?;
+            // SAFETY: the fd is valid for this call; flock does not retain it.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::WouldBlock {
+                    return Err(error);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "another Runtime already owns the Session database at {}",
+                        sessions_db.display()
+                    ),
+                ));
+            }
+            Ok(Self {
+                sessions_db,
+                _file: file,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = sessions_db;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Session database locking is unsupported on this platform",
+            ))
+        }
+    }
+
+    /// The absolute path of the locked Session database.
+    pub fn sessions_db(&self) -> &Path {
+        &self.sessions_db
+    }
+}
+
 #[cfg(unix)]
 fn private_file(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};

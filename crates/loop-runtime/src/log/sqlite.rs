@@ -13,6 +13,9 @@ enum Command {
     Allocate(String, u32, i64, Reply<u64>),
     Finish(u64, i64, Reply<()>),
     Activity(Reply<std::collections::HashMap<SessionKey, i64>>),
+    Recovery(u64, Reply<Vec<LoggedEvent>>),
+    LastRecovered(Reply<u64>),
+    MarkRecovered(u64, i64, Reply<()>),
 }
 
 /// SQLite Event Log at `<agent_dir>/events.db` (independent of Session storage).
@@ -90,12 +93,29 @@ impl EventLog for SqliteEventLog {
     async fn last_activity_ms(&self) -> Result<std::collections::HashMap<SessionKey, i64>> {
         self.request(Command::Activity).await
     }
+    async fn recovery_records(&self, from_generation: u64) -> Result<Vec<LoggedEvent>> {
+        self.request(|reply| Command::Recovery(from_generation, reply))
+            .await
+    }
+    async fn last_recovered_generation(&self) -> Result<u64> {
+        self.request(Command::LastRecovered).await
+    }
+    async fn mark_recovered(&self, generation: u64, recovered_ms: i64) -> Result<()> {
+        self.request(|reply| Command::MarkRecovered(generation, recovered_ms, reply))
+            .await
+    }
 }
 
-const MIGRATIONS: &[(&str, &str)] = &[(
-    "001_initial.sql",
-    include_str!("migrations/001_initial.sql"),
-)];
+const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "001_initial.sql",
+        include_str!("migrations/001_initial.sql"),
+    ),
+    (
+        "002_recovery.sql",
+        include_str!("migrations/002_recovery.sql"),
+    ),
+];
 fn migrate(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);",
@@ -159,6 +179,32 @@ fn writer(mut conn: Connection, mut receiver: mpsc::Receiver<Command>) {
             }
             Command::Activity(reply) => {
                 let _ = reply.send(activity(&conn));
+            }
+            Command::Recovery(from, reply) => {
+                let _ = reply.send(recovery(&conn, from));
+            }
+            Command::LastRecovered(reply) => {
+                let _ = reply.send(
+                    conn.query_row(
+                        "SELECT COALESCE(MAX(generation),0) FROM runtime_generations WHERE recovered_ms IS NOT NULL",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into),
+                );
+            }
+            Command::MarkRecovered(generation, at, reply) => {
+                let result = (|| {
+                    let changed = conn.execute(
+                        "UPDATE runtime_generations SET recovered_ms=?1 WHERE generation=?2",
+                        params![at, sql_seq(generation)?],
+                    )?;
+                    if changed == 0 {
+                        return Err(EventLogError::Invalid("unknown Runtime generation".into()));
+                    }
+                    Ok(())
+                })();
+                let _ = reply.send(result);
             }
             Command::Finish(generation, stopped, reply) => {
                 let result = (|| {
@@ -248,18 +294,45 @@ fn append(conn: &mut Connection, events: Vec<Event>) -> Result<Vec<LoggedEvent>>
     Ok(records)
 }
 
+const COLUMNS: &str = "global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload";
+
 fn read(conn: &Connection, session: Option<&SessionKey>, after: u64) -> Result<Vec<LoggedEvent>> {
     // All stored sequences fit i64; a larger cursor is simply past the end.
     if after > i64::MAX as u64 {
         return Ok(Vec::new());
     }
     let sql = if session.is_some() {
-        "SELECT global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload FROM events WHERE session_key=?1 AND session_seq>?2 ORDER BY session_seq"
+        format!("SELECT {COLUMNS} FROM events WHERE session_key=?1 AND session_seq>?2 ORDER BY session_seq")
     } else {
-        "SELECT global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload FROM events WHERE ?1 IS NULL AND global_seq>?2 ORDER BY global_seq"
+        format!(
+            "SELECT {COLUMNS} FROM events WHERE ?1 IS NULL AND global_seq>?2 ORDER BY global_seq"
+        )
     };
+    rows(
+        conn,
+        &sql,
+        params![session.map(SessionKey::as_str), after as i64],
+    )
+}
+
+/// Turn boundaries and Escalation records, filtered in SQL so recovery never
+/// loads streamed text.
+fn recovery(conn: &Connection, from_generation: u64) -> Result<Vec<LoggedEvent>> {
+    if from_generation > i64::MAX as u64 {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT {COLUMNS} FROM events WHERE generation>=?1 AND (\
+         kind IN ('escalation_raised','escalation_answered','escalation_withdrawn') \
+         OR (kind='update' AND json_extract(payload,'$.event.payload.update.type') \
+             IN ('turn_started','turn_ended'))) ORDER BY global_seq"
+    );
+    rows(conn, &sql, params![from_generation as i64])
+}
+
+fn rows(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> Result<Vec<LoggedEvent>> {
     let mut stmt = conn.prepare(sql)?;
-    let mut rows = stmt.query(params![session.map(SessionKey::as_str), after as i64])?;
+    let mut rows = stmt.query(args)?;
     let mut result = Vec::new();
     while let Some(row) = rows.next()? {
         let payload: String = row.get(7)?;

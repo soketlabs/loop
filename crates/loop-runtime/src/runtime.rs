@@ -111,8 +111,10 @@ impl OpeningLease {
     ) -> BackendResult<Self> {
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
+            // Never a live owner: another owner's lease is replaced only when
+            // its heartbeat is stale and its pid is dead (Decision 3).
             let result = store
-                .acquire_lease(&id, &identity)
+                .takeover_lease(&id, &identity, false)
                 .await
                 .map_err(failed)
                 .map(|()| Self {
@@ -264,6 +266,114 @@ impl Runtime {
     pub fn with_subagent_depth(mut self, depth: u32) -> Self {
         self.subagent_depth = depth;
         self
+    }
+    /// Recover from the previous Runtime before accepting clients (design §12).
+    ///
+    /// Ends every turn an earlier generation left open with `runtime_restarted`
+    /// and withdraws its pending Escalations. Nothing is retried. A second pass
+    /// changes nothing. It reads only turn boundaries and Escalation records
+    /// since the newest generation whose recovery committed.
+    ///
+    /// With `lock` (the lock of this Runtime's own Session database), leases of
+    /// an earlier Runtime are reclaimed and released.
+    ///
+    /// Precondition: call before serving any Session; turns of this generation
+    /// are never ended here.
+    pub async fn recover(
+        &self,
+        lock: Option<&loop_app_core::runtime_instance::SessionDatabaseLock>,
+    ) -> BackendResult<crate::Recovery> {
+        use crate::recovery::{unfinished, REASON};
+        if let Some(lock) = lock {
+            let ours = std::path::absolute(&self.factory.globals.sessions_db).map_err(failed)?;
+            if lock.sessions_db() != ours {
+                return Err(failed(format!(
+                    "the held lock is for {}, not this Runtime's Session database {}",
+                    lock.sessions_db().display(),
+                    ours.display()
+                )));
+            }
+        }
+        let from = self.log.last_recovered_generation().await.map_err(failed)?;
+        let records = self.log.recovery_records(from).await.map_err(failed)?;
+        let (turns, escalations) = unfinished(&records, self.generation);
+        let ts_ms = now();
+        let mut events = Vec::with_capacity(turns.len() + escalations.len());
+        for (session, turn_id) in &turns {
+            events.push(Event::update(
+                self.generation,
+                ts_ms,
+                UpdateEnvelope::live(
+                    self.instance.clone(),
+                    self.generation,
+                    session.clone(),
+                    Some(turn_id.clone()),
+                    0,
+                    SessionUpdate::TurnEnded {
+                        turn_id: turn_id.clone(),
+                        stop: loop_protocol::StopReason::RuntimeRestarted,
+                        error: None,
+                    },
+                ),
+            ));
+        }
+        for open in &escalations {
+            events.push(Event {
+                generation: self.generation,
+                session_key: Some(open.session.clone()),
+                turn: None,
+                ts_ms,
+                kind: EventKind::EscalationWithdrawn(
+                    json!({"id": open.id, "generation": open.generation, "reason": REASON}),
+                ),
+            });
+        }
+        for chunk in events.chunks(crate::log::MAX_BATCH_EVENTS) {
+            for event in chunk {
+                if let Some(key) = &event.session_key {
+                    touch(&self.activity, key, ts_ms);
+                }
+            }
+            self.log
+                .append_batch(chunk.to_vec())
+                .await
+                .map_err(failed)?;
+        }
+        self.log
+            .mark_recovered(self.generation, now())
+            .await
+            .map_err(failed)?;
+        let mut leases_reclaimed = 0;
+        if lock.is_some() {
+            for meta in self.store.list(None).await.map_err(failed)? {
+                let Some(lease) = self.store.lease(&meta.id).await.map_err(failed)? else {
+                    continue;
+                };
+                if lease.identity.owner != "runtime" || lease.identity == self.identity {
+                    continue;
+                }
+                // One Session's lease must not keep the Runtime from starting;
+                // opening it later reports the conflict.
+                let reclaimed = async {
+                    self.store
+                        .takeover_lease(&meta.id, &self.identity, true)
+                        .await?;
+                    self.store.release_lease(&meta.id, &self.identity).await
+                }
+                .await;
+                match reclaimed {
+                    Ok(()) => leases_reclaimed += 1,
+                    Err(error) => {
+                        eprintln!("Runtime recovery: lease of Session {}: {error}", meta.id)
+                    }
+                }
+            }
+        }
+        Ok(crate::Recovery {
+            turns_ended: turns.len(),
+            escalations_withdrawn: escalations.len(),
+            leases_reclaimed,
+        })
     }
     /// Bound each step of closing a Session whose turn ignores cancellation.
     pub fn with_close_grace(mut self, grace: Duration) -> Self {
