@@ -68,9 +68,7 @@ pub fn init_tracing<'a>(
         let (writer, path) = match mode {
             TracingMode::Foreground { interactive } => debug_log_writer(cwd, interactive)?,
             TracingMode::Daemon { agent_dir } => {
-                let path = loop_app_core::config::paths::runtime_log_path(agent_dir);
-                fs::create_dir_all(agent_dir.join("logs"))?;
-                let file = OpenOptions::new().create(true).append(true).open(&path)?;
+                let (file, path) = loop_app_core::config::paths::open_runtime_log(agent_dir)?;
                 (Box::new(file) as Box<dyn Write + Send>, path)
             }
         };

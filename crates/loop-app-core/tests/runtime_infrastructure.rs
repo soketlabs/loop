@@ -25,7 +25,8 @@ fn runtime_paths_are_private_and_keep_lock_identity_in_the_agent_directory() {
     assert_eq!(runtime_log_path(&agent), agent.join("logs/runtime.log"));
     let long_agent = agent.join("x".repeat(120));
     let fallback = runtime_socket_path(&long_agent).unwrap();
-    assert_eq!(fallback.file_name().unwrap(), "runtime.sock");
+    let name = fallback.file_name().unwrap().to_str().unwrap();
+    assert!(name.ends_with(".sock") && name != "runtime.sock", "{name}");
     assert!(fallback
         .parent()
         .unwrap()
@@ -110,4 +111,17 @@ fn runtime_lock_never_truncates_a_symlink_target() {
             0o600
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn fallback_socket_is_unique_per_agent_dir_and_stable() {
+    let base = tempfile::tempdir().unwrap();
+    let a = base.path().join("a").join("x".repeat(120));
+    let b = base.path().join("b").join("x".repeat(120));
+    let sa = runtime_socket_path(&a).unwrap();
+    let sb = runtime_socket_path(&b).unwrap();
+    assert_ne!(sa, sb);
+    assert_eq!(sa, runtime_socket_path(&a).unwrap());
+    assert_eq!(sa.parent(), sb.parent());
 }

@@ -4,6 +4,9 @@ use std::{io, path::Path};
 
 /// Holds the agent directory's exclusive OS file lock until dropped.
 /// The lock inode is never unlinked, so all starters contend on the same file.
+///
+/// The caller must hold this lock before probing, unlinking, or binding the Runtime
+/// socket (`loop_wire::socket::unix_listen`); the socket path alone does not serialize starters.
 #[derive(Debug)]
 pub struct RuntimeInstanceLock {
     #[cfg(unix)]
