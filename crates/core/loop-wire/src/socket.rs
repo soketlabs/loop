@@ -22,18 +22,51 @@ use crate::transport::{Transport, MAX_MESSAGE_BYTES};
 
 /// Listen on a Unix socket at `path`, readable and writable by its owner
 /// only. A stale socket file left by an earlier run is replaced; the parent
-/// directory is created with mode 0700 when missing.
+/// directory is verified as user-owned and set to mode 0700. Callers must
+/// hold their single-instance lock while probing and reclaiming a socket.
 #[cfg(unix)]
 pub fn unix_listen(path: &std::path::Path) -> io::Result<tokio::net::UnixListener> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    if let Some(parent) = path.parent() {
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(parent)?;
+        let metadata = std::fs::symlink_metadata(parent)?;
+        // SAFETY: geteuid has no arguments or preconditions.
+        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Runtime socket directory must be owned by the current user",
+            ));
+        }
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Runtime socket path exists and is not a socket",
+                ));
+            }
+            // Nonblocking even when a live peer's accept queue is full. Only an
+            // unambiguous refusal proves staleness; other errors leave it intact.
+            let probe = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+            probe.set_nonblocking(true)?;
+            match probe.connect(&socket2::SockAddr::unix(path)?) {
+                Ok(()) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "Runtime already listening",
+                    ))
+                }
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(path)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
@@ -169,6 +202,47 @@ mod tests {
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_runtime_socket_is_never_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run/runtime.sock");
+        let first = unix_listen(&path).unwrap();
+        let error = unix_listen(&path).expect_err("live listener must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(error.to_string().contains("Runtime already listening"));
+        let _client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        first.accept().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_non_socket_file_is_not_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.sock");
+        std::fs::write(&path, "keep me").unwrap();
+        assert_eq!(
+            unix_listen(&path).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "keep me");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_existing_socket_directory_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("run");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _listener = unix_listen(&parent.join("runtime.sock")).unwrap();
+        assert_eq!(
+            std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[tokio::test]
