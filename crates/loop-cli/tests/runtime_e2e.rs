@@ -97,6 +97,54 @@ fn text_reply(text: &str) -> FakeResponse {
         ]),
     )
 }
+/// One assistant message calling `subagent` once per task, in parallel.
+fn subagent_reply(tasks: &[&str]) -> FakeResponse {
+    let calls: Vec<_> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, task)| {
+            json!({"index":i,"id":format!("sub-{i}"),"type":"function",
+                "function":{"name":"subagent","arguments":json!({"task":task}).to_string()}})
+        })
+        .collect();
+    FakeResponse::new(
+        200,
+        "text/event-stream",
+        sse(&[
+            json!({"index":0,"delta":{"role":"assistant","tool_calls":calls},"finish_reason":null}),
+            json!({"index":0,"delta":{},"finish_reason":"tool_calls"}),
+        ]),
+    )
+}
+
+/// Both children of `SPAWN2` reply only once the other has asked, so the test
+/// fails unless they run at the same time.
+static PAIR: [std::sync::atomic::AtomicBool; 2] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
+fn rendezvous(me: usize) -> bool {
+    use std::sync::atomic::Ordering;
+    PAIR[me].store(true, Ordering::Release);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !PAIR[1 - me].load(Ordering::Acquire) {
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+fn last_word(text: &str) -> String {
+    text.split_whitespace()
+        .last()
+        .unwrap_or("")
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect()
+}
+
 fn approval_reply() -> FakeResponse {
     let call = json!({"index":0,"id":"call-1","type":"function",
         "function":{"name":"bash","arguments":"{\"command\":\"echo approved\"}"}});
@@ -134,23 +182,34 @@ fn model(request: &RecordedRequest, gate: &Gate) -> FakeResponse {
                 .cloned()
                 .unwrap_or_default();
             if last["role"] == "tool" {
-                return text_reply("tool done");
+                return text_reply(&format!("tool done: {}", last_word(&content_text(&last))));
             }
             let text = content_text(&last);
+            // Subagent commands. A child's prompt is its task.
+            if text.contains("SPAWN2") {
+                return subagent_reply(&["PARA say kidA", "PARB say kidB"]);
+            }
+            if let Some(word) = text.strip_prefix("SPAWN1 ") {
+                return subagent_reply(&[&format!("say {word}")]);
+            }
+            if text.contains("SPAWN-APPROVAL") {
+                return subagent_reply(&["NEEDS-APPROVAL"]);
+            }
+            if text.contains("DEEP") {
+                return subagent_reply(&["DEEP"]);
+            }
+            for (me, tag) in ["PARA", "PARB"].into_iter().enumerate() {
+                if text.contains(tag) && !rendezvous(me) {
+                    return text_reply("reply serial");
+                }
+            }
             if text.contains("NEEDS-APPROVAL") {
                 if text.contains("GATED") {
                     gate.pass();
                 }
                 return approval_reply();
             }
-            let word: String = text
-                .split_whitespace()
-                .last()
-                .unwrap_or("")
-                .chars()
-                .filter(char::is_ascii_alphanumeric)
-                .collect();
-            text_reply(&format!("reply {word}"))
+            text_reply(&format!("reply {}", last_word(&text)))
         }
         _ => FakeResponse::new(404, "text/plain", "not found"),
     }
@@ -224,7 +283,12 @@ impl Fixture {
         cmd
     }
     async fn serve(&self) -> Proc {
-        let mut serve = Proc::spawn(self.command(&["serve", "--permission-mode", "ask"]));
+        self.serve_with(&[]).await
+    }
+    async fn serve_with(&self, extra: &[&str]) -> Proc {
+        let mut args = vec!["serve", "--permission-mode", "ask"];
+        args.extend_from_slice(extra);
+        let mut serve = Proc::spawn(self.command(&args));
         // After `kill -9` the old socket file remains; wait for a real listener.
         let ready = async {
             loop {
@@ -253,6 +317,17 @@ impl Fixture {
         let rows: Vec<_> = listing.lines().skip(1).collect();
         assert_eq!(rows.len(), 1, "{listing}");
         rows[0].split('\t').next().unwrap().to_owned()
+    }
+    /// The id of the only Session without a parent.
+    async fn only_parent(&self) -> String {
+        let listing = self.attach(&[]).finish().await;
+        let roots: Vec<_> = listing
+            .lines()
+            .skip(1)
+            .filter(|l| l.ends_with("\t-"))
+            .collect();
+        assert_eq!(roots.len(), 1, "{listing}");
+        roots[0].split('\t').next().unwrap().to_owned()
     }
     async fn client(&self) -> Arc<loop_wire::RemoteBackend> {
         let stream = tokio::net::UnixStream::connect(&self.socket).await.unwrap();
@@ -637,6 +712,313 @@ async fn kill_9_mid_turn_then_restart_ends_the_turn_uncertain_and_the_session_wo
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!serve.output().contains("recovered"), "{}", serve.output());
         assert_eq!(count(&fx.events().await, restarted_end), 1);
+        serve.stop().await;
+    })
+    .await
+}
+
+// ---- Subagents -------------------------------------------------------------
+
+fn payloads(
+    events: &[loop_runtime::log::LoggedEvent],
+    pick: impl Fn(&EventKind) -> Option<&Value>,
+) -> Vec<(Option<String>, Value)> {
+    events
+        .iter()
+        .filter_map(|e| {
+            pick(&e.event.kind)
+                .map(|p| (e.event.session_key.as_ref().map(|k| k.0.clone()), p.clone()))
+        })
+        .collect()
+}
+fn started_children(events: &[loop_runtime::log::LoggedEvent]) -> Vec<(Option<String>, Value)> {
+    payloads(events, |k| match k {
+        EventKind::SubagentStarted(p) => Some(p),
+        _ => None,
+    })
+}
+fn ended_children(events: &[loop_runtime::log::LoggedEvent]) -> Vec<(Option<String>, Value)> {
+    payloads(events, |k| match k {
+        EventKind::SubagentEnded(p) => Some(p),
+        _ => None,
+    })
+}
+/// Some model request carried every one of these tool results together.
+fn tool_results_seen_together(model: &FakeHttpServer, needles: &[&str]) -> bool {
+    model.requests().iter().any(|r| {
+        let body: Value = serde_json::from_slice(&r.body).unwrap_or_default();
+        let results: Vec<String> = body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m["role"] == "tool")
+            .map(content_text)
+            .collect();
+        needles
+            .iter()
+            .all(|n| results.iter().any(|r| r.contains(n)))
+    })
+}
+async fn wait_events(
+    fx: &Fixture,
+    what: &str,
+    done: impl Fn(&[loop_runtime::log::LoggedEvent]) -> bool,
+) {
+    tokio::time::timeout(WAIT, async {
+        while !done(&fx.events().await) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("never saw {what}"));
+}
+fn rows(listing: &str) -> Vec<Vec<String>> {
+    listing
+        .lines()
+        .skip(1)
+        .map(|l| l.split('\t').map(str::to_owned).collect())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_parent_runs_two_subagents_in_parallel_and_gets_both_answers() {
+    bounded(async {
+        let fx = Fixture::new();
+        let serve = fx.serve().await;
+        let work = fx.work.to_str().unwrap();
+        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        parent.line("SPAWN2").await;
+        parent.wait_text("tool done").await;
+        parent.finish().await;
+
+        let events = fx.events().await;
+        assert_eq!(started_children(&events).len(), 2);
+        let ended = ended_children(&events);
+        assert_eq!(ended.len(), 2, "{ended:?}");
+        assert!(
+            ended.iter().all(|(_, p)| p["status"] == "completed"),
+            "{ended:?}"
+        );
+        // Each child waited for the other, so they ran at the same time.
+        assert!(
+            tool_results_seen_together(&fx.model, &["reply kidA", "reply kidB"]),
+            "the parent never received both answers"
+        );
+        serve.stop().await;
+    })
+    .await
+}
+
+#[tokio::test]
+async fn finished_children_stay_listed_under_their_parent_in_loop_attach() {
+    bounded(async {
+        let fx = Fixture::new();
+        let serve = fx.serve().await;
+        let work = fx.work.to_str().unwrap();
+        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        parent.line("SPAWN1 kid").await;
+        parent.wait_text("tool done: kid").await;
+        parent.finish().await;
+
+        let listing = fx.attach(&[]).finish().await;
+        let rows = rows(&listing);
+        assert_eq!(rows.len(), 2, "{listing}");
+        let root = rows.iter().find(|r| r[5] == "-").expect("root row");
+        let child = rows.iter().find(|r| r[5] != "-").expect("child row");
+        assert_eq!(child[5], root[0], "{listing}");
+        // The child's log stays; attaching replays its answer.
+        let output = fx.attach(&[&child[0]]).finish().await;
+        assert!(output.contains("reply kid"), "{output}");
+        serve.stop().await;
+    })
+    .await
+}
+
+#[tokio::test]
+async fn cancelling_the_parent_cascades_and_withdraws_a_parked_child_escalation() {
+    bounded(async {
+        let fx = Fixture::new();
+        let serve = fx.serve().await;
+        let work = fx.work.to_str().unwrap();
+        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        parent.line("SPAWN-APPROVAL").await;
+        let raised = |e: &EventKind| matches!(e, EventKind::EscalationRaised(_));
+        wait_events(&fx, "the child's Escalation", |e| count(e, raised) == 1).await;
+        let child = started_children(&fx.events().await)[0].1["child"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // The approval belongs to the child Session, parked: nobody attached to it.
+        let events = fx.events().await;
+        let escalation = events.iter().find(|e| raised(&e.event.kind)).unwrap();
+        assert_eq!(escalation.event.session_key.as_ref().unwrap().0, child);
+
+        parent.signal("-INT");
+        parent.wait_text("Turn cancelled").await;
+        wait_events(&fx, "the cascade", |e| {
+            count(e, |k| matches!(k, EventKind::EscalationWithdrawn(_))) == 1
+                && ended_children(e).len() == 1
+        })
+        .await;
+        let events = fx.events().await;
+        let withdrawn = events
+            .iter()
+            .find(|e| matches!(e.event.kind, EventKind::EscalationWithdrawn(_)))
+            .unwrap();
+        assert_eq!(withdrawn.event.session_key.as_ref().unwrap().0, child);
+        assert_eq!(ended_children(&events)[0].1["status"], "cancelled");
+        assert_eq!(
+            count(&events, |e| matches!(e, EventKind::EscalationAnswered(_))),
+            0
+        );
+        parent.finish().await;
+
+        // The cancelled child was closed.
+        let client = fx.client().await;
+        let sessions = client.list().await.unwrap();
+        let child = sessions.iter().find(|s| s.r#ref.key.0 == child).unwrap();
+        assert!(!child.live && child.parent.is_some(), "{child:?}");
+        drop(client);
+        serve.stop().await;
+    })
+    .await
+}
+
+#[tokio::test]
+async fn kill_9_while_a_child_waits_ends_parent_and_child_uncertain_without_retrying() {
+    bounded(async {
+        let fx = Fixture::new();
+        let serve = fx.serve().await;
+        let work = fx.work.to_str().unwrap();
+        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        parent.line("SPAWN-APPROVAL").await;
+        let raised = |e: &EventKind| matches!(e, EventKind::EscalationRaised(_));
+        wait_events(&fx, "the child's Escalation", |e| count(e, raised) == 1).await;
+        let listing = fx.attach(&[]).finish().await;
+        let root = rows(&listing).into_iter().find(|r| r[5] == "-").unwrap()[0].clone();
+        let chat_calls = || {
+            fx.model
+                .requests()
+                .iter()
+                .filter(|r| r.path == "/v1/chat/completions")
+                .count()
+        };
+        let model_calls = chat_calls();
+
+        serve.signal("-KILL");
+        parent.stdin.take();
+        let _ = tokio::time::timeout(WAIT, parent.child.wait()).await;
+        drop(serve);
+        let serve = fx.serve().await;
+        serve
+            .wait_text(
+                "recovered 2 interrupted turn(s), withdrew 1 Escalation(s), reclaimed 2 lease(s)",
+            )
+            .await;
+
+        let events = fx.events().await;
+        let ended: std::collections::HashSet<_> = events
+            .iter()
+            .filter(|e| restarted_end(&e.event.kind))
+            .map(|e| e.event.session_key.clone())
+            .collect();
+        assert_eq!(ended.len(), 2, "parent and child each end once");
+        let surface = fx.attach(&[&root]);
+        surface.wait_text("uncertain — Runtime restarted").await;
+        surface.finish().await;
+        // Nothing was retried: no prompt reached the model again.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(chat_calls(), model_calls);
+        serve.stop().await;
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_finished_child_frees_its_session_slot() {
+    bounded(async {
+        let fx = Fixture::new();
+        // Room for the parent and one child only.
+        let serve = fx.serve_with(&["--max-sessions", "2"]).await;
+        let work = fx.work.to_str().unwrap();
+        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        parent.line("SPAWN1 one").await;
+        parent.wait_text("tool done: one").await;
+        let first = parent.finish().await;
+        let root = fx.only_parent().await;
+        let client = fx.client().await;
+        tokio::time::timeout(WAIT, async {
+            while client.list().await.unwrap().iter().any(|s| s.busy) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("parent turn never ended");
+        // A second child fits only if the first one's slot was freed.
+        let mut parent = fx.attach(&[&root]);
+        parent.line("SPAWN1 two").await;
+        parent.wait_text("tool done: two").await;
+        let output = first + parent.finish().await.as_str();
+        assert!(!output.contains("limit"), "{output}");
+
+        let ended = ended_children(&fx.events().await);
+        assert_eq!(ended.len(), 2, "{ended:?}");
+        assert!(ended
+            .iter()
+            .all(|(_, p)| p["status"] == "completed" && p["closed"].is_null()));
+        let client = fx.client().await;
+        let live = client
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|s| s.live)
+            .count();
+        assert_eq!(live, 1, "only the parent stays loaded");
+        drop(client);
+        serve.stop().await;
+    })
+    .await
+}
+
+#[tokio::test]
+async fn the_subagent_depth_limit_is_enforced_through_the_binary() {
+    bounded(async {
+        let fx = Fixture::new();
+        let serve = fx.serve().await;
+        let work = fx.work.to_str().unwrap();
+        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        // Every level asks for another child; depth 2 is refused.
+        parent.line("DEEP").await;
+        parent.wait_text("tool done").await;
+        parent.finish().await;
+
+        let started = started_children(&fx.events().await);
+        let depths: Vec<_> = started.iter().map(|(_, p)| p["depth"].clone()).collect();
+        assert_eq!(depths, [json!(1), json!(2)], "{started:?}");
+        // Each level's first model call: the depth-2 child is not offered
+        // `subagent`, so its call fails and it answers without a child.
+        let offers: Vec<bool> = fx
+            .model
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/v1/chat/completions")
+            .filter_map(|r| {
+                let body: Value = serde_json::from_slice(&r.body).ok()?;
+                (body["messages"].as_array()?.len() == 2).then(|| {
+                    body["tools"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|t| t["function"]["name"] == "subagent")
+                })
+            })
+            .collect();
+        assert_eq!(offers, [true, true, false], "{offers:?}");
+        assert!(tool_results_seen_together(
+            &fx.model,
+            &["subagent not found"]
+        ));
         serve.stop().await;
     })
     .await
