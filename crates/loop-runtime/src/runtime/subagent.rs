@@ -18,14 +18,37 @@ use loop_protocol::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex, Weak,
     },
 };
+use std::{future::Future, pin::Pin};
 use tokio::sync::oneshot;
+
+/// Resolves when the call that started a child must stop.
+type Stop = Pin<Box<dyn Future<Output = ()> + Send>>;
+const CANCELLED: &str = "Subagent was cancelled.";
+
+/// Resolves once the parent turn that began at `epoch` is cancelled. The
+/// epoch is the turn's starting cancellation count, so a cancellation that
+/// landed before this is first polled still counts.
+async fn turn_cancelled(parent: &LiveSession, epoch: u64) {
+    let mut cancel = parent.cancel.subscribe();
+    loop {
+        if *cancel.borrow_and_update() != epoch || cancel.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+impl LiveSession {
+    fn cancelled_since(&self, epoch: u64) -> bool {
+        *self.cancel.borrow() != epoch
+    }
+}
 
 pub(super) const DEFAULT_DEPTH: u32 = 2;
 const TOOL: &str = "subagent";
@@ -90,11 +113,14 @@ impl ChildState {
 /// does not have.
 pub(super) async fn confine(parent: &LiveSession, child: &OpenedSession) -> PathBuf {
     let gate = &parent.opened.tool_gate;
-    let mode = match gate.mode() {
-        // A child cannot leave plan mode; it may only investigate.
+    let target = &child.tool_gate;
+    // A child cannot leave plan mode; it may only investigate. Its own
+    // workspace may set a stricter mode than the parent's.
+    let plain = |mode| match mode {
         PermissionMode::Plan => PermissionMode::ReadOnly,
         mode => mode,
     };
+    let mode = plain(gate.mode()).min(plain(target.mode()));
     let parent_servers: BTreeSet<String> = parent
         .opened
         .workspace
@@ -139,8 +165,7 @@ pub(super) async fn confine(parent: &LiveSession, child: &OpenedSession) -> Path
         }
     }
     let (policy, _) = gate.policy().with(layer);
-    let target = &child.tool_gate;
-    target.set_permissions(gate.permissions());
+    target.set_permissions(merge_rules(&gate.permissions(), &target.permissions()));
     target.set_mode(mode);
     target.set_policy(policy);
     let workspace = if child.workspace.cwd == parent.opened.workspace.cwd {
@@ -196,7 +221,7 @@ fn tool(rt: Weak<Runtime>, parent: Weak<LiveSession>) -> AgentTool {
             },
             "required": ["task"]
         }),
-        move |_id, args: Value, _cancel, _update| {
+        move |_id, args: Value, cancel, _update| {
             let rt = rt.clone();
             let parent = parent.clone();
             async move {
@@ -204,12 +229,28 @@ fn tool(rt: Weak<Runtime>, parent: Weak<LiveSession>) -> AgentTool {
                     .map_err(|e| format!("invalid subagent arguments: {e}"))?;
                 let rt = rt.upgrade().ok_or("Runtime stopped")?;
                 let parent = parent.upgrade().ok_or("Session closed")?;
+                // Taken at dispatch: the turn's own cancellation count, so a
+                // cancel before the detached task runs is not lost.
+                let epoch = parent.turn_epoch.load(Ordering::Acquire);
                 // The child's lifecycle belongs to the Runtime: it finishes,
                 // closes the child and restores the permit even if this
-                // call is dropped. Dropping it counts as cancellation.
+                // call is dropped. Dropping it counts as cancellation, as do
+                // the parent turn's cancellation and the harness's token.
                 let (abandon, abandoned) = oneshot::channel::<()>();
+                let token: Stop = match cancel {
+                    Some(token) => Box::pin(async move { token.cancelled().await }),
+                    None => Box::pin(std::future::pending()),
+                };
+                let watched = Arc::clone(&parent);
+                let stop: Stop = Box::pin(async move {
+                    tokio::select! {
+                        _ = turn_cancelled(&watched, epoch) => {}
+                        _ = token => {}
+                        _ = abandoned => {}
+                    }
+                });
                 let task =
-                    tokio::spawn(async move { rt.run_subagent(parent, args, abandoned).await });
+                    tokio::spawn(async move { rt.run_subagent(parent, args, epoch, stop).await });
                 let result = task.await.map_err(|e| e.to_string())?;
                 drop(abandon);
                 result.map(AgentToolResult::text)
@@ -223,7 +264,8 @@ impl Runtime {
         self: Arc<Self>,
         parent: Arc<LiveSession>,
         args: Args,
-        abandoned: oneshot::Receiver<()>,
+        epoch: u64,
+        mut stop: Stop,
     ) -> Result<String, String> {
         if parent.depth >= self.subagent_depth {
             return Err(format!(
@@ -232,12 +274,12 @@ impl Runtime {
             ));
         }
         let cwd = resolve_cwd(&parent, args.cwd.as_deref())?;
-        let parent_cancel = parent.cancel.subscribe();
+        if parent.cancelled_since(epoch) {
+            return Err(CANCELLED.into());
+        }
         self.enter_wait(&parent).await;
-        let result = self
-            .child_turn(&parent, cwd, args, parent_cancel, abandoned)
-            .await;
-        let back = self.leave_wait(&parent).await;
+        let (result, halted) = self.child_turn(&parent, cwd, args, epoch, &mut stop).await;
+        let back = self.leave_wait(&parent, epoch, halted).await;
         match (result, back) {
             (Ok(answer), Ok(())) => Ok(answer),
             (Err(error), _) => Err(error),
@@ -256,14 +298,37 @@ impl Runtime {
         *waiting += 1;
     }
 
-    async fn leave_wait(&self, parent: &LiveSession) -> Result<(), BackendError> {
+    // A cancelled or halted turn never takes a permit back: it would queue
+    // behind unrelated turns only to end. The permit mutex is not held while
+    // waiting, so the turn's own cleanup is never blocked.
+    async fn leave_wait(
+        &self,
+        parent: &LiveSession,
+        epoch: u64,
+        halted: bool,
+    ) -> Result<(), BackendError> {
         let mut waiting = parent.waiting.lock().await;
         *waiting -= 1;
-        if *waiting == 0 {
-            self.reacquire_turn_permit(&parent.reference).await
-        } else {
-            Ok(())
+        if *waiting > 0 {
+            return Ok(());
         }
+        let ended = || failed("Session turn ended");
+        if halted || parent.cancelled_since(epoch) {
+            return Err(ended());
+        }
+        let permit = tokio::select! {
+            permit = self.turns.clone().acquire_owned() => permit.map_err(failed)?,
+            _ = turn_cancelled(parent, epoch) => return Err(ended()),
+        };
+        let mut slot = parent.permit.lock().await;
+        if parent.cancelled_since(epoch)
+            || parent.closing.load(Ordering::Acquire)
+            || !parent.busy.load(Ordering::Acquire)
+        {
+            return Err(ended());
+        }
+        *slot = Some(permit);
+        Ok(())
     }
 
     async fn child_turn(
@@ -271,9 +336,9 @@ impl Runtime {
         parent: &Arc<LiveSession>,
         cwd: PathBuf,
         args: Args,
-        mut parent_cancel: tokio::sync::watch::Receiver<u64>,
-        mut abandoned: oneshot::Receiver<()>,
-    ) -> Result<String, String> {
+        epoch: u64,
+        stop: &mut Stop,
+    ) -> (Result<String, String>, bool) {
         let open = ChildOpen {
             parent: Arc::clone(parent),
             cwd: cwd.clone(),
@@ -282,13 +347,20 @@ impl Runtime {
         let child = match self.open(None, SessionSpec::default(), Some(open)).await {
             Ok(child) => child,
             Err(BackendError::Busy) => {
-                return Err(format!(
+                let error = format!(
                     "the Runtime is at its limit of {} live Sessions; run fewer subagents at once",
                     self.limits.max_sessions
-                ))
+                );
+                return (Err(error), false);
             }
-            Err(error) => return Err(format!("could not open a child Session: {error}")),
+            Err(error) => {
+                return (
+                    Err(format!("could not open a child Session: {error}")),
+                    false,
+                )
+            }
         };
+        let mut halted = false;
         self.log_parent(
             parent,
             EventKind::SubagentStarted(json!({
@@ -298,21 +370,25 @@ impl Runtime {
         )
         .await;
         let outcome = async {
+            // Cancelled while the child was opening: never prompt it.
+            if parent.cancelled_since(epoch) {
+                halted = true;
+                return Ok(TurnOutcome::Cancelled);
+            }
             let turn = self
                 .prompt(&child, vec![ContentBlock::text(args.task.clone())])
                 .await
                 .map_err(|e| format!("could not start the child: {e}"))?;
             tokio::select! {
                 outcome = turn.outcome() => Ok(outcome),
-                _ = parent_cancel.changed() => Err(()),
-                _ = &mut abandoned => Err(()),
+                _ = stop => {
+                    // Cancel cascades: the child's own subagent calls watch
+                    // its cancellation in turn.
+                    halted = true;
+                    self.cancel(&child);
+                    Ok(TurnOutcome::Cancelled)
+                }
             }
-            .or_else(|()| {
-                // Cancel cascades: the child's own subagent calls watch its
-                // cancellation in turn.
-                self.cancel(&child);
-                Ok::<_, String>(TurnOutcome::Cancelled)
-            })
         }
         .await;
         let state = self
@@ -338,7 +414,7 @@ impl Runtime {
                 Ok("Subagent finished without an answer.".into()),
             ),
             Ok(TurnOutcome::Completed(_)) => ("completed", Ok(answer)),
-            Ok(TurnOutcome::Cancelled) => ("cancelled", Err("Subagent was cancelled.".into())),
+            Ok(TurnOutcome::Cancelled) => ("cancelled", Err(CANCELLED.into())),
             Ok(TurnOutcome::Failed(info)) => {
                 ("failed", Err(format!("Subagent failed: {}", info.message)))
             }
@@ -356,7 +432,7 @@ impl Runtime {
             })),
         )
         .await;
-        result
+        (result, halted)
     }
 
     async fn close_child(&self, child: &SessionRef, force: bool) -> Result<(), BackendError> {
@@ -426,4 +502,27 @@ fn resolve_cwd(parent: &LiveSession, cwd: Option<&str>) -> Result<PathBuf, Strin
         ));
     }
     Ok(resolved)
+}
+
+/// A child's `toolPermissions`: the stricter of its parent's and its own
+/// workspace's rule for each key. A child workspace's own `allow` rules are
+/// dropped, since they could lift an ask its parent keeps.
+pub(super) fn merge_rules(
+    parent: &BTreeMap<String, ToolPermission>,
+    child: &BTreeMap<String, ToolPermission>,
+) -> BTreeMap<String, ToolPermission> {
+    let mut merged = parent.clone();
+    for (key, &own) in child {
+        match merged.get(key) {
+            Some(inherited) if own.strictness() > inherited.strictness() => {
+                merged.insert(key.clone(), own);
+            }
+            Some(_) => {}
+            None if own != ToolPermission::Allow => {
+                merged.insert(key.clone(), own);
+            }
+            None => {}
+        }
+    }
+    merged
 }

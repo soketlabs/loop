@@ -702,3 +702,241 @@ async fn the_tool_is_offered_only_inside_a_shared_runtime() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_parent_does_not_wait_for_an_unrelated_turn() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let kid_started = Arc::new(tokio::sync::Notify::new());
+        let other_started = Arc::new(tokio::sync::Notify::new());
+        let release_other = Arc::new(tokio::sync::Notify::new());
+        let (k, o, r) = (
+            kid_started.clone(),
+            other_started.clone(),
+            release_other.clone(),
+        );
+        let script: Script = Arc::new(move |turn: Turn| {
+            let (k, o, r) = (k.clone(), o.clone(), r.clone());
+            match (turn.task.as_str(), turn.call) {
+                ("root", 1) => ready(calls(vec![spawn("kid")])),
+                ("kid", _) => Box::pin(async move {
+                    k.notify_one();
+                    std::future::pending().await
+                }),
+                ("other", _) => Box::pin(async move {
+                    o.notify_one();
+                    r.notified().await;
+                    text("other done")
+                }),
+                _ => ready(text("done")),
+            }
+        });
+        let limits = RuntimeLimits {
+            max_sessions: 16,
+            max_active_turns: 1,
+        };
+        let (rt, _log, _seen) = runtime(dir.path(), "full-access", limits, script).await;
+        let root = rt.new_session(SessionSpec::default()).await.unwrap();
+        let other = rt.new_session(SessionSpec::default()).await.unwrap();
+        let turn = rt
+            .prompt(&root, vec![ContentBlock::text("root")])
+            .await
+            .unwrap();
+        kid_started.notified().await;
+        // Queued behind the child for the only permit.
+        let other_turn = rt
+            .prompt(&other, vec![ContentBlock::text("other")])
+            .await
+            .unwrap();
+        rt.cancel(&root);
+        other_started.notified().await;
+        let outcome = tokio::time::timeout(Duration::from_secs(5), turn.outcome())
+            .await
+            .expect("cancelled parent must not wait for the unrelated turn's permit");
+        assert!(matches!(outcome, TurnOutcome::Cancelled));
+        assert!(!rt.is_busy(&root));
+        release_other.notify_one();
+        assert!(matches!(
+            other_turn.outcome().await,
+            TurnOutcome::Completed(_)
+        ));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancellation_before_the_subagent_task_runs_is_honored() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let in_call = Arc::new(tokio::sync::Notify::new());
+        let signal = in_call.clone();
+        let script: Script = Arc::new(move |turn: Turn| {
+            let signal = signal.clone();
+            match turn.task.as_str() {
+                "root" => Box::pin(async move {
+                    signal.notify_one();
+                    std::future::pending().await
+                }),
+                _ => ready(text("should not run")),
+            }
+        });
+        let (rt, _log, seen) =
+            runtime(dir.path(), "full-access", RuntimeLimits::default(), script).await;
+        let root = rt.new_session(SessionSpec::default()).await.unwrap();
+        let _turn = rt
+            .prompt(&root, vec![ContentBlock::text("root")])
+            .await
+            .unwrap();
+        in_call.notified().await;
+        let live = rt.route(&root).unwrap();
+        let tool = live
+            .opened
+            .harness
+            .get_tools()
+            .await
+            .into_iter()
+            .find(|t| t.name == "subagent")
+            .unwrap();
+        let call = (tool.execute)("id".into(), json!({"task": "kid"}), None, None);
+        tokio::pin!(call);
+        // Dispatch: the detached task is spawned but has not run yet.
+        assert!(futures::poll!(&mut call).is_pending());
+        live.cancel.send_modify(|n| *n += 1);
+        let result = call.await;
+        assert!(result.is_err(), "a cancelled turn must not get a result");
+        assert_eq!(
+            seen.calls("kid"),
+            0,
+            "no child model call after cancellation"
+        );
+        assert!(children(&rt.list().await.unwrap(), &root).is_empty());
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_keeps_its_own_workspace_restrictions() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(sub.join(".loop")).unwrap();
+        std::fs::write(
+            sub.join(".loop/settings.json"),
+            r#"{"toolPermissions":{"bash":"deny"}}"#,
+        )
+        .unwrap();
+        loop_app_core::config::TrustStore::load(loop_app_core::config::trust_path(
+            &dir.path().join("agent"),
+        ))
+        .unwrap()
+        .set(&sub, true)
+        .unwrap();
+        let script: Script = Arc::new(|turn: Turn| match (turn.task.as_str(), turn.call) {
+            ("root", 1) => ready(calls(vec![(
+                "subagent",
+                json!({"task": "sub worker", "cwd": "sub"}),
+            )])),
+            ("sub worker", 1) => ready(calls(vec![("bash", json!({"command": "touch made"}))])),
+            _ => ready(text("done")),
+        });
+        let (rt, _log, seen) =
+            runtime(dir.path(), "full-access", RuntimeLimits::default(), script).await;
+        let root = rt.new_session(SessionSpec::default()).await.unwrap();
+        assert!(matches!(
+            run(&rt, &root, "root").await,
+            TurnOutcome::Completed(_)
+        ));
+        assert_eq!(seen.calls("sub worker"), 2);
+        assert!(
+            !sub.join("made").exists(),
+            "the child workspace denies bash"
+        );
+        let results = seen.results("sub worker");
+        assert!(results[0].contains("denied"), "{results:?}");
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn merged_rules_keep_the_stricter_and_drop_child_only_allows() {
+    use loop_app_core::permissions::ToolPermission::*;
+    let parent = std::collections::BTreeMap::from([
+        ("bash".to_owned(), Allow),
+        ("write".to_owned(), Ask),
+        ("subagent".to_owned(), Allow),
+    ]);
+    let child = std::collections::BTreeMap::from([
+        ("bash".to_owned(), Deny),
+        ("write".to_owned(), Allow),
+        ("bash(rm *)".to_owned(), Allow),
+        ("web_fetch".to_owned(), Ask),
+    ]);
+    let merged = subagent::merge_rules(&parent, &child);
+    assert_eq!(merged["bash"], Deny);
+    assert_eq!(merged["write"], Ask);
+    assert_eq!(merged["subagent"], Allow);
+    assert_eq!(merged["web_fetch"], Ask);
+    assert!(!merged.contains_key("bash(rm *)"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_child_cannot_be_reopened_as_an_unrestricted_root() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let script: Script = Arc::new(|turn: Turn| match (turn.task.as_str(), turn.call) {
+            ("root", 1) => ready(calls(vec![spawn("kid")])),
+            _ => ready(text("done")),
+        });
+        let (rt, _log, _seen) =
+            runtime(dir.path(), "full-access", RuntimeLimits::default(), script).await;
+        let root = rt.new_session(SessionSpec::default()).await.unwrap();
+        rt.route(&root)
+            .unwrap()
+            .opened
+            .tool_gate
+            .set_mode(PermissionMode::ReadOnly);
+        assert!(matches!(
+            run(&rt, &root, "root").await,
+            TurnOutcome::Completed(_)
+        ));
+        let kid = children(&rt.list().await.unwrap(), &root).pop().unwrap();
+        assert!(!kid.live);
+        let error = rt
+            .load_session(&kid.r#ref, SessionSpec::default())
+            .await
+            .expect_err("a Subagent must not reopen without its parent's ceiling");
+        assert!(error.to_string().contains("Subagent"), "{error}");
+        assert!(!rt
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.r#ref == kid.r#ref && s.live));
+
+        // A fork also records a parent but is not a Subagent; it still reopens.
+        rt.close(&root.key, false).await.unwrap();
+        let fork = rt
+            .store
+            .fork(
+                &root.native_id,
+                loop_agent::harness::session::SessionForkSelection::All,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let fork = reference(&fork.metadata().id);
+        rt.load_session(&fork, SessionSpec::default())
+            .await
+            .unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

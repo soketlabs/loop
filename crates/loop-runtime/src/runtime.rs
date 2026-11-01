@@ -166,6 +166,8 @@ struct LiveSession {
     child: Option<Arc<subagent::ChildState>>,
     /// Subagent calls of the current turn that are waiting on a child.
     waiting: AsyncMutex<usize>,
+    /// The cancellation count when the current turn began.
+    turn_epoch: std::sync::atomic::AtomicU64,
 }
 enum Command {
     Cancel,
@@ -304,6 +306,14 @@ impl Runtime {
                     return Err(BackendError::Busy);
                 }
                 return Ok(live.reference.clone());
+            }
+            if let Some(parent) = self.subagent_parent(session).await? {
+                // Reopened alone it would lose its parent's ceiling and depth.
+                return Err(failed(format!(
+                    "Session {} is a Subagent of Session {parent}; a Subagent runs only for its \
+                     parent and cannot be reopened. Its Event Log stays readable with `loop attach`.",
+                    session.native_id
+                )));
             }
         }
         if self.sessions.lock().unwrap().len() >= self.limits.max_sessions {
@@ -455,6 +465,7 @@ impl Runtime {
                 workspace,
                 child: child_state,
                 waiting: AsyncMutex::new(0),
+                turn_epoch: std::sync::atomic::AtomicU64::new(0),
             });
             if depth < self.subagent_depth {
                 if let Some(me) = self.me.get() {
@@ -506,6 +517,32 @@ impl Runtime {
             self.discard_new_row(created, &id).await;
         }
         result
+    }
+    /// The parent of a Session the Runtime opened as a Subagent. Forks also
+    /// record a parent, so only the Event Log's record of the child's opening
+    /// tells them apart; the log is scanned only for Sessions with a parent.
+    async fn subagent_parent(&self, session: &SessionRef) -> BackendResult<Option<String>> {
+        let known = self
+            .factory
+            .globals
+            .repository
+            .list(None)
+            .await
+            .map_err(failed)?;
+        let Some(parent) = known
+            .into_iter()
+            .find(|m| m.id == session.native_id)
+            .and_then(|m| m.parent_session_id)
+        else {
+            return Ok(None);
+        };
+        let events = self.log.read_runtime_after(0).await.map_err(failed)?;
+        let child = events.iter().any(|record| {
+            record.event.session_key.as_ref() == Some(&session.key)
+                && matches!(&record.event.kind, EventKind::SessionOpened(payload)
+                    if !payload["parent"].is_null())
+        });
+        Ok(child.then_some(parent))
     }
     // A failed open of a Session this call created must not leave an empty row.
     async fn discard_new_row(&self, created: bool, id: &str) {
@@ -910,6 +947,8 @@ impl AgentBackend for Runtime {
         // Admission and execution belong to the Runtime, even if a Surface drops
         // the request future or its TurnHandle while waiting for a permit.
         let mut cancelled = live.cancel.subscribe();
+        live.turn_epoch
+            .store(*cancelled.borrow(), Ordering::Release);
         let task_live = Arc::clone(&live);
         let task = tokio::spawn(async move {
             let live = task_live;
