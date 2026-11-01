@@ -269,13 +269,33 @@ impl Runtime {
     }
     /// Recover from the previous Runtime before accepting clients (design §12).
     ///
-    /// Ends every turn an earlier generation left open with `runtime_restarted`,
-    /// withdraws its pending Escalations and, when the caller holds the
-    /// associated `runtime.lock` (`runtime_lock_held`), reclaims leases left by an
-    /// earlier Runtime. Nothing is retried. A second pass changes nothing.
-    pub async fn recover(&self, runtime_lock_held: bool) -> BackendResult<crate::Recovery> {
+    /// Ends every turn an earlier generation left open with `runtime_restarted`
+    /// and withdraws its pending Escalations. Nothing is retried. A second pass
+    /// changes nothing. It reads only turn boundaries and Escalation records
+    /// since the newest generation whose recovery committed.
+    ///
+    /// With `lock` (the lock of this Runtime's own Session database), leases of
+    /// an earlier Runtime are reclaimed and released.
+    ///
+    /// Precondition: call before serving any Session; turns of this generation
+    /// are never ended here.
+    pub async fn recover(
+        &self,
+        lock: Option<&loop_app_core::runtime_instance::SessionDatabaseLock>,
+    ) -> BackendResult<crate::Recovery> {
         use crate::recovery::{unfinished, REASON};
-        let records = self.log.read_runtime_after(0).await.map_err(failed)?;
+        if let Some(lock) = lock {
+            let ours = std::path::absolute(&self.factory.globals.sessions_db).map_err(failed)?;
+            if lock.sessions_db() != ours {
+                return Err(failed(format!(
+                    "the held lock is for {}, not this Runtime's Session database {}",
+                    lock.sessions_db().display(),
+                    ours.display()
+                )));
+            }
+        }
+        let from = self.log.last_recovered_generation().await.map_err(failed)?;
+        let records = self.log.recovery_records(from).await.map_err(failed)?;
         let (turns, escalations) = unfinished(&records, self.generation);
         let ts_ms = now();
         let mut events = Vec::with_capacity(turns.len() + escalations.len());
@@ -319,8 +339,12 @@ impl Runtime {
                 .await
                 .map_err(failed)?;
         }
+        self.log
+            .mark_recovered(self.generation, now())
+            .await
+            .map_err(failed)?;
         let mut leases_reclaimed = 0;
-        if runtime_lock_held {
+        if lock.is_some() {
             for meta in self.store.list(None).await.map_err(failed)? {
                 let Some(lease) = self.store.lease(&meta.id).await.map_err(failed)? else {
                     continue;

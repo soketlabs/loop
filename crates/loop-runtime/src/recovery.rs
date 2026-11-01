@@ -50,6 +50,11 @@ pub(crate) fn unfinished(
                         (record.global_seq, true),
                     );
                 }
+                // Ids are process-local counters. A live turn of this generation
+                // must not close an old one; only recovery's own end may.
+                SessionUpdate::TurnEnded { stop, .. }
+                    if event.generation >= current
+                        && *stop != loop_protocol::StopReason::RuntimeRestarted => {}
                 SessionUpdate::TurnEnded { turn_id, .. } => {
                     if let Some(open) = turns.get_mut(&(session.clone(), turn_id.clone())) {
                         open.1 = false;
@@ -106,4 +111,53 @@ pub(crate) fn unfinished(
         turns.into_iter().map(|(_, key)| key).collect(),
         escalations.into_iter().map(|(_, open)| open).collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log::Event;
+    use loop_protocol::{StopReason, UpdateEnvelope};
+
+    fn turn(global_seq: u64, generation: u64, update: SessionUpdate) -> LoggedEvent {
+        LoggedEvent {
+            global_seq,
+            session_seq: Some(global_seq),
+            event: Event::update(
+                generation,
+                0,
+                UpdateEnvelope::live(
+                    "loop".into(),
+                    generation,
+                    "s".into(),
+                    Some(TurnId("turn-1".into())),
+                    0,
+                    update,
+                ),
+            ),
+        }
+    }
+    fn ended(stop: StopReason) -> SessionUpdate {
+        SessionUpdate::TurnEnded {
+            turn_id: TurnId("turn-1".into()),
+            stop,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn a_live_turn_with_a_reused_id_does_not_hide_an_old_open_turn() {
+        let started = SessionUpdate::TurnStarted {
+            turn_id: TurnId("turn-1".into()),
+        };
+        let records = vec![
+            turn(1, 1, started.clone()),
+            turn(2, 2, started),
+            turn(3, 2, ended(StopReason::EndTurn)),
+        ];
+        assert_eq!(unfinished(&records, 2).0.len(), 1);
+        let mut recovered = records;
+        recovered.push(turn(4, 2, ended(StopReason::RuntimeRestarted)));
+        assert!(unfinished(&recovered, 2).0.is_empty());
+    }
 }

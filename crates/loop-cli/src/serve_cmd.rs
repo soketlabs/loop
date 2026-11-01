@@ -78,7 +78,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // The Session database may live outside this agent directory and be shared
     // with another Runtime; its ownership domain needs its own Lock.
     let sessions_db = paths::sessions_db_path(&agent_dir);
-    let _sessions_lock = lock_session_database(&sessions_db)?;
+    let sessions_lock = loop_app_core::runtime_instance::SessionDatabaseLock::acquire(&sessions_db)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let settings = Settings::load_file(&paths::settings_path(&agent_dir)).unwrap_or_default();
     let globals = GlobalResources::load(agent_dir.clone(), &settings.providers, true).await?;
@@ -118,7 +119,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // Recover before accepting clients. Holding runtime.lock (and the Session
     // database lock) proves the previous Runtime is dead.
     let recovered = runtime
-        .recover(true)
+        .recover(Some(&sessions_lock))
         .await
         .map_err(|e| anyhow::anyhow!("Runtime recovery failed: {e}"))?;
     if recovered != loop_runtime::Recovery::default() {
@@ -227,35 +228,6 @@ where
             Registered::Pending(future)
         }
     })
-}
-
-/// Exclusive flock on `runtime.lock` beside the Session database, held for the
-/// Runtime's lifetime. Leases in that database are only reclaimed under it.
-#[cfg(unix)]
-fn lock_session_database(sessions_db: &std::path::Path) -> anyhow::Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
-    let dir = sessions_db
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(dir.join("runtime.lock"))?;
-    // SAFETY: the fd is valid for this call; flock does not retain it.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        anyhow::bail!(
-            "another Runtime already owns the Session database at {}",
-            sessions_db.display()
-        );
-    }
-    Ok(file)
 }
 
 #[cfg(all(test, unix))]

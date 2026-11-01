@@ -114,6 +114,26 @@ pub trait EventLog: Send + Sync {
     async fn allocate_generation(&self, owner: &str, pid: u32, started_ms: i64) -> Result<u64>;
     /// Record a clean stop for a previously allocated generation.
     async fn finish_generation(&self, generation: u64, stopped_ms: i64) -> Result<()>;
+    /// Turn boundaries (`turn_started`, `turn_ended` Updates) and Escalation
+    /// records of generations at or after `from_generation`, in `global_seq`
+    /// order. Implementations should filter in storage; the default scans the log.
+    async fn recovery_records(&self, from_generation: u64) -> Result<Vec<LoggedEvent>> {
+        Ok(self
+            .read_runtime_after(0)
+            .await?
+            .into_iter()
+            .filter(|r| r.event.generation >= from_generation && is_recovery_record(&r.event.kind))
+            .collect())
+    }
+    /// Newest generation whose crash recovery committed, or 0. Records of older
+    /// generations are already settled. The default never remembers one.
+    async fn last_recovered_generation(&self) -> Result<u64> {
+        Ok(0)
+    }
+    /// Remember that this generation's recovery committed.
+    async fn mark_recovered(&self, _generation: u64, _recovered_ms: i64) -> Result<()> {
+        Ok(())
+    }
     /// Newest event timestamp per Session. Implementations should answer with an
     /// aggregate query; the default scans the whole log.
     async fn last_activity_ms(&self) -> Result<std::collections::HashMap<SessionKey, i64>> {
@@ -125,6 +145,21 @@ pub trait EventLog: Send + Sync {
             }
         }
         Ok(activity)
+    }
+}
+
+/// Whether crash recovery needs this record.
+pub fn is_recovery_record(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Update(envelope) => matches!(
+            envelope.update,
+            loop_protocol::SessionUpdate::TurnStarted { .. }
+                | loop_protocol::SessionUpdate::TurnEnded { .. }
+        ),
+        EventKind::EscalationRaised(_)
+        | EventKind::EscalationAnswered(_)
+        | EventKind::EscalationWithdrawn(_) => true,
+        _ => false,
     }
 }
 
