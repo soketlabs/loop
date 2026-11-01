@@ -39,7 +39,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     };
     use loop_protocol::{rpc::PeerInfo, AgentBackend};
     use loop_runtime::{log::SqliteEventLog, Runtime, RuntimeLimits};
-    use loop_wire::server::{serve_with_options, ServeOptions};
+    use loop_wire::server::{serve_with_control, ServeOptions};
 
     if let Some(mode) = &args.permission_mode {
         if PermissionMode::parse(mode).is_none() {
@@ -186,8 +186,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                     let backend: Arc<dyn AgentBackend> = runtime.clone();
-                    let served = serve_with_options(
+                    let control: Arc<dyn loop_wire::RuntimeControl> = runtime.clone();
+                    let served = serve_with_control(
                         backend,
+                        control,
                         loop_wire::socket::unix(stream),
                         info.clone(),
                         ServeOptions { owns_backend: false },
