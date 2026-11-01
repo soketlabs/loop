@@ -4621,6 +4621,7 @@ dependencies = [
  "dirs",
  "futures",
  "ignore",
+ "libc",
  "loop-agent",
  "loop-ai",
  "loop-app-core",

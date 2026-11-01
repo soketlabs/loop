@@ -13,6 +13,7 @@ fn serve(agent: &Path, args: &[&str]) -> Command {
     cmd.arg("serve")
         .args(args)
         .env("LOOP_CODING_AGENT_DIR", agent)
+        .env("LOOP_CODING_AGENT_SESSION_DIR", agent.join("sessions"))
         .env_remove("LOOP_DEBUG")
         .env_remove("RUST_LOG")
         .current_dir(agent)
@@ -161,4 +162,33 @@ impl loop_protocol::HostServices for NoHost {
             reason: "test host".into(),
         }
     }
+}
+
+#[tokio::test]
+async fn shared_session_database_is_owned_by_one_runtime() {
+    let (_dir, first_agent) = agent_dir();
+    let second_agent = first_agent.parent().unwrap().join("agent2");
+    std::fs::create_dir_all(&second_agent).unwrap();
+    let shared = first_agent.join("shared-sessions");
+    let socket = first_agent.join("run/runtime.sock");
+    let mut first = serve(&first_agent, &[])
+        .env("LOOP_CODING_AGENT_SESSION_DIR", &shared)
+        .spawn()
+        .unwrap();
+    wait_for(&socket, &mut first).await;
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        serve(&second_agent, &[])
+            .env("LOOP_CODING_AGENT_SESSION_DIR", &shared)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Session database"), "{stderr}");
+    assert!(socket.exists(), "first Runtime untouched");
+    signal(&first, "-TERM");
+    first.wait().await.unwrap();
 }

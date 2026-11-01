@@ -70,17 +70,22 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         None,
     )?;
     // Register handlers before the socket appears so an early signal is not lost.
-    let mut signal = Box::pin(crate::runtime_signals::shutdown_signal());
-    futures::future::poll_fn(|cx| match std::future::Future::poll(signal.as_mut(), cx) {
-        std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
-        _ => std::task::Poll::Ready(Ok(())),
-    })
-    .await
-    .context("could not register shutdown signal handlers")?;
+    let (mut signal, mut shutdown_ready) =
+        match register(Box::pin(crate::runtime_signals::shutdown_signal()))
+            .await
+            .context("could not register shutdown signal handlers")?
+        {
+            Registered::Pending(signal) => (Some(signal), false),
+            Registered::Done => (None, true),
+        };
+
+    // The Session database may live outside this agent directory and be shared
+    // with another Runtime; its ownership domain needs its own Lock.
+    let sessions_db = paths::sessions_db_path(&agent_dir);
+    let _sessions_lock = lock_session_database(&sessions_db)?;
 
     let settings = Settings::load_file(&paths::settings_path(&agent_dir)).unwrap_or_default();
     let globals = GlobalResources::load(agent_dir.clone(), &settings.providers, true).await?;
-    let sessions_db = globals.sessions_db.clone();
     let log = Arc::new(
         SqliteEventLog::open(&agent_dir)
             .await
@@ -167,13 +172,16 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         version: env!("CARGO_PKG_VERSION").into(),
     };
     let mut connections = tokio::task::JoinSet::new();
-    loop {
+    while !shutdown_ready {
+        let Some(pending) = signal.as_mut() else {
+            break;
+        };
         tokio::select! {
-            result = &mut signal => {
+            result = pending => {
                 if let Err(e) = result {
                     tracing::error!(error = %e, "shutdown signal failed");
                 }
-                break;
+                shutdown_ready = true;
             }
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
@@ -212,3 +220,78 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 use std::sync::Arc;
+
+/// Outcome of the first poll of the shutdown future.
+pub enum Registered<F> {
+    /// Handlers are registered; keep awaiting this future.
+    Pending(std::pin::Pin<Box<F>>),
+    /// Shutdown was already requested; the future must not be polled again.
+    Done,
+}
+
+/// Poll once so handlers register, keeping a shutdown that is already ready.
+pub async fn register<F>(mut future: std::pin::Pin<Box<F>>) -> std::io::Result<Registered<F>>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    futures::future::poll_fn(|cx| match future.as_mut().poll(cx) {
+        std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+        std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
+        std::task::Poll::Pending => std::task::Poll::Ready(Ok(false)),
+    })
+    .await
+    .map(|done| {
+        if done {
+            Registered::Done
+        } else {
+            Registered::Pending(future)
+        }
+    })
+}
+
+/// Exclusive flock on `runtime.lock` beside the Session database, held for the
+/// Runtime's lifetime. Leases in that database are only reclaimed under it.
+#[cfg(unix)]
+fn lock_session_database(sessions_db: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = sessions_db
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join("runtime.lock"))?;
+    // SAFETY: the fd is valid for this call; flock does not retain it.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        anyhow::bail!(
+            "another Runtime already owns the Session database at {}",
+            sessions_db.display()
+        );
+    }
+    Ok(file)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_shutdown_ready_during_registration_is_kept() {
+        let ready = Box::pin(std::future::ready(Ok(())));
+        assert!(matches!(register(ready).await.unwrap(), Registered::Done));
+        let pending = Box::pin(std::future::pending::<std::io::Result<()>>());
+        assert!(matches!(
+            register(pending).await.unwrap(),
+            Registered::Pending(_)
+        ));
+        let failed = Box::pin(std::future::ready(Err(std::io::Error::other("x"))));
+        assert!(register(failed).await.is_err());
+    }
+}

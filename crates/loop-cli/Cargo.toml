@@ -69,6 +69,7 @@ tempfile = { workspace = true }
 regex = { workspace = true }
 axum = { workspace = true }
 rmcp = { workspace = true }
+libc = "0.2"
 
 [[test]]
 name = "print_trace"
