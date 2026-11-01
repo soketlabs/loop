@@ -126,6 +126,23 @@ enum Commands {
     /// Show usage (tokens, models, tools, agents, sessions) in the terminal.
     #[cfg(feature = "usage")]
     Usage,
+    /// Run the Runtime: one process that holds many Sessions and serves them
+    /// over a local socket. Never reads stdin or prompts.
+    ///
+    /// Folders without recorded trust get global settings only. Use the
+    /// global `--permission-mode` flag to choose a mode; `full-access` takes
+    /// effect only through that flag, never from settings.
+    Serve {
+        /// Socket path (default: `run/runtime.sock` in the agent directory).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Most Sessions held at once.
+        #[arg(long, default_value_t = 16)]
+        max_sessions: usize,
+        /// Most turns running at once; further turns queue.
+        #[arg(long, default_value_t = 8)]
+        max_active_turns: usize,
+    },
 }
 
 #[tokio::main]
@@ -221,6 +238,25 @@ async fn real_main() -> anyhow::Result<()> {
                 );
                 tokio::task::block_in_place(|| loop_dashboard::run(options))?;
                 return Ok(());
+            }
+            Commands::Serve {
+                socket,
+                max_sessions,
+                max_active_turns,
+            } => {
+                // Before bootstrap: no stdin, no trust prompt, no TUI.
+                let cwd = match &cli.cwd {
+                    Some(cwd) => std::path::absolute(cwd)?,
+                    None => std::env::current_dir()?,
+                };
+                return loop_cli::serve_cmd::run(loop_cli::serve_cmd::ServeArgs {
+                    socket: socket.clone(),
+                    max_sessions: *max_sessions,
+                    max_active_turns: *max_active_turns,
+                    permission_mode: cli.permission_mode.clone(),
+                    cwd,
+                })
+                .await;
             }
             _ => (),
         }
@@ -381,4 +417,60 @@ async fn real_main() -> anyhow::Result<()> {
     #[cfg(feature = "telemetry")]
     print_mode::shutdown_telemetry(&telemetry).await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_parses_with_defaults_and_flags() {
+        let cli = Cli::try_parse_from(["loop", "serve"]).unwrap();
+        let Some(Commands::Serve {
+            socket,
+            max_sessions,
+            max_active_turns,
+        }) = cli.command
+        else {
+            panic!("not serve")
+        };
+        assert_eq!((socket, max_sessions, max_active_turns), (None, 16, 8));
+        let cli = Cli::try_parse_from([
+            "loop",
+            "serve",
+            "--socket",
+            "/tmp/x.sock",
+            "--max-sessions",
+            "3",
+            "--max-active-turns",
+            "2",
+            "--permission-mode",
+            "full-access",
+        ])
+        .unwrap();
+        assert_eq!(cli.permission_mode.as_deref(), Some("full-access"));
+        let Some(Commands::Serve {
+            socket,
+            max_sessions,
+            max_active_turns,
+        }) = cli.command
+        else {
+            panic!("not serve")
+        };
+        assert_eq!(socket, Some(PathBuf::from("/tmp/x.sock")));
+        assert_eq!((max_sessions, max_active_turns), (3, 2));
+    }
+
+    #[test]
+    fn serve_help_describes_the_command() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("serve")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--socket") && help.contains("--max-sessions"));
+        assert!(help.contains("full-access"));
+    }
 }
