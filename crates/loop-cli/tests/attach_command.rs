@@ -178,6 +178,19 @@ async fn attach_renders_replay_then_live_and_typed_line_becomes_prompt() {
             .await
         });
         wait_text(&output, "replayed").await;
+        let header = output
+            .lock()
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            header.starts_with(&format!("Attached to Session {}", session.key))
+                && header.contains(&dir.path().display().to_string())
+                && header.contains("Ctrl+D"),
+            "header: {header:?}"
+        );
         tx.send(Input::Line("live-input".into())).unwrap();
         wait_text(&output, "live-input").await;
         while rt.is_busy(&session) {
@@ -203,7 +216,7 @@ async fn new_session_uses_cwd_and_eof_only_detaches() {
         let (server, client) = loop_wire::transport::memory();
         let served = serve(rt.clone(), server);
         let (backend, events) = connect(client).await.unwrap();
-        let (tx, mut terminal, _) = script();
+        let (tx, mut terminal, output) = script();
         tx.send(Input::Eof).unwrap();
         drive(
             backend,
@@ -221,6 +234,21 @@ async fn new_session_uses_cwd_and_eof_only_detaches() {
         let list = rt.list().await.unwrap();
         assert_eq!(list.len(), 1);
         assert!(list[0].live);
+        let text = output.lock().unwrap().clone();
+        let header = text.lines().next().unwrap_or_default();
+        assert!(
+            header.starts_with(&format!("New Session {}", list[0].r#ref.key))
+                && header.contains(
+                    &dir.path()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string()
+                )
+                && header.contains("Ctrl+D")
+                && header.contains("Ctrl+C twice"),
+            "header: {text:?}"
+        );
         assert_eq!(
             list[0].cwd.canonicalize().unwrap(),
             dir.path().canonicalize().unwrap()
@@ -344,7 +372,10 @@ async fn immediate_eof_renders_the_complete_replay_before_detaching() {
         )
         .await
         .unwrap();
-        assert_eq!(output.lock().unwrap().as_str(), "replayed\n");
+        let text = output.lock().unwrap().clone();
+        let (header, replay) = text.split_once('\n').unwrap();
+        assert!(header.starts_with("Attached to Session"), "{text:?}");
+        assert_eq!(replay, "replayed\n");
         served.done.await.unwrap();
         rt.shutdown().await;
     })

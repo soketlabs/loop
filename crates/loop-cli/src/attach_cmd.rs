@@ -317,6 +317,15 @@ mod unix {
         })
     }
 
+    /// One line on connect: which Session, where, and how to leave.
+    fn header(what: &str, session: &SessionRef, cwd: &std::path::Path) -> String {
+        format!(
+            "{what} {} in {}. Ctrl+D or Ctrl+C twice detaches; the Session keeps running.\n",
+            session.key,
+            cwd.display()
+        )
+    }
+
     /// The lease refusal suggests `loop attach`, which is what just failed.
     fn load_error(error: loop_protocol::BackendError) -> anyhow::Error {
         let text = error.to_string();
@@ -335,14 +344,16 @@ mod unix {
         terminal: &mut dyn Terminal,
     ) -> anyhow::Result<()> {
         let backend = client.backend.clone();
-        let session = if args.new {
+        let (session, header) = if args.new {
             let cwd = std::path::absolute(args.cwd.unwrap_or(std::env::current_dir()?))?;
-            backend
+            let session = backend
                 .new_session(SessionSpec {
-                    cwd: Some(cwd),
+                    cwd: Some(cwd.clone()),
                     ..Default::default()
                 })
-                .await?
+                .await?;
+            let header = header("New Session", &session, &cwd);
+            (session, header)
         } else {
             let mut sessions = backend.list().await?;
             let Some(id) = args.id else {
@@ -358,10 +369,12 @@ mod unix {
                 }
                 1 => {
                     let found = found.remove(0);
+                    let header =
+                        |session: &SessionRef| header("Attached to Session", session, &found.cwd);
                     // A Subagent runs only for its parent and is never reloaded;
                     // its Event Log stays readable.
                     if found.live || found.parent.is_some() {
-                        found.r#ref
+                        (found.r#ref.clone(), header(&found.r#ref))
                     } else {
                         // Not loaded (e.g. after a Runtime restart). Loading takes
                         // its lease, so prompts typed here can run.
@@ -369,7 +382,10 @@ mod unix {
                             .load_session(&found.r#ref, SessionSpec::default())
                             .await
                         {
-                            Ok(session) => session,
+                            Ok(session) => {
+                                let header = header(&session);
+                                (session, header)
+                            }
                             Err(error) => {
                                 client.shutdown().await;
                                 return Err(load_error(error));
@@ -384,6 +400,7 @@ mod unix {
                 }
             }
         };
+        terminal.write(&header)?;
         let mut updates = backend.subscribe();
         let snapshot = backend.attach(&session, 0).await?;
         let result = attached(
