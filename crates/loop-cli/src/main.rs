@@ -103,6 +103,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Watch a Runtime Session, or list Sessions when no id is given.
+    Attach {
+        /// Session id or unique prefix.
+        #[arg(conflicts_with = "new")]
+        id: Option<String>,
+        /// Create a Session before attaching.
+        #[arg(long)]
+        new: bool,
+        /// Working directory for a new Session.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Runtime socket path.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Show config directory paths.
     Config,
     /// Print version (same as --version).
@@ -238,6 +253,20 @@ async fn real_main() -> anyhow::Result<()> {
                 );
                 tokio::task::block_in_place(|| loop_dashboard::run(options))?;
                 return Ok(());
+            }
+            Commands::Attach {
+                id,
+                new,
+                cwd,
+                socket,
+            } => {
+                return loop_cli::attach_cmd::run(loop_cli::attach_cmd::AttachArgs {
+                    id: id.clone(),
+                    new: *new,
+                    cwd: cwd.clone().or(cli.cwd.clone()),
+                    socket: socket.clone(),
+                })
+                .await;
             }
             Commands::Serve {
                 socket,
@@ -422,6 +451,55 @@ async fn real_main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attach_parses_and_rejects_conflicting_selection() {
+        for args in [
+            vec!["loop", "attach"],
+            vec!["loop", "attach", "abc"],
+            vec![
+                "loop",
+                "attach",
+                "--new",
+                "--cwd",
+                "/tmp",
+                "--socket",
+                "/tmp/r.sock",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        let cli = Cli::try_parse_from([
+            "loop",
+            "attach",
+            "--new",
+            "--cwd",
+            "/tmp",
+            "--socket",
+            "/tmp/r.sock",
+        ])
+        .unwrap();
+        let Some(Commands::Attach {
+            new, cwd, socket, ..
+        }) = cli.command
+        else {
+            panic!("not attach")
+        };
+        assert!(new);
+        assert_eq!(cwd, Some(PathBuf::from("/tmp")));
+        assert_eq!(socket, Some(PathBuf::from("/tmp/r.sock")));
+        assert!(Cli::try_parse_from(["loop", "attach", "abc", "--new"]).is_err());
+        let cli = Cli::try_parse_from(["loop", "attach"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attach {
+                id: None,
+                new: false,
+                socket: None,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn serve_parses_with_defaults_and_flags() {
