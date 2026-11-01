@@ -155,6 +155,13 @@ sets both.
 
 - **Session references.** `session` is always a full `SessionRef`
   (`instance`, `key`, `native_id`), never a title.
+- **List.** `session/list` returns every stored Session, closed ones
+  included. `parent` is set only for a Subagent child the Runtime opened. A
+  fork also stores a parent, but the list reports `parent: null` for it.
+  `name` of a Subagent child is its task, shortened.
+- **Escalations from Subagents.** A child's `host/interact` goes to clients
+  attached to the child and to any ancestor. Its `session` names the child,
+  and `host/interact_withdrawn` names the child too.
 - **Attach.** The result comes first, then the updates after `after_seq` up to
   `latest_seq` with `origin: "replay"`, then live updates.
   - `seq` is the Session's durable, contiguous update sequence from the Event Log.

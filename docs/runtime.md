@@ -46,6 +46,8 @@ Session database is shared.
 
 ```bash
 loop attach                  # list Sessions: id, folder, title, busy, last activity, parent
+loop attach --all            # also list finished Subagent Sessions
+loop attach --json           # every Session as JSON, for scripts
 loop attach 3f2a             # attach to a Session by id or unique id prefix
 loop attach --new            # create a Session in the current folder and attach
 loop attach --new --cwd DIR  # create a Session in DIR and attach
@@ -53,9 +55,18 @@ loop attach --new --cwd DIR  # create a Session in DIR and attach
 
 When you attach, the Surface replays the Session's history and then follows it
 live. A Session that is not loaded, for example after the Runtime restarted, is
-loaded when you attach. Child Sessions started by a Subagent show their parent
-in the list. A finished child is never loaded again: attaching replays its
-output, but you cannot prompt it.
+loaded when you attach. Child Sessions started by a Subagent are named after
+their task and show their parent in the list. Once the parent has its answer,
+a finished child is closed: it frees its slot and is listed only with
+`--all`. So are children that a cancel or a Runtime restart ended; the list
+says how many it left out. It is never loaded again: attaching replays its output, but you
+cannot prompt it.
+
+The table is for people: columns are aligned with spaces, titles are cut
+short and PARENT shows the first 8 characters of the parent id. Scripts should
+use `loop attach --json`. It prints a JSON array with one `SessionInfo` per
+Session, closed Subagents included, with full ids and fields `live`, `busy`,
+`parent`, `created_ms` and `last_active_ms`.
 
 `--socket PATH` connects to a Runtime that was started with a custom socket.
 
@@ -77,10 +88,19 @@ continue watching.
 An approval is an Escalation: a tool that needs your decision before it runs.
 
 - Every attached Surface sees the request as numbered choices.
+- A Subagent's request also goes to every Surface attached to its parent, or
+  to any Session above it, so watching the parent is enough. `loop attach`
+  labels it with the child, for example
+  `Escalation from Subagent 1a2b3c4d (check the tests): bash cargo test`.
 - The first valid answer wins. The other Surfaces show
   `Another client answered; Escalation withdrawn.`
 - If no Surface is attached, the request waits, with no timeout. The next
   Surface to attach sees it.
+- **File edits are applied before you answer.** In `ask` mode a file edit
+  (`write`, `edit`) is written first and reverted if you reject it. While its
+  approval is parked, the change is already on disk; rejecting it, or
+  cancelling the turn, puts the file back. If the Runtime is killed while
+  that approval waits, the change stays on disk.
 - Cancelling the turn withdraws its pending approvals.
 - An "allow for this Session" grant lasts only while the Runtime runs. It is
   never restored after a restart.

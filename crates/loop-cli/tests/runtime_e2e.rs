@@ -313,21 +313,20 @@ impl Fixture {
     }
     /// The only Session's id, from `loop attach` listing.
     async fn only_session(&self) -> String {
-        let listing = self.attach(&[]).finish().await;
-        let rows: Vec<_> = listing.lines().skip(1).collect();
-        assert_eq!(rows.len(), 1, "{listing}");
-        rows[0].split('\t').next().unwrap().to_owned()
+        let listing = self.attach(&["--json"]).finish().await;
+        let sessions = sessions(&listing);
+        assert_eq!(sessions.len(), 1, "{listing}");
+        sessions[0].r#ref.key.to_string()
     }
     /// The id of the only Session without a parent.
     async fn only_parent(&self) -> String {
-        let listing = self.attach(&[]).finish().await;
-        let roots: Vec<_> = listing
-            .lines()
-            .skip(1)
-            .filter(|l| l.ends_with("\t-"))
+        let listing = self.attach(&["--json"]).finish().await;
+        let roots: Vec<_> = sessions(&listing)
+            .into_iter()
+            .filter(|s| s.parent.is_none())
             .collect();
         assert_eq!(roots.len(), 1, "{listing}");
-        roots[0].split('\t').next().unwrap().to_owned()
+        roots[0].r#ref.key.to_string()
     }
     async fn client(&self) -> Arc<loop_wire::RemoteBackend> {
         let stream = tokio::net::UnixStream::connect(&self.socket).await.unwrap();
@@ -772,12 +771,17 @@ async fn wait_events(
     .await
     .unwrap_or_else(|_| panic!("never saw {what}"));
 }
-fn rows(listing: &str) -> Vec<Vec<String>> {
+/// Sessions from `loop attach --json`.
+fn sessions(listing: &str) -> Vec<loop_protocol::rpc::SessionInfo> {
+    serde_json::from_str(listing).unwrap_or_else(|e| panic!("{e}: {listing}"))
+}
+/// Rows of the human listing: lines between the header and the first blank.
+fn listed(listing: &str) -> usize {
     listing
         .lines()
         .skip(1)
-        .map(|l| l.split('\t').map(str::to_owned).collect())
-        .collect()
+        .take_while(|l| !l.is_empty())
+        .count()
 }
 
 #[tokio::test]
@@ -810,7 +814,7 @@ async fn a_parent_runs_two_subagents_in_parallel_and_gets_both_answers() {
 }
 
 #[tokio::test]
-async fn finished_children_stay_listed_under_their_parent_in_loop_attach() {
+async fn finished_children_are_hidden_unless_all_and_stay_attachable() {
     bounded(async {
         let fx = Fixture::new();
         let serve = fx.serve().await;
@@ -820,14 +824,30 @@ async fn finished_children_stay_listed_under_their_parent_in_loop_attach() {
         parent.wait_text("tool done: kid").await;
         parent.finish().await;
 
+        // A finished child is closed: hidden unless asked for.
         let listing = fx.attach(&[]).finish().await;
-        let rows = rows(&listing);
-        assert_eq!(rows.len(), 2, "{listing}");
-        let root = rows.iter().find(|r| r[5] == "-").expect("root row");
-        let child = rows.iter().find(|r| r[5] != "-").expect("child row");
-        assert_eq!(child[5], root[0], "{listing}");
+        assert_eq!(listed(&listing), 1, "{listing}");
+        assert!(
+            listing.contains(
+                "1 closed Subagent Session not shown (finished, cancelled or interrupted)"
+            ),
+            "{listing}"
+        );
+        let listing = fx.attach(&["--all"]).finish().await;
+        assert_eq!(listed(&listing), 2, "{listing}");
+        let listing = fx.attach(&["--json"]).finish().await;
+        let all = sessions(&listing);
+        assert_eq!(all.len(), 2, "{listing}");
+        let root = all.iter().find(|s| s.parent.is_none()).expect("root");
+        let child = all.iter().find(|s| s.parent.is_some()).expect("child");
+        assert_eq!(child.parent.as_ref(), Some(&root.r#ref), "{listing}");
+        assert!(!child.live, "{listing}");
         // The child's log stays; attaching replays its answer.
-        let output = fx.attach(&[&child[0]]).finish().await;
+        let output = fx.attach(&[child.r#ref.key.as_str()]).finish().await;
+        assert!(
+            output.starts_with("Replaying finished Subagent Session"),
+            "{output}"
+        );
         assert!(output.contains("reply kid"), "{output}");
         serve.stop().await;
     })
@@ -848,7 +868,7 @@ async fn cancelling_the_parent_cascades_and_withdraws_a_parked_child_escalation(
             .as_str()
             .unwrap()
             .to_owned();
-        // The approval belongs to the child Session, parked: nobody attached to it.
+        // The approval belongs to the child Session; the parent's Surface sees it.
         let events = fx.events().await;
         let escalation = events.iter().find(|e| raised(&e.event.kind)).unwrap();
         assert_eq!(escalation.event.session_key.as_ref().unwrap().0, child);
@@ -885,6 +905,34 @@ async fn cancelling_the_parent_cascades_and_withdraws_a_parked_child_escalation(
 }
 
 #[tokio::test]
+async fn a_surface_watching_the_parent_answers_its_childs_escalation() {
+    bounded(async {
+        let fx = Fixture::new();
+        let serve = fx.serve().await;
+        let work = fx.work.to_str().unwrap();
+        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        parent.line("SPAWN-APPROVAL").await;
+        parent.wait_text("Escalation from Subagent ").await;
+        // The task arrives once the child's name is looked up.
+        parent.wait_text("(NEEDS-APPROVAL)").await;
+        parent.wait_text("1. ").await;
+        parent.line("1").await;
+        parent.wait_text("tool done: approved").await;
+        let events = fx.events().await;
+        let ended = ended_children(&events);
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert_eq!(ended[0].1["status"], "completed", "{ended:?}");
+        assert_eq!(
+            count(&events, |e| matches!(e, EventKind::EscalationAnswered(_))),
+            1
+        );
+        parent.finish().await;
+        serve.stop().await;
+    })
+    .await
+}
+
+#[tokio::test]
 async fn kill_9_while_a_child_waits_ends_parent_and_child_uncertain_without_retrying() {
     bounded(async {
         let fx = Fixture::new();
@@ -894,8 +942,14 @@ async fn kill_9_while_a_child_waits_ends_parent_and_child_uncertain_without_retr
         parent.line("SPAWN-APPROVAL").await;
         let raised = |e: &EventKind| matches!(e, EventKind::EscalationRaised(_));
         wait_events(&fx, "the child's Escalation", |e| count(e, raised) == 1).await;
-        let listing = fx.attach(&[]).finish().await;
-        let root = rows(&listing).into_iter().find(|r| r[5] == "-").unwrap()[0].clone();
+        let listing = fx.attach(&["--json"]).finish().await;
+        let root = sessions(&listing)
+            .into_iter()
+            .find(|s| s.parent.is_none())
+            .unwrap()
+            .r#ref
+            .key
+            .to_string();
         let chat_calls = || {
             fx.model
                 .requests()
@@ -963,9 +1017,9 @@ async fn a_finished_child_frees_its_session_slot() {
 
         let ended = ended_children(&fx.events().await);
         assert_eq!(ended.len(), 2, "{ended:?}");
-        assert!(ended
-            .iter()
-            .all(|(_, p)| p["status"] == "completed" && p["closed"].is_null()));
+        assert!(ended.iter().all(|(_, p)| p["status"] == "completed"
+            && p["closed"].is_null()
+            && p["closed_ok"] == true));
         let client = fx.client().await;
         let live = client
             .list()

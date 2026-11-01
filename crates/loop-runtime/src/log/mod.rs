@@ -134,6 +134,48 @@ pub trait EventLog: Send + Sync {
     async fn mark_recovered(&self, _generation: u64, _recovered_ms: i64) -> Result<()> {
         Ok(())
     }
+    /// Sessions whose opening recorded a parent: the Runtime's Subagents.
+    /// Implementations should filter in storage; the default scans the log.
+    async fn subagent_sessions(&self) -> Result<std::collections::HashSet<SessionKey>> {
+        Ok(self
+            .read_runtime_after(0)
+            .await?
+            .into_iter()
+            .filter_map(|record| match &record.event.kind {
+                EventKind::SessionOpened(payload) if !payload["parent"].is_null() => {
+                    record.event.session_key
+                }
+                _ => None,
+            })
+            .collect())
+    }
+    /// How many prompts this Session was sent. Each turn starts from one, so
+    /// this bounds the turns begun even when a turn left no Update.
+    /// Implementations should count in storage; the default scans the log.
+    async fn prompts_sent(&self, session: &SessionKey) -> Result<u64> {
+        Ok(self
+            .read_runtime_after(0)
+            .await?
+            .iter()
+            .filter(|r| {
+                r.event.session_key.as_ref() == Some(session)
+                    && matches!(r.event.kind, EventKind::PromptSent(_))
+            })
+            .count() as u64)
+    }
+    /// Distinct turn ids this Session's Updates belong to. Implementations
+    /// should answer without decoding payloads; the default reads every Update.
+    async fn turn_ids(&self, session: &SessionKey) -> Result<Vec<TurnId>> {
+        let mut turns = Vec::new();
+        for record in self.read_after(session, 0).await? {
+            if let Some(turn) = record.event.turn {
+                if !turns.contains(&turn) {
+                    turns.push(turn);
+                }
+            }
+        }
+        Ok(turns)
+    }
     /// Newest event timestamp per Session. Implementations should answer with an
     /// aggregate query; the default scans the whole log.
     async fn last_activity_ms(&self) -> Result<std::collections::HashMap<SessionKey, i64>> {

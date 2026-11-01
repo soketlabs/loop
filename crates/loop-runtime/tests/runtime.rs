@@ -425,6 +425,11 @@ impl EventLog for FailingLog {
     async fn latest_seq(&self, s: &loop_protocol::SessionKey) -> loop_runtime::log::Result<u64> {
         self.inner.latest_seq(s).await
     }
+    async fn subagent_sessions(
+        &self,
+    ) -> loop_runtime::log::Result<std::collections::HashSet<loop_protocol::SessionKey>> {
+        self.inner.subagent_sessions().await
+    }
     async fn allocate_generation(&self, o: &str, p: u32, t: i64) -> loop_runtime::log::Result<u64> {
         self.inner.allocate_generation(o, p, t).await
     }
@@ -707,6 +712,7 @@ async fn list_reads_activity_from_memory_not_the_event_log() {
     let log = Arc::new(FailingLog::default());
     let rt = runtime(dir.path(), log.clone(), RuntimeLimits::default()).await;
     let a = rt.new_session(SessionSpec::default()).await.unwrap();
+    let reads = log.runtime_reads.load(std::sync::atomic::Ordering::Acquire);
     let before = rt.list().await.unwrap()[0].last_active_ms;
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     rt.prompt(&a, vec![ContentBlock::text("hi")])
@@ -714,7 +720,6 @@ async fn list_reads_activity_from_memory_not_the_event_log() {
         .unwrap()
         .outcome()
         .await;
-    let reads = log.runtime_reads.load(std::sync::atomic::Ordering::Acquire);
     for _ in 0..3 {
         let listed = rt.list().await.unwrap();
         assert!(listed[0].last_active_ms > before);
@@ -724,4 +729,104 @@ async fn list_reads_activity_from_memory_not_the_event_log() {
         reads
     );
     rt.shutdown().await;
+}
+
+fn turn_starts(records: &[loop_runtime::log::LoggedEvent]) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(|r| match &r.event.kind {
+            EventKind::Update(envelope) => match &envelope.update {
+                loop_protocol::SessionUpdate::TurnStarted { turn_id } => Some(turn_id.0.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn turn_ids_continue_across_runtime_restarts() {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite: Arc<dyn EventLog> = Arc::new(
+            loop_runtime::log::SqliteEventLog::open(dir.path())
+                .await
+                .unwrap(),
+        );
+        let memory: Arc<dyn EventLog> = Arc::new(MemoryEventLog::new());
+        for (n, log) in [sqlite, memory].into_iter().enumerate() {
+            let dir = dir.path().join(n.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            let rt = runtime(&dir, log.clone(), RuntimeLimits::default()).await;
+            let a = rt.new_session(SessionSpec::default()).await.unwrap();
+            for prompt in ["one", "two"] {
+                rt.prompt(&a, vec![ContentBlock::text(prompt)])
+                    .await
+                    .unwrap()
+                    .outcome()
+                    .await;
+            }
+            rt.shutdown().await;
+            let rt = runtime(&dir, log.clone(), RuntimeLimits::default()).await;
+            rt.load_session(&a, SessionSpec::default()).await.unwrap();
+            rt.prompt(&a, vec![ContentBlock::text("three")])
+                .await
+                .unwrap()
+                .outcome()
+                .await;
+            rt.shutdown().await;
+            let turns = turn_starts(&log.read_after(&a.key, 0).await.unwrap());
+            assert_eq!(turns, ["turn-1", "turn-2", "turn-3"], "log {n}");
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_turn_lost_before_its_start_was_logged_never_has_its_id_reused() {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite: Arc<dyn EventLog> = Arc::new(
+            loop_runtime::log::SqliteEventLog::open(dir.path())
+                .await
+                .unwrap(),
+        );
+        let memory: Arc<dyn EventLog> = Arc::new(MemoryEventLog::new());
+        for (n, log) in [sqlite, memory].into_iter().enumerate() {
+            let dir = dir.path().join(n.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            let rt = runtime(&dir, log.clone(), RuntimeLimits::default()).await;
+            let a = rt.new_session(SessionSpec::default()).await.unwrap();
+            rt.prompt(&a, vec![ContentBlock::text("one")])
+                .await
+                .unwrap()
+                .outcome()
+                .await;
+            rt.shutdown().await;
+            // A crash after the prompt was logged, before its turn start was:
+            // turn-2 may have run without leaving its id in the log.
+            log.append_batch(vec![loop_runtime::log::Event {
+                generation: rt.generation(),
+                session_key: Some(a.key.clone()),
+                turn: None,
+                ts_ms: 1,
+                kind: EventKind::PromptSent(serde_json::json!({"content": []})),
+            }])
+            .await
+            .unwrap();
+            let rt = runtime(&dir, log.clone(), RuntimeLimits::default()).await;
+            rt.load_session(&a, SessionSpec::default()).await.unwrap();
+            rt.prompt(&a, vec![ContentBlock::text("three")])
+                .await
+                .unwrap()
+                .outcome()
+                .await;
+            rt.shutdown().await;
+            let turns = turn_starts(&log.read_after(&a.key, 0).await.unwrap());
+            assert_eq!(turns, ["turn-1", "turn-3"], "log {n}");
+        }
+    })
+    .await
+    .unwrap();
 }

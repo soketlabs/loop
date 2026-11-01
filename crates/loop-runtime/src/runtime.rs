@@ -25,7 +25,7 @@ use loop_protocol::{
 use loop_wire::control::EscalationRecipient;
 use serde_json::json;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     path::PathBuf,
     sync::{
@@ -80,10 +80,28 @@ pub struct Runtime {
     /// Set by [`Runtime::into_shared`]; the `subagent` tool calls back through it.
     me: OnceLock<Weak<Runtime>>,
     subagent_depth: u32,
+    /// Sessions the Runtime opened as Subagents, read from the Event Log once.
+    subagents: AsyncMutex<Option<HashSet<SessionKey>>>,
 }
 /// Newest event timestamp per Session, kept in memory so listing never scans the log.
 type Activity = Arc<Mutex<HashMap<SessionKey, i64>>>;
 type Recipients = HashMap<u64, Arc<dyn EscalationRecipient>>;
+/// Surfaces that should see Escalations of the first Session in `lineage`:
+/// those attached to it or to any Session above it.
+fn wanted(
+    recipients: &HashMap<SessionKey, Recipients>,
+    lineage: &[SessionKey],
+) -> HashMap<u64, Arc<dyn EscalationRecipient>> {
+    let mut wanted = HashMap::new();
+    for key in lineage {
+        for (&connection, recipient) in recipients.get(key).into_iter().flatten() {
+            wanted
+                .entry(connection)
+                .or_insert_with(|| recipient.clone());
+        }
+    }
+    wanted
+}
 fn touch(activity: &Activity, key: &SessionKey, ts_ms: i64) {
     let mut map = activity.lock().unwrap();
     let slot = map.entry(key.clone()).or_insert(ts_ms);
@@ -162,6 +180,8 @@ struct LiveSession {
     tail: Mutex<VecDeque<UpdateEnvelope>>,
     /// Subagent nesting: 0 for a Session a Surface opened.
     depth: u32,
+    /// The Session that opened this one as a Subagent.
+    parent: Option<SessionKey>,
     /// The directory the gate treats as this Session's workspace.
     workspace: PathBuf,
     /// Present on a Subagent: its answer and model-call count.
@@ -251,6 +271,7 @@ impl Runtime {
             close_grace: CLOSE_GRACE,
             me: OnceLock::new(),
             subagent_depth: subagent::DEFAULT_DEPTH,
+            subagents: AsyncMutex::new(None),
         })
     }
     /// Share the Runtime. Only a shared Runtime offers its Sessions the
@@ -523,6 +544,22 @@ impl Runtime {
                 },
             );
             let reference = opened.native.current_session().await;
+            if !created {
+                // Turn ids stay unique per Session across Runtime generations.
+                let turns = self.log.turn_ids(&reference.key).await.map_err(failed)?;
+                let last = turns
+                    .iter()
+                    .filter_map(|turn| turn.as_str().strip_prefix("turn-")?.parse::<u64>().ok())
+                    .max()
+                    .unwrap_or(0);
+                // A turn lost before its start was logged left only its prompt.
+                let prompts = self
+                    .log
+                    .prompts_sent(&reference.key)
+                    .await
+                    .map_err(failed)?;
+                opened.native.continue_turns_after(last.max(prompts));
+            }
             let escalations =
                 crate::EscalationHost::new(reference.clone(), self.log.clone(), self.generation);
             // Runtime grants are live Session state, never restored after a crash.
@@ -557,6 +594,11 @@ impl Runtime {
                 .await
                 .map_err(failed)?;
             touch(&self.activity, &reference.key, ts_ms);
+            if parent.is_some() {
+                if let Some(keys) = self.subagents.lock().await.as_mut() {
+                    keys.insert(reference.key.clone());
+                }
+            }
             let live = Arc::new(LiveSession {
                 opened,
                 escalations,
@@ -572,6 +614,7 @@ impl Runtime {
                 activity: Arc::clone(&self.activity),
                 tail: Mutex::new(VecDeque::new()),
                 depth,
+                parent: parent.clone(),
                 workspace,
                 child: child_state,
                 waiting: AsyncMutex::new(0),
@@ -583,12 +626,13 @@ impl Runtime {
                 }
             }
             // Attachments outlive unloading. Serialize restoration with new
-            // registration and disconnect, so none can miss this host.
+            // registration and disconnect, so none can miss this host. A
+            // Subagent's Escalations also go to Surfaces watching an ancestor.
             let recipients = self.recipients.lock().await;
-            if let Some(attached) = recipients.get(&reference.key) {
-                for (&connection, recipient) in attached {
-                    live.escalations.attach(connection, recipient.clone()).await;
-                }
+            let mut lineage = vec![reference.key.clone()];
+            lineage.extend(parent.iter().flat_map(|p| self.lineage(p)));
+            for (connection, recipient) in wanted(&recipients, &lineage) {
+                live.escalations.attach(connection, recipient).await;
             }
             let task = tokio::spawn(pump(
                 Arc::clone(&live),
@@ -628,6 +672,17 @@ impl Runtime {
         }
         result
     }
+    /// This live Session and the live Sessions above it, nearest first.
+    fn lineage(&self, key: &SessionKey) -> Vec<SessionKey> {
+        let sessions = self.sessions.lock().unwrap();
+        let mut lineage = vec![key.clone()];
+        let mut next = sessions.get(key).and_then(|live| live.parent.clone());
+        while let Some(key) = next.filter(|key| !lineage.contains(key)) {
+            next = sessions.get(&key).and_then(|live| live.parent.clone());
+            lineage.push(key);
+        }
+        lineage
+    }
     /// The parent of a Session the Runtime opened as a Subagent. Forks also
     /// record a parent, so only the Event Log's record of the child's opening
     /// tells them apart; the log is scanned only for Sessions with a parent.
@@ -646,13 +701,19 @@ impl Runtime {
         else {
             return Ok(None);
         };
-        let events = self.log.read_runtime_after(0).await.map_err(failed)?;
-        let child = events.iter().any(|record| {
-            record.event.session_key.as_ref() == Some(&session.key)
-                && matches!(&record.event.kind, EventKind::SessionOpened(payload)
-                    if !payload["parent"].is_null())
-        });
+        let child = self.subagent_keys().await?.contains(&session.key);
         Ok(child.then_some(parent))
+    }
+    /// Keys of every Session opened as a Subagent. The Event Log is asked
+    /// once; children opened later are added as they open.
+    async fn subagent_keys(&self) -> BackendResult<HashSet<SessionKey>> {
+        let mut known = self.subagents.lock().await;
+        if let Some(keys) = known.as_ref() {
+            return Ok(keys.clone());
+        }
+        let keys = self.log.subagent_sessions().await.map_err(failed)?;
+        *known = Some(keys.clone());
+        Ok(keys)
     }
     // A failed open of a Session this call created must not leave an empty row.
     async fn discard_new_row(&self, created: bool, id: &str) {
@@ -671,12 +732,15 @@ impl Runtime {
             .list(None)
             .await
             .map_err(failed)?;
+        // Forks also record a parent; only Subagents report one here.
+        let subagents = self.subagent_keys().await?;
         let activity = self.activity.lock().unwrap().clone();
         let sessions = self.sessions.lock().unwrap();
         Ok(known
             .into_iter()
             .map(|meta| {
                 let r = reference(&meta.id);
+                let subagent = subagents.contains(&r.key);
                 let live = sessions.get(&r.key);
                 let last_active_ms = activity
                     .get(&r.key)
@@ -687,7 +751,10 @@ impl Runtime {
                     r#ref: r,
                     cwd: meta.cwd.map(PathBuf::from).unwrap_or_default(),
                     name: meta.name,
-                    parent: meta.parent_session_id.map(|s| reference(&s)),
+                    parent: meta
+                        .parent_session_id
+                        .filter(|_| subagent)
+                        .map(|s| reference(&s)),
                     live: live.is_some(),
                     busy: live.is_some_and(|s| s.busy.load(Ordering::Acquire)),
                     created_ms: meta.created_at.max(0) as u64,
@@ -926,10 +993,21 @@ impl loop_wire::RuntimeControl for Runtime {
                 }
             }
         }
-        if let Ok(live) = self.route(session) {
-            match recipient {
-                Some(recipient) => live.escalations.attach(connection, recipient).await,
-                None => live.escalations.detach(connection).await,
+        // The Session itself and every live Subagent below it.
+        let affected: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
+        for live in affected {
+            let lineage = self.lineage(&live.reference.key);
+            if !lineage.contains(&session.key) {
+                continue;
+            }
+            let wanted = wanted(&recipients, &lineage);
+            for old in live.escalations.connections().await {
+                if !wanted.contains_key(&old) {
+                    live.escalations.detach(old).await;
+                }
+            }
+            for (connection, recipient) in wanted {
+                live.escalations.attach(connection, recipient).await;
             }
         }
         Ok(())

@@ -53,10 +53,17 @@ async fn runtime_with_log(
     dir: &std::path::Path,
     log: Arc<dyn loop_runtime::log::EventLog>,
 ) -> Arc<Runtime> {
-    let models = Arc::new(loop_ai::Models::create(Default::default()));
     let responses = loop_ai::providers::FauxScript::new();
     responses.push(loop_ai::providers::FauxResponse::Text("replayed".into()));
     responses.push(loop_ai::providers::FauxResponse::Text("live-input".into()));
+    runtime_with_script(dir, log, responses).await
+}
+async fn runtime_with_script(
+    dir: &std::path::Path,
+    log: Arc<dyn loop_runtime::log::EventLog>,
+    responses: loop_ai::providers::FauxScript,
+) -> Arc<Runtime> {
+    let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(loop_ai::providers::faux_provider(responses));
     let globals =
         loop_app_core::runtime::GlobalResources::with_models(dir.join("agent"), models).unwrap();
@@ -135,7 +142,23 @@ async fn list_and_ambiguous_prefix_show_session_details_newest_first() {
             .await;
             assert_eq!(result.is_err(), id.is_some());
             let text = output.lock().unwrap().clone();
-            assert!(text.contains("FOLDER\tTITLE\tBUSY\tLAST ACTIVE (ms)\tPARENT"));
+            let header = text.lines().next().unwrap();
+            let columns: Vec<_> = header.split_whitespace().collect();
+            assert_eq!(
+                columns,
+                ["ID", "FOLDER", "TITLE", "BUSY", "LAST", "ACTIVE", "PARENT"],
+                "{text}"
+            );
+            let row = text.lines().find(|l| l.contains("First")).unwrap();
+            assert!(row.contains(" no ") && row.contains("just now"), "{text}");
+            // Columns line up: every row puts BUSY where the header does.
+            let busy = header.find("BUSY").unwrap();
+            assert!(
+                text.lines()
+                    .skip(1)
+                    .all(|l| matches!(&l[busy..busy + 3], "no " | "yes")),
+                "{text}"
+            );
             assert!(
                 text.find(&second.key.to_string()).unwrap()
                     < text.find(&first.key.to_string()).unwrap()
@@ -178,6 +201,19 @@ async fn attach_renders_replay_then_live_and_typed_line_becomes_prompt() {
             .await
         });
         wait_text(&output, "replayed").await;
+        let header = output
+            .lock()
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            header.starts_with(&format!("Attached to Session {}", session.key))
+                && header.contains(&dir.path().display().to_string())
+                && header.contains("Ctrl+D"),
+            "header: {header:?}"
+        );
         tx.send(Input::Line("live-input".into())).unwrap();
         wait_text(&output, "live-input").await;
         while rt.is_busy(&session) {
@@ -203,7 +239,7 @@ async fn new_session_uses_cwd_and_eof_only_detaches() {
         let (server, client) = loop_wire::transport::memory();
         let served = serve(rt.clone(), server);
         let (backend, events) = connect(client).await.unwrap();
-        let (tx, mut terminal, _) = script();
+        let (tx, mut terminal, output) = script();
         tx.send(Input::Eof).unwrap();
         drive(
             backend,
@@ -221,6 +257,21 @@ async fn new_session_uses_cwd_and_eof_only_detaches() {
         let list = rt.list().await.unwrap();
         assert_eq!(list.len(), 1);
         assert!(list[0].live);
+        let text = output.lock().unwrap().clone();
+        let header = text.lines().next().unwrap_or_default();
+        assert!(
+            header.starts_with(&format!("New Session {}", list[0].r#ref.key))
+                && header.contains(
+                    &dir.path()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string()
+                )
+                && header.contains("Ctrl+D")
+                && header.contains("Ctrl+C twice"),
+            "header: {text:?}"
+        );
         assert_eq!(
             list[0].cwd.canonicalize().unwrap(),
             dir.path().canonicalize().unwrap()
@@ -344,7 +395,10 @@ async fn immediate_eof_renders_the_complete_replay_before_detaching() {
         )
         .await
         .unwrap();
-        assert_eq!(output.lock().unwrap().as_str(), "replayed\n");
+        let text = output.lock().unwrap().clone();
+        let (header, replay) = text.split_once('\n').unwrap();
+        assert!(header.starts_with("Attached to Session"), "{text:?}");
+        assert_eq!(replay, "replayed\n");
         served.done.await.unwrap();
         rt.shutdown().await;
     })
@@ -734,6 +788,300 @@ async fn attaching_to_a_session_held_by_another_loop_says_what_to_do() {
         assert!(error.contains("in use"), "{error}");
         assert!(!error.contains("loop attach"), "circular hint: {error}");
         assert!(error.contains("Close it there"), "{error}");
+        served.done.await.unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn attach_shows_tool_calls_and_starts_each_message_on_its_own_line() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let responses = loop_ai::providers::FauxScript::new();
+        responses.push(loop_ai::providers::FauxResponse::Text("LIVE-OK".into()));
+        responses.push(loop_ai::providers::FauxResponse::ToolCalls(vec![
+            loop_ai::ToolCall {
+                id: "call-ls".into(),
+                name: "ls".into(),
+                arguments: serde_json::json!({"path": "."}),
+                thought_signature: None,
+            },
+        ]));
+        responses.push(loop_ai::providers::FauxResponse::Text(
+            "The folder is empty.".into(),
+        ));
+        let rt = runtime_with_script(dir.path(), Arc::new(MemoryEventLog::new()), responses).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        for prompt in ["first", "second"] {
+            rt.prompt(&session, vec![ContentBlock::text(prompt)])
+                .await
+                .unwrap()
+                .outcome()
+                .await;
+        }
+        let (server, client) = loop_wire::transport::memory();
+        let served = serve(rt.clone(), server);
+        let (backend, events) = connect(client).await.unwrap();
+        let (tx, mut terminal, output) = script();
+        tx.send(Input::Eof).unwrap();
+        drive(
+            backend,
+            events,
+            AttachArgs {
+                id: Some(session.key.to_string()),
+                ..Default::default()
+            },
+            &mut terminal,
+        )
+        .await
+        .unwrap();
+        let text = output.lock().unwrap().clone();
+        assert!(
+            text.ends_with("LIVE-OK\n• ls .\n  └ done\nThe folder is empty.\n"),
+            "{text:?}"
+        );
+        served.done.await.unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_subagents_escalation_is_labelled_and_withdrawn_by_its_own_session() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let child = rt
+            .new_session(SessionSpec {
+                name: Some("check the folder".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (mut server, client) = loop_wire::transport::memory();
+        let inject = server.outgoing.clone();
+        let messages = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = messages.clone();
+        let (forward, incoming) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(raw) = server.incoming.recv().await {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&raw).unwrap());
+                if forward.send(raw).is_err() {
+                    break;
+                }
+            }
+        });
+        let served = serve(
+            rt.clone(),
+            loop_wire::transport::Transport {
+                incoming,
+                outgoing: server.outgoing,
+            },
+        );
+        let (backend, events) = connect(client).await.unwrap();
+        let (tx, mut terminal, output) = script();
+        let key = session.key.to_string();
+        let task = tokio::spawn(async move {
+            drive(
+                backend,
+                events,
+                AttachArgs {
+                    id: Some(key),
+                    ..Default::default()
+                },
+                &mut terminal,
+            )
+            .await
+        });
+        wait_text(&output, "Attached to Session").await;
+        let request = |rpc_id: u64, from: &loop_protocol::SessionRef, title: &str| {
+            serde_json::json!({"jsonrpc":"2.0", "id":rpc_id, "method":"host/interact", "params":{
+                "session":from, "kind":"permission", "id":"approval-1",
+                "tool_call":{"id":"t", "title":title, "kind":"execute", "status":"pending"},
+                "options":[{"native_id":"accept", "label":"Allow once", "kind_hint":"allow_once"}]
+            }})
+            .to_string()
+        };
+        inject.send(request(9001, &child, "ls child")).unwrap();
+        let short = &child.key.as_str()[..8];
+        wait_text(&output, &format!("Subagent {short}: ls child")).await;
+        wait_text(&output, &format!("Subagent {short} (check the folder)")).await;
+        // Same native id, different Session: a separate request.
+        inject.send(request(9002, &session, "ls parent")).unwrap();
+        inject
+            .send(
+                serde_json::json!({"jsonrpc":"2.0", "method":"host/interact_withdrawn",
+                "params":{"session":child, "id":"approval-1"}})
+                .to_string(),
+            )
+            .unwrap();
+        wait_text(&output, "Escalation: ls parent").await;
+        tx.send(Input::Line("2".into())).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if messages
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v["id"] == 9002 && v["result"]["native_id"] == "accept")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("parent approval not answered: {:?}", output.lock().unwrap()));
+        assert!(messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"] == 9001 && v["result"]["outcome"] == "cancelled"));
+        drop(inject);
+        tx.send(Input::Eof).unwrap();
+        task.await.unwrap().unwrap();
+        served.done.await.unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_slow_session_list_never_delays_a_subagents_escalation() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let child = rt
+            .new_session(SessionSpec {
+                name: Some("slow name".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (mut server, client) = loop_wire::transport::memory();
+        let inject = server.outgoing.clone();
+        let messages = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = messages.clone();
+        let (forward, incoming) = mpsc::unbounded_channel();
+        let stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stalling = stall.clone();
+        tokio::spawn(async move {
+            while let Some(raw) = server.incoming.recv().await {
+                let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                captured.lock().unwrap().push(value.clone());
+                // Once attached, the Runtime never answers a listing.
+                if stalling.load(std::sync::atomic::Ordering::Acquire)
+                    && value["method"] == "session/list"
+                {
+                    continue;
+                }
+                if forward.send(raw).is_err() {
+                    break;
+                }
+            }
+        });
+        let served = serve(
+            rt.clone(),
+            loop_wire::transport::Transport {
+                incoming,
+                outgoing: server.outgoing,
+            },
+        );
+        let (backend, events) = connect(client).await.unwrap();
+        let (tx, mut terminal, output) = script();
+        let key = session.key.to_string();
+        let task = tokio::spawn(async move {
+            drive(
+                backend,
+                events,
+                AttachArgs {
+                    id: Some(key),
+                    ..Default::default()
+                },
+                &mut terminal,
+            )
+            .await
+        });
+        wait_text(&output, "Attached to Session").await;
+        stall.store(true, std::sync::atomic::Ordering::Release);
+        inject
+            .send(serde_json::json!({"jsonrpc":"2.0", "id":9001, "method":"host/interact", "params":{
+                "session":child, "kind":"permission", "id":"approval-1",
+                "tool_call":{"id":"t", "title":"ls child", "kind":"execute", "status":"pending"},
+                "options":[{"native_id":"accept", "label":"Allow once", "kind_hint":"allow_once"}]
+            }}).to_string())
+            .unwrap();
+        let short = &child.key.as_str()[..8];
+        let started = std::time::Instant::now();
+        wait_text(&output, &format!("Subagent {short}")).await;
+        tx.send(Input::Line("1".into())).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if messages.lock().unwrap().iter().any(|v| v["id"] == 9001 && v["result"]["native_id"] == "accept") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "answered after {:?}",
+            started.elapsed()
+        );
+        drop(inject);
+        tx.send(Input::Eof).unwrap();
+        task.await.unwrap().unwrap();
+        served.done.await.unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn json_listing_prints_every_session_as_session_info() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).await;
+        let session = rt
+            .new_session(SessionSpec {
+                name: Some("two  spaces".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (server, client) = loop_wire::transport::memory();
+        let served = serve(rt.clone(), server);
+        let (backend, events) = connect(client).await.unwrap();
+        let (_tx, mut terminal, output) = script();
+        drive(
+            backend,
+            events,
+            AttachArgs {
+                json: true,
+                ..Default::default()
+            },
+            &mut terminal,
+        )
+        .await
+        .unwrap();
+        let text = output.lock().unwrap().clone();
+        let list: Vec<loop_protocol::rpc::SessionInfo> =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].r#ref, session);
+        assert_eq!(list[0].name.as_deref(), Some("two  spaces"));
         served.done.await.unwrap();
         rt.shutdown().await;
     })

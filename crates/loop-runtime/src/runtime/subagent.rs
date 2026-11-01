@@ -344,7 +344,11 @@ impl Runtime {
             cwd: cwd.clone(),
             max_turns: args.max_turns,
         };
-        let child = match self.open(None, SessionSpec::default(), Some(open)).await {
+        let spec = SessionSpec {
+            name: Some(title(&args.task)),
+            ..Default::default()
+        };
+        let child = match self.open(None, spec, Some(open)).await {
             Ok(child) => child,
             Err(BackendError::Busy) => {
                 let error = format!(
@@ -424,14 +428,15 @@ impl Runtime {
             ),
             Err(error) => ("failed", Err(error)),
         };
-        self.log_parent(
-            parent,
-            EventKind::SubagentEnded(json!({
-                "child": child.key, "status": status, "model_calls": calls,
-                "closed": closed.as_ref().map_err(ToString::to_string).err(),
-            })),
-        )
-        .await;
+        // `closed` is the close error, or null when the child closed; older
+        // logs only have that field. `closed_ok` states the outcome directly.
+        let ended = json!({
+            "child": child.key, "status": status, "model_calls": calls,
+            "closed": closed.as_ref().map_err(ToString::to_string).err(),
+            "closed_ok": closed.is_ok(),
+        });
+        self.log_parent(parent, EventKind::SubagentEnded(ended))
+            .await;
         (result, halted)
     }
 
@@ -458,6 +463,22 @@ impl Runtime {
             super::fail(parent, failed(error));
         }
     }
+}
+
+/// A child's display name: the first line of its task, shortened.
+fn title(task: &str) -> String {
+    const MAX: usize = 60;
+    let line = task
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("Subagent")
+        .trim();
+    if line.chars().count() <= MAX {
+        return line.to_owned();
+    }
+    let mut short: String = line.chars().take(MAX - 1).collect();
+    short.push('…');
+    short
 }
 
 fn last_output(answer: &str) -> String {

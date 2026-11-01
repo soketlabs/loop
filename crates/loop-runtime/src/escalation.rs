@@ -126,6 +126,17 @@ impl EscalationHost {
         }
         state.delivery = next;
     }
+    /// Connections currently receiving this Session's Escalations.
+    pub(crate) async fn connections(&self) -> Vec<u64> {
+        self.0
+            .state
+            .lock()
+            .await
+            .recipients
+            .keys()
+            .copied()
+            .collect()
+    }
     /// Detaching only removes this recipient; pending requests stay parked.
     pub async fn detach(&self, connection: u64) {
         let mut state = self.0.state.lock().await;

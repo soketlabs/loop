@@ -184,6 +184,7 @@ JSON with lenient handling of unknown kinds.
 | `PromptSent`, `Cancelled` | Input and cancellation intent, with Session and turn correlation when known |
 | `EscalationRaised`, `EscalationAnswered`, `EscalationWithdrawn` | Request, winning answer, grants and withdrawal reason |
 | `SessionOpened`, `SessionClosed` | Session lifecycle, cwd and parent linkage where applicable |
+| `SubagentStarted`, `SubagentEnded` | On the parent: child id, task, status and model calls. In `SubagentEnded`, `closed` is the child's close error or null when it closed; `closed_ok` (newer logs only) is true when it closed |
 | `RuntimeStarted`, `RuntimeStopped` | Runtime lifecycle and generation |
 | `Unknown` | Future records retained without inventing their meaning |
 
@@ -315,8 +316,9 @@ are `instance`, `key` and `native_id`
 The response to attach precedes its replay, followed by live updates.
 `latest_seq` is the snapshot's last update `session_seq`, not its last
 `global_seq` or the last seq the client has rendered. A client persists only
-its own processed update cursor. `SessionInfo.parent` identifies a parent
-Session when present; `last_active_ms` supplies the list's last activity.
+its own processed update cursor. `SessionInfo.parent` identifies the parent
+of a Subagent child; forks report none, though storage records their source.
+`last_active_ms` supplies the list's last activity.
 
 ```json
 {"jsonrpc":"2.0","id":90,"method":"host/interact","params":{"kind":"permission","id":"approval-7","session":{"instance":"loop","key":"s1","native_id":"s1"},"options":[{"native_id":"accept","label":"Allow once","kind_hint":"allow_once"},{"native_id":"reject","label":"Reject","kind_hint":"reject_once"}]}}

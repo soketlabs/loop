@@ -7,6 +7,10 @@ pub struct AttachArgs {
     pub new: bool,
     pub cwd: Option<PathBuf>,
     pub socket: Option<PathBuf>,
+    /// List finished Subagent children too.
+    pub all: bool,
+    /// Print every Session as a JSON array of `SessionInfo` instead.
+    pub json: bool,
 }
 
 #[cfg(not(unix))]
@@ -42,11 +46,11 @@ mod unix {
     use loop_protocol::{
         rpc::{methods, InteractWithdrawnParams, PeerInfo, SessionInfo},
         AgentBackend, ContentBlock, HostServices, InteractionOutcome, InteractionRequest,
-        SessionRef, SessionSpec,
+        SessionKey, SessionRef, SessionSpec,
     };
     use loop_wire::{transport::Transport, RemoteBackend};
     use std::{
-        collections::{HashSet, VecDeque},
+        collections::VecDeque,
         io::{BufRead, Write},
         sync::Arc,
     };
@@ -115,6 +119,8 @@ mod unix {
     struct LostContact;
 
     pub enum HostEvent {
+        /// Which Session a `host/interact` request that follows came from.
+        Origin(loop_protocol::InteractionId, SessionRef),
         Request(Box<InteractionRequest>, oneshot::Sender<InteractionOutcome>),
         Withdrawn(InteractWithdrawnParams),
         Disconnected,
@@ -185,6 +191,17 @@ mod unix {
                                     let _ = notices.send(HostEvent::Withdrawn(params));
                                 }
                             }
+                            // The wire client drops the request's Session; a
+                            // Subagent's requests reach its ancestors' Surfaces.
+                            if value["method"] == methods::HOST_INTERACT {
+                                let params = &value["params"];
+                                if let (Ok(id), Ok(session)) = (
+                                    serde_json::from_value(params["id"].clone()),
+                                    serde_json::from_value(params["session"].clone()),
+                                ) {
+                                    let _ = notices.send(HostEvent::Origin(id, session));
+                                }
+                            }
                         }
                         if tx.send(raw).is_err() { break; }
                     }
@@ -223,19 +240,68 @@ mod unix {
         if sessions.is_empty() {
             return "No Sessions. Use `loop attach --new` to create one.\n".into();
         }
-        let mut text = String::from("ID\tFOLDER\tTITLE\tBUSY\tLAST ACTIVE (ms)\tPARENT\n");
-        for s in sessions {
-            text.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\n",
-                s.r#ref.key,
-                s.cwd.display(),
-                s.name.as_deref().unwrap_or("(untitled)"),
-                s.busy,
-                s.last_active_ms,
-                s.parent.as_ref().map(|p| p.key.as_str()).unwrap_or("-")
-            ));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let mut rows =
+            vec![["ID", "FOLDER", "TITLE", "BUSY", "LAST ACTIVE", "PARENT"].map(String::from)];
+        for s in sessions.iter() {
+            rows.push([
+                s.r#ref.key.to_string(),
+                s.cwd.display().to_string(),
+                clip(s.name.as_deref().unwrap_or("(untitled)"), 40),
+                if s.busy { "yes" } else { "no" }.into(),
+                ago(now, s.last_active_ms),
+                s.parent
+                    .as_ref()
+                    .map_or("-".into(), |p| p.key.as_str().chars().take(8).collect()),
+            ]);
+        }
+        let mut widths = [0; 6];
+        for row in &rows {
+            for (width, cell) in widths.iter_mut().zip(row) {
+                *width = (*width).max(cell.chars().count());
+            }
+        }
+        let mut text = String::new();
+        for row in rows {
+            let mut line = String::new();
+            for (i, cell) in row.iter().enumerate() {
+                if i + 1 == row.len() {
+                    line.push_str(cell);
+                } else {
+                    line.push_str(cell);
+                    let pad = widths[i] - cell.chars().count() + 2;
+                    line.extend(std::iter::repeat_n(' ', pad));
+                }
+            }
+            text.push_str(line.trim_end());
+            text.push('\n');
         }
         text
+    }
+
+    /// At most `max` characters, marking a cut with an ellipsis.
+    fn clip(text: &str, max: usize) -> String {
+        let line = text.lines().next().unwrap_or_default();
+        if line.chars().count() <= max && line.len() == text.len() {
+            return line.into();
+        }
+        let mut clipped: String = line.chars().take(max - 1).collect();
+        clipped.push('…');
+        clipped
+    }
+
+    /// How long ago `then_ms` was, for a person: "just now", "42s ago", "2m ago".
+    pub(super) fn ago(now_ms: u64, then_ms: u64) -> String {
+        let secs = now_ms.saturating_sub(then_ms) / 1000;
+        match secs {
+            0..10 => "just now".into(),
+            10..60 => format!("{secs}s ago"),
+            60..3600 => format!("{}m ago", secs / 60),
+            3600..86400 => format!("{}h ago", secs / 3600),
+            _ => format!("{}d ago", secs / 86400),
+        }
     }
 
     fn matches(sessions: &[SessionInfo], id: &str) -> Vec<SessionInfo> {
@@ -258,9 +324,20 @@ mod unix {
         request: InteractionRequest,
         reply: oneshot::Sender<InteractionOutcome>,
         first_choice: usize,
+        session: SessionKey,
+        /// Set when the request comes from a Subagent of the attached Session.
+        from: Option<String>,
     }
-    fn show(request: &InteractionRequest, first_choice: usize) -> String {
-        let mut text = String::from("\nEscalation: ");
+    impl Pending {
+        fn show(&self) -> String {
+            show(&self.request, self.first_choice, self.from.as_deref())
+        }
+    }
+    fn show(request: &InteractionRequest, first_choice: usize, from: Option<&str>) -> String {
+        let mut text = match from {
+            Some(from) => format!("\nEscalation from {from}: "),
+            None => String::from("\nEscalation: "),
+        };
         match request {
             InteractionRequest::Permission {
                 tool_call, options, ..
@@ -317,6 +394,60 @@ mod unix {
         })
     }
 
+    /// "Subagent 1a2b3c4d (its task)" for a child Session's request.
+    /// Request bookkeeping that keeps only the newest entries, so requests
+    /// that never arrive (or are never withdrawn) cannot grow it without bound.
+    pub(super) struct Recent<T>(VecDeque<T>);
+    impl<T> Default for Recent<T> {
+        fn default() -> Self {
+            Self(VecDeque::new())
+        }
+    }
+    impl<T> Recent<T> {
+        pub(super) const CAP: usize = 256;
+        pub(super) fn push(&mut self, item: T) {
+            if self.0.len() == Self::CAP {
+                self.0.pop_front();
+            }
+            self.0.push_back(item);
+        }
+        /// Remove and return the oldest entry matching `pred`.
+        pub(super) fn take(&mut self, pred: impl Fn(&T) -> bool) -> Option<T> {
+            let index = self.0.iter().position(pred)?;
+            self.0.remove(index)
+        }
+        pub(super) fn any(&self, pred: impl Fn(&T) -> bool) -> bool {
+            self.0.iter().any(pred)
+        }
+        #[cfg(test)]
+        pub(super) fn len(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    fn short_label(child: &SessionKey) -> String {
+        let short: String = child.as_str().chars().take(8).collect();
+        format!("Subagent {short}")
+    }
+    /// The child's name (its task), looked up off the input loop.
+    async fn subagent_name(backend: Arc<RemoteBackend>, child: SessionKey) -> Option<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), backend.list())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|list| list.into_iter().find(|s| s.r#ref.key == child))
+            .and_then(|s| s.name)
+    }
+
+    /// One line on connect: which Session, where, and how to leave.
+    fn header(what: &str, session: &SessionRef, cwd: &std::path::Path) -> String {
+        format!(
+            "{what} {} in {}. Ctrl+D or Ctrl+C twice detaches; the Session keeps running.\n",
+            session.key,
+            cwd.display()
+        )
+    }
+
     /// The lease refusal suggests `loop attach`, which is what just failed.
     fn load_error(error: loop_protocol::BackendError) -> anyhow::Error {
         let text = error.to_string();
@@ -335,18 +466,47 @@ mod unix {
         terminal: &mut dyn Terminal,
     ) -> anyhow::Result<()> {
         let backend = client.backend.clone();
-        let session = if args.new {
+        let (session, header) = if args.new {
             let cwd = std::path::absolute(args.cwd.unwrap_or(std::env::current_dir()?))?;
-            backend
+            let session = backend
                 .new_session(SessionSpec {
-                    cwd: Some(cwd),
+                    cwd: Some(cwd.clone()),
                     ..Default::default()
                 })
-                .await?
+                .await?;
+            let header = header("New Session", &session, &cwd);
+            (session, header)
         } else {
             let mut sessions = backend.list().await?;
             let Some(id) = args.id else {
-                terminal.write(&list_text(&mut sessions))?;
+                if args.json {
+                    let mut text = serde_json::to_string_pretty(&sessions)?;
+                    text.push('\n');
+                    terminal.write(&text)?;
+                    client.shutdown().await;
+                    return Ok(());
+                }
+                let hidden = if args.all {
+                    0
+                } else {
+                    let before = sessions.len();
+                    sessions.retain(|s| s.live || s.parent.is_none());
+                    before - sessions.len()
+                };
+                let mut text = list_text(&mut sessions);
+                if hidden > 0 {
+                    // Closed covers finished children and ones a cancel or a
+                    // Runtime restart ended; none of them can be prompted.
+                    let (noun, them) = if hidden == 1 {
+                        ("Session", "it")
+                    } else {
+                        ("Sessions", "them")
+                    };
+                    text.push_str(&format!(
+                        "\n{hidden} closed Subagent {noun} not shown (finished, cancelled or interrupted); `loop attach --all` lists {them}.\n"
+                    ));
+                }
+                terminal.write(&text)?;
                 client.shutdown().await;
                 return Ok(());
             };
@@ -358,10 +518,21 @@ mod unix {
                 }
                 1 => {
                     let found = found.remove(0);
+                    let header =
+                        |session: &SessionRef| header("Attached to Session", session, &found.cwd);
                     // A Subagent runs only for its parent and is never reloaded;
                     // its Event Log stays readable.
                     if found.live || found.parent.is_some() {
-                        found.r#ref
+                        let header = if found.live {
+                            header(&found.r#ref)
+                        } else {
+                            format!(
+                                "Replaying finished Subagent Session {} in {}. It cannot take prompts; Ctrl+D detaches.\n",
+                                found.r#ref.key,
+                                found.cwd.display()
+                            )
+                        };
+                        (found.r#ref.clone(), header)
                     } else {
                         // Not loaded (e.g. after a Runtime restart). Loading takes
                         // its lease, so prompts typed here can run.
@@ -369,7 +540,10 @@ mod unix {
                             .load_session(&found.r#ref, SessionSpec::default())
                             .await
                         {
-                            Ok(session) => session,
+                            Ok(session) => {
+                                let header = header(&session);
+                                (session, header)
+                            }
                             Err(error) => {
                                 client.shutdown().await;
                                 return Err(load_error(error));
@@ -384,6 +558,7 @@ mod unix {
                 }
             }
         };
+        terminal.write(&header)?;
         let mut updates = backend.subscribe();
         let snapshot = backend.attach(&session, 0).await?;
         let result = attached(
@@ -432,15 +607,25 @@ mod unix {
         // buffered answer remains tied to its original Escalation even if a
         // withdrawal wins the race with terminal input.
         let mut next_choice = 1;
-        let mut withdrawn = HashSet::new();
+        let mut withdrawn: Recent<(SessionKey, loop_protocol::InteractionId)> = Recent::default();
+        // Origins of requests not yet received, in arrival order.
+        let mut origins: Recent<(loop_protocol::InteractionId, SessionRef)> = Recent::default();
+        let mut labels: std::collections::HashMap<SessionKey, String> = Default::default();
+        let mut naming = tokio::task::JoinSet::new();
         let mut interrupted = false;
+        let mut renderer = crate::print_mode::TextRenderer::default();
         let mut prompts = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 Some(event) = events.recv() => match event {
+                    HostEvent::Origin(id, from) => origins.push((id, from)),
                     HostEvent::Request(request, reply) => {
                         let request = *request;
-                        if withdrawn.remove(request.id()) { let _ = reply.send(InteractionOutcome::Cancelled); continue; }
+                        let from = origins
+                            .take(|(id, _)| id == request.id())
+                            .map(|(_, from)| from)
+                            .unwrap_or_else(|| session.clone());
+                        if withdrawn.take(|(key, id)| *key == from.key && id == request.id()).is_some() { let _ = reply.send(InteractionOutcome::Cancelled); continue; }
                         if !matches!(request, InteractionRequest::Permission {..} | InteractionRequest::Question {..}) {
                             let _ = reply.send(InteractionOutcome::Rejected { reason: "loop attach supports choices and text questions".into() }); continue;
                         }
@@ -450,32 +635,60 @@ mod unix {
                             InteractionRequest::Question { choices, .. } => choices.as_ref().map_or(1, |c| c.len().max(1)),
                             _ => 1,
                         };
-                        if pending.is_empty() { terminal.write(&show(&request, first_choice))?; }
-                        pending.push(Pending { request, reply, first_choice });
+                        let label = if from.key == session.key {
+                            None
+                        } else {
+                            if !labels.contains_key(&from.key) {
+                                labels.insert(from.key.clone(), short_label(&from.key));
+                                let (backend, child) = (backend.clone(), from.key.clone());
+                                naming.spawn(async move { let name = subagent_name(backend, child.clone()).await; (child, name) });
+                            }
+                            labels.get(&from.key).cloned()
+                        };
+                        let item = Pending { request, reply, first_choice, session: from.key, from: label };
+                        if pending.is_empty() { terminal.write(&item.show())?; }
+                        pending.push(item);
                     }
-                    HostEvent::Withdrawn(params) if params.session == *session => {
-                        withdrawn.insert(params.id.clone());
-                        if let Some(index) = pending.iter().position(|p| p.request.id() == &params.id) {
+                    HostEvent::Withdrawn(params) => {
+                        let key = (params.session.key.clone(), params.id.clone());
+                        let held = pending.iter().position(|p| p.session == key.0 && p.request.id() == &key.1);
+                        if let Some(index) = held {
                             let item = pending.remove(index);
                             let _ = item.reply.send(InteractionOutcome::Cancelled);
+                        } else if key.0 == session.key || origins.any(|(id, s)| s.key == key.0 && *id == key.1) {
+                            // It may arrive before its request does.
+                            withdrawn.push(key.clone());
                         }
-                        terminal.write("\r\x1b[2KAnother client answered; Escalation withdrawn.\n")?;
-                        if let Some(next) = pending.first() { terminal.write(&show(&next.request, next.first_choice))?; }
+                        if held.is_some() || key.0 == session.key {
+                            terminal.write("\r\x1b[2KAnother client answered; Escalation withdrawn.\n")?;
+                            if let Some(next) = pending.first() { terminal.write(&next.show())?; }
+                        }
                     }
-                    HostEvent::Withdrawn(_) => {},
                     HostEvent::Disconnected => return Err(LostContact.into()),
                 },
                 update = updates.recv() => {
                     let envelope = update.map_err(|e| anyhow::anyhow!("Runtime updates interrupted ({e}); reattach to replay"))?;
                     if envelope.session != session.key { continue; }
                     last_seq = envelope.seq;
-                    if let Some(text) = crate::print_mode::agent_text_chunk(&envelope.update) { terminal.write(text)?; }
+                    let text = renderer.render(&envelope.update);
+                    if !text.is_empty() { terminal.write(&text)?; }
                     if let loop_protocol::SessionUpdate::TurnEnded { error, stop, .. } = envelope.update {
-                        terminal.write("\n")?;
                         if stop == loop_protocol::StopReason::RuntimeRestarted {
                             terminal.write("Turn ended uncertain — Runtime restarted. Its tools may or may not have run; nothing was retried.\n")?;
                         }
                         if let Some(error) = error { terminal.write(&format!("loop: {}\n", error.message))?; }
+                    }
+                },
+                Some(named) = naming.join_next(), if !naming.is_empty() => {
+                    if let Ok((child, Some(name))) = named {
+                        let label = format!("{} ({name})", short_label(&child));
+                        if pending.first().is_some_and(|p| p.session == child) {
+                            terminal.write(&format!("  {label}\n"))?;
+                        }
+                        for item in pending.iter_mut().filter(|p| p.session == child) {
+                            item.from = Some(label.clone());
+                        }
+                        labels.insert(child, label);
                     }
                 },
                 Some(result) = prompts.join_next(), if !prompts.is_empty() => {
@@ -509,7 +722,7 @@ mod unix {
                             if let Some(outcome) = answer(&item.request, &line, item.first_choice) {
                                 let item = pending.remove(0);
                                 let _ = item.reply.send(outcome);
-                                if let Some(next) = pending.first() { terminal.write(&show(&next.request, next.first_choice))?; }
+                                if let Some(next) = pending.first() { terminal.write(&next.show())?; }
                             } else { terminal.write("Enter one of the numbered choices.\n")?; }
                         } else if !explicit_prompt && next_choice > 1 && line.trim().parse::<usize>().is_ok() {
                             terminal.write("Choice no longer active; ignored. Start a numeric prompt with `> `.\n")?;
@@ -530,6 +743,36 @@ mod unix {
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{ago, Recent};
+
+        #[test]
+        fn request_bookkeeping_keeps_only_the_newest_entries() {
+            let mut recent = Recent::default();
+            for n in 0..Recent::<u32>::CAP as u32 + 10 {
+                recent.push(n);
+            }
+            assert_eq!(recent.len(), Recent::<u32>::CAP);
+            assert_eq!(recent.take(|n| *n == 3), None, "the oldest are dropped");
+            assert_eq!(recent.take(|n| *n == 20), Some(20));
+            assert_eq!(recent.take(|n| *n == 20), None);
+            assert!(recent.any(|n| *n == 21));
+        }
+
+        #[test]
+        fn last_activity_reads_as_a_relative_time() {
+            let now = 10_000_000_000;
+            assert_eq!(ago(now, now), "just now");
+            assert_eq!(ago(now, now + 5_000), "just now");
+            assert_eq!(ago(now, now - 9_000), "just now");
+            assert_eq!(ago(now, now - 42_000), "42s ago");
+            assert_eq!(ago(now, now - 2 * 60_000 - 5_000), "2m ago");
+            assert_eq!(ago(now, now - 3 * 3_600_000), "3h ago");
+            assert_eq!(ago(now, now - 49 * 3_600_000), "2d ago");
         }
     }
 }
