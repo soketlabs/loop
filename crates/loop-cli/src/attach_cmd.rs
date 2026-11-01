@@ -317,6 +317,17 @@ mod unix {
         })
     }
 
+    /// The lease refusal suggests `loop attach`, which is what just failed.
+    fn load_error(error: loop_protocol::BackendError) -> anyhow::Error {
+        let text = error.to_string();
+        match text.split_once(" Use `loop attach") {
+            Some((held, _)) if text.contains(" is in use by ") => anyhow::anyhow!(
+                "{held} Close it there, or wait until that process has exited for 30 s, then attach again."
+            ),
+            _ => error.into(),
+        }
+    }
+
     pub async fn drive(
         client: AttachClient,
         mut events: mpsc::UnboundedReceiver<HostEvent>,
@@ -359,7 +370,7 @@ mod unix {
                             Ok(session) => session,
                             Err(error) => {
                                 client.shutdown().await;
-                                return Err(error.into());
+                                return Err(load_error(error));
                             }
                         }
                     }
