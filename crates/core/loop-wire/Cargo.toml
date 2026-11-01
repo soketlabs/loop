@@ -26,3 +26,7 @@ tempfile = { workspace = true }
 loop-agent = { workspace = true }
 loop-ai = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+socket2 = "0.6"

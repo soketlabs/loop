@@ -139,7 +139,19 @@ fn fills_orphan_tool_results() {
 
     let out = transform_messages(&messages, &target);
     assert_eq!(out.len(), 2);
-    assert!(matches!(&out[1], Message::ToolResult(t) if t.tool_call_id == "call_1"));
+    // No result was recorded: the call was interrupted (for example by a
+    // Runtime restart), so the model must not read it as an empty success.
+    let Message::ToolResult(t) = &out[1] else {
+        panic!("{:?}", out[1])
+    };
+    assert_eq!(t.tool_call_id, "call_1");
+    assert!(t.is_error);
+    assert!(
+        matches!(&t.content[..], [loop_ai::ToolResultContent::Text(text)]
+            if text.text.contains("may or may not have run")),
+        "{:?}",
+        t.content
+    );
 }
 
 #[test]

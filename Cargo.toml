@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/loop-ai",
     "crates/loop-orchestration",
+    "crates/loop-runtime",
     "crates/loop-mcp",
     "crates/loop-agent",
     "crates/loop-app-core",
@@ -20,6 +21,7 @@ members = [
 default-members = [
     "crates/loop-ai",
     "crates/loop-orchestration",
+    "crates/loop-runtime",
     "crates/loop-mcp",
     "crates/loop-agent",
     "crates/loop-app-core",
@@ -45,6 +47,7 @@ loop-ai = { path = "crates/loop-ai" }
 loop-agent = { path = "crates/loop-agent" }
 loop-app-core = { path = "crates/loop-app-core" }
 loop-orchestration = { path = "crates/loop-orchestration" }
+loop-runtime = { path = "crates/loop-runtime" }
 loop-mcp = { path = "crates/loop-mcp" }
 loop-telemetry = { path = "crates/loop-telemetry" }
 loop-test-support = { path = "crates/loop-test-support" }

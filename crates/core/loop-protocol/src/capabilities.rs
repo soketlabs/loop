@@ -26,4 +26,8 @@ pub struct Capabilities {
     pub fs_client: bool,
     /// Runs commands through Loop's terminal instead of its own.
     pub terminal_client: bool,
+    /// Manages several Sessions through list and close requests.
+    pub multi_session: bool,
+    /// Supports attach, cursor replay and detach.
+    pub attach: bool,
 }

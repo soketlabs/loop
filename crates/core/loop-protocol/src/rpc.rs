@@ -22,6 +22,14 @@ pub mod methods {
     pub const INITIALIZE: &str = "initialize";
     /// Client → server request: [`crate::SessionSpec`] → [`crate::SessionRef`].
     pub const SESSION_NEW: &str = "session/new";
+    /// Client → server request: `{}` → `[SessionInfo]`.
+    pub const SESSION_LIST: &str = "session/list";
+    /// Client → server request: [`super::CloseParams`] → `{}`.
+    pub const SESSION_CLOSE: &str = "session/close";
+    /// Client → server request: [`super::AttachParams`] → [`super::AttachResult`].
+    pub const SESSION_ATTACH: &str = "session/attach";
+    /// Client → server request: [`super::SessionParams`] → `{}`.
+    pub const SESSION_DETACH: &str = "session/detach";
     /// Client → server request: [`super::LoadParams`] → [`crate::SessionRef`].
     pub const SESSION_LOAD: &str = "session/load";
     /// Client → server request: [`super::SessionParams`] →
@@ -34,9 +42,11 @@ pub mod methods {
     pub const SESSION_CANCEL: &str = "session/cancel";
     /// Server → client notification: an [`crate::UpdateEnvelope`].
     pub const SESSION_UPDATE: &str = "session/update";
-    /// Server → client request: [`crate::InteractionRequest`] →
+    /// Server → client request: [`super::InteractParams`] →
     /// [`crate::InteractionOutcome`].
     pub const HOST_INTERACT: &str = "host/interact";
+    /// Server → client notification: [`super::InteractWithdrawnParams`].
+    pub const HOST_INTERACT_WITHDRAWN: &str = "host/interact_withdrawn";
     /// Client → server request: `{}` → `{}`. The server shuts the backend
     /// down and closes the connection.
     pub const SHUTDOWN: &str = "shutdown";
@@ -95,6 +105,91 @@ pub struct InitializeResult {
 pub struct SessionParams {
     /// The session.
     pub session: SessionRef,
+}
+
+/// One Session in the Runtime's list, including closed Sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionInfo {
+    /// The full Session reference.
+    pub r#ref: SessionRef,
+    /// Working directory.
+    pub cwd: std::path::PathBuf,
+    /// Display name, when set.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Parent Session, when this is a Subagent.
+    #[serde(default)]
+    pub parent: Option<SessionRef>,
+    /// Whether the Runtime currently holds this Session open.
+    pub live: bool,
+    /// Whether a turn is running.
+    pub busy: bool,
+    /// Creation time in milliseconds since the Unix epoch.
+    pub created_ms: u64,
+    /// Last activity time in milliseconds since the Unix epoch.
+    pub last_active_ms: u64,
+}
+
+/// `session/close` params. Closing a busy Session requires `force`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CloseParams {
+    /// The Session to close.
+    pub session: SessionRef,
+    /// Cancel a running turn before closing. Defaults to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+}
+
+/// `session/attach` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AttachParams {
+    /// The Session to attach.
+    pub session: SessionRef,
+    /// Last processed update sequence; zero replays from the beginning.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub after_seq: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// `session/attach` result, sent before replay and live updates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AttachResult {
+    /// Last update sequence in the replay snapshot, not an audit cursor.
+    pub latest_seq: u64,
+    /// Runtime generation of the snapshot.
+    pub generation: u64,
+}
+
+/// `host/interact` params, preserving the v1 interaction shape.
+///
+/// Routing lives at the wire boundary so local backends can continue producing
+/// Session-independent requests. Flattening keeps old v1 messages compatible.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct InteractParams {
+    /// The Session awaiting an answer. Absent on single-Session v1 peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionRef>,
+    /// The backend's original request and native interaction id.
+    #[serde(flatten)]
+    pub request: crate::InteractionRequest,
+}
+
+/// `host/interact_withdrawn` notification params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct InteractWithdrawnParams {
+    /// The Session whose Escalation is no longer pending.
+    pub session: SessionRef,
+    /// The original interaction id, not a connection's JSON-RPC request id.
+    pub id: crate::InteractionId,
 }
 
 /// `session/load` params.
@@ -162,6 +257,10 @@ impl From<PromptResult> for TurnOutcome {
                 stop: StopReason::Cancelled,
                 ..
             } => Self::Cancelled,
+            PromptResult {
+                stop: StopReason::RuntimeRestarted,
+                ..
+            } => Self::Uncertain,
             PromptResult {
                 stop: StopReason::Error,
                 ..
@@ -256,9 +355,7 @@ pub fn negotiate(client: u32) -> u32 {
 /// `schema/loop-protocol.json` is this value.
 #[cfg(feature = "schema")]
 pub fn json_schema() -> Value {
-    use crate::{
-        InteractionOutcome, InteractionRequest, SessionUpdate, UpdateEnvelope, PROTOCOL_VERSION,
-    };
+    use crate::{InteractionOutcome, SessionUpdate, UpdateEnvelope, PROTOCOL_VERSION};
 
     let mut generator = schemars::generate::SchemaSettings::draft2020_12().into_generator();
     let reference = |schema: schemars::Schema| serde_json::to_value(schema).unwrap_or_default();
@@ -268,11 +365,16 @@ pub fn json_schema() -> Value {
     let session = reference(generator.subschema_for::<SessionRef>());
     let load = reference(generator.subschema_for::<LoadParams>());
     let session_params = reference(generator.subschema_for::<SessionParams>());
+    let session_list = reference(generator.subschema_for::<Vec<SessionInfo>>());
+    let close = reference(generator.subschema_for::<CloseParams>());
+    let attach = reference(generator.subschema_for::<AttachParams>());
+    let attached = reference(generator.subschema_for::<AttachResult>());
+    let withdrawn = reference(generator.subschema_for::<InteractWithdrawnParams>());
     let transcript = reference(generator.subschema_for::<Vec<SessionUpdate>>());
     let prompt_params = reference(generator.subschema_for::<PromptParams>());
     let prompt_result = reference(generator.subschema_for::<PromptResult>());
     let envelope = reference(generator.subschema_for::<UpdateEnvelope>());
-    let interaction = reference(generator.subschema_for::<InteractionRequest>());
+    let interaction = reference(generator.subschema_for::<InteractParams>());
     let interaction_outcome = reference(generator.subschema_for::<InteractionOutcome>());
     let error = reference(generator.subschema_for::<RpcErrorBody>());
     let empty = serde_json::json!({"type": "object"});
@@ -297,12 +399,17 @@ pub fn json_schema() -> Value {
         "methods": {
             methods::INITIALIZE: method(up, "request", &initialize_params, Some(&initialize_result)),
             methods::SESSION_NEW: method(up, "request", &spec, Some(&session)),
+            methods::SESSION_LIST: method(up, "request", &empty, Some(&session_list)),
+            methods::SESSION_CLOSE: method(up, "request", &close, Some(&empty)),
+            methods::SESSION_ATTACH: method(up, "request", &attach, Some(&attached)),
+            methods::SESSION_DETACH: method(up, "request", &session_params, Some(&empty)),
             methods::SESSION_LOAD: method(up, "request", &load, Some(&session)),
             methods::SESSION_TRANSCRIPT: method(up, "request", &session_params, Some(&transcript)),
             methods::SESSION_PROMPT: method(up, "request", &prompt_params, Some(&prompt_result)),
             methods::SESSION_CANCEL: method(up, "notification", &session_params, None),
             methods::SESSION_UPDATE: method(down, "notification", &envelope, None),
             methods::HOST_INTERACT: method(down, "request", &interaction, Some(&interaction_outcome)),
+            methods::HOST_INTERACT_WITHDRAWN: method(down, "notification", &withdrawn, None),
             methods::SHUTDOWN: method(up, "request", &empty, Some(&empty)),
         },
         "error": error,

@@ -181,6 +181,8 @@ pub enum StopReason {
     Cancelled,
     /// The turn failed. `TurnEnded::error` says why.
     Error,
+    /// Interrupted by a Runtime restart; effects are uncertain. Never retry automatically.
+    RuntimeRestarted,
     /// A reason this reader does not know.
     #[serde(other)]
     Other,

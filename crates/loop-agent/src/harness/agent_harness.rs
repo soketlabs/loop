@@ -133,6 +133,7 @@ pub struct AgentHarness {
     tool_execution: Mutex<ToolExecutionMode>,
     before_tool_call: Mutex<Option<BeforeToolHook>>,
     after_tool_call: Mutex<Option<AfterToolHook>>,
+    should_stop_after_turn: Mutex<Option<crate::types::ShouldStopAfterTurnFn>>,
     bash_limits: Mutex<crate::harness::tools::BashLimits>,
     #[allow(dead_code)]
     steering_mode: Mutex<QueueMode>,
@@ -178,6 +179,7 @@ impl AgentHarness {
             tool_execution: Mutex::new(ToolExecutionMode::Parallel),
             before_tool_call: Mutex::new(None),
             after_tool_call: Mutex::new(None),
+            should_stop_after_turn: Mutex::new(None),
             bash_limits: Mutex::new(Default::default()),
             steering_mode: Mutex::new(QueueMode::OneAtATime),
             follow_up_mode: Mutex::new(QueueMode::OneAtATime),
@@ -260,7 +262,10 @@ impl AgentHarness {
         self.wait_for_idle().await;
 
         let store = self.session.lock().await.store();
-        let reader = store.load(id).await.map_err(AgentHarnessError::Session)?;
+        let reader = store
+            .open_writer(id)
+            .await
+            .map_err(AgentHarnessError::Session)?;
         let new_session = Session::new(store, reader);
         let sid = new_session.metadata().id.clone();
 
@@ -720,6 +725,12 @@ impl AgentHarness {
     /// Set after-tool-call hook (e.g. interactive file-edit review).
     pub fn set_after_tool_call(&self, hook: Option<AfterToolHook>) {
         *self.after_tool_call.lock() = hook;
+    }
+
+    /// Decide after each model call whether the run ends there, even with
+    /// tool results pending (for example a Subagent's model-call limit).
+    pub fn set_should_stop_after_turn(&self, hook: Option<crate::types::ShouldStopAfterTurnFn>) {
+        *self.should_stop_after_turn.lock() = hook;
     }
 
     /// Register a harness hook.
@@ -1237,6 +1248,16 @@ impl AgentHarness {
     ) -> Result<AgentMessage, AgentHarnessError> {
         // Fail before touching phase or session, so nothing is recorded for the prompt.
         self.require_model().await?;
+        let lease_cancellation = self.session.lock().await.store().write_cancellation();
+        if lease_cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(crate::harness::types::SessionError::Invalid(
+                "Session lease ownership was lost; stop writing and cancel work.".into(),
+            )
+            .into());
+        }
         {
             let mut phase = self.phase.lock();
             if *phase != AgentHarnessPhase::Idle {
@@ -1245,7 +1266,9 @@ impl AgentHarness {
             *phase = AgentHarnessPhase::Turn;
         }
 
-        let token = CancellationToken::new();
+        let token = lease_cancellation
+            .map(|token| token.child_token())
+            .unwrap_or_default();
         *self.cancel.lock() = Some(token.clone());
         tracing::info!("run_turn: started");
 
@@ -1344,6 +1367,7 @@ impl AgentHarness {
         config.stream_options.reasoning = snapshot.thinking_level.to_reasoning();
         config.before_tool_call = self.before_tool_call.lock().clone();
         config.after_tool_call = self.after_tool_call.lock().clone();
+        config.should_stop_after_turn = self.should_stop_after_turn.lock().clone();
         config.run_labels = RunLabels {
             agent: Some(RunLabels::MAIN),
             skills: self.active_skill_names.read().await.clone(),

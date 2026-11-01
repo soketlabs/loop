@@ -115,3 +115,59 @@ fn tagged_enums_are_discriminated_unions() {
     assert_eq!(methods["session/prompt"]["kind"], "request");
     assert_eq!(methods["host/interact"]["direction"], "server_to_client");
 }
+
+#[test]
+fn runtime_methods_and_messages_are_in_the_schema() {
+    use loop_protocol::rpc::methods;
+    let schema = json_schema();
+    assert_eq!(schema["protocol_version"], 1);
+    for method in [
+        methods::SESSION_LIST,
+        methods::SESSION_CLOSE,
+        methods::SESSION_ATTACH,
+        methods::SESSION_DETACH,
+    ] {
+        assert_eq!(schema["methods"][method]["direction"], "client_to_server");
+        assert_eq!(schema["methods"][method]["kind"], "request");
+        assert!(schema["methods"][method].get("result").is_some());
+    }
+    assert_eq!(
+        schema["methods"][methods::HOST_INTERACT_WITHDRAWN]["kind"],
+        "notification"
+    );
+    assert_eq!(
+        schema["methods"][methods::HOST_INTERACT_WITHDRAWN]["direction"],
+        "server_to_client"
+    );
+    let session = json!({"instance":"loop","key":"s1","native_id":"s1"});
+    for (definition, message) in [
+        (
+            "SessionInfo",
+            json!({"ref":session,"cwd":"/work","name":null,"parent":null,"live":true,"busy":false,"created_ms":1,"last_active_ms":2}),
+        ),
+        ("CloseParams", json!({"session":session})),
+        ("AttachParams", json!({"session":session})),
+        ("AttachResult", json!({"latest_seq":42,"generation":3})),
+        (
+            "InteractParams",
+            json!({"kind":"permission","id":"p1","session":session,"options":[]}),
+        ),
+        (
+            "InteractParams",
+            json!({"kind":"question","id":"q1","prompt":"Which?"}),
+        ),
+        (
+            "InteractWithdrawnParams",
+            json!({"session":session,"id":"p1"}),
+        ),
+        ("StopReason", json!("runtime_restarted")),
+    ] {
+        assert!(
+            validator(definition).is_valid(&message),
+            "{definition}: {message}"
+        );
+    }
+    assert!(!validator("AttachParams").is_valid(&json!({"session":session,"after_seq":-1})));
+    assert!(!validator("InteractParams")
+        .is_valid(&json!({"kind":"permission","id":"p1","session":7,"options":[]})));
+}

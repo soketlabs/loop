@@ -313,6 +313,100 @@ impl TurnReport {
     }
 }
 
+/// Text shared by print mode and the Runtime's plain-text Surface.
+pub fn agent_text_chunk(update: &SessionUpdate) -> Option<&str> {
+    match update {
+        SessionUpdate::MessageChunk {
+            role: Role::Agent,
+            content,
+            ..
+        } => content.as_text(),
+        _ => None,
+    }
+}
+
+/// Plain-text rendering of a Session's updates for a line terminal: agent
+/// text, one line per tool call and one per finished call, with each message
+/// starting on its own line.
+#[derive(Debug)]
+pub struct TextRenderer {
+    at_line_start: bool,
+    tools: std::collections::HashMap<loop_protocol::ToolCallId, String>,
+}
+
+impl Default for TextRenderer {
+    fn default() -> Self {
+        Self {
+            at_line_start: true,
+            tools: Default::default(),
+        }
+    }
+}
+
+impl TextRenderer {
+    /// Text to write for one update; empty when it shows nothing.
+    pub fn render(&mut self, update: &SessionUpdate) -> String {
+        use loop_protocol::ToolCallStatus;
+        let mut out = String::new();
+        match update {
+            SessionUpdate::MessageStarted {
+                role: Role::Agent, ..
+            } => self.break_line(&mut out),
+            SessionUpdate::ToolCall(call) => {
+                self.break_line(&mut out);
+                let label = match call.name.as_deref() {
+                    Some(name) if name != call.title && !call.title.starts_with(name) => {
+                        format!("{name}: {}", call.title)
+                    }
+                    _ => call.title.clone(),
+                };
+                out.push_str(&format!("• {label}\n"));
+                self.tools.insert(call.id.clone(), label);
+                if let Some(status) = finished(call.status) {
+                    out.push_str(status);
+                    self.tools.remove(&call.id);
+                }
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                let status = update.status.and_then(finished);
+                if let Some(status) = status.filter(|_| self.tools.remove(&update.id).is_some()) {
+                    self.break_line(&mut out);
+                    out.push_str(status);
+                }
+            }
+            SessionUpdate::TurnEnded { .. } => self.break_line(&mut out),
+            _ => {
+                if let Some(text) = agent_text_chunk(update) {
+                    out.push_str(text);
+                }
+            }
+        }
+        if !out.is_empty() {
+            self.at_line_start = out.ends_with('\n');
+        }
+        return out;
+
+        fn finished(status: ToolCallStatus) -> Option<&'static str> {
+            match status {
+                ToolCallStatus::Completed => Some("  └ done\n"),
+                ToolCallStatus::Failed => Some("  └ failed\n"),
+                ToolCallStatus::Pending | ToolCallStatus::InProgress => None,
+            }
+        }
+    }
+
+    /// Whether the last text written ended a line.
+    pub fn at_line_start(&self) -> bool {
+        self.at_line_start
+    }
+
+    fn break_line(&self, out: &mut String) {
+        if !self.at_line_start && out.is_empty() {
+            out.push('\n');
+        }
+    }
+}
+
 /// Run one turn and return the text of the agent's last message, or why the
 /// turn failed.
 pub async fn print_turn(
@@ -369,19 +463,13 @@ pub async fn run_turn(
             continue;
         }
         on_update(&envelope);
+        if let Some(text) = agent_text_chunk(&envelope.update) {
+            report.text.push_str(text);
+        }
         match envelope.update {
             SessionUpdate::MessageStarted {
                 role: Role::Agent, ..
             } => report.text.clear(),
-            SessionUpdate::MessageChunk {
-                role: Role::Agent,
-                content,
-                ..
-            } => {
-                if let Some(text) = content.as_text() {
-                    report.text.push_str(text);
-                }
-            }
             SessionUpdate::Usage(usage) => report.usage = Some(usage),
             SessionUpdate::TurnEnded { stop, error, .. } => {
                 report.stop = Some(stop);
@@ -536,5 +624,78 @@ mod tests {
         assistant.error_message = Some("rate limited".into());
         let err = final_text(&AgentMessage::assistant(assistant)).unwrap_err();
         assert_eq!(err.to_string(), "rate limited");
+    }
+
+    fn agent_text(message: &str, text: &str) -> SessionUpdate {
+        SessionUpdate::MessageChunk {
+            message_id: loop_protocol::MessageId(message.into()),
+            role: Role::Agent,
+            content: ContentBlock::text(text),
+        }
+    }
+    fn started(message: &str) -> SessionUpdate {
+        SessionUpdate::MessageStarted {
+            message_id: loop_protocol::MessageId(message.into()),
+            role: Role::Agent,
+        }
+    }
+    fn render(updates: &[SessionUpdate]) -> String {
+        let mut renderer = TextRenderer::default();
+        updates.iter().map(|u| renderer.render(u)).collect()
+    }
+
+    #[test]
+    fn text_renderer_separates_messages_and_shows_tool_calls_compactly() {
+        let mut ls = loop_protocol::ToolCall {
+            id: "call-1".into(),
+            name: Some("ls".into()),
+            title: "ls .".into(),
+            kind: loop_protocol::ToolKind::Read,
+            status: loop_protocol::ToolCallStatus::InProgress,
+            content: Vec::new(),
+            locations: Vec::new(),
+            raw_input: None,
+        };
+        let mut done = loop_protocol::ToolCallUpdate::new("call-1".into());
+        done.status = Some(loop_protocol::ToolCallStatus::Completed);
+        let mut partial = loop_protocol::ToolCallUpdate::new("call-1".into());
+        partial.content = Some(Vec::new());
+        let text = render(&[
+            started("m1"),
+            agent_text("m1", "LIVE-OK"),
+            SessionUpdate::ToolCall(ls.clone()),
+            SessionUpdate::ToolCallUpdate(partial),
+            SessionUpdate::ToolCallUpdate(done),
+            started("m2"),
+            agent_text("m2", "The folder has one file."),
+        ]);
+        assert_eq!(text, "LIVE-OK\n• ls .\n  └ done\nThe folder has one file.");
+
+        ls.id = "call-2".into();
+        ls.name = Some("bash".into());
+        ls.title = "rm -rf build".into();
+        let mut failed = loop_protocol::ToolCallUpdate::new("call-2".into());
+        failed.status = Some(loop_protocol::ToolCallStatus::Failed);
+        let text = render(&[
+            SessionUpdate::ToolCall(ls),
+            SessionUpdate::ToolCallUpdate(failed),
+            started("m3"),
+            agent_text("m3", "Second\n"),
+            started("m4"),
+            agent_text("m4", "Third"),
+        ]);
+        assert_eq!(text, "• bash: rm -rf build\n  └ failed\nSecond\nThird");
+    }
+
+    #[test]
+    fn text_renderer_ends_a_turn_on_its_own_line_once() {
+        let end = SessionUpdate::TurnEnded {
+            turn_id: loop_protocol::TurnId("turn-1".into()),
+            stop: loop_protocol::StopReason::EndTurn,
+            error: None,
+        };
+        assert_eq!(render(&[agent_text("m", "hi"), end.clone()]), "hi\n");
+        assert_eq!(render(&[agent_text("m", "hi\n"), end.clone()]), "hi\n");
+        assert_eq!(render(std::slice::from_ref(&end)), "");
     }
 }

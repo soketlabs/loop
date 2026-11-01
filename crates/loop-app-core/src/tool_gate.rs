@@ -89,6 +89,17 @@ impl ToolGate {
         })
     }
 
+    /// Create a gate bound to a Session's workspace before tools are built.
+    /// Relative call paths and Policy checks never use the process cwd.
+    pub fn new_for_workspace(
+        permissions: BTreeMap<String, ToolPermission>,
+        cwd: &std::path::Path,
+    ) -> Arc<Self> {
+        let gate = Self::new(permissions);
+        gate.set_workspace(crate::permissions::workspace_root(cwd));
+        gate
+    }
+
     /// Install the gate into `harness`'s tool slots and run its hooks.
     pub fn install(self: &Arc<Self>, harness: &Arc<AgentHarness>) {
         self.workspace
@@ -274,6 +285,11 @@ impl ToolGate {
             let rules = gate.permissions.lock();
             crate::permissions::search_may_show(&rules, tool, path, &workspace, home.as_deref())
         })
+    }
+
+    /// The `toolPermissions` rules in force.
+    pub fn permissions(&self) -> BTreeMap<String, ToolPermission> {
+        self.permissions.lock().clone()
     }
 
     /// Replace the per-tool permissions (settings changed).

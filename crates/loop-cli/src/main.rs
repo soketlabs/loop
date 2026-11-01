@@ -103,6 +103,27 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Watch a Runtime Session, or list Sessions when no id is given.
+    Attach {
+        /// Session id or unique prefix.
+        #[arg(conflicts_with = "new")]
+        id: Option<String>,
+        /// Create a Session before attaching.
+        #[arg(long)]
+        new: bool,
+        /// Working directory for a new Session.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Runtime socket path.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Also list finished Subagent Sessions.
+        #[arg(long, conflicts_with_all = ["id", "new"])]
+        all: bool,
+        /// Print every Session, closed Subagents included, as JSON.
+        #[arg(long, conflicts_with_all = ["id", "new"])]
+        json: bool,
+    },
     /// Show config directory paths.
     Config,
     /// Print version (same as --version).
@@ -126,6 +147,23 @@ enum Commands {
     /// Show usage (tokens, models, tools, agents, sessions) in the terminal.
     #[cfg(feature = "usage")]
     Usage,
+    /// Run the Runtime: one process that holds many Sessions and serves them
+    /// over a local socket. Never reads stdin or prompts.
+    ///
+    /// Folders without recorded trust get global settings only. Use the
+    /// global `--permission-mode` flag to choose a mode; `full-access` takes
+    /// effect only through that flag, never from settings.
+    Serve {
+        /// Socket path (default: `run/runtime.sock` in the agent directory).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Most Sessions held at once.
+        #[arg(long, default_value_t = 16)]
+        max_sessions: usize,
+        /// Most turns running at once; further turns queue.
+        #[arg(long, default_value_t = 8)]
+        max_active_turns: usize,
+    },
 }
 
 #[tokio::main]
@@ -221,6 +259,43 @@ async fn real_main() -> anyhow::Result<()> {
                 );
                 tokio::task::block_in_place(|| loop_dashboard::run(options))?;
                 return Ok(());
+            }
+            Commands::Attach {
+                id,
+                new,
+                cwd,
+                socket,
+                all,
+                json,
+            } => {
+                return loop_cli::attach_cmd::run(loop_cli::attach_cmd::AttachArgs {
+                    id: id.clone(),
+                    new: *new,
+                    cwd: cwd.clone().or(cli.cwd.clone()),
+                    socket: socket.clone(),
+                    all: *all,
+                    json: *json,
+                })
+                .await;
+            }
+            Commands::Serve {
+                socket,
+                max_sessions,
+                max_active_turns,
+            } => {
+                // Before bootstrap: no stdin, no trust prompt, no TUI.
+                let cwd = match &cli.cwd {
+                    Some(cwd) => std::path::absolute(cwd)?,
+                    None => std::env::current_dir()?,
+                };
+                return loop_cli::serve_cmd::run(loop_cli::serve_cmd::ServeArgs {
+                    socket: socket.clone(),
+                    max_sessions: *max_sessions,
+                    max_active_turns: *max_active_turns,
+                    permission_mode: cli.permission_mode.clone(),
+                    cwd,
+                })
+                .await;
             }
             _ => (),
         }
@@ -381,4 +456,121 @@ async fn real_main() -> anyhow::Result<()> {
     #[cfg(feature = "telemetry")]
     print_mode::shutdown_telemetry(&telemetry).await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attach_parses_and_rejects_conflicting_selection() {
+        for args in [
+            vec!["loop", "attach"],
+            vec!["loop", "attach", "abc"],
+            vec![
+                "loop",
+                "attach",
+                "--new",
+                "--cwd",
+                "/tmp",
+                "--socket",
+                "/tmp/r.sock",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        let cli = Cli::try_parse_from([
+            "loop",
+            "attach",
+            "--new",
+            "--cwd",
+            "/tmp",
+            "--socket",
+            "/tmp/r.sock",
+        ])
+        .unwrap();
+        let Some(Commands::Attach {
+            new, cwd, socket, ..
+        }) = cli.command
+        else {
+            panic!("not attach")
+        };
+        assert!(new);
+        assert_eq!(cwd, Some(PathBuf::from("/tmp")));
+        assert_eq!(socket, Some(PathBuf::from("/tmp/r.sock")));
+        assert!(Cli::try_parse_from(["loop", "attach", "abc", "--new"]).is_err());
+        let cli = Cli::try_parse_from(["loop", "attach", "--all"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attach { all: true, .. })
+        ));
+        assert!(Cli::try_parse_from(["loop", "attach", "abc", "--all"]).is_err());
+        let cli = Cli::try_parse_from(["loop", "attach", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attach { json: true, .. })
+        ));
+        assert!(Cli::try_parse_from(["loop", "attach", "--new", "--json"]).is_err());
+        let cli = Cli::try_parse_from(["loop", "attach"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attach {
+                id: None,
+                new: false,
+                socket: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn serve_parses_with_defaults_and_flags() {
+        let cli = Cli::try_parse_from(["loop", "serve"]).unwrap();
+        let Some(Commands::Serve {
+            socket,
+            max_sessions,
+            max_active_turns,
+        }) = cli.command
+        else {
+            panic!("not serve")
+        };
+        assert_eq!((socket, max_sessions, max_active_turns), (None, 16, 8));
+        let cli = Cli::try_parse_from([
+            "loop",
+            "serve",
+            "--socket",
+            "/tmp/x.sock",
+            "--max-sessions",
+            "3",
+            "--max-active-turns",
+            "2",
+            "--permission-mode",
+            "full-access",
+        ])
+        .unwrap();
+        assert_eq!(cli.permission_mode.as_deref(), Some("full-access"));
+        let Some(Commands::Serve {
+            socket,
+            max_sessions,
+            max_active_turns,
+        }) = cli.command
+        else {
+            panic!("not serve")
+        };
+        assert_eq!(socket, Some(PathBuf::from("/tmp/x.sock")));
+        assert_eq!((max_sessions, max_active_turns), (3, 2));
+    }
+
+    #[test]
+    fn serve_help_describes_the_command() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("serve")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--socket") && help.contains("--max-sessions"));
+        assert!(help.contains("full-access"));
+    }
 }

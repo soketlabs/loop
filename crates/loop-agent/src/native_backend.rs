@@ -56,6 +56,9 @@ struct StreamState {
     session: SessionKey,
     seq: u64,
     mapper: NativeEventMapper,
+    /// Turns already numbered per Session this backend streamed before, so
+    /// switching back never repeats a turn id.
+    turns: std::collections::HashMap<SessionKey, u64>,
 }
 
 impl NativeBackend {
@@ -70,6 +73,7 @@ impl NativeBackend {
             session,
             seq: 0,
             mapper: NativeEventMapper::new(),
+            turns: Default::default(),
         }));
         let backend = Arc::new(Self {
             instance: BackendInstanceId::from(NATIVE_INSTANCE),
@@ -101,13 +105,25 @@ impl NativeBackend {
         self.session_ref(self.harness.session_id().await)
     }
 
+    /// Number this Session's next turns after `turns` earlier ones, recorded
+    /// elsewhere (for example in the Runtime's Event Log), so turn ids stay
+    /// unique across process restarts.
+    pub fn continue_turns_after(&self, turns: u64) {
+        self.stream.lock().mapper.continue_after(turns);
+    }
+
     /// Point the update stream at a session the harness switched to by
     /// itself (for example after forking).
     pub fn adopt_session(&self, native_id: &str) -> SessionRef {
         let mut stream = self.stream.lock();
+        let (old, started) = (stream.session.clone(), stream.mapper.turns_started());
+        let seen = stream.turns.entry(old).or_default();
+        *seen = (*seen).max(started);
         stream.session = SessionKey::from(native_id);
         stream.seq = 0;
         stream.mapper = NativeEventMapper::new();
+        let earlier = stream.turns.get(&stream.session).copied().unwrap_or(0);
+        stream.mapper.continue_after(earlier);
         drop(stream);
         self.session_ref(native_id.to_owned())
     }

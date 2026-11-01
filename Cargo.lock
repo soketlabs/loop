@@ -4584,6 +4584,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "ignore",
+ "libc",
  "loop-acp",
  "loop-agent",
  "loop-ai",
@@ -4620,6 +4621,7 @@ dependencies = [
  "dirs",
  "futures",
  "ignore",
+ "libc",
  "loop-agent",
  "loop-ai",
  "loop-app-core",
@@ -4627,9 +4629,11 @@ dependencies = [
  "loop-mcp",
  "loop-orchestration",
  "loop-protocol",
+ "loop-runtime",
  "loop-telemetry",
  "loop-test-support",
  "loop-update",
+ "loop-wire",
  "opentelemetry_sdk",
  "parking_lot",
  "png 0.18.1",
@@ -4743,6 +4747,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "loop-runtime"
+version = "0.6.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "loop-agent",
+ "loop-ai",
+ "loop-app-core",
+ "loop-protocol",
+ "loop-wire",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "loop-telemetry"
 version = "0.6.0"
 dependencies = [
@@ -4796,12 +4819,14 @@ dependencies = [
  "async-trait",
  "futures",
  "jsonschema",
+ "libc",
  "loop-agent",
  "loop-ai",
  "loop-protocol",
  "parking_lot",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "tokio",
  "tokio-tungstenite",

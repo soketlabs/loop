@@ -373,3 +373,58 @@ async fn a_provider_error_is_reported_once() {
         .count();
     assert_eq!(reports, 1, "{updates:?}");
 }
+
+fn turn_id(envelopes: &[UpdateEnvelope]) -> String {
+    envelopes
+        .iter()
+        .find_map(|e| match &e.update {
+            SessionUpdate::TurnStarted { turn_id } => Some(turn_id.0.clone()),
+            _ => None,
+        })
+        .expect("a turn start")
+}
+
+#[tokio::test]
+async fn switching_back_to_a_session_continues_its_turn_numbering() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let responses = (0..4)
+            .map(|n| FauxResponse::Text(format!("r{n}")))
+            .collect();
+        let backend = backend(responses, vec![]).await;
+        let first = backend.current_session().await;
+        // Turns recorded elsewhere, for example in the Runtime's Event Log.
+        backend.continue_turns_after(10);
+        let mut rx = backend.subscribe();
+        backend
+            .prompt(&first, text("a"))
+            .await
+            .unwrap()
+            .outcome()
+            .await;
+        assert_eq!(turn_id(&collect_turn(&mut rx).await), "turn-11");
+
+        let second = backend.new_session(SessionSpec::default()).await.unwrap();
+        backend
+            .prompt(&second, text("b"))
+            .await
+            .unwrap()
+            .outcome()
+            .await;
+        assert_eq!(turn_id(&collect_turn(&mut rx).await), "turn-1");
+
+        let first = backend
+            .load_session(&first, SessionSpec::default())
+            .await
+            .unwrap();
+        let mut rx = backend.subscribe();
+        backend
+            .prompt(&first, text("c"))
+            .await
+            .unwrap()
+            .outcome()
+            .await;
+        assert_eq!(turn_id(&collect_turn(&mut rx).await), "turn-12");
+    })
+    .await
+    .unwrap();
+}

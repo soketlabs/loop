@@ -1,0 +1,24 @@
+[package]
+name = "loop-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Runtime ownership and durable Session Event Log"
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+loop-agent = { workspace = true, features = ["sqlite"] }
+loop-ai.workspace = true
+loop-app-core.workspace = true
+loop-protocol.workspace = true
+loop-wire.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
