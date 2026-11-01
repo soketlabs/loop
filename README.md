@@ -63,6 +63,7 @@ loop update --check          # show the latest release
 loop update                  # verify and install it
 loop rollback                # restore the previous binary
 loop uninstall               # remove program files; keep all user data
+loop uninstall --purge       # also remove all agent data
 ```
 
 See [Install and update](docs/install-update.md) for custom paths, pinned
