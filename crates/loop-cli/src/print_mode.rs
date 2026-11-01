@@ -313,6 +313,18 @@ impl TurnReport {
     }
 }
 
+/// Text shared by print mode and the Runtime's plain-text Surface.
+pub fn agent_text_chunk(update: &SessionUpdate) -> Option<&str> {
+    match update {
+        SessionUpdate::MessageChunk {
+            role: Role::Agent,
+            content,
+            ..
+        } => content.as_text(),
+        _ => None,
+    }
+}
+
 /// Run one turn and return the text of the agent's last message, or why the
 /// turn failed.
 pub async fn print_turn(
@@ -369,19 +381,13 @@ pub async fn run_turn(
             continue;
         }
         on_update(&envelope);
+        if let Some(text) = agent_text_chunk(&envelope.update) {
+            report.text.push_str(text);
+        }
         match envelope.update {
             SessionUpdate::MessageStarted {
                 role: Role::Agent, ..
             } => report.text.clear(),
-            SessionUpdate::MessageChunk {
-                role: Role::Agent,
-                content,
-                ..
-            } => {
-                if let Some(text) = content.as_text() {
-                    report.text.push_str(text);
-                }
-            }
             SessionUpdate::Usage(usage) => report.usage = Some(usage),
             SessionUpdate::TurnEnded { stop, error, .. } => {
                 report.stop = Some(stop);

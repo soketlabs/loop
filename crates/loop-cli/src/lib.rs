@@ -4,6 +4,7 @@
 
 pub mod agent_question;
 pub mod app;
+pub mod attach_cmd;
 pub mod clipboard;
 pub mod commands;
 pub mod debug_log;
