@@ -298,3 +298,61 @@ async fn without_the_runtime_lock_a_live_runtime_lease_is_never_taken_over() {
     .await
     .expect("test timed out");
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn opening_takes_over_only_a_stale_lease_of_a_dead_process() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let Seeded { a, b, store, log } = seed(dir.path()).await;
+        let rt = runtime(dir.path(), log.clone()).await;
+        // A crashed standalone writer: dead pid and a heartbeat long past 30 s.
+        store
+            .release_lease(
+                &b.0,
+                &LeaseIdentity {
+                    owner: "standalone".into(),
+                    pid: 1,
+                    generation: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let crashed = LeaseIdentity {
+            owner: "standalone".into(),
+            pid: i32::MAX as u32,
+            generation: 0,
+        };
+        store.acquire_lease(&b.0, &crashed).await.unwrap();
+        rusqlite::Connection::open(dir.path().join("agent/sessions.db"))
+            .unwrap()
+            .execute("UPDATE session_leases SET heartbeat_ms=0", [])
+            .unwrap();
+        rt.load_session(&reference(&b), SessionSpec::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.lease(&b.0).await.unwrap().unwrap().identity.owner,
+            "runtime"
+        );
+        // A live owner (pid 1), even with an old heartbeat, is never taken over.
+        let error = rt
+            .load_session(&reference(&a), SessionSpec::default())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("in use"), "{error}");
+        assert_eq!(
+            store
+                .lease(&a.0)
+                .await
+                .unwrap()
+                .unwrap()
+                .identity
+                .generation,
+            1
+        );
+        rt.shutdown().await;
+    })
+    .await
+    .expect("test timed out");
+}

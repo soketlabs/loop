@@ -28,7 +28,9 @@ running after you close the terminal, use your usual tool, such as `nohup`,
 | `--cwd DIR` | current folder | Folder for Sessions that name none |
 
 Only one Runtime can use an agent directory, or a Session database, at a time.
-A second `loop serve` exits with `a Runtime is already running (pid N)`.
+A second `loop serve` exits with `a Runtime is already running (pid N)`, or
+with `another Runtime already owns the Session database at …` when only the
+Session database is shared.
 
 ### Permissions and trust
 
@@ -98,6 +100,11 @@ Runtime was killed, there are two ways to get the Session back:
 - **Restart `loop serve`.** It reclaims its old leases straight away.
 - **Use `loop --resume <id>`.** This works once the lease is at least 30
   seconds old and the old Runtime process is gone.
+
+The same rule works the other way round. If a terminal `loop` crashed while
+holding a Session, the Runtime loads that Session once the lease is at least
+30 seconds old and that process is gone. A lease whose owner is still running
+is never taken over.
 
 ## After a crash
 

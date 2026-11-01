@@ -111,8 +111,10 @@ impl OpeningLease {
     ) -> BackendResult<Self> {
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
+            // Never a live owner: another owner's lease is replaced only when
+            // its heartbeat is stale and its pid is dead (Decision 3).
             let result = store
-                .acquire_lease(&id, &identity)
+                .takeover_lease(&id, &identity, false)
                 .await
                 .map_err(failed)
                 .map(|()| Self {
