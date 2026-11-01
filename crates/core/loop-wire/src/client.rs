@@ -39,6 +39,9 @@ pub struct RemoteBackend {
     /// Sessions with a turn running, from the update stream and from
     /// prompts this client sent.
     busy: Arc<Mutex<HashSet<SessionKey>>>,
+    /// Sessions with a prompt this client sent still unanswered. Unlike
+    /// `busy`, observation (detach) never clears these.
+    local: Arc<Mutex<HashSet<SessionKey>>>,
 }
 
 impl RemoteBackend {
@@ -82,6 +85,7 @@ impl RemoteBackend {
             server: result.server_info,
             updates,
             busy,
+            local: Arc::default(),
         }))
     }
 
@@ -117,9 +121,13 @@ impl RemoteBackend {
         let params = SessionParams {
             session: session.clone(),
         };
-        call::<Value>(&self.conn, methods::SESSION_DETACH, &params)
-            .await
-            .map(|_| ())
+        call::<Value>(&self.conn, methods::SESSION_DETACH, &params).await?;
+        // The `turn_ended` of a turn someone else is running will never
+        // arrive now; stop believing the Session is busy because of it.
+        if !self.local.lock().contains(&session.key) {
+            self.busy.lock().remove(&session.key);
+        }
+        Ok(())
     }
 
     /// Close a Session; a busy one needs `force`.
@@ -186,6 +194,8 @@ impl AgentBackend for RemoteBackend {
         let (done, handle) = TurnHandle::channel();
         let conn = Arc::clone(&self.conn);
         let busy = Arc::clone(&self.busy);
+        let local = Arc::clone(&self.local);
+        local.lock().insert(session.key.clone());
         let key = session.key.clone();
         // The response comes when the turn ends. A turn another client
         // started first shows up here as a failed outcome, not as `Busy`.
@@ -201,6 +211,7 @@ impl AgentBackend for RemoteBackend {
                     other => ErrorInfo::new(ErrorCategory::Agent, other.to_string()),
                 }),
             };
+            local.lock().remove(&key);
             busy.lock().remove(&key);
             let _ = done.send(outcome);
         });

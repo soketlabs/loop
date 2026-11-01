@@ -137,11 +137,12 @@ enum Control {
     /// The `session/new` or `session/load` finished.
     RegisterEnd,
     /// An attach started: buffer live updates of `key` until it is answered.
-    Attaching { key: SessionKey },
+    Attaching { key: SessionKey, op: u64 },
     /// The attach finished; answer `id`, replay, then go live.
     Attached {
         id: PeerRequestId,
         key: SessionKey,
+        op: u64,
         after_seq: u64,
         result: BackendResult<Attachment>,
     },
@@ -186,10 +187,9 @@ async fn run(
                         Ok(params) => {
                             interact.store(params.client_capabilities.interact, Ordering::Release);
                             let mut capabilities = backend.capabilities();
-                            if runtime.is_some() {
-                                capabilities.multi_session = true;
-                                capabilities.attach = true;
-                            }
+                            // Advertise only what this connection can serve.
+                            capabilities.multi_session = runtime.is_some();
+                            capabilities.attach = runtime.is_some();
                             let result = InitializeResult {
                                 protocol_version: negotiate(params.protocol_version),
                                 server_info: info.clone(),
@@ -299,13 +299,16 @@ async fn handle(
             Ok(AttachParams { session, after_seq }) => {
                 // The forwarder buffers this Session's live updates from here
                 // until it has sent the replay, then answers the request.
+                let op = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
                 let _ = control.send(Control::Attaching {
                     key: session.key.clone(),
+                    op,
                 });
                 let result = runtime.unwrap().attach(&session, after_seq).await;
                 let _ = control.send(Control::Attached {
                     id,
                     key: session.key,
+                    op,
                     after_seq,
                     result,
                 });
@@ -407,9 +410,16 @@ async fn forward(
                     feeds.registering = feeds.registering.saturating_sub(1);
                     if feeds.registering == 0 {
                         feeds.pending.clear();
+                        feeds.dropped = 0;
                     }
                 }
                 Some(Control::Owned { key }) => {
+                    if feeds.dropped > 0 {
+                        // Updates were discarded while this Session was being
+                        // made; never skip silently.
+                        lagged(&conn, &instance, feeds.dropped);
+                        return;
+                    }
                     if feeds.own(key.clone()) {
                         for envelope in feeds.take_pending(&key) {
                             if feeds.deliver(&conn, envelope).is_err() {
@@ -418,9 +428,9 @@ async fn forward(
                         }
                     }
                 }
-                Some(Control::Attaching { key }) => feeds.start_attach(key),
-                Some(Control::Attached { id, key, after_seq, result }) => {
-                    if feeds.finish_attach(&conn, id, key, after_seq, result).is_err() {
+                Some(Control::Attaching { key, op }) => feeds.start_attach(key, op),
+                Some(Control::Attached { id, key, op, after_seq, result }) => {
+                    if feeds.finish_attach(&conn, id, key, op, after_seq, result).is_err() {
                         return;
                     }
                 }
@@ -429,8 +439,6 @@ async fn forward(
                     conn.respond(id, Ok(json!({})));
                 }
                 Some(Control::Prompted { ticket, session, id, outcome }) => {
-                    // Prompting a Session makes it this connection's.
-                    feeds.own(session.clone());
                     let tx = outcome_tx.clone();
                     tokio::spawn(async move {
                         let outcome = outcome.await.unwrap_or(TurnOutcome::Uncertain);
@@ -456,29 +464,33 @@ async fn forward(
             }
             update = updates.recv(), if started => match update {
                 Ok(envelope) => {
-                    match &envelope.update {
-                        SessionUpdate::TurnStarted { turn_id } => {
-                            if let Some(w) = waiting
-                                .iter_mut()
-                                .find(|w| w.session == envelope.session && w.turn.is_none())
-                            {
-                                w.turn = Some(turn_id.clone());
-                            }
+                    if let SessionUpdate::TurnStarted { turn_id } = &envelope.update {
+                        if let Some(w) = waiting
+                            .iter_mut()
+                            .find(|w| w.session == envelope.session && w.turn.is_none())
+                        {
+                            w.turn = Some(turn_id.clone());
                         }
-                        SessionUpdate::TurnEnded { turn_id, .. } => {
-                            for w in waiting.iter_mut().filter(|w| w.turn.as_ref() == Some(turn_id)) {
-                                w.ended = true;
-                            }
-                        }
-                        _ => {}
                     }
-                    let sent = if filtering {
+                    let ended_turn = match &envelope.update {
+                        SessionUpdate::TurnEnded { turn_id, .. } => Some(turn_id.clone()),
+                        _ => None,
+                    };
+                    let routed = if filtering {
                         feeds.route(&conn, envelope)
                     } else {
                         conn.notify(methods::SESSION_UPDATE, to_value(&envelope))
+                            .map(|()| false)
                     };
-                    if sent.is_err() {
-                        return;
+                    match routed {
+                        Err(_) => return,
+                        // A buffered end is sent later by the attach, which
+                        // records it in `feeds.ended`.
+                        Ok(buffered) => {
+                            if let (Some(turn), false) = (ended_turn, buffered) {
+                                feeds.ended.push(turn);
+                            }
+                        }
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -503,6 +515,14 @@ async fn forward(
                 }
             }
         }
+        for turn in feeds.ended.drain(..) {
+            for w in waiting
+                .iter_mut()
+                .filter(|w| w.turn.as_ref() == Some(&turn))
+            {
+                w.ended = true;
+            }
+        }
         let (done, still): (Vec<Waiting>, Vec<Waiting>) = waiting
             .into_iter()
             .partition(|w| w.ended && w.outcome.is_some());
@@ -521,13 +541,14 @@ enum Feed {
     /// An attach is reading the Event Log; live updates wait in `buffer`.
     /// `prior` is the cursor of an earlier feed, kept if the attach fails.
     Attaching {
+        /// The attach operation that owns this entry.
+        op: u64,
         buffer: Vec<UpdateEnvelope>,
         prior: Option<u64>,
     },
 }
 
-/// The Sessions this connection created, loaded, prompted or attached.
-#[derive(Default)]
+/// The Sessions this connection created, loaded or attached.
 struct Feeds {
     map: HashMap<SessionKey, Feed>,
     /// Running `session/new` / `session/load` calls.
@@ -535,12 +556,44 @@ struct Feeds {
     /// Updates of unknown Sessions seen while `registering`: one of them may
     /// be the Session being made.
     pending: Vec<UpdateEnvelope>,
+    /// Capacity of `pending`.
+    pending_limit: usize,
+    /// Updates that did not fit in `pending` during the current registration.
+    dropped: u64,
+    /// Turns whose `turn_ended` reached the client (or needs no sending).
+    ended: Vec<TurnId>,
 }
 
 /// Most updates held for a Session that is still being created or loaded.
 const PENDING_LIMIT: usize = 65_536;
 
+impl Default for Feeds {
+    fn default() -> Self {
+        Self::with_limit(PENDING_LIMIT)
+    }
+}
+
 impl Feeds {
+    fn with_limit(pending_limit: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            registering: 0,
+            pending: Vec::new(),
+            pending_limit,
+            dropped: 0,
+            ended: Vec::new(),
+        }
+    }
+
+    /// Send an update to the client, noting a `turn_ended`.
+    fn send(&mut self, conn: &Connection, envelope: &UpdateEnvelope) -> Result<(), RpcError> {
+        conn.notify(methods::SESSION_UPDATE, to_value(envelope))?;
+        if let SessionUpdate::TurnEnded { turn_id, .. } = &envelope.update {
+            self.ended.push(turn_id.clone());
+        }
+        Ok(())
+    }
+
     /// Make `key` this connection's. False if it already was.
     fn own(&mut self, key: SessionKey) -> bool {
         if self.map.contains_key(&key) {
@@ -558,17 +611,25 @@ impl Feeds {
         mine
     }
 
-    /// Forward, buffer or drop an update from the Runtime.
-    fn route(&mut self, conn: &Connection, envelope: UpdateEnvelope) -> Result<(), RpcError> {
+    /// Forward, buffer or drop an update from the Runtime. True if it was
+    /// buffered behind an attach rather than sent or dropped.
+    fn route(&mut self, conn: &Connection, envelope: UpdateEnvelope) -> Result<bool, RpcError> {
         match self.map.get_mut(&envelope.session) {
-            Some(Feed::Attaching { buffer, .. }) => buffer.push(envelope),
-            Some(Feed::Live { .. }) => return self.deliver(conn, envelope),
-            None if self.registering > 0 && self.pending.len() < PENDING_LIMIT => {
-                self.pending.push(envelope);
+            Some(Feed::Attaching { buffer, .. }) => {
+                buffer.push(envelope);
+                return Ok(true);
+            }
+            Some(Feed::Live { .. }) => self.deliver(conn, envelope)?,
+            None if self.registering > 0 => {
+                if self.pending.len() < self.pending_limit {
+                    self.pending.push(envelope);
+                } else {
+                    self.dropped += 1;
+                }
             }
             None => {}
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Send a live update of a Live feed unless the client already has it.
@@ -576,25 +637,20 @@ impl Feeds {
         if let Some(Feed::Live { last_sent }) = self.map.get_mut(&envelope.session) {
             if envelope.seq > *last_sent {
                 *last_sent = envelope.seq;
-                conn.notify(methods::SESSION_UPDATE, to_value(&envelope))?;
+                self.send(conn, &envelope)?;
             }
         }
         Ok(())
     }
 
-    fn start_attach(&mut self, key: SessionKey) {
-        let prior = match self.map.remove(&key) {
-            Some(Feed::Live { last_sent }) => Some(last_sent),
-            Some(Feed::Attaching { prior, .. }) => prior,
-            None => None,
+    /// Begin attach operation `op`, superseding any earlier one for `key`.
+    fn start_attach(&mut self, key: SessionKey, op: u64) {
+        let (buffer, prior) = match self.map.remove(&key) {
+            Some(Feed::Live { last_sent }) => (Vec::new(), Some(last_sent)),
+            Some(Feed::Attaching { buffer, prior, .. }) => (buffer, prior),
+            None => (Vec::new(), None),
         };
-        self.map.insert(
-            key,
-            Feed::Attaching {
-                buffer: Vec::new(),
-                prior,
-            },
-        );
+        self.map.insert(key, Feed::Attaching { op, buffer, prior });
     }
 
     /// Answer the attach, then replay, then the updates buffered meanwhile.
@@ -603,16 +659,24 @@ impl Feeds {
         conn: &Connection,
         id: PeerRequestId,
         key: SessionKey,
+        op: u64,
         after_seq: u64,
         result: BackendResult<Attachment>,
     ) -> Result<(), RpcError> {
-        let (buffer, prior) = match self.map.remove(&key) {
-            Some(Feed::Attaching { buffer, prior }) => (buffer, prior),
-            // Detached while reading the log: nothing to deliver.
-            _ => {
-                conn.respond(id, Ok(json!({})));
-                return Ok(());
-            }
+        // Only the operation that owns the entry may complete it; a detach or a
+        // newer attach supersedes this one.
+        let ours = matches!(self.map.get(&key), Some(Feed::Attaching { op: o, .. }) if *o == op);
+        if !ours {
+            conn.respond_error(
+                id,
+                codes::INVALID_REQUEST,
+                "the attach was superseded by a detach or a newer attach".into(),
+                None,
+            );
+            return Ok(());
+        }
+        let Some(Feed::Attaching { buffer, prior, .. }) = self.map.remove(&key) else {
+            return Ok(());
         };
         let (last, buffer) = match result {
             Ok(attachment) => {
@@ -632,7 +696,7 @@ impl Feeds {
                     last = envelope.seq;
                     envelope.origin = Origin::Replay;
                     envelope.generation = attachment.generation;
-                    conn.notify(methods::SESSION_UPDATE, to_value(&envelope))?;
+                    self.send(conn, &envelope)?;
                 }
                 (last, buffer)
             }
@@ -721,5 +785,79 @@ fn respond(conn: &Connection, id: PeerRequestId, result: Result<Value, RpcErrorB
     match result {
         Ok(value) => conn.respond(id, Ok(value)),
         Err(body) => conn.respond_error(id, body.code, body.message, body.data),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::memory;
+
+    fn update(session: &str, seq: u64) -> UpdateEnvelope {
+        UpdateEnvelope::live(
+            "i".into(),
+            1,
+            SessionKey(session.into()),
+            None,
+            seq,
+            SessionUpdate::Notice {
+                level: NoticeLevel::Info,
+                text: String::new(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn registration_overflow_is_counted_not_silently_skipped() {
+        let (conn, _peer) = memory();
+        let (conn, _incoming) = Connection::new(conn);
+        let mut feeds = Feeds::with_limit(4);
+        feeds.registering = 1;
+        for seq in 1..=10 {
+            feeds.route(&conn, update("other", seq)).unwrap();
+        }
+        assert_eq!(feeds.pending.len(), 4);
+        assert_eq!(feeds.dropped, 6, "overflow must be recorded");
+    }
+
+    #[tokio::test]
+    async fn a_superseded_attach_cannot_complete_a_newer_one() {
+        let (conn, _peer) = memory();
+        let (conn, _incoming) = Connection::new(conn);
+        let mut feeds = Feeds::default();
+        let key = SessionKey("s".into());
+        feeds.start_attach(key.clone(), 1);
+        feeds.start_attach(key.clone(), 2);
+        let empty = || {
+            Ok(Attachment {
+                latest_seq: 0,
+                generation: 1,
+                replay: Box::new(std::iter::empty()),
+            })
+        };
+        // The first completion is stale: it must not touch the newer entry.
+        feeds
+            .finish_attach(&conn, json!(1), key.clone(), 1, 0, empty())
+            .unwrap();
+        assert!(matches!(
+            feeds.map.get(&key),
+            Some(Feed::Attaching { op: 2, .. })
+        ));
+        feeds
+            .finish_attach(&conn, json!(2), key.clone(), 2, 0, empty())
+            .unwrap();
+        assert!(matches!(feeds.map.get(&key), Some(Feed::Live { .. })));
+        // Detach, then a stale completion: no feed is resurrected or removed.
+        feeds.map.remove(&key);
+        feeds.start_attach(key.clone(), 3);
+        feeds.map.remove(&key);
+        feeds.start_attach(key.clone(), 4);
+        feeds
+            .finish_attach(&conn, json!(3), key.clone(), 3, 0, empty())
+            .unwrap();
+        assert!(matches!(
+            feeds.map.get(&key),
+            Some(Feed::Attaching { op: 4, .. })
+        ));
     }
 }

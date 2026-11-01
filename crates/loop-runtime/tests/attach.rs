@@ -10,10 +10,11 @@ use loop_runtime::log::{EventLog, MemoryEventLog, SqliteEventLog};
 use loop_runtime::{Runtime, RuntimeLimits};
 use loop_wire::server::{serve_with_control, serve_with_options, ServeOptions, Served};
 use loop_wire::transport::memory;
-use loop_wire::RemoteBackend;
+use loop_wire::{Attachment, RemoteBackend, RuntimeControl};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast::Receiver;
+use tokio::sync::Notify;
 
 fn opts(cwd: &std::path::Path) -> BootstrapOpts {
     BootstrapOpts {
@@ -251,6 +252,7 @@ async fn a_v1_client_works_and_unknown_methods_stay_unknown_without_control_body
         .unwrap();
     let session = old.new_session(SessionSpec::default()).await.unwrap();
     say(&old, &session, "hi").await;
+    assert!(!old.capabilities().multi_session && !old.capabilities().attach);
     assert!(old.list().await.is_err());
     assert!(old.attach(&session, 0).await.is_err());
     // A client of a Runtime connection that never uses the new methods too.
@@ -406,6 +408,189 @@ async fn an_observer_is_not_asked_to_answer() {
     tokio::time::timeout(
         Duration::from_secs(60),
         an_observer_is_not_asked_to_answer_body(),
+    )
+    .await
+    .expect("test timed out");
+}
+
+async fn rejected_prompt_does_not_subscribe_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = runtime(dir.path(), Arc::new(MemoryEventLog::new())).await;
+    let (owner, _s1) = connect(&rt).await;
+    let (other, _s2) = connect(&rt).await;
+    let mut rx = other.subscribe();
+    let session = owner.new_session(SessionSpec::default()).await.unwrap();
+    let wrong = SessionRef {
+        native_id: "wrong".into(),
+        ..session.clone()
+    };
+    let rejected = other
+        .prompt(&wrong, vec![ContentBlock::text("no")])
+        .await
+        .unwrap()
+        .outcome()
+        .await;
+    assert!(!matches!(rejected, TurnOutcome::Completed(_)));
+    say(&owner, &session, "mine").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "a rejected prompt subscribed the connection"
+    );
+}
+
+/// Holds `attach` until released.
+struct Gate {
+    rt: Arc<Runtime>,
+    open: Notify,
+}
+#[async_trait::async_trait]
+impl RuntimeControl for Gate {
+    async fn list(&self) -> loop_protocol::BackendResult<Vec<loop_protocol::rpc::SessionInfo>> {
+        RuntimeControl::list(&*self.rt).await
+    }
+    async fn close(&self, s: &SessionRef, f: bool) -> loop_protocol::BackendResult<()> {
+        RuntimeControl::close(&*self.rt, s, f).await
+    }
+    async fn attach(&self, s: &SessionRef, a: u64) -> loop_protocol::BackendResult<Attachment> {
+        let snapshot = RuntimeControl::attach(&*self.rt, s, a).await;
+        self.open.notified().await;
+        snapshot
+    }
+}
+
+async fn prompt_completes_only_after_its_end_update_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = runtime(dir.path(), Arc::new(MemoryEventLog::new())).await;
+    let gate = Arc::new(Gate {
+        rt: rt.clone(),
+        open: Notify::new(),
+    });
+    let (server, client) = memory();
+    let _served = serve_with_control(
+        rt.clone(),
+        gate.clone(),
+        server,
+        info(),
+        ServeOptions {
+            owns_backend: false,
+        },
+    );
+    let remote = RemoteBackend::connect(client, info(), Arc::new(Reject))
+        .await
+        .unwrap();
+    let session = remote.new_session(SessionSpec::default()).await.unwrap();
+    let mut rx = remote.subscribe();
+    let attaching = {
+        let (remote, session) = (remote.clone(), session.clone());
+        tokio::spawn(async move { remote.attach(&session, 0).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let turn = remote
+        .prompt(&session, vec![ContentBlock::text("x")])
+        .await
+        .unwrap();
+    // The turn finishes in the Runtime while the snapshot is still held.
+    while rt.is_busy(&session) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.open.notify_one();
+    assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+    attaching.await.unwrap().unwrap();
+    let mut ended = false;
+    while let Ok(e) = rx.try_recv() {
+        ended |= matches!(e.update, loop_protocol::SessionUpdate::TurnEnded { .. });
+    }
+    assert!(
+        ended,
+        "the prompt completed before its turn_ended was delivered"
+    );
+}
+
+async fn overlapping_attaches_both_get_a_typed_answer_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = runtime(dir.path(), Arc::new(MemoryEventLog::new())).await;
+    let (owner, _s) = connect(&rt).await;
+    let session = owner.new_session(SessionSpec::default()).await.unwrap();
+    say(&owner, &session, "a").await;
+    let mut rx = owner.subscribe();
+    let (a, b) = tokio::join!(owner.attach(&session, 0), owner.attach(&session, 0));
+    // One may be superseded, but none may answer with a non-attach result.
+    assert!(a.is_ok() || b.is_ok());
+    say(&owner, &session, "b").await;
+    let last = rt.event_log().latest_seq(&session.key).await.unwrap();
+    let got = collect(&mut rx, &session.key, last).await;
+    assert!(got.last().unwrap().seq == last);
+}
+
+async fn detaching_mid_turn_clears_observed_busy_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = runtime(dir.path(), Arc::new(MemoryEventLog::new())).await;
+    let (owner, _s1) = connect(&rt).await;
+    let (watcher, _s2) = connect(&rt).await;
+    let session = owner.new_session(SessionSpec::default()).await.unwrap();
+    let mut rx = watcher.subscribe();
+    watcher.attach(&session, 0).await.unwrap();
+    let producer = {
+        let (owner, session) = (owner.clone(), session.clone());
+        tokio::spawn(async move {
+            for i in 0..10 {
+                say(&owner, &session, &format!("{i}")).await;
+            }
+        })
+    };
+    loop {
+        let e = rx.recv().await.unwrap();
+        if matches!(e.update, loop_protocol::SessionUpdate::TurnStarted { .. }) {
+            break;
+        }
+    }
+    watcher.detach(&session).await.unwrap();
+    producer.await.unwrap();
+    assert!(!watcher.is_busy(&session));
+    watcher
+        .load_session(&session, SessionSpec::default())
+        .await
+        .unwrap();
+    say(&watcher, &session, "mine").await;
+}
+
+#[tokio::test]
+async fn rejected_prompt_does_not_subscribe() {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        rejected_prompt_does_not_subscribe_body(),
+    )
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn prompt_completes_only_after_its_end_update() {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        prompt_completes_only_after_its_end_update_body(),
+    )
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn overlapping_attaches_both_get_a_typed_answer() {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        overlapping_attaches_both_get_a_typed_answer_body(),
+    )
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn detaching_mid_turn_clears_observed_busy() {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        detaching_mid_turn_clears_observed_busy_body(),
     )
     .await
     .expect("test timed out");
