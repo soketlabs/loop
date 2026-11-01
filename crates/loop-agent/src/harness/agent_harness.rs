@@ -260,7 +260,10 @@ impl AgentHarness {
         self.wait_for_idle().await;
 
         let store = self.session.lock().await.store();
-        let reader = store.load(id).await.map_err(AgentHarnessError::Session)?;
+        let reader = store
+            .open_writer(id)
+            .await
+            .map_err(AgentHarnessError::Session)?;
         let new_session = Session::new(store, reader);
         let sid = new_session.metadata().id.clone();
 

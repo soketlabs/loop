@@ -185,8 +185,8 @@ impl SqliteSessionStore {
 
     /// Replace a stale lease only when its pid is dead. The Runtime exception is
     /// explicit: the caller must hold the associated runtime.lock for THIS store's
-    /// ownership domain. Only runtime-to-runtime reclamation bypasses age or unknown liveness.
-    /// A probe that positively identifies a live pid always prevents takeover.
+    /// ownership domain. Only runtime-to-runtime reclamation bypasses age and pid liveness: a
+    /// live pid may have been recycled since the recorded Runtime died.
     pub async fn takeover_lease(
         &self,
         id: &str,
@@ -223,10 +223,10 @@ impl SqliteSessionStore {
             if let Some(lease) = read_lease(&tx, &id)? {
                 if lease.identity == identity { return Ok(()); }
                 let reclaim = runtime_lock_held && identity.owner == "runtime" && lease.identity.owner == "runtime";
-                let liveness = env.pid_liveness(lease.identity.pid);
-                let stale_dead = now.saturating_sub(lease.heartbeat_ms) >= LEASE_STALE_AFTER_MS
-                    && liveness == PidLiveness::Dead;
-                if !takeover || liveness == PidLiveness::Alive || (!reclaim && !stale_dead) { return Err(conflict(&id, &lease)); }
+                if !takeover || (!reclaim && (
+                    now.saturating_sub(lease.heartbeat_ms) < LEASE_STALE_AFTER_MS
+                    || env.pid_liveness(lease.identity.pid) != PidLiveness::Dead
+                )) { return Err(conflict(&id, &lease)); }
             }
             tx.execute("INSERT INTO session_leases(session_id, owner, pid, generation, heartbeat_ms) VALUES (?1,?2,?3,?4,?5)
                 ON CONFLICT(session_id) DO UPDATE SET owner=excluded.owner, pid=excluded.pid, generation=excluded.generation, heartbeat_ms=excluded.heartbeat_ms",
@@ -281,16 +281,26 @@ impl SqliteSessionStore {
 }
 
 /// Open the standalone bootstrap store and claim its resumed Session, if any.
-/// Ownership is renewed every 5 s and released when the final store handle drops.
+/// On Unix, ownership is renewed every 5 s and released when the final store
+/// handle drops. Other platforms retain standalone behavior without leases;
+/// the explicit lease API remains available with injectable process liveness.
 pub async fn create_sqlite_session_store_for_resume(
     path: impl AsRef<std::path::Path>,
     id: Option<&str>,
 ) -> Result<Arc<dyn crate::harness::session::SessionStore>, SessionError> {
     let store = SqliteSessionStore::open(path)?;
-    Ok(Arc::new(match id {
-        Some(id) => store.standalone_resume(id).await?,
-        None => store.standalone_writer(),
-    }))
+    #[cfg(unix)]
+    {
+        Ok(Arc::new(match id {
+            Some(id) => store.standalone_resume(id).await?,
+            None => store.standalone_writer(),
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = id;
+        Ok(Arc::new(store))
+    }
 }
 
 pub(super) struct ResumeLeaseGuard {

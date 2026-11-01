@@ -550,7 +550,7 @@ impl SessionStore for SqliteSessionStore {
         Ok(Arc::new(SqliteReader { meta, path }))
     }
 
-    async fn load(&self, id: &str) -> Result<Arc<dyn SessionReader>, SessionError> {
+    async fn open_writer(&self, id: &str) -> Result<Arc<dyn SessionReader>, SessionError> {
         if let Some(guard) = &self.resume_guard {
             if guard.failed() {
                 return Err(SessionError::Invalid(
@@ -565,6 +565,10 @@ impl SessionStore for SqliteSessionStore {
             .await?;
             guard.track(id);
         }
+        self.load(id).await
+    }
+
+    async fn load(&self, id: &str) -> Result<Arc<dyn SessionReader>, SessionError> {
         let path = self.path.clone();
         let id = id.to_string();
         let meta = tokio::task::spawn_blocking(move || {

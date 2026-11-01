@@ -358,7 +358,7 @@ impl SessionFactory {
             settings.set_selected_model(&m.provider, &m.id);
         }
 
-        // Standalone Surfaces own their writer lease; Runtime callers manage
+        // Unix standalone Surfaces own their writer lease; Runtime callers manage
         // ownership separately before opening through the shared repository.
         let standalone_repository = if workspace.standalone {
             let store =
@@ -546,7 +546,7 @@ impl SessionFactory {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod lease_tests {
     use super::*;
 

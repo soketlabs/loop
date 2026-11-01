@@ -318,7 +318,12 @@ pub trait SessionStore: Send + Sync {
         cwd: Option<String>,
         name: Option<String>,
     ) -> Result<Arc<dyn SessionReader>, SessionError>;
-    /// Load by id.
+    /// Admit a writer for an existing Session. Lease-aware stores acquire ownership
+    /// here; reader loading, summaries and search use `load` instead.
+    async fn open_writer(&self, id: &str) -> Result<Arc<dyn SessionReader>, SessionError> {
+        self.load(id).await
+    }
+    /// Load a reader by id without acquiring writer ownership.
     async fn load(&self, id: &str) -> Result<Arc<dyn SessionReader>, SessionError>;
     /// List sessions.
     async fn list(&self, cwd: Option<&str>) -> Result<Vec<SessionMetadata>, SessionError>;
