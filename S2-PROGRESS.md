@@ -40,7 +40,7 @@ Known follow-ups:
 
 ## How the work was run
 
-- Briefs for every chunk: `/Users/anandgupta/.claude/jobs/b3fa4ea3/tmp/w*-*.md` (job tmp; may be cleaned — copy anything needed). Pattern: common rules file + chunk brief, then a read-only review, then fixes, then a combined merge check in `../loop-wt/wave1-merge`.
+- Briefs for every chunk: `s2-briefs/` on this branch (copied from the job tmp dir; includes the review outputs). Pattern: common rules file + chunk brief, then a read-only review, then fixes, then a combined merge check in `../loop-wt/wave1-merge`.
 - Worktrees: `../loop-wt/<chunk>`; shared build dir `CARGO_TARGET_DIR=../loop-wt/target` (the disk filled twice with per-worktree targets).
 - Agents: Codex (gpt-6.1-sol) and Claude Sonnet 5.5 in Herdr panes; all stopped at handover. Suggested next: Opus 5.5 for S2.6, S2.9 and S2.10; Codex or Sonnet for reviews and smaller chunks. Check Codex `/status` and Claude `/usage` between waves.
 - macOS has no `timeout`; bound test runs with `perl -e 'alarm 600; exec @ARGV' cargo test ...`.

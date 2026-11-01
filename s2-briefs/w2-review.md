@@ -1,0 +1,5 @@
+# Review S2 wave 2 branches (read-only; do not edit, commit or switch branches)
+Repo /Users/anandgupta/Soket/Code/LOOP/loop. Branches, one commit each on top of staging: s2/runtime-core (e88835e) and s2/serve-infra (a208bd8). Worktrees: ../loop-wt/runtime-core and ../loop-wt/serve-infra.
+Use git diff staging..<branch> and read the code. Check each against docs/design/runtime.md (approved, incl. its Decisions list) and the briefs /Users/anandgupta/.claude/jobs/b3fa4ea3/tmp/w2-runtime-core.md and /Users/anandgupta/.claude/jobs/b3fa4ea3/tmp/w2-serve-infra.md.
+Report only actionable findings: correctness bugs (races, deadlocks, lost or duplicated events, seq gaps, lease leaks, permits never released), design mismatches, required tests missing, Windows build breakage, unsafe socket/lock handling. Verify each finding against the code before reporting; no style nits.
+Write findings as Markdown to /Users/anandgupta/.claude/jobs/b3fa4ea3/tmp/w2-review-out.md (severity P0-P3, branch, file:line, issue, fix). Reply only with the path and counts by severity.

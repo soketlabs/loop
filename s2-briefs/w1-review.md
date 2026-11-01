@@ -1,0 +1,5 @@
+# Review S2 wave 1 branches (read-only; do not edit or commit anything)
+Repo /Users/anandgupta/Soket/Code/LOOP/loop. Branches (each one commit on top of staging): s2/event-log, s2/session-factory, s2/protocol-types. (s2/store-lease is being rebased; skip it.)
+Use `git diff staging..<branch>` and the code. Check each against docs/design/runtime.md (approved, incl. its Decisions list) and the chunk briefs in /Users/anandgupta/.claude/jobs/b3fa4ea3/tmp/w1-*.md.
+Report only actionable findings: correctness bugs, design mismatches, missing tests the brief required, behaviour changes in bootstrap (session-factory must be behaviour-neutral for TUI/--print/desktop), schema/compat breaks for v1 peers, Windows build breakage. Note specially: protocol-types used flattened InteractParams with an optional `session` instead of a field on each InteractionRequest variant — is the wire JSON exactly what the design says, and is it a sound choice for the S2.6 Escalation routing?
+Write findings as Markdown to /Users/anandgupta/.claude/jobs/b3fa4ea3/tmp/w1-review-out.md (severity, branch, file:line, issue, fix). Reply only with the path and a count of findings by severity.

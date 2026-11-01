@@ -1,0 +1,10 @@
+# S2.7b: the `loop serve` command
+Worktree: /Users/anandgupta/Soket/Code/LOOP/loop-wt/serve-cmd (branch s2/serve-cmd, based on staging with waves 1-2: Runtime core, serve infra: paths, RuntimeInstanceLock, socket probe, daemon tracing, signal helper). Read w3-common.md in this folder first, then docs/design/runtime.md §9.
+Scope: crates/loop-cli only (+ tiny glue elsewhere if unavoidable). Do NOT edit loop-wire server.rs/client.rs or loop-runtime internals (another agent adds multi-Session serving there); use their current public API (serve_with_options with owns_backend=false).
+- Commands::Serve { socket: Option<PathBuf>, max_sessions (default 16), max_active_turns (default 8), permission_mode: Option<...> }. Handle it BEFORE the interactive bootstrap in crates/loop-cli/src/main.rs (~233/269); it must never read stdin or prompt for trust.
+- Startup: take RuntimeInstanceLock, init daemon tracing to runtime.log, build GlobalResources + loop_runtime::Runtime with an Event Log at <agent_dir>/events.db, reclaim own leases (runtime.lock is held = proof), bind the socket via the probe, log RuntimeStarted.
+- Accept loop: one serve task per connection. SIGINT/SIGTERM: stop accepting, shut the Runtime down cleanly (RuntimeStopped, release leases, remove socket + pid file).
+- permission_mode: per-workspace settings by default; `full-access` only via the flag.
+- Non-unix: `loop serve` prints that it is unsupported on this platform and exits non-zero.
+- Add `loop serve --help` text; keep other commands unchanged.
+Tests: CLI parsing; serve does not fall into bootstrap (no stdin read); a second `loop serve` with the same agent dir refuses with the "already running" message; startup+SIGTERM cleans up socket and pid file (spawn the built binary with LOOP_CODING_AGENT_DIR isolation, timeouts, kill-on-drop; cfg(unix)). A client connecting through RemoteBackend can create a Session and prompt it with the faux/fake provider if practical; otherwise leave the end-to-end prompt test to S2.10 and say so.
