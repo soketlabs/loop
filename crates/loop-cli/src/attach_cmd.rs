@@ -15,7 +15,7 @@ pub async fn run(_: AttachArgs) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-pub use unix::{connect, drive, Input, Terminal};
+pub use unix::{connect, drive, AttachClient, Input, Terminal};
 
 #[cfg(unix)]
 pub async fn run(args: AttachArgs) -> anyhow::Result<()> {
@@ -46,7 +46,7 @@ mod unix {
     };
     use loop_wire::{transport::Transport, RemoteBackend};
     use std::{
-        collections::HashSet,
+        collections::{HashSet, VecDeque},
         io::{BufRead, Write},
         sync::Arc,
     };
@@ -69,6 +69,7 @@ mod unix {
     pub struct StdioTerminal {
         lines: mpsc::UnboundedReceiver<std::io::Result<String>>,
         interrupt: tokio::signal::unix::Signal,
+        stdin_ended: bool,
     }
     impl StdioTerminal {
         pub fn new() -> anyhow::Result<Self> {
@@ -83,7 +84,11 @@ mod unix {
                     }
                 }
             });
-            Ok(Self { lines, interrupt })
+            Ok(Self {
+                lines,
+                interrupt,
+                stdin_ended: false,
+            })
         }
     }
     #[async_trait::async_trait]
@@ -91,9 +96,9 @@ mod unix {
         async fn read(&mut self) -> anyhow::Result<Input> {
             tokio::select! {
                 _ = self.interrupt.recv() => Ok(Input::Interrupt),
-                line = self.lines.recv() => match line {
+                line = self.lines.recv(), if !self.stdin_ended => match line {
                     Some(line) => Ok(Input::Line(line?)),
-                    None => Ok(Input::Eof),
+                    None => { self.stdin_ended = true; Ok(Input::Eof) },
                 }
             }
         }
@@ -130,41 +135,87 @@ mod unix {
         }
     }
 
+    /// Owns the local transport lifetime independently of cleanup RPC replies.
+    pub struct AttachClient {
+        backend: Arc<RemoteBackend>,
+        closed: tokio_util::sync::CancellationToken,
+    }
+    impl Drop for AttachClient {
+        fn drop(&mut self) {
+            self.closed.cancel();
+        }
+    }
+    impl AttachClient {
+        async fn cleanup_rpc<T>(
+            &self,
+            rpc: impl std::future::Future<Output = T>,
+        ) -> anyhow::Result<T> {
+            tokio::select! {
+                biased;
+                _ = self.closed.cancelled() => Err(LostContact.into()),
+                result = tokio::time::timeout(std::time::Duration::from_secs(2), rpc) => {
+                    result.map_err(|_| anyhow::anyhow!("Runtime cleanup timed out; closing the local connection"))
+                }
+            }
+        }
+        async fn shutdown(&self) {
+            let _ = self.cleanup_rpc(self.backend.shutdown()).await;
+        }
+    }
+
     /// Connect the approval host and expose withdrawals ignored by older wire clients.
     pub async fn connect(
         mut transport: Transport,
-    ) -> anyhow::Result<(Arc<RemoteBackend>, mpsc::UnboundedReceiver<HostEvent>)> {
+    ) -> anyhow::Result<(AttachClient, mpsc::UnboundedReceiver<HostEvent>)> {
         let (events_tx, events) = mpsc::unbounded_channel();
         let (tx, incoming) = mpsc::unbounded_channel();
+        let (outgoing, mut from_wire) = mpsc::unbounded_channel();
         let notices = events_tx.clone();
+        let closed = tokio_util::sync::CancellationToken::new();
+        let pump_closed = closed.clone();
         tokio::spawn(async move {
-            while let Some(raw) = transport.incoming.recv().await {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
-                    if value["method"] == methods::HOST_INTERACT_WITHDRAWN {
-                        if let Ok(params) = serde_json::from_value(value["params"].clone()) {
-                            let _ = notices.send(HostEvent::Withdrawn(params));
+            loop {
+                tokio::select! {
+                    _ = pump_closed.cancelled() => break,
+                    raw = transport.incoming.recv() => {
+                        let Some(raw) = raw else { break; };
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+                            if value["method"] == methods::HOST_INTERACT_WITHDRAWN {
+                                if let Ok(params) = serde_json::from_value(value["params"].clone()) {
+                                    let _ = notices.send(HostEvent::Withdrawn(params));
+                                }
+                            }
                         }
+                        if tx.send(raw).is_err() { break; }
+                    }
+                    raw = from_wire.recv() => {
+                        let Some(raw) = raw else { break; };
+                        if transport.outgoing.send(raw).is_err() { break; }
                     }
                 }
-                if tx.send(raw).is_err() {
-                    return;
-                }
             }
+            pump_closed.cancel();
             let _ = notices.send(HostEvent::Disconnected);
+            // Dropping both transport directions closes locally even when the
+            // peer never replies and the wire reader already drained requests.
         });
-        let backend = RemoteBackend::connect(
-            Transport {
-                incoming,
-                outgoing: transport.outgoing,
-            },
+        let backend = match RemoteBackend::connect(
+            Transport { incoming, outgoing },
             PeerInfo {
                 name: "loop attach".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
             },
             Arc::new(Host(events_tx)),
         )
-        .await?;
-        Ok((backend, events))
+        .await
+        {
+            Ok(backend) => backend,
+            Err(error) => {
+                closed.cancel();
+                return Err(error.into());
+            }
+        };
+        Ok((AttachClient { backend, closed }, events))
     }
 
     fn list_text(sessions: &mut [SessionInfo]) -> String {
@@ -206,8 +257,9 @@ mod unix {
     struct Pending {
         request: InteractionRequest,
         reply: oneshot::Sender<InteractionOutcome>,
+        first_choice: usize,
     }
-    fn show(request: &InteractionRequest) -> String {
+    fn show(request: &InteractionRequest, first_choice: usize) -> String {
         let mut text = String::from("\nEscalation: ");
         match request {
             InteractionRequest::Permission {
@@ -221,7 +273,7 @@ mod unix {
                         .unwrap_or("Tool approval")
                 ));
                 for (i, option) in options.iter().enumerate() {
-                    text.push_str(&format!("  {}. {}\n", i + 1, option.label));
+                    text.push_str(&format!("  {}. {}\n", i + first_choice, option.label));
                 }
             }
             InteractionRequest::Question {
@@ -229,19 +281,23 @@ mod unix {
             } => {
                 text.push_str(&format!("{prompt}\n"));
                 for (i, choice) in choices.iter().flatten().enumerate() {
-                    text.push_str(&format!("  {}. {}\n", i + 1, choice.label));
+                    text.push_str(&format!("  {}. {}\n", i + first_choice, choice.label));
                 }
             }
             _ => text.push_str("This request cannot be presented.\n"),
         }
         text
     }
-    fn answer(request: &InteractionRequest, line: &str) -> Option<InteractionOutcome> {
+    fn answer(
+        request: &InteractionRequest,
+        line: &str,
+        first_choice: usize,
+    ) -> Option<InteractionOutcome> {
         let index = line
             .trim()
             .parse::<usize>()
             .ok()
-            .and_then(|i| i.checked_sub(1));
+            .and_then(|i| i.checked_sub(first_choice));
         let id = match request {
             InteractionRequest::Permission { options, .. } => {
                 options.get(index?)?.native_id.clone()
@@ -262,11 +318,12 @@ mod unix {
     }
 
     pub async fn drive(
-        backend: Arc<RemoteBackend>,
+        client: AttachClient,
         mut events: mpsc::UnboundedReceiver<HostEvent>,
         args: AttachArgs,
         terminal: &mut dyn Terminal,
     ) -> anyhow::Result<()> {
+        let backend = client.backend.clone();
         let session = if args.new {
             let cwd = std::path::absolute(args.cwd.unwrap_or(std::env::current_dir()?))?;
             backend
@@ -279,19 +336,19 @@ mod unix {
             let mut sessions = backend.list().await?;
             let Some(id) = args.id else {
                 terminal.write(&list_text(&mut sessions))?;
-                backend.shutdown().await;
+                client.shutdown().await;
                 return Ok(());
             };
             let mut found = matches(&sessions, &id);
             match found.len() {
                 0 => {
-                    backend.shutdown().await;
+                    client.shutdown().await;
                     anyhow::bail!("No Session matches `{id}`");
                 }
                 1 => found.remove(0).r#ref,
                 _ => {
                     terminal.write(&list_text(&mut found))?;
-                    backend.shutdown().await;
+                    client.shutdown().await;
                     anyhow::bail!("Ambiguous Session prefix `{id}`; use a longer id");
                 }
             }
@@ -317,11 +374,16 @@ mod unix {
             return result;
         }
         // Detach is observation only: never cancel or close a Session on exit.
-        let detached = backend.detach(&session).await;
-        backend.shutdown().await;
+        let detached = client
+            .cleanup_rpc(backend.detach(&session))
+            .await
+            .and_then(|result| result.map_err(anyhow::Error::from));
+        // Never enqueue a fresh RPC after detach observes a dead transport.
+        if detached.is_ok() {
+            client.shutdown().await;
+        }
         result?;
-        detached?;
-        Ok(())
+        detached
     }
 
     async fn attached(
@@ -333,7 +395,12 @@ mod unix {
         replay_until: u64,
     ) -> anyhow::Result<()> {
         let mut last_seq = 0;
+        let mut deferred = VecDeque::new();
         let mut pending: Vec<Pending> = Vec::new();
+        // Numbers are request identities, never reused by this Surface. A
+        // buffered answer remains tied to its original Escalation even if a
+        // withdrawal wins the race with terminal input.
+        let mut next_choice = 1;
         let mut withdrawn = HashSet::new();
         let mut interrupted = false;
         let mut prompts = tokio::task::JoinSet::new();
@@ -346,8 +413,14 @@ mod unix {
                         if !matches!(request, InteractionRequest::Permission {..} | InteractionRequest::Question {..}) {
                             let _ = reply.send(InteractionOutcome::Rejected { reason: "loop attach supports choices and text questions".into() }); continue;
                         }
-                        if pending.is_empty() { terminal.write(&show(&request))?; }
-                        pending.push(Pending { request, reply });
+                        let first_choice = next_choice;
+                        next_choice += match &request {
+                            InteractionRequest::Permission { options, .. } => options.len().max(1),
+                            InteractionRequest::Question { choices, .. } => choices.as_ref().map_or(1, |c| c.len().max(1)),
+                            _ => 1,
+                        };
+                        if pending.is_empty() { terminal.write(&show(&request, first_choice))?; }
+                        pending.push(Pending { request, reply, first_choice });
                     }
                     HostEvent::Withdrawn(params) if params.session == *session => {
                         withdrawn.insert(params.id.clone());
@@ -356,7 +429,7 @@ mod unix {
                             let _ = item.reply.send(InteractionOutcome::Cancelled);
                         }
                         terminal.write("\r\x1b[2KAnother client answered; Escalation withdrawn.\n")?;
-                        if let Some(next) = pending.first() { terminal.write(&show(&next.request))?; }
+                        if let Some(next) = pending.first() { terminal.write(&show(&next.request, next.first_choice))?; }
                     }
                     HostEvent::Withdrawn(_) => {},
                     HostEvent::Disconnected => return Err(LostContact.into()),
@@ -374,8 +447,20 @@ mod unix {
                 Some(result) = prompts.join_next(), if !prompts.is_empty() => {
                     if let Err(error) = result? { terminal.write(&format!("loop: {error}\n"))?; }
                 },
-                // Finish the snapshot even when piped stdin immediately closes.
-                input = terminal.read(), if last_seq >= replay_until => match input? {
+                // Lines and piped EOF wait for the snapshot, but controls must
+                // stay responsive even while history is still being delivered.
+                input = async {
+                    if last_seq >= replay_until {
+                        if let Some(input) = deferred.pop_front() { return Ok(input); }
+                    }
+                    terminal.read().await
+                } => {
+                    let input = input?;
+                    if last_seq < replay_until && !matches!(input, Input::Interrupt) {
+                        deferred.push_back(input);
+                        continue;
+                    }
+                    match input {
                     Input::Eof => return Ok(()),
                     Input::Interrupt if interrupted => return Ok(()),
                     Input::Interrupt => {
@@ -384,12 +469,16 @@ mod unix {
                         terminal.write("\nTurn cancelled. Ctrl+C again to detach.\n")?;
                     }
                     Input::Line(line) => {
-                        if let Some(item) = pending.first() {
-                            if let Some(outcome) = answer(&item.request, &line) {
+                        let explicit_prompt = line.starts_with("> ");
+                        let line = line.strip_prefix("> ").unwrap_or(&line).to_owned();
+                        if let Some(item) = pending.first().filter(|_| !explicit_prompt) {
+                            if let Some(outcome) = answer(&item.request, &line, item.first_choice) {
                                 let item = pending.remove(0);
                                 let _ = item.reply.send(outcome);
-                                if let Some(next) = pending.first() { terminal.write(&show(&next.request))?; }
+                                if let Some(next) = pending.first() { terminal.write(&show(&next.request, next.first_choice))?; }
                             } else { terminal.write("Enter one of the numbered choices.\n")?; }
+                        } else if !explicit_prompt && next_choice > 1 && line.trim().parse::<usize>().is_ok() {
+                            terminal.write("Choice no longer active; ignored. Start a numeric prompt with `> `.\n")?;
                         } else if !line.trim().is_empty() {
                             interrupted = false;
                             match backend.prompt(session, vec![ContentBlock::text(line)]).await {
@@ -403,6 +492,7 @@ mod unix {
                                 Err(error) => terminal.write(&format!("loop: {error}\n"))?,
                             }
                         }
+                    }
                     }
                 }
             }

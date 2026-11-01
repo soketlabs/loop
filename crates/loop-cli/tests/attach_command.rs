@@ -295,7 +295,7 @@ async fn numbered_approval_withdrawal_and_interrupts_use_the_wire() {
         }).await.expect("approval response missing");
         output.lock().unwrap().clear();
         inject.send(request(9002, "approve-2")).unwrap();
-        wait_text(&output, "1. Allow once").await;
+        wait_text(&output, "3. Allow once").await;
         inject.send(serde_json::json!({"jsonrpc":"2.0", "method":"host/interact_withdrawn", "params":{"session":session,"id":"approve-2"}}).to_string()).unwrap();
         wait_text(&output, "Another client answered").await;
         // Release the injection sender so server shutdown closes the transport.
@@ -504,6 +504,190 @@ async fn connection_loss_reports_error_and_leaves_the_session_running() {
         assert!(rt.list().await.unwrap()[0].live);
         served.done.abort();
         let _ = served.done.await;
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+struct PausedInput {
+    script: Script,
+    enabled: tokio::sync::watch::Receiver<bool>,
+}
+#[async_trait::async_trait]
+impl Terminal for PausedInput {
+    async fn read(&mut self) -> anyhow::Result<Input> {
+        while !*self.enabled.borrow_and_update() {
+            self.enabled.changed().await?;
+        }
+        self.script.read().await
+    }
+    fn write(&mut self, text: &str) -> anyhow::Result<()> {
+        self.script.write(text)
+    }
+}
+
+#[tokio::test]
+async fn buffered_withdrawn_answer_never_answers_the_next_request_or_becomes_a_prompt() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for queued in [false, true] {
+            let dir = tempfile::tempdir().unwrap(); let rt = runtime(dir.path()).await;
+            let session = rt.new_session(SessionSpec::default()).await.unwrap();
+            let (mut server, client) = loop_wire::transport::memory();
+            let inject = server.outgoing.clone();
+            let messages = Arc::new(Mutex::new(Vec::<serde_json::Value>::new())); let captured = messages.clone();
+            let (forward, incoming) = mpsc::unbounded_channel();
+            tokio::spawn(async move { while let Some(raw) = server.incoming.recv().await {
+                captured.lock().unwrap().push(serde_json::from_str(&raw).unwrap());
+                if forward.send(raw).is_err() { break; }
+            }});
+            let served = serve(rt.clone(), loop_wire::transport::Transport { incoming, outgoing: server.outgoing });
+            let (backend, events) = connect(client).await.unwrap(); let (tx, script, output) = script();
+            let (enable, enabled) = tokio::sync::watch::channel(false); let mut terminal = PausedInput { script, enabled };
+            let key = session.key.to_string();
+            let task = tokio::spawn(async move { drive(backend, events, AttachArgs { id: Some(key), ..Default::default() }, &mut terminal).await });
+            let approval = |rpc_id: u64, id: &str| serde_json::json!({"jsonrpc":"2.0", "id":rpc_id, "method":"host/interact", "params":{
+                "session": session, "kind":"permission", "id":id,
+                "options":[{"native_id":"allow", "label":id, "kind_hint":"allow_once"}]
+            }}).to_string();
+            // Wait until attachment before injecting an Escalation.
+            loop {
+                if messages.lock().unwrap().iter().any(|m| m["method"] == "session/attach") { break; }
+                tokio::task::yield_now().await;
+            }
+            inject.send(approval(9101, "A")).unwrap(); wait_text(&output, "1. A").await;
+            if queued { inject.send(approval(9102, "B")).unwrap(); }
+            tx.send(Input::Line("1".into())).unwrap(); // Entered for A, still buffered.
+            inject.send(serde_json::json!({"jsonrpc":"2.0", "method":"host/interact_withdrawn", "params":{"session":session,"id":"A"}}).to_string()).unwrap();
+            wait_text(&output, "Another client answered").await;
+            if queued { wait_text(&output, ". B").await; }
+            drop(inject); enable.send(true).unwrap();
+            tx.send(Input::Interrupt).unwrap(); wait_text(&output, "Ctrl+C again").await;
+            tx.send(Input::Interrupt).unwrap(); task.await.unwrap().unwrap(); served.done.await.unwrap();
+            let messages = messages.lock().unwrap().clone();
+            assert!(!messages.iter().any(|m| m["id"] == 9102 && m["result"]["outcome"] == "selected"), "stale answer approved B: {messages:?}");
+            assert!(!messages.iter().any(|m| m["method"] == "session/prompt"), "stale answer became a prompt: {messages:?}");
+            rt.shutdown().await;
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn runtime_loss_after_detach_request_closes_locally_without_a_shutdown_rpc() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for drop_connection in [true, false] {
+        let dir = tempfile::tempdir().unwrap(); let rt = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let (mut server, mut client) = loop_wire::transport::memory();
+        let (cut, cut_rx) = tokio::sync::oneshot::channel();
+        let (to_client, incoming) = mpsc::unbounded_channel();
+        tokio::spawn(async move { tokio::pin!(cut_rx); loop { tokio::select! {
+            _ = &mut cut_rx => return,
+            raw = client.incoming.recv() => match raw { Some(raw) => { if to_client.send(raw).is_err() { return; } }, None => return }
+        }}});
+        let (forward, server_incoming) = mpsc::unbounded_channel();
+        let messages = Arc::new(Mutex::new(Vec::<serde_json::Value>::new())); let captured = messages.clone();
+        let closed = Arc::new(tokio::sync::Notify::new()); let closed_peer = closed.clone();
+        tokio::spawn(async move {
+            let mut cut = Some(cut); let mut forward = Some(forward);
+            while let Some(raw) = server.incoming.recv().await {
+                let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                let detach = value["method"] == "session/detach"; captured.lock().unwrap().push(value);
+                if detach {
+                    if drop_connection { let _ = cut.take().unwrap().send(()); forward.take(); }
+                    // Otherwise keep the transport alive but never acknowledge.
+                }
+                else if let Some(forward) = &forward { let _ = forward.send(raw); }
+            }
+            closed_peer.notify_one();
+        });
+        let served = serve(rt.clone(), loop_wire::transport::Transport { incoming: server_incoming, outgoing: server.outgoing });
+        let (backend, events) = connect(loop_wire::transport::Transport { incoming, outgoing: client.outgoing }).await.unwrap();
+        let (tx, mut terminal, _) = script(); tx.send(Input::Eof).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), drive(backend, events, AttachArgs { id: Some(session.key.to_string()), ..Default::default() }, &mut terminal)).await.expect("cleanup hung after Runtime loss");
+        assert!(result.is_err());
+        tokio::time::timeout(Duration::from_secs(1), closed.notified()).await.expect("local transport stayed open");
+        assert!(!messages.lock().unwrap().iter().any(|m| m["method"] == "shutdown"));
+        served.done.await.unwrap(); assert!(rt.list().await.unwrap()[0].live); rt.shutdown().await;
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn interrupts_cancel_and_detach_before_gated_replay_finishes() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        rt.prompt(&session, vec![ContentBlock::text("history")])
+            .await
+            .unwrap()
+            .outcome()
+            .await;
+        let (mut server, client) = loop_wire::transport::memory();
+        let messages = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = messages.clone();
+        let (forward, incoming) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(raw) = server.incoming.recv().await {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&raw).unwrap());
+                if forward.send(raw).is_err() {
+                    break;
+                }
+            }
+        });
+        let (outgoing, mut server_output) = mpsc::unbounded_channel::<String>();
+        let replay_held = Arc::new(tokio::sync::Notify::new());
+        let held = replay_held.clone();
+        tokio::spawn(async move {
+            while let Some(raw) = server_output.recv().await {
+                let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                if value["method"] == "session/update" {
+                    held.notify_one();
+                    continue;
+                }
+                if server.outgoing.send(raw).is_err() {
+                    break;
+                }
+            }
+        });
+        let served = serve(
+            rt.clone(),
+            loop_wire::transport::Transport { incoming, outgoing },
+        );
+        let (backend, events) = connect(client).await.unwrap();
+        let (tx, mut terminal, output) = script();
+        let key = session.key.to_string();
+        let task = tokio::spawn(async move {
+            drive(
+                backend,
+                events,
+                AttachArgs {
+                    id: Some(key),
+                    ..Default::default()
+                },
+                &mut terminal,
+            )
+            .await
+        });
+        replay_held.notified().await;
+        tx.send(Input::Interrupt).unwrap();
+        wait_text(&output, "Ctrl+C again").await;
+        tx.send(Input::Interrupt).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("interrupt could not detach during replay")
+            .unwrap()
+            .unwrap();
+        served.done.await.unwrap();
+        let messages = messages.lock().unwrap().clone();
+        assert!(messages.iter().any(|m| m["method"] == "session/cancel"));
+        assert!(messages.iter().any(|m| m["method"] == "session/detach"));
+        assert!(!output.lock().unwrap().contains("replayed"));
+        assert!(rt.list().await.unwrap()[0].live);
         rt.shutdown().await;
     })
     .await
