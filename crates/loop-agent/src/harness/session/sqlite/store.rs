@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::harness::session::fork::{entries_for_fork_selection, SessionForkSelection};
 use crate::harness::session::types::{
@@ -22,6 +22,7 @@ use super::branch_cache::{
 use super::materialize::{insert_empty_materialized, update_materialized_on_append};
 
 const MIGRATION_001: &str = include_str!("migrations/001_initial.sql");
+const MIGRATION_003: &str = include_str!("migrations/003_session_leases.sql");
 const MIGRATION_002: &str = include_str!("migrations/002_branch_tips.sql");
 
 struct Migration {
@@ -38,22 +39,46 @@ const MIGRATIONS: &[Migration] = &[
         id: "002_branch_tips.sql",
         sql: MIGRATION_002,
     },
+    Migration {
+        id: "003_session_leases.sql",
+        sql: MIGRATION_003,
+    },
 ];
 
 /// Open or create a SQLite session store at `path`.
 pub fn create_sqlite_session_store(
     path: impl AsRef<Path>,
 ) -> Result<Arc<dyn SessionStore>, SessionError> {
-    let path = path.as_ref().to_path_buf();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| SessionError::Io(e.to_string()))?;
-    }
-    let mut conn = open(&path)?;
-    apply_migrations(&mut conn)?;
-    Ok(Arc::new(SqliteSessionStore { path }))
+    Ok(Arc::new(SqliteSessionStore::open(path)?))
 }
 
-fn open(path: &Path) -> Result<Connection, SessionError> {
+impl SqliteSessionStore {
+    /// Open a store using the system clock and conservative process-liveness probe.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, SessionError> {
+        Self::with_environment(path, Arc::new(super::leases::SystemLeaseEnvironment))
+    }
+
+    /// Open with injectable time and process liveness for deterministic recovery tests.
+    pub fn with_environment(
+        path: impl AsRef<Path>,
+        environment: Arc<dyn super::leases::LeaseEnvironment>,
+    ) -> Result<Self, SessionError> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| SessionError::Io(e.to_string()))?;
+        }
+        let mut conn = open(&path)?;
+        apply_migrations(&mut conn)?;
+        Ok(Self {
+            path,
+            environment,
+            identity: None,
+            resume_guard: None,
+        })
+    }
+}
+
+pub(super) fn open(path: &Path) -> Result<Connection, SessionError> {
     let conn = Connection::open(path).map_err(|e| SessionError::Storage(e.to_string()))?;
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
         .map_err(|e| SessionError::Storage(e.to_string()))?;
@@ -104,8 +129,13 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), SessionError> {
     Ok(())
 }
 
-struct SqliteSessionStore {
-    path: PathBuf,
+/// SQLite Session store with optional lease fencing for writers.
+#[derive(Clone)]
+pub struct SqliteSessionStore {
+    pub(super) path: PathBuf,
+    pub(super) environment: Arc<dyn super::leases::LeaseEnvironment>,
+    pub(super) identity: Option<super::leases::LeaseIdentity>,
+    pub(super) resume_guard: Option<Arc<super::leases::ResumeLeaseGuard>>,
 }
 
 struct SqliteReader {
@@ -305,6 +335,55 @@ fn read_path_to_root_or_compaction_conn(
     Ok(trim_path_to_root_or_compaction(&entries))
 }
 
+fn append_entry_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    pending: PendingSessionWrite,
+) -> Result<SessionTreeEntry, SessionError> {
+    let leaf: Option<String> = tx
+        .query_row(
+            "SELECT active_leaf_id FROM sessions WHERE id=?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| SessionError::NotFound(session_id.to_string()))?;
+    let seq: i64 = tx
+        .query_row(
+            "SELECT next_seq FROM session_sequences WHERE session_id=?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| SessionError::Storage(e.to_string()))?;
+    let id = loop_ai::new_id();
+    let ts = now_ms();
+    let entry = pending_to_entry(pending, id.clone(), leaf.clone(), ts);
+    let new_leaf = if let SessionTreeEntry::Leaf { target_id, .. } = &entry {
+        target_id.clone()
+    } else {
+        Some(entry.id().to_string())
+    };
+    let payload =
+        serde_json::to_string(&entry).map_err(|e| SessionError::Storage(e.to_string()))?;
+    tx.execute(
+                "INSERT INTO session_entries(session_id, entry_id, parent_id, entry_seq, payload) VALUES (?1,?2,?3,?4,?5)",
+                params![session_id, entry.id(), entry.parent_id(), seq, payload],
+            )
+            .map_err(|e| SessionError::Storage(e.to_string()))?;
+    tx.execute(
+        "UPDATE session_sequences SET next_seq=?1 WHERE session_id=?2",
+        params![seq + 1, session_id],
+    )
+    .map_err(|e| SessionError::Storage(e.to_string()))?;
+    tx.execute(
+        "UPDATE sessions SET active_leaf_id=?1 WHERE id=?2",
+        params![new_leaf, session_id],
+    )
+    .map_err(|e| SessionError::Storage(e.to_string()))?;
+    append_entry_to_branch_cache(tx, session_id, entry.id(), seq, entry.parent_id())?;
+    update_materialized_on_append(tx, session_id, seq, &entry)?;
+    Ok(entry)
+}
+
 fn delete_session_rows(tx: &Transaction<'_>, session_id: &str) -> Result<(), SessionError> {
     tx.execute(
         "DELETE FROM entry_materialized WHERE session_id=?1",
@@ -417,6 +496,12 @@ impl SessionReader for SqliteReader {
 
 #[async_trait]
 impl SessionStore for SqliteSessionStore {
+    fn write_cancellation(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.resume_guard
+            .as_ref()
+            .map(|guard| guard.cancellation.clone())
+    }
+
     async fn create(
         &self,
         cwd: Option<String>,
@@ -433,13 +518,14 @@ impl SessionStore for SqliteSessionStore {
             created_at,
             path: None,
         };
+        let guard = self.resume_guard.clone();
         tokio::task::spawn_blocking({
             let path = path.clone();
             let id = id.clone();
             move || {
                 let mut conn = open(&path)?;
                 let tx = conn
-                    .transaction()
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|e| SessionError::Storage(e.to_string()))?;
                 tx.execute(
                     "INSERT INTO sessions(id, cwd, name, parent_session_id, active_leaf_id, created_at) VALUES (?1,?2,?3,NULL,NULL,?4)",
@@ -452,8 +538,10 @@ impl SessionStore for SqliteSessionStore {
                 )
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
                 insert_empty_materialized(&tx, &id)?;
+                if let Some(guard) = &guard { guard.claim_created(&tx, &id)?; }
                 tx.commit()
                     .map_err(|e| SessionError::Storage(e.to_string()))?;
+                if let Some(guard) = &guard { guard.track(&id); }
                 Ok::<(), SessionError>(())
             }
         })
@@ -463,6 +551,20 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn load(&self, id: &str) -> Result<Arc<dyn SessionReader>, SessionError> {
+        if let Some(guard) = &self.resume_guard {
+            if guard.failed() {
+                return Err(SessionError::Invalid(
+                    "Session lease renewal failed; stop writing and cancel work.".into(),
+                ));
+            }
+            self.takeover_lease(
+                id,
+                self.identity.as_ref().expect("standalone identity"),
+                false,
+            )
+            .await?;
+            guard.track(id);
+        }
         let path = self.path.clone();
         let id = id.to_string();
         let meta = tokio::task::spawn_blocking(move || {
@@ -553,58 +655,20 @@ impl SessionStore for SqliteSessionStore {
     ) -> Result<SessionTreeEntry, SessionError> {
         let path = self.path.clone();
         let session_id = session_id.to_string();
+        let identity = self.identity.clone();
+        let guard = self.resume_guard.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = open(&path)?;
             let tx = conn
-                .transaction()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
-            let leaf: Option<String> = tx
-                .query_row(
-                    "SELECT active_leaf_id FROM sessions WHERE id=?1",
-                    params![session_id],
-                    |row| row.get(0),
-                )
-                .map_err(|_| SessionError::NotFound(session_id.clone()))?;
-            let seq: i64 = tx
-                .query_row(
-                    "SELECT next_seq FROM session_sequences WHERE session_id=?1",
-                    params![session_id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| SessionError::Storage(e.to_string()))?;
-            let id = loop_ai::new_id();
-            let ts = now_ms();
-            let entry = pending_to_entry(pending, id.clone(), leaf.clone(), ts);
-            let new_leaf = if let SessionTreeEntry::Leaf { target_id, .. } = &entry {
-                target_id.clone()
-            } else {
-                Some(entry.id().to_string())
-            };
-            let payload =
-                serde_json::to_string(&entry).map_err(|e| SessionError::Storage(e.to_string()))?;
-            tx.execute(
-                "INSERT INTO session_entries(session_id, entry_id, parent_id, entry_seq, payload) VALUES (?1,?2,?3,?4,?5)",
-                params![session_id, entry.id(), entry.parent_id(), seq, payload],
-            )
-            .map_err(|e| SessionError::Storage(e.to_string()))?;
-            tx.execute(
-                "UPDATE session_sequences SET next_seq=?1 WHERE session_id=?2",
-                params![seq + 1, session_id],
-            )
-            .map_err(|e| SessionError::Storage(e.to_string()))?;
-            tx.execute(
-                "UPDATE sessions SET active_leaf_id=?1 WHERE id=?2",
-                params![new_leaf, session_id],
-            )
-            .map_err(|e| SessionError::Storage(e.to_string()))?;
-            append_entry_to_branch_cache(
-                &tx,
-                &session_id,
-                entry.id(),
-                seq,
-                entry.parent_id(),
-            )?;
-            update_materialized_on_append(&tx, &session_id, seq, &entry)?;
+            if guard.as_ref().is_some_and(|guard| guard.failed()) {
+                return Err(SessionError::Invalid(
+                    "Session lease renewal failed; stop writing and cancel work.".into(),
+                ));
+            }
+            super::leases::check_write(&tx, &session_id, identity.as_ref())?;
+            let entry = append_entry_tx(&tx, &session_id, pending)?;
             tx.commit()
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
             Ok(entry)
@@ -616,14 +680,25 @@ impl SessionStore for SqliteSessionStore {
     async fn delete(&self, id: &str) -> Result<(), SessionError> {
         let path = self.path.clone();
         let id = id.to_string();
+        let identity = self.identity.clone();
+        let guard = self.resume_guard.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = open(&path)?;
             let tx = conn
-                .transaction()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
+            if guard.as_ref().is_some_and(|guard| guard.failed()) {
+                return Err(SessionError::Invalid(
+                    "Session lease renewal failed; stop writing and cancel work.".into(),
+                ));
+            }
+            super::leases::check_write(&tx, &id, identity.as_ref())?;
             delete_session_rows(&tx, &id)?;
             tx.commit()
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
+            if let Some(guard) = &guard {
+                guard.forget(&id);
+            }
             Ok(())
         })
         .await
@@ -637,14 +712,30 @@ impl SessionStore for SqliteSessionStore {
         through_entry_id: Option<&str>,
         name: Option<String>,
     ) -> Result<Arc<dyn SessionReader>, SessionError> {
-        let reader = self.load(source_id).await?;
-        let leaf = reader.read_head().await?;
-        let entries = reader.read_entries(None).await?;
-        let selected =
-            entries_for_fork_selection(&entries, leaf.as_deref(), selection, through_entry_id)?;
-        let meta = reader.metadata().clone();
-        let new_reader = self.create(meta.cwd.clone(), name).await?;
-        for entry in selected {
+        let path = self.path.clone();
+        let source_id = source_id.to_string();
+        let through_entry_id = through_entry_id.map(str::to_owned);
+        let guard = self.resume_guard.clone();
+        let new_id = tokio::task::spawn_blocking(move || {
+            let mut conn = open(&path)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|e| SessionError::Storage(e.to_string()))?;
+            let (cwd, leaf): (Option<String>, Option<String>) = tx.query_row(
+                "SELECT cwd, active_leaf_id FROM sessions WHERE id=?1", [&source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(|e| SessionError::Storage(e.to_string()))?
+                .ok_or_else(|| SessionError::NotFound(source_id.clone()))?;
+            let entries = load_all(&tx, &source_id)?;
+            let selected = entries_for_fork_selection(&entries, leaf.as_deref(), selection, through_entry_id.as_deref())?;
+            let new_id = create_session_id();
+            tx.execute(
+                "INSERT INTO sessions(id, cwd, name, parent_session_id, active_leaf_id, created_at) VALUES (?1,?2,?3,?4,NULL,?5)",
+                params![new_id, cwd, name, source_id, now_ms()],
+            ).map_err(|e| SessionError::Storage(e.to_string()))?;
+            tx.execute("INSERT INTO session_sequences(session_id, next_seq) VALUES (?1, 1)", [&new_id])
+                .map_err(|e| SessionError::Storage(e.to_string()))?;
+            insert_empty_materialized(&tx, &new_id)?;
+            for entry in selected {
             let pending = match entry {
                 SessionTreeEntry::Message { message, .. } => {
                     PendingSessionWrite::Message { message }
@@ -678,24 +769,13 @@ impl SessionStore for SqliteSessionStore {
                 }
                 SessionTreeEntry::Custom { .. } => continue,
             };
-            self.append_entry(&new_reader.metadata().id, pending)
-                .await?;
-        }
-        let path = self.path.clone();
-        let new_id = new_reader.metadata().id.clone();
-        let source_id = source_id.to_string();
-        let update_id = new_id.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = open(&path)?;
-            conn.execute(
-                "UPDATE sessions SET parent_session_id=?1 WHERE id=?2",
-                params![source_id, update_id],
-            )
-            .map_err(|e| SessionError::Storage(e.to_string()))?;
-            Ok::<(), SessionError>(())
-        })
-        .await
-        .map_err(|e| SessionError::Storage(e.to_string()))??;
+                append_entry_tx(&tx, &new_id, pending)?;
+            }
+            if let Some(guard) = &guard { guard.claim_created(&tx, &new_id)?; }
+            tx.commit().map_err(|e| SessionError::Storage(e.to_string()))?;
+            if let Some(guard) = &guard { guard.track(&new_id); }
+            Ok::<_, SessionError>(new_id)
+        }).await.map_err(|e| SessionError::Storage(e.to_string()))??;
         self.load(&new_id).await
     }
 }

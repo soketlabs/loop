@@ -67,6 +67,20 @@ async fn characterization_child() {
     );
     assert_eq!(runtime.session_id, runtime.harness.session_id().await);
     assert_eq!(runtime.harness.cwd(), cwd.canonicalize().unwrap());
+    let session_id = runtime.session_id.clone();
+    let store = loop_agent::harness::session::sqlite::SqliteSessionStore::open(
+        loop_app_core::config::paths::sessions_db_path(&runtime.agent_dir),
+    )
+    .unwrap();
+    // Resume after the first standalone writer closes and releases its lease.
+    drop(runtime);
+    for _ in 0..100 {
+        if store.lease(&session_id).await.unwrap().is_none() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(store.lease(&session_id).await.unwrap().is_none());
     opts = BootstrapOpts {
         cwd,
         provider: None,
@@ -76,14 +90,14 @@ async fn characterization_child() {
         append_system_prompt: None,
         no_context_files: true,
         interactive: false,
-        session_id: Some(runtime.session_id.clone()),
+        session_id: Some(session_id.clone()),
         no_web: true,
         permission_mode: Some("ask".into()),
         agent: Some("external".into()),
     };
     let resumed = bootstrap(opts).await.unwrap();
     assert!(resumed.resumed);
-    assert_eq!(resumed.session_id, runtime.session_id);
+    assert_eq!(resumed.session_id, session_id);
 }
 
 #[cfg(unix)]

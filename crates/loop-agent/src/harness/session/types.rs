@@ -306,6 +306,12 @@ pub trait SessionReader: Send + Sync {
 /// Session store.
 #[async_trait]
 pub trait SessionStore: Send + Sync {
+    /// Cancellation source for work owned by this writer. Lease renewal failure
+    /// cancels this token permanently; harnesses use a child token for each turn.
+    fn write_cancellation(&self) -> Option<tokio_util::sync::CancellationToken> {
+        None
+    }
+
     /// Create a session.
     async fn create(
         &self,

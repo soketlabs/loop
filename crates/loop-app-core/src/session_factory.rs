@@ -358,6 +358,24 @@ impl SessionFactory {
             settings.set_selected_model(&m.provider, &m.id);
         }
 
+        // Standalone Surfaces own their writer lease; Runtime callers manage
+        // ownership separately before opening through the shared repository.
+        let standalone_repository = if workspace.standalone {
+            let store =
+                loop_agent::harness::session::sqlite::create_sqlite_session_store_for_resume(
+                    &globals.sessions_db,
+                    opts.session_id.as_deref(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("sqlite session store: {e}"))?;
+            Some(create_session_repository(store, None))
+        } else {
+            None
+        };
+        let repository = standalone_repository
+            .as_ref()
+            .unwrap_or(&globals.repository);
+
         let (sandbox, tool_env, disabled) = workspace.execution().await?;
         let sandbox = sandbox.clone();
         let tool_env = Arc::clone(tool_env);
@@ -366,14 +384,12 @@ impl SessionFactory {
         }
         let resumed = opts.session_id.is_some();
         let session = if let Some(id) = &opts.session_id {
-            globals
-                .repository
+            repository
                 .open(id)
                 .await
                 .map_err(|e| anyhow::anyhow!("load session: {e}"))?
         } else {
-            globals
-                .repository
+            repository
                 .create(Some(workspace.cwd.to_string_lossy().into_owned()), None)
                 .await
                 .map_err(|e| anyhow::anyhow!("create session: {e}"))?
@@ -527,5 +543,65 @@ impl SessionFactory {
             model_note,
             startup_notices,
         })
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn standalone_factory_refuses_runtime_lease_before_opening_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = Arc::new(Models::create(Default::default()));
+        let globals =
+            Arc::new(GlobalResources::with_models(dir.path().join("agent"), models).unwrap());
+        let source = globals.repository.create(None, None).await.unwrap();
+        let id = source.metadata().id.clone();
+        let store =
+            loop_agent::harness::session::sqlite::SqliteSessionStore::open(&globals.sessions_db)
+                .unwrap();
+        store
+            .acquire_lease(
+                &id,
+                &loop_agent::harness::session::sqlite::LeaseIdentity {
+                    owner: "runtime".into(),
+                    pid: std::process::id(),
+                    generation: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let opts = BootstrapOpts {
+            cwd: dir.path().to_path_buf(),
+            provider: None,
+            model: None,
+            theme: None,
+            system_prompt: None,
+            append_system_prompt: None,
+            no_context_files: true,
+            interactive: false,
+            session_id: Some(id.clone()),
+            no_web: true,
+            permission_mode: Some("ask".into()),
+            agent: None,
+        };
+        let workspace = Arc::new(
+            WorkspaceResources::load_resolved(&globals, &opts, false, Settings::default(), true)
+                .await
+                .unwrap(),
+        );
+        let factory = SessionFactory::new(globals);
+        let error = match factory.open(workspace, &opts).await {
+            Ok(_) => panic!("standalone resume accepted an owned Session"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(&format!(
+                "Session {id} is in use by Runtime {}. Use `loop attach {id}` instead.",
+                std::process::id()
+            )),
+            "{error}"
+        );
     }
 }
