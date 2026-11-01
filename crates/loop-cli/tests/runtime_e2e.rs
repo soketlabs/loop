@@ -121,7 +121,7 @@ struct Fixture {
     agent: PathBuf,
     work: PathBuf,
     socket: PathBuf,
-    _model: FakeHttpServer,
+    model: FakeHttpServer,
 }
 impl Fixture {
     fn new() -> Self {
@@ -152,7 +152,7 @@ impl Fixture {
             agent,
             work,
             _dir: dir,
-            _model: model,
+            model,
         }
     }
     fn command(&self, args: &[&str]) -> Command {
@@ -518,6 +518,30 @@ async fn kill_9_mid_turn_then_restart_ends_the_turn_uncertain_and_the_session_wo
         surface.wait_text("uncertain — Runtime restarted").await;
         surface.line("say again").await;
         surface.wait_text("reply again").await;
+        // The interrupted tool call must not reach the model unanswered;
+        // OpenAI-compatible APIs reject such a history.
+        let last = fx
+            .model
+            .requests()
+            .into_iter()
+            .rfind(|r| r.path == "/v1/chat/completions")
+            .unwrap();
+        let body: Value = serde_json::from_slice(&last.body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        let calls: Vec<_> = messages
+            .iter()
+            .flat_map(|m| m["tool_calls"].as_array().cloned().unwrap_or_default())
+            .map(|c| c["id"].clone())
+            .collect();
+        let answered: Vec<_> = messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["tool_call_id"].clone())
+            .collect();
+        assert!(
+            calls.iter().all(|c| answered.contains(c)),
+            "unanswered tool call in {messages:#?}"
+        );
         let output = surface.finish().await;
         assert!(!output.contains("Escalation:"), "stale approval replayed: {output}");
 
