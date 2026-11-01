@@ -287,6 +287,11 @@ impl ToolGate {
         })
     }
 
+    /// The `toolPermissions` rules in force.
+    pub fn permissions(&self) -> BTreeMap<String, ToolPermission> {
+        self.permissions.lock().clone()
+    }
+
     /// Replace the per-tool permissions (settings changed).
     pub fn set_permissions(&self, permissions: BTreeMap<String, ToolPermission>) {
         *self.permissions.lock() = permissions;
