@@ -477,7 +477,16 @@ mod unix {
                     // A Subagent runs only for its parent and is never reloaded;
                     // its Event Log stays readable.
                     if found.live || found.parent.is_some() {
-                        (found.r#ref.clone(), header(&found.r#ref))
+                        let header = if found.live {
+                            header(&found.r#ref)
+                        } else {
+                            format!(
+                                "Replaying finished Subagent Session {} in {}. It cannot take prompts; Ctrl+D detaches.\n",
+                                found.r#ref.key,
+                                found.cwd.display()
+                            )
+                        };
+                        (found.r#ref.clone(), header)
                     } else {
                         // Not loaded (e.g. after a Runtime restart). Loading takes
                         // its lease, so prompts typed here can run.

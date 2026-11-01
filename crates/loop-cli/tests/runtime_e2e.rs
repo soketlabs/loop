@@ -850,6 +850,10 @@ async fn finished_children_are_hidden_unless_all_and_stay_attachable() {
         assert!(root[0].starts_with(&child[5]), "{listing}");
         // The child's log stays; attaching replays its answer.
         let output = fx.attach(&[&child[0]]).finish().await;
+        assert!(
+            output.starts_with("Replaying finished Subagent Session"),
+            "{output}"
+        );
         assert!(output.contains("reply kid"), "{output}");
         serve.stop().await;
     })
@@ -870,7 +874,7 @@ async fn cancelling_the_parent_cascades_and_withdraws_a_parked_child_escalation(
             .as_str()
             .unwrap()
             .to_owned();
-        // The approval belongs to the child Session, parked: nobody attached to it.
+        // The approval belongs to the child Session; the parent's Surface sees it.
         let events = fx.events().await;
         let escalation = events.iter().find(|e| raised(&e.event.kind)).unwrap();
         assert_eq!(escalation.event.session_key.as_ref().unwrap().0, child);
@@ -901,6 +905,33 @@ async fn cancelling_the_parent_cascades_and_withdraws_a_parked_child_escalation(
         let child = sessions.iter().find(|s| s.r#ref.key.0 == child).unwrap();
         assert!(!child.live && child.parent.is_some(), "{child:?}");
         drop(client);
+        serve.stop().await;
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_surface_watching_the_parent_answers_its_childs_escalation() {
+    bounded(async {
+        let fx = Fixture::new();
+        let serve = fx.serve().await;
+        let work = fx.work.to_str().unwrap();
+        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        parent.line("SPAWN-APPROVAL").await;
+        parent.wait_text("Escalation from Subagent ").await;
+        parent.wait_text("(NEEDS-APPROVAL)").await;
+        parent.wait_text("1. ").await;
+        parent.line("1").await;
+        parent.wait_text("tool done: approved").await;
+        let events = fx.events().await;
+        let ended = ended_children(&events);
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert_eq!(ended[0].1["status"], "completed", "{ended:?}");
+        assert_eq!(
+            count(&events, |e| matches!(e, EventKind::EscalationAnswered(_))),
+            1
+        );
+        parent.finish().await;
         serve.stop().await;
     })
     .await
