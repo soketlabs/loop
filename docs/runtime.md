@@ -122,7 +122,19 @@ before it accepts any Surface:
 
 `loop serve` prints what it recovered, for example
 `recovered 1 interrupted turn(s), withdrew 1 Escalation(s), reclaimed 1 lease(s)`.
-Starting it again recovers nothing more.
+It prints nothing when there was nothing to recover. Starting it again
+recovers nothing more.
+
+- **What startup reads.** Recovery reads only turn starts and ends and
+  approval records, and only since the last Runtime run whose recovery
+  finished. It never loads streamed text. A Runtime that ran for a long time
+  without a restart still means more records to check on the next start.
+- **Leases that cannot be reclaimed.** If one Session's lease cannot be
+  reclaimed, `loop serve` prints `Runtime recovery: lease of Session <id>: …`
+  to stderr and carries on. Attaching to that Session reports the conflict.
+- **What the model sees.** The Session history may not contain the
+  interrupted turn at all. Where it does contain a tool call without a result,
+  the model is told the call was interrupted and may or may not have run.
 
 ## Where things live
 
