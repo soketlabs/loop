@@ -1097,3 +1097,143 @@ async fn a_grandchilds_escalation_reaches_surfaces_watching_any_ancestor() {
     .await
     .unwrap();
 }
+
+/// A root in ask mode whose only child asks to run `bash`.
+async fn asking_child(
+    dir: &std::path::Path,
+) -> (Arc<Runtime>, SessionRef, loop_protocol::TurnHandle) {
+    let script: Script = Arc::new(|turn: Turn| match (turn.task.as_str(), turn.call) {
+        ("root", 1) => ready(calls(vec![spawn("asker")])),
+        ("asker", 1) => ready(calls(vec![("bash", json!({"command": "echo hi"}))])),
+        (task, _) => ready(text(format!("{task} done"))),
+    });
+    let (rt, _, _) = runtime(dir, "ask", RuntimeLimits::default(), script).await;
+    let root = rt.new_session(SessionSpec::default()).await.unwrap();
+    let turn = rt
+        .prompt(&root, vec![ContentBlock::text("root")])
+        .await
+        .unwrap();
+    (rt, root, turn)
+}
+fn allow(params: &loop_protocol::rpc::InteractParams) -> loop_protocol::InteractionOutcome {
+    let loop_protocol::InteractionRequest::Permission { options, .. } = &params.request else {
+        panic!("{params:?}")
+    };
+    let native_id = options
+        .iter()
+        .find(|o| o.native_id == loop_app_core::interaction::native_options::ACCEPT)
+        .unwrap_or(&options[0])
+        .native_id
+        .clone();
+    loop_protocol::InteractionOutcome::Selected {
+        native_id,
+        note: None,
+    }
+}
+/// Nothing more arrives for a moment.
+async fn quiet(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Asked>) {
+    let more = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+    assert!(more.is_err(), "unexpected second delivery");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detaching_from_an_ancestor_withdraws_only_that_surface() {
+    use loop_wire::RuntimeControl;
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, root, turn) = asking_child(dir.path()).await;
+        let (one, mut one_rx) = watcher();
+        let (two, mut two_rx) = watcher();
+        RuntimeControl::recipient(rt.as_ref(), &root, 1, Some(one))
+            .await
+            .unwrap();
+        RuntimeControl::recipient(rt.as_ref(), &root, 2, Some(two))
+            .await
+            .unwrap();
+        let (_, _one_answer, one_withdrawn) = one_rx.recv().await.unwrap();
+        let (params, two_answer, _) = two_rx.recv().await.unwrap();
+        RuntimeControl::recipient(rt.as_ref(), &root, 1, None)
+            .await
+            .unwrap();
+        one_withdrawn
+            .await
+            .expect("the detached Surface is withdrawn");
+        // A Surface that attaches later is withdrawn when another answers.
+        let (three, mut three_rx) = watcher();
+        RuntimeControl::recipient(rt.as_ref(), &root, 3, Some(three))
+            .await
+            .unwrap();
+        let (_, _three_answer, three_withdrawn) = three_rx.recv().await.unwrap();
+        two_answer.send(allow(&params)).unwrap();
+        three_withdrawn
+            .await
+            .expect("the late Surface is withdrawn");
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_connection_on_child_and_ancestor_gets_one_prompt() {
+    use loop_wire::RuntimeControl;
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, root, turn) = asking_child(dir.path()).await;
+        let (surface, mut rx) = watcher();
+        RuntimeControl::recipient(rt.as_ref(), &root, 1, Some(surface.clone()))
+            .await
+            .unwrap();
+        let (params, answer, mut withdrawn) = rx.recv().await.unwrap();
+        let child = params.session.clone().unwrap();
+        RuntimeControl::recipient(rt.as_ref(), &child, 1, Some(surface))
+            .await
+            .unwrap();
+        quiet(&mut rx).await;
+        // Still attached to the child itself: leaving the root withdraws nothing.
+        RuntimeControl::recipient(rt.as_ref(), &root, 1, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            withdrawn.try_recv().is_err(),
+            "kept by its direct attachment"
+        );
+        quiet(&mut rx).await;
+        answer.send(allow(&params)).unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ancestors_surface_disconnecting_leaves_the_request_parked() {
+    use loop_wire::RuntimeControl;
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, root, turn) = asking_child(dir.path()).await;
+        let (gone, mut gone_rx) = watcher();
+        RuntimeControl::recipient(rt.as_ref(), &root, 1, Some(gone))
+            .await
+            .unwrap();
+        let (_, _gone_answer, gone_withdrawn) = gone_rx.recv().await.unwrap();
+        RuntimeControl::disconnected(rt.as_ref(), 1).await;
+        gone_withdrawn
+            .await
+            .expect("the disconnected Surface is withdrawn");
+        assert!(rt.is_busy(&root), "the request stays parked");
+        let (next, mut next_rx) = watcher();
+        RuntimeControl::recipient(rt.as_ref(), &root, 2, Some(next))
+            .await
+            .unwrap();
+        let (params, answer, _) = next_rx.recv().await.unwrap();
+        answer.send(allow(&params)).unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
