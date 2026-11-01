@@ -109,9 +109,16 @@ fn start(
     let host = Arc::new(ClientHost {
         conn: Arc::clone(&conn),
         interact: Arc::clone(&interact),
+        id: NEXT_TICKET.fetch_add(1, Ordering::Relaxed),
     });
     let done = tokio::spawn(run(
-        backend, runtime, conn, incoming, info, options, interact,
+        backend,
+        runtime,
+        conn,
+        incoming,
+        info,
+        options,
+        host.clone(),
     ));
     Served { host, done }
 }
@@ -133,7 +140,7 @@ enum Control {
     /// Sessions not yet known until it says which one it made.
     RegisterBegin,
     /// That Session is now this connection's.
-    Owned { key: SessionKey },
+    Owned { session: loop_protocol::SessionRef },
     /// The `session/new` or `session/load` finished.
     RegisterEnd,
     /// An attach started: buffer live updates of `key` until it is answered.
@@ -145,9 +152,13 @@ enum Control {
         op: u64,
         after_seq: u64,
         result: BackendResult<Attachment>,
+        session: loop_protocol::SessionRef,
     },
     /// Stop forwarding `key`, then answer `id`.
-    Detach { id: PeerRequestId, key: SessionKey },
+    Detach {
+        id: PeerRequestId,
+        session: loop_protocol::SessionRef,
+    },
 }
 
 async fn run(
@@ -157,7 +168,7 @@ async fn run(
     mut incoming: mpsc::UnboundedReceiver<Incoming>,
     info: PeerInfo,
     options: ServeOptions,
-    interact: Arc<AtomicBool>,
+    host: Arc<ClientHost>,
 ) {
     // Subscribe now so nothing between `initialize` and the first update is
     // missed; forwarding starts once the client is initialized.
@@ -168,7 +179,8 @@ async fn run(
         backend.instance().clone(),
         updates,
         control_rx,
-        runtime.is_some(),
+        runtime.clone(),
+        host.clone(),
     ));
     let mut initialized = false;
     while let Some(message) = incoming.recv().await {
@@ -185,7 +197,8 @@ async fn run(
                 if method == methods::INITIALIZE {
                     match parse::<InitializeParams>(params) {
                         Ok(params) => {
-                            interact.store(params.client_capabilities.interact, Ordering::Release);
+                            host.interact
+                                .store(params.client_capabilities.interact, Ordering::Release);
                             let mut capabilities = backend.capabilities();
                             // Advertise only what this connection can serve.
                             capabilities.multi_session = runtime.is_some();
@@ -223,15 +236,15 @@ async fn run(
                 }
                 let backend = Arc::clone(&backend);
                 let runtime = runtime.clone();
-                let conn = Arc::clone(&conn);
                 let control = control.clone();
+                let host = host.clone();
                 // Each request runs on its own, so a long `session/load`
                 // doesn't hold up a `session/cancel`.
                 tokio::spawn(async move {
                     handle(
                         backend.as_ref(),
                         runtime.as_deref(),
-                        &conn,
+                        &host,
                         &control,
                         id,
                         &method,
@@ -242,19 +255,24 @@ async fn run(
             }
         }
     }
-    conn.fail_pending().await;
     forwarder.abort();
+    let _ = forwarder.await;
+    if let Some(runtime) = &runtime {
+        runtime.disconnected(host.id).await;
+    }
+    conn.fail_pending().await;
 }
 
 async fn handle(
     backend: &dyn AgentBackend,
     runtime: Option<&dyn RuntimeControl>,
-    conn: &Connection,
+    host: &Arc<ClientHost>,
     control: &mpsc::UnboundedSender<Control>,
     id: PeerRequestId,
     method: &str,
     params: Value,
 ) {
+    let conn = &host.conn;
     let result = match method {
         methods::SESSION_NEW => match parse(params) {
             Ok(spec) => {
@@ -262,7 +280,7 @@ async fn handle(
                 let made = backend.new_session(spec).await;
                 if let Ok(session) = &made {
                     let _ = control.send(Control::Owned {
-                        key: session.key.clone(),
+                        session: session.clone(),
                     });
                 }
                 let _ = control.send(Control::RegisterEnd);
@@ -276,7 +294,7 @@ async fn handle(
                 let loaded = backend.load_session(&session, spec).await;
                 if let Ok(session) = &loaded {
                     let _ = control.send(Control::Owned {
-                        key: session.key.clone(),
+                        session: session.clone(),
                     });
                 }
                 let _ = control.send(Control::RegisterEnd);
@@ -307,7 +325,8 @@ async fn handle(
                 let result = runtime.unwrap().attach(&session, after_seq).await;
                 let _ = control.send(Control::Attached {
                     id,
-                    key: session.key,
+                    key: session.key.clone(),
+                    session,
                     op,
                     after_seq,
                     result,
@@ -318,10 +337,7 @@ async fn handle(
         },
         methods::SESSION_DETACH if runtime.is_some() => match parse::<SessionParams>(params) {
             Ok(SessionParams { session }) => {
-                let _ = control.send(Control::Detach {
-                    id,
-                    key: session.key,
-                });
+                let _ = control.send(Control::Detach { id, session });
                 return;
             }
             Err(error) => return conn.respond(id, Err(error)),
@@ -388,8 +404,10 @@ async fn forward(
     instance: BackendInstanceId,
     mut updates: broadcast::Receiver<UpdateEnvelope>,
     mut control: mpsc::UnboundedReceiver<Control>,
-    filtering: bool,
+    runtime: Option<Arc<dyn RuntimeControl>>,
+    host: Arc<ClientHost>,
 ) {
+    let filtering = runtime.is_some();
     let mut feeds = Feeds::default();
     let mut started = false;
     // In the order the prompts were sent; a session's next `turn_started`
@@ -413,13 +431,15 @@ async fn forward(
                         feeds.dropped = 0;
                     }
                 }
-                Some(Control::Owned { key }) => {
+                Some(Control::Owned { session }) => {
+                    let key = session.key.clone();
                     if feeds.dropped > 0 {
                         // Updates were discarded while this Session was being
                         // made; never skip silently.
                         lagged(&conn, &instance, feeds.dropped);
                         return;
                     }
+                    register_recipient(runtime.as_deref(), &host, &session, true).await;
                     if feeds.own(key.clone()) {
                         for envelope in feeds.take_pending(&key) {
                             if feeds.deliver(&conn, envelope).is_err() {
@@ -429,13 +449,16 @@ async fn forward(
                     }
                 }
                 Some(Control::Attaching { key, op }) => feeds.start_attach(key, op),
-                Some(Control::Attached { id, key, op, after_seq, result }) => {
+                Some(Control::Attached { id, key, op, after_seq, result, session }) => {
+                    let attached = result.is_ok() && matches!(feeds.map.get(&key), Some(Feed::Attaching { op: current, .. }) if *current == op);
                     if feeds.finish_attach(&conn, id, key, op, after_seq, result).is_err() {
                         return;
                     }
+                    if attached { register_recipient(runtime.as_deref(), &host, &session, true).await; }
                 }
-                Some(Control::Detach { id, key }) => {
-                    feeds.map.remove(&key);
+                Some(Control::Detach { id, session }) => {
+                    register_recipient(runtime.as_deref(), &host, &session, false).await;
+                    feeds.map.remove(&session.key);
                     conn.respond(id, Ok(json!({})));
                 }
                 Some(Control::Prompted { ticket, session, id, outcome }) => {
@@ -744,9 +767,53 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 
 /// Asks the connected client through `host/interact`.
 struct ClientHost {
+    id: u64,
     conn: Arc<Connection>,
     /// Whether the client declared `interact` at `initialize`.
     interact: Arc<AtomicBool>,
+}
+
+async fn register_recipient(
+    runtime: Option<&dyn RuntimeControl>,
+    host: &Arc<ClientHost>,
+    session: &loop_protocol::SessionRef,
+    attached: bool,
+) {
+    if let Some(runtime) = runtime {
+        let recipient = if attached && host.interact.load(Ordering::Acquire) {
+            Some(host.clone() as Arc<dyn crate::control::EscalationRecipient>)
+        } else {
+            None
+        };
+        if let Err(error) = runtime.recipient(session, host.id, recipient).await {
+            tracing::debug!(%error, "could not register Escalation recipient");
+        }
+    }
+}
+
+#[async_trait]
+impl crate::control::EscalationRecipient for ClientHost {
+    fn withdraw(&self, params: loop_protocol::rpc::InteractWithdrawnParams) {
+        let _ = self
+            .conn
+            .notify(methods::HOST_INTERACT_WITHDRAWN, to_value(&params));
+    }
+
+    async fn interact(
+        &self,
+        params: loop_protocol::rpc::InteractParams,
+        withdrawn: oneshot::Receiver<()>,
+    ) -> Result<InteractionOutcome, ()> {
+        if !self.interact.load(Ordering::Acquire) {
+            return Err(());
+        }
+        let value = self
+            .conn
+            .interaction(params, withdrawn)
+            .await
+            .map_err(|_| ())?;
+        serde_json::from_value(value).map_err(|_| ())
+    }
 }
 
 #[async_trait]

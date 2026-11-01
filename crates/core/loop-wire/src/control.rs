@@ -19,6 +19,17 @@ pub struct Attachment {
 /// Session management for a Runtime shared by many connections.
 #[async_trait]
 pub trait RuntimeControl: Send + Sync {
+    /// Register an interactive connection after replay setup, or remove it on detach.
+    async fn recipient(
+        &self,
+        _session: &SessionRef,
+        _connection: u64,
+        _recipient: Option<std::sync::Arc<dyn EscalationRecipient>>,
+    ) -> BackendResult<()> {
+        Ok(())
+    }
+    /// Remove a disconnected connection from every Session.
+    async fn disconnected(&self, _connection: u64) {}
     /// Every known Session, live or not. Does not subscribe to any of them.
     async fn list(&self) -> BackendResult<Vec<SessionInfo>>;
     /// Close a Session. A busy Session needs `force`.
@@ -29,4 +40,20 @@ pub trait RuntimeControl: Send + Sync {
     /// update committed after the snapshot is delivered live; the overlap is
     /// removed by sequence number.
     async fn attach(&self, session: &SessionRef, after_seq: u64) -> BackendResult<Attachment>;
+}
+
+/// An interactive connection that can receive a Session's Escalations.
+#[async_trait]
+pub trait EscalationRecipient: Send + Sync {
+    /// Queue withdrawal synchronously in the connection's ordered output.
+    /// The Runtime calls this before removing the recipient or redispatching.
+    fn withdraw(&self, params: loop_protocol::rpc::InteractWithdrawnParams);
+    /// Ask the Surface, or return an error when it disconnects. The signal
+    /// clears pending JSON-RPC bookkeeping; notification is queued by `withdraw`.
+    /// Receiving `Ok(())` withdraws; a dropped sender means this recipient won.
+    async fn interact(
+        &self,
+        params: loop_protocol::rpc::InteractParams,
+        withdrawn: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<loop_protocol::InteractionOutcome, ()>;
 }

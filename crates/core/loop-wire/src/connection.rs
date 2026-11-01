@@ -173,6 +173,43 @@ impl Connection {
         rx.await.unwrap_or(Err(RpcError::Closed))
     }
 
+    /// Send an Escalation and retain withdrawal bookkeeping even after a reply,
+    /// until the Runtime decides which recipient won.
+    pub async fn interaction(
+        self: &Arc<Self>,
+        params: loop_protocol::rpc::InteractParams,
+        mut withdrawn: oneshot::Receiver<()>,
+    ) -> Result<Value, RpcError> {
+        if params.session.is_none() {
+            return Err(RpcError::Invalid(
+                "Runtime interaction requires a Session".into(),
+            ));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        let mut pending = self.pending.lock().await;
+        if withdrawn.try_recv() != Err(oneshot::error::TryRecvError::Empty) {
+            return Err(RpcError::Closed);
+        }
+        pending.insert(id, tx);
+        if self
+            .outgoing
+            .send(json!({"jsonrpc":"2.0", "id":id,
+            "method":loop_protocol::rpc::methods::HOST_INTERACT, "params":params}))
+            .is_err()
+        {
+            pending.remove(&id);
+            return Err(RpcError::Closed);
+        }
+        drop(pending);
+        let conn = self.clone();
+        tokio::spawn(async move {
+            let _ = withdrawn.await;
+            conn.pending.lock().await.remove(&id);
+        });
+        rx.await.unwrap_or(Err(RpcError::Closed))
+    }
+
     /// Deliver a response from the incoming channel to its waiting request.
     pub async fn resolve(&self, id: i64, result: Result<Value, RpcError>) {
         match self.pending.lock().await.remove(&id) {
