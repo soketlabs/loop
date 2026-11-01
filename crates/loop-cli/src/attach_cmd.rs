@@ -358,7 +358,9 @@ mod unix {
                 }
                 1 => {
                     let found = found.remove(0);
-                    if found.live {
+                    // A Subagent runs only for its parent and is never reloaded;
+                    // its Event Log stays readable.
+                    if found.live || found.parent.is_some() {
                         found.r#ref
                     } else {
                         // Not loaded (e.g. after a Runtime restart). Loading takes

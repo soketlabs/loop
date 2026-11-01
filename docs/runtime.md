@@ -54,7 +54,8 @@ loop attach --new --cwd DIR  # create a Session in DIR and attach
 When you attach, the Surface replays the Session's history and then follows it
 live. A Session that is not loaded, for example after the Runtime restarted, is
 loaded when you attach. Child Sessions started by a Subagent show their parent
-in the list.
+in the list. A finished child is never loaded again: attaching replays its
+output, but you cannot prompt it.
 
 `--socket PATH` connects to a Runtime that was started with a custom socket.
 
