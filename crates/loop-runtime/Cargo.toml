@@ -1,0 +1,19 @@
+[package]
+name = "loop-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Runtime ownership and durable Session Event Log"
+
+[dependencies]
+async-trait.workspace = true
+loop-protocol.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

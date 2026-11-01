@@ -4743,6 +4743,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "loop-runtime"
+version = "0.6.0"
+dependencies = [
+ "async-trait",
+ "loop-protocol",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "loop-telemetry"
 version = "0.6.0"
 dependencies = [
