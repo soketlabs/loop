@@ -919,6 +919,7 @@ async fn a_surface_watching_the_parent_answers_its_childs_escalation() {
         let mut parent = fx.attach(&["--new", "--cwd", work]);
         parent.line("SPAWN-APPROVAL").await;
         parent.wait_text("Escalation from Subagent ").await;
+        // The task arrives once the child's name is looked up.
         parent.wait_text("(NEEDS-APPROVAL)").await;
         parent.wait_text("1. ").await;
         parent.line("1").await;

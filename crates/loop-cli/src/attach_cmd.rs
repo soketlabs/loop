@@ -393,18 +393,18 @@ mod unix {
     }
 
     /// "Subagent 1a2b3c4d (its task)" for a child Session's request.
-    async fn subagent_label(backend: &RemoteBackend, child: &SessionRef) -> String {
-        let short: String = child.key.as_str().chars().take(8).collect();
-        let name = tokio::time::timeout(std::time::Duration::from_secs(2), backend.list())
+    fn short_label(child: &SessionKey) -> String {
+        let short: String = child.as_str().chars().take(8).collect();
+        format!("Subagent {short}")
+    }
+    /// The child's name (its task), looked up off the input loop.
+    async fn subagent_name(backend: Arc<RemoteBackend>, child: SessionKey) -> Option<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), backend.list())
             .await
             .ok()
             .and_then(Result::ok)
-            .and_then(|list| list.into_iter().find(|s| s.r#ref.key == child.key))
-            .and_then(|s| s.name);
-        match name {
-            Some(name) => format!("Subagent {short} ({name})"),
-            None => format!("Subagent {short}"),
-        }
+            .and_then(|list| list.into_iter().find(|s| s.r#ref.key == child))
+            .and_then(|s| s.name)
     }
 
     /// One line on connect: which Session, where, and how to leave.
@@ -565,6 +565,7 @@ mod unix {
         // Origins of requests not yet received, in arrival order.
         let mut origins: Vec<(loop_protocol::InteractionId, SessionRef)> = Vec::new();
         let mut labels: std::collections::HashMap<SessionKey, String> = Default::default();
+        let mut naming = tokio::task::JoinSet::new();
         let mut interrupted = false;
         let mut renderer = crate::print_mode::TextRenderer::default();
         let mut prompts = tokio::task::JoinSet::new();
@@ -593,7 +594,9 @@ mod unix {
                             None
                         } else {
                             if !labels.contains_key(&from.key) {
-                                labels.insert(from.key.clone(), subagent_label(backend, &from).await);
+                                labels.insert(from.key.clone(), short_label(&from.key));
+                                let (backend, child) = (backend.clone(), from.key.clone());
+                                naming.spawn(async move { let name = subagent_name(backend, child.clone()).await; (child, name) });
                             }
                             labels.get(&from.key).cloned()
                         };
@@ -629,6 +632,18 @@ mod unix {
                             terminal.write("Turn ended uncertain — Runtime restarted. Its tools may or may not have run; nothing was retried.\n")?;
                         }
                         if let Some(error) = error { terminal.write(&format!("loop: {}\n", error.message))?; }
+                    }
+                },
+                Some(named) = naming.join_next(), if !naming.is_empty() => {
+                    if let Ok((child, Some(name))) = named {
+                        let label = format!("{} ({name})", short_label(&child));
+                        if pending.first().is_some_and(|p| p.session == child) {
+                            terminal.write(&format!("  {label}\n"))?;
+                        }
+                        for item in pending.iter_mut().filter(|p| p.session == child) {
+                            item.from = Some(label.clone());
+                        }
+                        labels.insert(child, label);
                     }
                 },
                 Some(result) = prompts.join_next(), if !prompts.is_empty() => {
