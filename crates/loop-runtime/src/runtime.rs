@@ -641,6 +641,63 @@ impl Runtime {
     }
 }
 #[async_trait]
+impl loop_wire::RuntimeControl for Runtime {
+    async fn list(&self) -> BackendResult<Vec<SessionInfo>> {
+        Runtime::list(self).await
+    }
+    async fn close(&self, session: &SessionRef, force: bool) -> BackendResult<()> {
+        if session.instance != self.instance || session.key.0 != session.native_id {
+            return Err(BackendError::SessionNotFound(session.key.clone()));
+        }
+        Runtime::close(self, &session.key, force).await
+    }
+    async fn attach(
+        &self,
+        session: &SessionRef,
+        after_seq: u64,
+    ) -> BackendResult<loop_wire::Attachment> {
+        if session.instance != self.instance || session.key.0 != session.native_id {
+            return Err(BackendError::SessionNotFound(session.key.clone()));
+        }
+        let live = self.sessions.lock().unwrap().contains_key(&session.key);
+        if !live {
+            let known = self
+                .factory
+                .globals
+                .repository
+                .list(None)
+                .await
+                .map_err(failed)?;
+            if !known.iter().any(|m| m.id == session.native_id) {
+                return Err(BackendError::SessionNotFound(session.key.clone()));
+            }
+        }
+        // The caller already listens for live updates, so anything committed
+        // after this read is delivered live; the caller removes the overlap.
+        let records = self
+            .log
+            .read_after(&session.key, after_seq)
+            .await
+            .map_err(failed)?;
+        let mut replay = Vec::with_capacity(records.len());
+        for record in records {
+            if let EventKind::Update(envelope) = record.event.kind {
+                replay.push(envelope);
+            }
+        }
+        let latest_seq = match replay.last() {
+            Some(last) => last.seq,
+            None => self.log.latest_seq(&session.key).await.map_err(failed)?,
+        };
+        Ok(loop_wire::Attachment {
+            latest_seq,
+            generation: self.generation,
+            replay: Box::new(replay.into_iter()),
+        })
+    }
+}
+
+#[async_trait]
 impl AgentBackend for Runtime {
     fn instance(&self) -> &BackendInstanceId {
         &self.instance
@@ -648,6 +705,7 @@ impl AgentBackend for Runtime {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             multi_session: true,
+            attach: true,
             load_session: true,
             images: true,
             ..Capabilities::default()
