@@ -488,42 +488,87 @@ async fn parents_at_the_active_turn_cap_do_not_deadlock() {
     .unwrap();
 }
 
+/// Wait until `session` has logged an event whose JSON contains `needle`.
+async fn logged(
+    log: &MemoryEventLog,
+    session: impl Fn(&[SessionInfo]) -> Option<SessionKey>,
+    rt: &Runtime,
+    needle: &str,
+) -> SessionKey {
+    loop {
+        if let Some(key) = session(&rt.list().await.unwrap()) {
+            let events = log.read_runtime_after(0).await.unwrap();
+            if events.iter().any(|e| {
+                e.event.session_key.as_ref() == Some(&key)
+                    && serde_json::to_string(&e.event.kind)
+                        .unwrap()
+                        .contains(needle)
+            }) {
+                return key;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn payload<'a>(events: &'a [LoggedEvent], key: &SessionKey, kind: &str) -> Option<&'a Value> {
+    events.iter().rev().find_map(|e| {
+        if e.event.session_key.as_ref() != Some(key) {
+            return None;
+        }
+        match (&e.event.kind, kind) {
+            (EventKind::SessionClosed(p), "session_closed") => Some(p),
+            _ => None,
+        }
+    })
+}
+
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_the_parent_cancels_its_descendants() {
     tokio::time::timeout(LIMIT, async {
         let dir = tempfile::tempdir().unwrap();
-        let stuck = Arc::new(tokio::sync::Notify::new());
-        let signal = stuck.clone();
-        let script: Script = Arc::new(move |turn: Turn| {
-            let signal = signal.clone();
-            match (turn.task.as_str(), turn.call) {
-                ("root", 1) => ready(calls(vec![spawn("middle")])),
-                ("middle", 1) => ready(calls(vec![spawn("stuck")])),
-                ("stuck", _) => Box::pin(async move {
-                    signal.notify_one();
-                    std::future::pending().await
-                }),
-                _ => ready(text("done")),
-            }
+        let script: Script = Arc::new(|turn: Turn| match (turn.task.as_str(), turn.call) {
+            ("root", 1) => ready(calls(vec![spawn("middle")])),
+            ("middle", 1) => ready(calls(vec![spawn("leaf")])),
+            ("leaf", 1) => ready(calls(vec![("bash", json!({"command": "sleep 30"}))])),
+            _ => ready(text("done")),
         });
-        let (rt, log, _seen) =
-            runtime(dir.path(), "full-access", RuntimeLimits::default(), script).await;
+        let (globals, _seen) = globals(dir.path(), script);
+        let log = Arc::new(MemoryEventLog::new());
+        // The default close grace: a cascade that relied on aborting stuck
+        // turns would take seconds per level and record `aborted`.
+        let rt = Runtime::new(
+            globals,
+            opts(dir.path(), "full-access"),
+            log.clone(),
+            RuntimeLimits::default(),
+        )
+        .await
+        .unwrap()
+        .into_shared();
         let root = rt.new_session(SessionSpec::default()).await.unwrap();
         let turn = rt
             .prompt(&root, vec![ContentBlock::text("root")])
             .await
             .unwrap();
-        stuck.notified().await;
+        let r = root.clone();
+        let leaf = logged(
+            &log,
+            move |list| {
+                let middle = children(list, &r).pop()?;
+                Some(children(list, &middle.r#ref).pop()?.r#ref.key)
+            },
+            &rt,
+            "sleep 30",
+        )
+        .await;
         let list = rt.list().await.unwrap();
-        let middle = children(&list, &root);
-        assert_eq!(middle.len(), 1);
-        let leaf = children(&list, &middle[0].r#ref);
-        assert_eq!(leaf.len(), 1);
-        assert!(leaf[0].live && leaf[0].busy);
+        let middle = children(&list, &root).pop().unwrap().r#ref.key;
 
+        let started = std::time::Instant::now();
         rt.cancel(&root);
         assert!(matches!(turn.outcome().await, TurnOutcome::Cancelled));
-        // Every descendant closes, and the root learns its child ended.
         loop {
             let ended = kinds(&log.read_runtime_after(0).await.unwrap(), &root.key)
                 .contains(&"subagent_ended".to_owned());
@@ -532,11 +577,69 @@ async fn cancelling_the_parent_cancels_its_descendants() {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
         let events = log.read_runtime_after(0).await.unwrap();
-        for session in [&middle[0].r#ref, &leaf[0].r#ref] {
-            let kinds = kinds(&events, &session.key);
+        for key in [&middle, &leaf] {
+            let kinds = kinds(&events, key);
             assert!(kinds.contains(&"cancelled".to_owned()), "{kinds:?}");
-            assert!(kinds.contains(&"session_closed".to_owned()), "{kinds:?}");
+            let closed = payload(&events, key, "session_closed").unwrap();
+            assert_eq!(closed["aborted"], json!(false), "{closed}");
+        }
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ask_mode_spawns_without_asking_and_cancel_withdraws_child_escalations() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let script: Script = Arc::new(|turn: Turn| match (turn.task.as_str(), turn.call) {
+            ("root", 1) => ready(calls(vec![spawn("helper")])),
+            ("asking root", 1) => ready(calls(vec![spawn("asker")])),
+            ("asker", 1) => ready(calls(vec![("bash", json!({"command": "echo hi"}))])),
+            ("helper", _) => ready(text("helped")),
+            _ => ready(text("done")),
+        });
+        // `loop serve` defaults to ask mode; no Surface is attached here.
+        let (rt, log, seen) = runtime(dir.path(), "ask", RuntimeLimits::default(), script).await;
+        let root = rt.new_session(SessionSpec::default()).await.unwrap();
+        assert!(matches!(
+            run(&rt, &root, "root").await,
+            TurnOutcome::Completed(_)
+        ));
+        assert_eq!(seen.results("root"), vec!["helped".to_owned()]);
+
+        let other = rt.new_session(SessionSpec::default()).await.unwrap();
+        let turn = rt
+            .prompt(&other, vec![ContentBlock::text("asking root")])
+            .await
+            .unwrap();
+        let o = other.clone();
+        let asker = logged(
+            &log,
+            move |list| Some(children(list, &o).pop()?.r#ref.key),
+            &rt,
+            "escalation_raised",
+        )
+        .await;
+        rt.cancel(&other);
+        assert!(matches!(turn.outcome().await, TurnOutcome::Cancelled));
+        loop {
+            let kinds = kinds(&log.read_runtime_after(0).await.unwrap(), &asker);
+            if kinds.contains(&"session_closed".to_owned()) {
+                assert!(
+                    kinds.contains(&"escalation_withdrawn".to_owned()),
+                    "{kinds:?}"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         rt.shutdown().await;
     })
