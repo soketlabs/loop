@@ -31,9 +31,9 @@ impl SessionRepository {
         Ok(Session::new(Arc::clone(&self.store), reader))
     }
 
-    /// Open a session.
+    /// Open a Session for writing, acquiring ownership when required by the store.
     pub async fn open(&self, id: &str) -> Result<Session, SessionError> {
-        let reader = self.store.load(id).await?;
+        let reader = self.store.open_writer(id).await?;
         Ok(Session::new(Arc::clone(&self.store), reader))
     }
 

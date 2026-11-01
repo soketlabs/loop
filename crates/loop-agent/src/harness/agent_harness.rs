@@ -260,7 +260,10 @@ impl AgentHarness {
         self.wait_for_idle().await;
 
         let store = self.session.lock().await.store();
-        let reader = store.load(id).await.map_err(AgentHarnessError::Session)?;
+        let reader = store
+            .open_writer(id)
+            .await
+            .map_err(AgentHarnessError::Session)?;
         let new_session = Session::new(store, reader);
         let sid = new_session.metadata().id.clone();
 
@@ -1237,6 +1240,16 @@ impl AgentHarness {
     ) -> Result<AgentMessage, AgentHarnessError> {
         // Fail before touching phase or session, so nothing is recorded for the prompt.
         self.require_model().await?;
+        let lease_cancellation = self.session.lock().await.store().write_cancellation();
+        if lease_cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(crate::harness::types::SessionError::Invalid(
+                "Session lease ownership was lost; stop writing and cancel work.".into(),
+            )
+            .into());
+        }
         {
             let mut phase = self.phase.lock();
             if *phase != AgentHarnessPhase::Idle {
@@ -1245,7 +1258,9 @@ impl AgentHarness {
             *phase = AgentHarnessPhase::Turn;
         }
 
-        let token = CancellationToken::new();
+        let token = lease_cancellation
+            .map(|token| token.child_token())
+            .unwrap_or_default();
         *self.cancel.lock() = Some(token.clone());
         tracing::info!("run_turn: started");
 

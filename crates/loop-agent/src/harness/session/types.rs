@@ -306,13 +306,24 @@ pub trait SessionReader: Send + Sync {
 /// Session store.
 #[async_trait]
 pub trait SessionStore: Send + Sync {
+    /// Cancellation source for work owned by this writer. Lease renewal failure
+    /// cancels this token permanently; harnesses use a child token for each turn.
+    fn write_cancellation(&self) -> Option<tokio_util::sync::CancellationToken> {
+        None
+    }
+
     /// Create a session.
     async fn create(
         &self,
         cwd: Option<String>,
         name: Option<String>,
     ) -> Result<Arc<dyn SessionReader>, SessionError>;
-    /// Load by id.
+    /// Admit a writer for an existing Session. Lease-aware stores acquire ownership
+    /// here; reader loading, summaries and search use `load` instead.
+    async fn open_writer(&self, id: &str) -> Result<Arc<dyn SessionReader>, SessionError> {
+        self.load(id).await
+    }
+    /// Load a reader by id without acquiring writer ownership.
     async fn load(&self, id: &str) -> Result<Arc<dyn SessionReader>, SessionError>;
     /// List sessions.
     async fn list(&self, cwd: Option<&str>) -> Result<Vec<SessionMetadata>, SessionError>;

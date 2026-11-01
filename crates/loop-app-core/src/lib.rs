@@ -21,6 +21,6 @@ pub mod web_tools;
 pub use config::*;
 pub use runtime::{
     bootstrap, build_models, build_tools, mcp_server_entries, BootstrapOpts, ConnectedProvider,
-    Runtime,
+    GlobalResources, OpenedSession, Runtime, SessionFactory, WorkspaceResources,
 };
 pub use tool_approval::ToolApprovalBridge;

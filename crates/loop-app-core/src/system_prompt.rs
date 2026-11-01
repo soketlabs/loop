@@ -151,15 +151,31 @@ pub fn resolve_system_prompt_files(
     cli_system: Option<&str>,
     cli_append: Option<&str>,
 ) -> (Option<String>, Option<String>) {
-    let agent_dir = get_agent_dir();
+    resolve_system_prompt_files_in(
+        &get_agent_dir(),
+        cwd,
+        project_trusted,
+        cli_system,
+        cli_append,
+    )
+}
+
+/// Resolve prompt files against an explicit global directory, without process configuration.
+pub fn resolve_system_prompt_files_in(
+    agent_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+    cli_system: Option<&str>,
+    cli_append: Option<&str>,
+) -> (Option<String>, Option<String>) {
     let mut custom = cli_system.map(|s| s.to_string());
     let mut append = cli_append.map(|s| s.to_string());
 
-    let agent_sys = system_md_path(&agent_dir);
+    let agent_sys = system_md_path(agent_dir);
     if custom.is_none() && agent_sys.exists() {
         custom = std::fs::read_to_string(agent_sys).ok();
     }
-    let agent_append = append_system_md_path(&agent_dir);
+    let agent_append = append_system_md_path(agent_dir);
     if let Ok(extra) = std::fs::read_to_string(agent_append) {
         append = Some(match append {
             Some(a) => format!("{a}\n\n{extra}"),
@@ -189,13 +205,11 @@ pub fn resolve_system_prompt_files(
 
 /// Load AGENTS.md / CLAUDE.md from the agent dir, `~/.claude`, and ancestors of cwd.
 pub fn load_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
-    let mut files = Vec::new();
-    let mut seen_files = std::collections::HashSet::new();
-    read_context_in_dir(agent_dir, &mut seen_files, &mut files);
-    if let Some(home) = dirs::home_dir() {
-        let path = home.join(".claude").join("CLAUDE.md");
-        push_context_file(path, &mut seen_files, &mut files);
-    }
+    let mut files = load_global_context_files(agent_dir);
+    let mut seen_files = files
+        .iter()
+        .filter_map(|f| f.path.canonicalize().ok())
+        .collect();
 
     let mut dir = cwd.to_path_buf();
     let mut seen_dirs = std::collections::HashSet::new();
@@ -208,6 +222,19 @@ pub fn load_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
             break;
         }
     }
+    files
+}
+
+/// Load only global context, for a workspace without recorded trust.
+pub fn load_global_context_files(agent_dir: &Path) -> Vec<ContextFile> {
+    let mut files = Vec::new();
+    let mut seen_files = std::collections::HashSet::new();
+    read_context_in_dir(agent_dir, &mut seen_files, &mut files);
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".claude").join("CLAUDE.md");
+        push_context_file(path, &mut seen_files, &mut files);
+    }
+
     files
 }
 
