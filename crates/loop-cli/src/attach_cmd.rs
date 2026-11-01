@@ -44,7 +44,7 @@ mod unix {
     use loop_protocol::{
         rpc::{methods, InteractWithdrawnParams, PeerInfo, SessionInfo},
         AgentBackend, ContentBlock, HostServices, InteractionOutcome, InteractionRequest,
-        SessionRef, SessionSpec,
+        SessionKey, SessionRef, SessionSpec,
     };
     use loop_wire::{transport::Transport, RemoteBackend};
     use std::{
@@ -117,6 +117,8 @@ mod unix {
     struct LostContact;
 
     pub enum HostEvent {
+        /// Which Session a `host/interact` request that follows came from.
+        Origin(loop_protocol::InteractionId, SessionRef),
         Request(Box<InteractionRequest>, oneshot::Sender<InteractionOutcome>),
         Withdrawn(InteractWithdrawnParams),
         Disconnected,
@@ -185,6 +187,17 @@ mod unix {
                             if value["method"] == methods::HOST_INTERACT_WITHDRAWN {
                                 if let Ok(params) = serde_json::from_value(value["params"].clone()) {
                                     let _ = notices.send(HostEvent::Withdrawn(params));
+                                }
+                            }
+                            // The wire client drops the request's Session; a
+                            // Subagent's requests reach its ancestors' Surfaces.
+                            if value["method"] == methods::HOST_INTERACT {
+                                let params = &value["params"];
+                                if let (Ok(id), Ok(session)) = (
+                                    serde_json::from_value(params["id"].clone()),
+                                    serde_json::from_value(params["session"].clone()),
+                                ) {
+                                    let _ = notices.send(HostEvent::Origin(id, session));
                                 }
                             }
                         }
@@ -309,9 +322,20 @@ mod unix {
         request: InteractionRequest,
         reply: oneshot::Sender<InteractionOutcome>,
         first_choice: usize,
+        session: SessionKey,
+        /// Set when the request comes from a Subagent of the attached Session.
+        from: Option<String>,
     }
-    fn show(request: &InteractionRequest, first_choice: usize) -> String {
-        let mut text = String::from("\nEscalation: ");
+    impl Pending {
+        fn show(&self) -> String {
+            show(&self.request, self.first_choice, self.from.as_deref())
+        }
+    }
+    fn show(request: &InteractionRequest, first_choice: usize, from: Option<&str>) -> String {
+        let mut text = match from {
+            Some(from) => format!("\nEscalation from {from}: "),
+            None => String::from("\nEscalation: "),
+        };
         match request {
             InteractionRequest::Permission {
                 tool_call, options, ..
@@ -366,6 +390,21 @@ mod unix {
             native_id: id,
             note: None,
         })
+    }
+
+    /// "Subagent 1a2b3c4d (its task)" for a child Session's request.
+    async fn subagent_label(backend: &RemoteBackend, child: &SessionRef) -> String {
+        let short: String = child.key.as_str().chars().take(8).collect();
+        let name = tokio::time::timeout(std::time::Duration::from_secs(2), backend.list())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|list| list.into_iter().find(|s| s.r#ref.key == child.key))
+            .and_then(|s| s.name);
+        match name {
+            Some(name) => format!("Subagent {short} ({name})"),
+            None => format!("Subagent {short}"),
+        }
     }
 
     /// One line on connect: which Session, where, and how to leave.
@@ -514,15 +553,24 @@ mod unix {
         // withdrawal wins the race with terminal input.
         let mut next_choice = 1;
         let mut withdrawn = HashSet::new();
+        // Origins of requests not yet received, in arrival order.
+        let mut origins: Vec<(loop_protocol::InteractionId, SessionRef)> = Vec::new();
+        let mut labels: std::collections::HashMap<SessionKey, String> = Default::default();
         let mut interrupted = false;
         let mut renderer = crate::print_mode::TextRenderer::default();
         let mut prompts = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 Some(event) = events.recv() => match event {
+                    HostEvent::Origin(id, from) => origins.push((id, from)),
                     HostEvent::Request(request, reply) => {
                         let request = *request;
-                        if withdrawn.remove(request.id()) { let _ = reply.send(InteractionOutcome::Cancelled); continue; }
+                        let from = origins
+                            .iter()
+                            .position(|(id, _)| id == request.id())
+                            .map(|i| origins.remove(i).1)
+                            .unwrap_or_else(|| session.clone());
+                        if withdrawn.remove(&(from.key.clone(), request.id().clone())) { let _ = reply.send(InteractionOutcome::Cancelled); continue; }
                         if !matches!(request, InteractionRequest::Permission {..} | InteractionRequest::Question {..}) {
                             let _ = reply.send(InteractionOutcome::Rejected { reason: "loop attach supports choices and text questions".into() }); continue;
                         }
@@ -532,19 +580,33 @@ mod unix {
                             InteractionRequest::Question { choices, .. } => choices.as_ref().map_or(1, |c| c.len().max(1)),
                             _ => 1,
                         };
-                        if pending.is_empty() { terminal.write(&show(&request, first_choice))?; }
-                        pending.push(Pending { request, reply, first_choice });
+                        let label = if from.key == session.key {
+                            None
+                        } else {
+                            if !labels.contains_key(&from.key) {
+                                labels.insert(from.key.clone(), subagent_label(backend, &from).await);
+                            }
+                            labels.get(&from.key).cloned()
+                        };
+                        let item = Pending { request, reply, first_choice, session: from.key, from: label };
+                        if pending.is_empty() { terminal.write(&item.show())?; }
+                        pending.push(item);
                     }
-                    HostEvent::Withdrawn(params) if params.session == *session => {
-                        withdrawn.insert(params.id.clone());
-                        if let Some(index) = pending.iter().position(|p| p.request.id() == &params.id) {
+                    HostEvent::Withdrawn(params) => {
+                        let key = (params.session.key.clone(), params.id.clone());
+                        let held = pending.iter().position(|p| p.session == key.0 && p.request.id() == &key.1);
+                        if let Some(index) = held {
                             let item = pending.remove(index);
                             let _ = item.reply.send(InteractionOutcome::Cancelled);
+                        } else if key.0 == session.key || origins.iter().any(|(id, s)| s.key == key.0 && *id == key.1) {
+                            // It may arrive before its request does.
+                            withdrawn.insert(key.clone());
                         }
-                        terminal.write("\r\x1b[2KAnother client answered; Escalation withdrawn.\n")?;
-                        if let Some(next) = pending.first() { terminal.write(&show(&next.request, next.first_choice))?; }
+                        if held.is_some() || key.0 == session.key {
+                            terminal.write("\r\x1b[2KAnother client answered; Escalation withdrawn.\n")?;
+                            if let Some(next) = pending.first() { terminal.write(&next.show())?; }
+                        }
                     }
-                    HostEvent::Withdrawn(_) => {},
                     HostEvent::Disconnected => return Err(LostContact.into()),
                 },
                 update = updates.recv() => {
@@ -591,7 +653,7 @@ mod unix {
                             if let Some(outcome) = answer(&item.request, &line, item.first_choice) {
                                 let item = pending.remove(0);
                                 let _ = item.reply.send(outcome);
-                                if let Some(next) = pending.first() { terminal.write(&show(&next.request, next.first_choice))?; }
+                                if let Some(next) = pending.first() { terminal.write(&next.show())?; }
                             } else { terminal.write("Enter one of the numbered choices.\n")?; }
                         } else if !explicit_prompt && next_choice > 1 && line.trim().parse::<usize>().is_ok() {
                             terminal.write("Choice no longer active; ignored. Start a numeric prompt with `> `.\n")?;

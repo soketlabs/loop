@@ -86,6 +86,22 @@ pub struct Runtime {
 /// Newest event timestamp per Session, kept in memory so listing never scans the log.
 type Activity = Arc<Mutex<HashMap<SessionKey, i64>>>;
 type Recipients = HashMap<u64, Arc<dyn EscalationRecipient>>;
+/// Surfaces that should see Escalations of the first Session in `lineage`:
+/// those attached to it or to any Session above it.
+fn wanted(
+    recipients: &HashMap<SessionKey, Recipients>,
+    lineage: &[SessionKey],
+) -> HashMap<u64, Arc<dyn EscalationRecipient>> {
+    let mut wanted = HashMap::new();
+    for key in lineage {
+        for (&connection, recipient) in recipients.get(key).into_iter().flatten() {
+            wanted
+                .entry(connection)
+                .or_insert_with(|| recipient.clone());
+        }
+    }
+    wanted
+}
 fn touch(activity: &Activity, key: &SessionKey, ts_ms: i64) {
     let mut map = activity.lock().unwrap();
     let slot = map.entry(key.clone()).or_insert(ts_ms);
@@ -164,6 +180,8 @@ struct LiveSession {
     tail: Mutex<VecDeque<UpdateEnvelope>>,
     /// Subagent nesting: 0 for a Session a Surface opened.
     depth: u32,
+    /// The Session that opened this one as a Subagent.
+    parent: Option<SessionKey>,
     /// The directory the gate treats as this Session's workspace.
     workspace: PathBuf,
     /// Present on a Subagent: its answer and model-call count.
@@ -580,6 +598,7 @@ impl Runtime {
                 activity: Arc::clone(&self.activity),
                 tail: Mutex::new(VecDeque::new()),
                 depth,
+                parent: parent.clone(),
                 workspace,
                 child: child_state,
                 waiting: AsyncMutex::new(0),
@@ -591,12 +610,13 @@ impl Runtime {
                 }
             }
             // Attachments outlive unloading. Serialize restoration with new
-            // registration and disconnect, so none can miss this host.
+            // registration and disconnect, so none can miss this host. A
+            // Subagent's Escalations also go to Surfaces watching an ancestor.
             let recipients = self.recipients.lock().await;
-            if let Some(attached) = recipients.get(&reference.key) {
-                for (&connection, recipient) in attached {
-                    live.escalations.attach(connection, recipient.clone()).await;
-                }
+            let mut lineage = vec![reference.key.clone()];
+            lineage.extend(parent.iter().flat_map(|p| self.lineage(p)));
+            for (connection, recipient) in wanted(&recipients, &lineage) {
+                live.escalations.attach(connection, recipient).await;
             }
             let task = tokio::spawn(pump(
                 Arc::clone(&live),
@@ -635,6 +655,17 @@ impl Runtime {
             self.discard_new_row(created, &id).await;
         }
         result
+    }
+    /// This live Session and the live Sessions above it, nearest first.
+    fn lineage(&self, key: &SessionKey) -> Vec<SessionKey> {
+        let sessions = self.sessions.lock().unwrap();
+        let mut lineage = vec![key.clone()];
+        let mut next = sessions.get(key).and_then(|live| live.parent.clone());
+        while let Some(key) = next.filter(|key| !lineage.contains(key)) {
+            next = sessions.get(&key).and_then(|live| live.parent.clone());
+            lineage.push(key);
+        }
+        lineage
     }
     /// The parent of a Session the Runtime opened as a Subagent. Forks also
     /// record a parent, so only the Event Log's record of the child's opening
@@ -955,10 +986,21 @@ impl loop_wire::RuntimeControl for Runtime {
                 }
             }
         }
-        if let Ok(live) = self.route(session) {
-            match recipient {
-                Some(recipient) => live.escalations.attach(connection, recipient).await,
-                None => live.escalations.detach(connection).await,
+        // The Session itself and every live Subagent below it.
+        let affected: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
+        for live in affected {
+            let lineage = self.lineage(&live.reference.key);
+            if !lineage.contains(&session.key) {
+                continue;
+            }
+            let wanted = wanted(&recipients, &lineage);
+            for old in live.escalations.connections().await {
+                if !wanted.contains_key(&old) {
+                    live.escalations.detach(old).await;
+                }
+            }
+            for (connection, recipient) in wanted {
+                live.escalations.attach(connection, recipient).await;
             }
         }
         Ok(())

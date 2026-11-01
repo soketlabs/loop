@@ -996,3 +996,104 @@ async fn only_subagent_children_list_a_parent_and_their_end_says_they_closed() {
     .await
     .unwrap();
 }
+
+type Asked = (
+    loop_protocol::rpc::InteractParams,
+    oneshot::Sender<loop_protocol::InteractionOutcome>,
+    oneshot::Receiver<()>,
+);
+/// A Surface that hands every Escalation to the test.
+struct Watcher(tokio::sync::mpsc::UnboundedSender<Asked>);
+#[async_trait]
+impl EscalationRecipient for Watcher {
+    fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
+    async fn interact(
+        &self,
+        params: loop_protocol::rpc::InteractParams,
+        withdrawn: oneshot::Receiver<()>,
+    ) -> Result<loop_protocol::InteractionOutcome, ()> {
+        let (tx, rx) = oneshot::channel();
+        self.0.send((params, tx, withdrawn)).map_err(|_| ())?;
+        rx.await.map_err(|_| ())
+    }
+}
+fn watcher() -> (Arc<Watcher>, tokio::sync::mpsc::UnboundedReceiver<Asked>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (Arc::new(Watcher(tx)), rx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grandchilds_escalation_reaches_surfaces_watching_any_ancestor() {
+    use loop_wire::RuntimeControl;
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let script: Script = Arc::new(|turn: Turn| match (turn.task.as_str(), turn.call) {
+            ("root", 1) => ready(calls(vec![spawn("middle")])),
+            ("middle", 1) => ready(calls(vec![spawn("asker")])),
+            ("asker", 1) => ready(calls(vec![("bash", json!({"command": "echo hi"}))])),
+            (task, _) => ready(text(format!("{task} done"))),
+        });
+        let (rt, log, seen) = runtime(dir.path(), "ask", RuntimeLimits::default(), script).await;
+        let root = rt.new_session(SessionSpec::default()).await.unwrap();
+        let (early, mut early_rx) = watcher();
+        RuntimeControl::recipient(rt.as_ref(), &root, 1, Some(early))
+            .await
+            .unwrap();
+        let turn = rt
+            .prompt(&root, vec![ContentBlock::text("root")])
+            .await
+            .unwrap();
+
+        let (params, early_answer, early_withdrawn) = early_rx.recv().await.unwrap();
+        let asker = params
+            .session
+            .clone()
+            .expect("the request names its Session");
+        assert_ne!(asker, root, "the request comes from the grandchild");
+        let list = rt.list().await.unwrap();
+        let info = list.iter().find(|s| s.r#ref == asker).unwrap();
+        assert_eq!(info.name.as_deref(), Some("asker"));
+
+        // A Surface attaching to the root later still gets the parked request.
+        let (late, mut late_rx) = watcher();
+        RuntimeControl::recipient(rt.as_ref(), &root, 2, Some(late))
+            .await
+            .unwrap();
+        let (late_params, late_answer, _) = late_rx.recv().await.unwrap();
+        assert_eq!(late_params.session.as_ref(), Some(&asker));
+        let loop_protocol::InteractionRequest::Permission { options, .. } = &late_params.request
+        else {
+            panic!("{late_params:?}")
+        };
+        let allow = options
+            .iter()
+            .find(|o| o.native_id == loop_app_core::interaction::native_options::ACCEPT)
+            .unwrap_or(&options[0])
+            .native_id
+            .clone();
+        late_answer
+            .send(loop_protocol::InteractionOutcome::Selected {
+                native_id: allow,
+                note: None,
+            })
+            .unwrap();
+        // First answer wins; the other Surface is withdrawn.
+        early_withdrawn
+            .await
+            .expect("the early Surface is withdrawn");
+        drop(early_answer);
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        assert_eq!(seen.results("root"), vec!["middle done".to_owned()]);
+
+        let events = log.read_runtime_after(0).await.unwrap();
+        let kinds = kinds(&events, &asker.key);
+        assert!(kinds.contains(&"escalation_raised".to_owned()), "{kinds:?}");
+        assert!(
+            kinds.contains(&"escalation_answered".to_owned()),
+            "{kinds:?}"
+        );
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

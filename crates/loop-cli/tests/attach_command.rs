@@ -848,3 +848,111 @@ async fn attach_shows_tool_calls_and_starts_each_message_on_its_own_line() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn a_subagents_escalation_is_labelled_and_withdrawn_by_its_own_session() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let child = rt
+            .new_session(SessionSpec {
+                name: Some("check the folder".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (mut server, client) = loop_wire::transport::memory();
+        let inject = server.outgoing.clone();
+        let messages = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = messages.clone();
+        let (forward, incoming) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(raw) = server.incoming.recv().await {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&raw).unwrap());
+                if forward.send(raw).is_err() {
+                    break;
+                }
+            }
+        });
+        let served = serve(
+            rt.clone(),
+            loop_wire::transport::Transport {
+                incoming,
+                outgoing: server.outgoing,
+            },
+        );
+        let (backend, events) = connect(client).await.unwrap();
+        let (tx, mut terminal, output) = script();
+        let key = session.key.to_string();
+        let task = tokio::spawn(async move {
+            drive(
+                backend,
+                events,
+                AttachArgs {
+                    id: Some(key),
+                    ..Default::default()
+                },
+                &mut terminal,
+            )
+            .await
+        });
+        wait_text(&output, "Attached to Session").await;
+        let request = |rpc_id: u64, from: &loop_protocol::SessionRef, title: &str| {
+            serde_json::json!({"jsonrpc":"2.0", "id":rpc_id, "method":"host/interact", "params":{
+                "session":from, "kind":"permission", "id":"approval-1",
+                "tool_call":{"id":"t", "title":title, "kind":"execute", "status":"pending"},
+                "options":[{"native_id":"accept", "label":"Allow once", "kind_hint":"allow_once"}]
+            }})
+            .to_string()
+        };
+        inject.send(request(9001, &child, "ls child")).unwrap();
+        let short = &child.key.as_str()[..8];
+        wait_text(
+            &output,
+            &format!("Subagent {short} (check the folder): ls child"),
+        )
+        .await;
+        // Same native id, different Session: a separate request.
+        inject.send(request(9002, &session, "ls parent")).unwrap();
+        inject
+            .send(
+                serde_json::json!({"jsonrpc":"2.0", "method":"host/interact_withdrawn",
+                "params":{"session":child, "id":"approval-1"}})
+                .to_string(),
+            )
+            .unwrap();
+        wait_text(&output, "Escalation: ls parent").await;
+        tx.send(Input::Line("2".into())).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if messages
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v["id"] == 9002 && v["result"]["native_id"] == "accept")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("parent approval not answered: {:?}", output.lock().unwrap()));
+        assert!(messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"] == 9001 && v["result"]["outcome"] == "cancelled"));
+        drop(inject);
+        tx.send(Input::Eof).unwrap();
+        task.await.unwrap().unwrap();
+        served.done.await.unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

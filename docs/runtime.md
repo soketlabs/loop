@@ -80,6 +80,10 @@ continue watching.
 An approval is an Escalation: a tool that needs your decision before it runs.
 
 - Every attached Surface sees the request as numbered choices.
+- A Subagent's request also goes to every Surface attached to its parent, or
+  to any Session above it, so watching the parent is enough. `loop attach`
+  labels it with the child, for example
+  `Escalation from Subagent 1a2b3c4d (check the tests): bash cargo test`.
 - The first valid answer wins. The other Surfaces show
   `Another client answered; Escalation withdrawn.`
 - If no Surface is attached, the request waits, with no timeout. The next
