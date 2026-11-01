@@ -1,4 +1,4 @@
-//! Runtime foundations: a durable Event Log for Session replay and audit.
-//!
-//! Runtime routing, Session ownership and Surface connections are added separately.
+//! Runtime Session ownership and durable Event Log.
 pub mod log;
+mod runtime;
+pub use runtime::{Runtime, RuntimeLimits};

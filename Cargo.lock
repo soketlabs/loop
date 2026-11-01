@@ -4747,7 +4747,11 @@ name = "loop-runtime"
 version = "0.6.0"
 dependencies = [
  "async-trait",
+ "loop-agent",
+ "loop-ai",
+ "loop-app-core",
  "loop-protocol",
+ "loop-wire",
  "rusqlite",
  "serde",
  "serde_json",
