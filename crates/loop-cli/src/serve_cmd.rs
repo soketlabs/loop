@@ -27,10 +27,6 @@ pub async fn run(_args: ServeArgs) -> anyhow::Result<()> {
 #[cfg(unix)]
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     use anyhow::Context;
-    use loop_agent::harness::session::{
-        sqlite::{LeaseIdentity, SqliteSessionStore},
-        SessionStore,
-    };
     use loop_app_core::{
         config::{paths, Settings},
         permissions::PermissionMode,
@@ -119,39 +115,18 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // Shared, so its Sessions are offered the `subagent` tool.
     let runtime = runtime.into_shared();
 
-    // Holding runtime.lock proves the previous Runtime is dead: free its leases.
-    let store = SqliteSessionStore::open(&sessions_db)
-        .map_err(|e| anyhow::anyhow!("sqlite session store: {e}"))?;
-    let ours = LeaseIdentity {
-        owner: "runtime".into(),
-        pid: std::process::id(),
-        generation: i64::try_from(runtime.generation())?,
-    };
-    let mut reclaimed = 0usize;
-    for meta in store
-        .list(None)
+    // Recover before accepting clients. Holding runtime.lock (and the Session
+    // database lock) proves the previous Runtime is dead.
+    let recovered = runtime
+        .recover(true)
         .await
-        .map_err(|e| anyhow::anyhow!("listing Sessions: {e}"))?
-    {
-        let Ok(Some(lease)) = store.lease(&meta.id).await else {
-            continue;
-        };
-        if lease.identity.owner != "runtime" || lease.identity == ours {
-            continue;
-        }
-        match store.takeover_lease(&meta.id, &ours, true).await {
-            Ok(()) => {
-                reclaimed += 1;
-                if let Err(e) = store.release_lease(&meta.id, &ours).await {
-                    tracing::warn!(session = %meta.id, error = %e, "could not release reclaimed lease");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(session = %meta.id, error = %e, "could not reclaim lease")
-            }
-        }
+        .map_err(|e| anyhow::anyhow!("Runtime recovery failed: {e}"))?;
+    if recovered != loop_runtime::Recovery::default() {
+        eprintln!(
+            "loop serve: recovered {} interrupted turn(s), withdrew {} Escalation(s), reclaimed {} lease(s)",
+            recovered.turns_ended, recovered.escalations_withdrawn, recovered.leases_reclaimed
+        );
     }
-    drop(store);
 
     let socket = match &args.socket {
         Some(path) => path.clone(),
@@ -163,7 +138,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     tracing::info!(
         socket = %socket.display(),
         generation = runtime.generation(),
-        reclaimed,
+        turns_ended = recovered.turns_ended,
+        escalations_withdrawn = recovered.escalations_withdrawn,
+        leases_reclaimed = recovered.leases_reclaimed,
         "Runtime listening"
     );
     eprintln!("loop serve: listening on {}", socket.display());
