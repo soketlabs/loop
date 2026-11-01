@@ -134,6 +134,21 @@ pub trait EventLog: Send + Sync {
     async fn mark_recovered(&self, _generation: u64, _recovered_ms: i64) -> Result<()> {
         Ok(())
     }
+    /// Sessions whose opening recorded a parent: the Runtime's Subagents.
+    /// Implementations should filter in storage; the default scans the log.
+    async fn subagent_sessions(&self) -> Result<std::collections::HashSet<SessionKey>> {
+        Ok(self
+            .read_runtime_after(0)
+            .await?
+            .into_iter()
+            .filter_map(|record| match &record.event.kind {
+                EventKind::SessionOpened(payload) if !payload["parent"].is_null() => {
+                    record.event.session_key
+                }
+                _ => None,
+            })
+            .collect())
+    }
     /// Distinct turn ids this Session's Updates belong to. Implementations
     /// should answer without decoding payloads; the default reads every Update.
     async fn turn_ids(&self, session: &SessionKey) -> Result<Vec<TurnId>> {

@@ -368,3 +368,36 @@ shared_suite!(
     sqlite_runtime_records,
     runtime_records_have_no_session_cursor
 );
+
+async fn subagent_sessions(log: &dyn EventLog) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let opened = |key: &str, parent: serde_json::Value| Event {
+            generation: 1,
+            session_key: Some(key.into()),
+            turn: None,
+            ts_ms: 1,
+            kind: EventKind::SessionOpened(json!({"cwd": "/w", "parent": parent, "depth": 1})),
+        };
+        log.append_batch(vec![
+            opened("root", json!(null)),
+            opened("kid", json!("root")),
+            update("kid"),
+            opened("kid", json!("root")),
+            opened("other", json!(null)),
+        ])
+        .await
+        .unwrap();
+        let keys = log.subagent_sessions().await.unwrap();
+        assert_eq!(
+            keys,
+            std::collections::HashSet::from([SessionKey::from("kid")])
+        );
+    })
+    .await
+    .unwrap();
+}
+shared_suite!(
+    memory_subagent_sessions,
+    sqlite_subagent_sessions,
+    subagent_sessions
+);

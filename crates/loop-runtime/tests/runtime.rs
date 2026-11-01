@@ -425,6 +425,11 @@ impl EventLog for FailingLog {
     async fn latest_seq(&self, s: &loop_protocol::SessionKey) -> loop_runtime::log::Result<u64> {
         self.inner.latest_seq(s).await
     }
+    async fn subagent_sessions(
+        &self,
+    ) -> loop_runtime::log::Result<std::collections::HashSet<loop_protocol::SessionKey>> {
+        self.inner.subagent_sessions().await
+    }
     async fn allocate_generation(&self, o: &str, p: u32, t: i64) -> loop_runtime::log::Result<u64> {
         self.inner.allocate_generation(o, p, t).await
     }
@@ -707,6 +712,7 @@ async fn list_reads_activity_from_memory_not_the_event_log() {
     let log = Arc::new(FailingLog::default());
     let rt = runtime(dir.path(), log.clone(), RuntimeLimits::default()).await;
     let a = rt.new_session(SessionSpec::default()).await.unwrap();
+    let reads = log.runtime_reads.load(std::sync::atomic::Ordering::Acquire);
     let before = rt.list().await.unwrap()[0].last_active_ms;
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     rt.prompt(&a, vec![ContentBlock::text("hi")])
@@ -714,7 +720,6 @@ async fn list_reads_activity_from_memory_not_the_event_log() {
         .unwrap()
         .outcome()
         .await;
-    let reads = log.runtime_reads.load(std::sync::atomic::Ordering::Acquire);
     for _ in 0..3 {
         let listed = rt.list().await.unwrap();
         assert!(listed[0].last_active_ms > before);

@@ -698,23 +698,14 @@ impl Runtime {
         let child = self.subagent_keys().await?.contains(&session.key);
         Ok(child.then_some(parent))
     }
-    /// Keys of every Session opened as a Subagent. The Event Log is scanned
+    /// Keys of every Session opened as a Subagent. The Event Log is asked
     /// once; children opened later are added as they open.
     async fn subagent_keys(&self) -> BackendResult<HashSet<SessionKey>> {
         let mut known = self.subagents.lock().await;
         if let Some(keys) = known.as_ref() {
             return Ok(keys.clone());
         }
-        let events = self.log.read_runtime_after(0).await.map_err(failed)?;
-        let keys: HashSet<_> = events
-            .into_iter()
-            .filter_map(|record| match &record.event.kind {
-                EventKind::SessionOpened(payload) if !payload["parent"].is_null() => {
-                    record.event.session_key
-                }
-                _ => None,
-            })
-            .collect();
+        let keys = self.log.subagent_sessions().await.map_err(failed)?;
         *known = Some(keys.clone());
         Ok(keys)
     }

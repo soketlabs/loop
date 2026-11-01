@@ -11,6 +11,7 @@ enum Command {
     Read(Option<SessionKey>, u64, Reply<Vec<LoggedEvent>>),
     Latest(SessionKey, Reply<u64>),
     Turns(SessionKey, Reply<Vec<TurnId>>),
+    Subagents(Reply<std::collections::HashSet<SessionKey>>),
     Allocate(String, u32, i64, Reply<u64>),
     Finish(u64, i64, Reply<()>),
     Activity(Reply<std::collections::HashMap<SessionKey, i64>>),
@@ -82,6 +83,9 @@ impl EventLog for SqliteEventLog {
     async fn latest_seq(&self, session: &SessionKey) -> Result<u64> {
         self.request(|reply| Command::Latest(session.clone(), reply))
             .await
+    }
+    async fn subagent_sessions(&self) -> Result<std::collections::HashSet<SessionKey>> {
+        self.request(Command::Subagents).await
     }
     async fn turn_ids(&self, session: &SessionKey) -> Result<Vec<TurnId>> {
         self.request(|reply| Command::Turns(session.clone(), reply))
@@ -182,6 +186,9 @@ fn writer(mut conn: Connection, mut receiver: mpsc::Receiver<Command>) {
             Command::Turns(session, reply) => {
                 let _ = reply.send(turn_ids(&conn, &session));
             }
+            Command::Subagents(reply) => {
+                let _ = reply.send(subagents(&conn));
+            }
             Command::Allocate(owner, pid, started, reply) => {
                 let _ = reply.send(allocate(&mut conn, &owner, pid, started));
             }
@@ -270,6 +277,19 @@ fn latest(conn: &Connection, session: &SessionKey) -> Result<u64> {
         [session.as_str()],
         |row| row.get(0),
     )?)
+}
+
+fn subagents(conn: &Connection) -> Result<std::collections::HashSet<SessionKey>> {
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT session_key FROM events WHERE kind='session_opened' \
+         AND session_key IS NOT NULL \
+         AND json_extract(payload,'$.event.payload.parent') IS NOT NULL",
+    )?;
+    let keys = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .map(|key| key.map(SessionKey::from))
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(keys)
 }
 
 fn turn_ids(conn: &Connection, session: &SessionKey) -> Result<Vec<TurnId>> {
