@@ -313,17 +313,20 @@ impl Fixture {
     }
     /// The only Session's id, from `loop attach` listing.
     async fn only_session(&self) -> String {
-        let listing = self.attach(&[]).finish().await;
-        let rows = rows(&listing);
-        assert_eq!(rows.len(), 1, "{listing}");
-        rows[0][0].clone()
+        let listing = self.attach(&["--json"]).finish().await;
+        let sessions = sessions(&listing);
+        assert_eq!(sessions.len(), 1, "{listing}");
+        sessions[0].r#ref.key.to_string()
     }
     /// The id of the only Session without a parent.
     async fn only_parent(&self) -> String {
-        let listing = self.attach(&[]).finish().await;
-        let roots: Vec<_> = rows(&listing).into_iter().filter(|r| r[5] == "-").collect();
+        let listing = self.attach(&["--json"]).finish().await;
+        let roots: Vec<_> = sessions(&listing)
+            .into_iter()
+            .filter(|s| s.parent.is_none())
+            .collect();
         assert_eq!(roots.len(), 1, "{listing}");
-        roots[0][0].clone()
+        roots[0].r#ref.key.to_string()
     }
     async fn client(&self) -> Arc<loop_wire::RemoteBackend> {
         let stream = tokio::net::UnixStream::connect(&self.socket).await.unwrap();
@@ -768,35 +771,17 @@ async fn wait_events(
     .await
     .unwrap_or_else(|_| panic!("never saw {what}"));
 }
-/// Cells of `loop attach` listing rows, cut at the header's column starts.
-fn rows(listing: &str) -> Vec<Vec<String>> {
-    let mut lines = listing.lines();
-    let header: Vec<char> = lines.next().unwrap_or_default().chars().collect();
-    let starts: Vec<usize> = (0..header.len())
-        .filter(|&i| header[i] != ' ' && (i == 0 || (i >= 2 && header[i - 2..i] == [' ', ' '][..])))
-        .collect();
-    lines
-        .take_while(|line| !line.is_empty())
-        .map(|line| {
-            let line: Vec<char> = line.chars().collect();
-            starts
-                .iter()
-                .enumerate()
-                .map(|(n, &start)| {
-                    let end = starts
-                        .get(n + 1)
-                        .copied()
-                        .unwrap_or(line.len())
-                        .min(line.len());
-                    line[start.min(end)..end]
-                        .iter()
-                        .collect::<String>()
-                        .trim()
-                        .to_owned()
-                })
-                .collect()
-        })
-        .collect()
+/// Sessions from `loop attach --json`.
+fn sessions(listing: &str) -> Vec<loop_protocol::rpc::SessionInfo> {
+    serde_json::from_str(listing).unwrap_or_else(|e| panic!("{e}: {listing}"))
+}
+/// Rows of the human listing: lines between the header and the first blank.
+fn listed(listing: &str) -> usize {
+    listing
+        .lines()
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .count()
 }
 
 #[tokio::test]
@@ -841,15 +826,18 @@ async fn finished_children_are_hidden_unless_all_and_stay_attachable() {
 
         // A finished child is closed: hidden unless asked for.
         let listing = fx.attach(&[]).finish().await;
-        assert_eq!(rows(&listing).len(), 1, "{listing}");
+        assert_eq!(listed(&listing), 1, "{listing}");
         let listing = fx.attach(&["--all"]).finish().await;
-        let rows = rows(&listing);
-        assert_eq!(rows.len(), 2, "{listing}");
-        let root = rows.iter().find(|r| r[5] == "-").expect("root row");
-        let child = rows.iter().find(|r| r[5] != "-").expect("child row");
-        assert!(root[0].starts_with(&child[5]), "{listing}");
+        assert_eq!(listed(&listing), 2, "{listing}");
+        let listing = fx.attach(&["--json"]).finish().await;
+        let all = sessions(&listing);
+        assert_eq!(all.len(), 2, "{listing}");
+        let root = all.iter().find(|s| s.parent.is_none()).expect("root");
+        let child = all.iter().find(|s| s.parent.is_some()).expect("child");
+        assert_eq!(child.parent.as_ref(), Some(&root.r#ref), "{listing}");
+        assert!(!child.live, "{listing}");
         // The child's log stays; attaching replays its answer.
-        let output = fx.attach(&[&child[0]]).finish().await;
+        let output = fx.attach(&[child.r#ref.key.as_str()]).finish().await;
         assert!(
             output.starts_with("Replaying finished Subagent Session"),
             "{output}"
@@ -948,8 +936,14 @@ async fn kill_9_while_a_child_waits_ends_parent_and_child_uncertain_without_retr
         parent.line("SPAWN-APPROVAL").await;
         let raised = |e: &EventKind| matches!(e, EventKind::EscalationRaised(_));
         wait_events(&fx, "the child's Escalation", |e| count(e, raised) == 1).await;
-        let listing = fx.attach(&[]).finish().await;
-        let root = rows(&listing).into_iter().find(|r| r[5] == "-").unwrap()[0].clone();
+        let listing = fx.attach(&["--json"]).finish().await;
+        let root = sessions(&listing)
+            .into_iter()
+            .find(|s| s.parent.is_none())
+            .unwrap()
+            .r#ref
+            .key
+            .to_string();
         let chat_calls = || {
             fx.model
                 .requests()

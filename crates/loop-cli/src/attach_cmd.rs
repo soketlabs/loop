@@ -9,6 +9,8 @@ pub struct AttachArgs {
     pub socket: Option<PathBuf>,
     /// List finished Subagent children too.
     pub all: bool,
+    /// Print every Session as a JSON array of `SessionInfo` instead.
+    pub json: bool,
 }
 
 #[cfg(not(unix))]
@@ -477,6 +479,13 @@ mod unix {
         } else {
             let mut sessions = backend.list().await?;
             let Some(id) = args.id else {
+                if args.json {
+                    let mut text = serde_json::to_string_pretty(&sessions)?;
+                    text.push('\n');
+                    terminal.write(&text)?;
+                    client.shutdown().await;
+                    return Ok(());
+                }
                 let hidden = if args.all {
                     0
                 } else {

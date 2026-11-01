@@ -1048,3 +1048,43 @@ async fn a_slow_session_list_never_delays_a_subagents_escalation() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn json_listing_prints_every_session_as_session_info() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).await;
+        let session = rt
+            .new_session(SessionSpec {
+                name: Some("two  spaces".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (server, client) = loop_wire::transport::memory();
+        let served = serve(rt.clone(), server);
+        let (backend, events) = connect(client).await.unwrap();
+        let (_tx, mut terminal, output) = script();
+        drive(
+            backend,
+            events,
+            AttachArgs {
+                json: true,
+                ..Default::default()
+            },
+            &mut terminal,
+        )
+        .await
+        .unwrap();
+        let text = output.lock().unwrap().clone();
+        let list: Vec<loop_protocol::rpc::SessionInfo> =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].r#ref, session);
+        assert_eq!(list[0].name.as_deref(), Some("two  spaces"));
+        served.done.await.unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

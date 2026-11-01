@@ -120,6 +120,9 @@ enum Commands {
         /// Also list finished Subagent Sessions.
         #[arg(long, conflicts_with_all = ["id", "new"])]
         all: bool,
+        /// Print every Session, closed Subagents included, as JSON.
+        #[arg(long, conflicts_with_all = ["id", "new"])]
+        json: bool,
     },
     /// Show config directory paths.
     Config,
@@ -263,6 +266,7 @@ async fn real_main() -> anyhow::Result<()> {
                 cwd,
                 socket,
                 all,
+                json,
             } => {
                 return loop_cli::attach_cmd::run(loop_cli::attach_cmd::AttachArgs {
                     id: id.clone(),
@@ -270,6 +274,7 @@ async fn real_main() -> anyhow::Result<()> {
                     cwd: cwd.clone().or(cli.cwd.clone()),
                     socket: socket.clone(),
                     all: *all,
+                    json: *json,
                 })
                 .await;
             }
@@ -500,6 +505,12 @@ mod tests {
             Some(Commands::Attach { all: true, .. })
         ));
         assert!(Cli::try_parse_from(["loop", "attach", "abc", "--all"]).is_err());
+        let cli = Cli::try_parse_from(["loop", "attach", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attach { json: true, .. })
+        ));
+        assert!(Cli::try_parse_from(["loop", "attach", "--new", "--json"]).is_err());
         let cli = Cli::try_parse_from(["loop", "attach"]).unwrap();
         assert!(matches!(
             cli.command,
