@@ -88,6 +88,11 @@ An approval is an Escalation: a tool that needs your decision before it runs.
   `Another client answered; Escalation withdrawn.`
 - If no Surface is attached, the request waits, with no timeout. The next
   Surface to attach sees it.
+- **File edits are applied before you answer.** In `ask` mode a file edit
+  (`write`, `edit`) is written first and reverted if you reject it. While its
+  approval is parked, the change is already on disk; rejecting it, or
+  cancelling the turn, puts the file back. If the Runtime is killed while
+  that approval waits, the change stays on disk.
 - Cancelling the turn withdraws its pending approvals.
 - An "allow for this Session" grant lasts only while the Runtime runs. It is
   never restored after a restart.
