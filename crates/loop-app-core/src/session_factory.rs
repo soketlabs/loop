@@ -92,6 +92,9 @@ pub struct WorkspaceResources {
     pub host: Arc<dyn ExecutionEnv>,
     pub mcp_client: Arc<loop_mcp::McpClientManager>,
     pub startup_notices: Vec<String>,
+    // Standalone prompts retain the caller's spelling and lexical ancestors;
+    // cwd is separately normalized for workspace identity and execution.
+    prompt_cwd: PathBuf,
     hooks: crate::hooks_load::LoadedHooks,
     web: crate::web_tools::WebTools,
     sandbox: OnceCell<(SandboxMode, Arc<dyn ExecutionEnv>, bool)>,
@@ -122,7 +125,16 @@ impl WorkspaceResources {
         mut settings: Settings,
         standalone: bool,
     ) -> anyhow::Result<Self> {
-        let cwd = absolute_workspace(&opts.cwd)?;
+        let cwd = if standalone {
+            opts.cwd.canonicalize()?
+        } else {
+            absolute_workspace(&opts.cwd)?
+        };
+        let prompt_cwd = if standalone {
+            opts.cwd.clone()
+        } else {
+            cwd.clone()
+        };
         if let Some(theme) = &opts.theme {
             settings.theme = theme.clone();
         }
@@ -143,14 +155,14 @@ impl WorkspaceResources {
         let context_files = if opts.no_context_files {
             vec![]
         } else if standalone || project_trusted {
-            load_context_files(&cwd, &globals.agent_dir)
+            load_context_files(&prompt_cwd, &globals.agent_dir)
         } else {
             crate::system_prompt::load_global_context_files(&globals.agent_dir)
         };
         let (custom_system_prompt, append_system_prompt) =
             crate::system_prompt::resolve_system_prompt_files_in(
                 &globals.agent_dir,
-                &cwd,
+                &prompt_cwd,
                 project_trusted,
                 opts.system_prompt.as_deref(),
                 opts.append_system_prompt.as_deref(),
@@ -193,6 +205,7 @@ impl WorkspaceResources {
             web,
             mcp_client,
             startup_notices,
+            prompt_cwd,
             hooks,
             sandbox: OnceCell::new(),
             standalone,
@@ -407,7 +420,7 @@ impl SessionFactory {
         let system_prompt = build_system_prompt(BuildSystemPromptOptions {
             custom_prompt: workspace.custom_system_prompt.as_deref(),
             append_system_prompt: workspace.append_system_prompt.as_deref(),
-            cwd: &workspace.cwd,
+            cwd: &workspace.prompt_cwd,
             selected_tools: &selected,
             tool_snippets: &snippets,
             context_files: &workspace.context_files,

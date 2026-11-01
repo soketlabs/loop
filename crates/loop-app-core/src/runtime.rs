@@ -1295,7 +1295,6 @@ fn thinking_label(level: AgentThinkingLevel) -> &'static str {
 
 /// Bootstrap the full application Runtime, preserving interactive trust and sandbox fallback.
 pub async fn bootstrap(mut opts: BootstrapOpts) -> anyhow::Result<Runtime> {
-    opts.cwd = opts.cwd.canonicalize()?;
     let agent_dir = get_agent_dir();
     ensure_agent_dirs(&agent_dir)?;
     std::env::set_var("LOOP_CODING_AGENT", "true");
@@ -1340,6 +1339,9 @@ pub async fn bootstrap(mut opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         WorkspaceResources::load_resolved(&globals, &opts, project_trusted, settings, true).await?,
     );
     let factory = SessionFactory::new(Arc::clone(&globals));
+    // Standalone context discovery has already walked the caller's lexical path.
+    // Session identity and execution use the normalized workspace from here on.
+    opts.cwd = workspace.cwd.clone();
     let opened = factory.open(Arc::clone(&workspace), &opts).await?;
     let OpenedSession {
         harness,
