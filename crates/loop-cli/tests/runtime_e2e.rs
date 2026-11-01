@@ -827,6 +827,12 @@ async fn finished_children_are_hidden_unless_all_and_stay_attachable() {
         // A finished child is closed: hidden unless asked for.
         let listing = fx.attach(&[]).finish().await;
         assert_eq!(listed(&listing), 1, "{listing}");
+        assert!(
+            listing.contains(
+                "1 closed Subagent Session not shown (finished, cancelled or interrupted)"
+            ),
+            "{listing}"
+        );
         let listing = fx.attach(&["--all"]).finish().await;
         assert_eq!(listed(&listing), 2, "{listing}");
         let listing = fx.attach(&["--json"]).finish().await;

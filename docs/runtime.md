@@ -58,7 +58,8 @@ live. A Session that is not loaded, for example after the Runtime restarted, is
 loaded when you attach. Child Sessions started by a Subagent are named after
 their task and show their parent in the list. Once the parent has its answer,
 a finished child is closed: it frees its slot and is listed only with
-`--all`. It is never loaded again: attaching replays its output, but you
+`--all`. So are children that a cancel or a Runtime restart ended; the list
+says how many it left out. It is never loaded again: attaching replays its output, but you
 cannot prompt it.
 
 The table is for people: columns are aligned with spaces, titles are cut

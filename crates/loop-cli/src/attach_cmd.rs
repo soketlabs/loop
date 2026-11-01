@@ -495,8 +495,15 @@ mod unix {
                 };
                 let mut text = list_text(&mut sessions);
                 if hidden > 0 {
+                    // Closed covers finished children and ones a cancel or a
+                    // Runtime restart ended; none of them can be prompted.
+                    let (noun, them) = if hidden == 1 {
+                        ("Session", "it")
+                    } else {
+                        ("Sessions", "them")
+                    };
                     text.push_str(&format!(
-                        "\n{hidden} finished Subagent Session(s) not shown; `loop attach --all` lists them.\n"
+                        "\n{hidden} closed Subagent {noun} not shown (finished, cancelled or interrupted); `loop attach --all` lists {them}.\n"
                     ));
                 }
                 terminal.write(&text)?;
