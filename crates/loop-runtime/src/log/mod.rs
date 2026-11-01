@@ -110,6 +110,18 @@ pub trait EventLog: Send + Sync {
     async fn allocate_generation(&self, owner: &str, pid: u32, started_ms: i64) -> Result<u64>;
     /// Record a clean stop for a previously allocated generation.
     async fn finish_generation(&self, generation: u64, stopped_ms: i64) -> Result<()>;
+    /// Newest event timestamp per Session. Implementations should answer with an
+    /// aggregate query; the default scans the whole log.
+    async fn last_activity_ms(&self) -> Result<std::collections::HashMap<SessionKey, i64>> {
+        let mut activity = std::collections::HashMap::new();
+        for record in self.read_runtime_after(0).await? {
+            if let Some(key) = record.event.session_key {
+                let ts = activity.entry(key).or_insert(record.event.ts_ms);
+                *ts = (*ts).max(record.event.ts_ms);
+            }
+        }
+        Ok(activity)
+    }
 }
 
 fn validate(events: &[Event]) -> Result<()> {

@@ -45,13 +45,37 @@ pub struct Served {
     pub done: JoinHandle<()>,
 }
 
-/// Serve `backend` to one client over `transport`.
+/// Connection ownership policy.
+#[derive(Debug, Clone, Copy)]
+pub struct ServeOptions {
+    /// Shut down the backend when this connection receives `shutdown`.
+    /// Shared Runtime connections set this to false.
+    pub owns_backend: bool,
+}
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self { owns_backend: true }
+    }
+}
+
+/// Serve `backend` to one client over `transport` with backend ownership.
+/// Existing in-process callers retain their shutdown behavior.
 pub fn serve(backend: Arc<dyn AgentBackend>, transport: Transport, info: PeerInfo) -> Served {
+    serve_with_options(backend, transport, info, ServeOptions::default())
+}
+
+/// Serve one connection with an explicit backend ownership policy.
+pub fn serve_with_options(
+    backend: Arc<dyn AgentBackend>,
+    transport: Transport,
+    info: PeerInfo,
+    options: ServeOptions,
+) -> Served {
     let (conn, incoming) = Connection::new(transport);
     let host = Arc::new(ClientHost {
         conn: Arc::clone(&conn),
     });
-    let done = tokio::spawn(run(backend, conn, incoming, info));
+    let done = tokio::spawn(run(backend, conn, incoming, info, options));
     Served { host, done }
 }
 
@@ -75,6 +99,7 @@ async fn run(
     conn: Arc<Connection>,
     mut incoming: mpsc::UnboundedReceiver<Incoming>,
     info: PeerInfo,
+    options: ServeOptions,
 ) {
     // Subscribe now so nothing between `initialize` and the first update is
     // missed; forwarding starts once the client is initialized.
@@ -125,7 +150,9 @@ async fn run(
                     continue;
                 }
                 if method == methods::SHUTDOWN {
-                    backend.shutdown().await;
+                    if options.owns_backend {
+                        backend.shutdown().await;
+                    }
                     conn.respond(id, Ok(json!({})));
                     conn.close();
                     break;
