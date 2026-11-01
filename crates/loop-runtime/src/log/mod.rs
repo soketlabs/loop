@@ -32,6 +32,10 @@ pub enum EventKind {
     EscalationWithdrawn(Value),
     SessionOpened(Value),
     SessionClosed(Value),
+    /// A Session's `subagent` call opened a child (logged on the parent).
+    SubagentStarted(Value),
+    /// A child's result reached its parent (logged on the parent).
+    SubagentEnded(Value),
     RuntimeStarted(Value),
     RuntimeStopped(Value),
     /// Unrecognized activity, including its original kind and payload.

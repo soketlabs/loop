@@ -61,19 +61,31 @@ impl FauxScript {
     }
 }
 
+/// Chooses a response from the request, for tests with concurrent Sessions.
+/// The response may wait, so a test can hold a model call open.
+pub type FauxResponder = Arc<
+    dyn Fn(&Context) -> std::pin::Pin<Box<dyn std::future::Future<Output = FauxResponse> + Send>>
+        + Send
+        + Sync,
+>;
+
 struct FauxAdapter {
     script: FauxScript,
+    responder: Option<FauxResponder>,
 }
 
 impl ApiAdapter for FauxAdapter {
     fn stream(
         &self,
         model: &Model,
-        _context: &Context,
+        context: &Context,
         _options: StreamOptions,
         _auth: ModelAuth,
     ) -> AssistantMessageEventStream {
-        emit(model, self.script.next())
+        match &self.responder {
+            Some(responder) => emit(model, responder(context)),
+            None => emit(model, std::future::ready(self.script.next())),
+        }
     }
 
     fn stream_simple(
@@ -87,13 +99,16 @@ impl ApiAdapter for FauxAdapter {
     }
 }
 
-fn emit(model: &Model, response: FauxResponse) -> AssistantMessageEventStream {
+fn emit(
+    model: &Model,
+    response: impl std::future::Future<Output = FauxResponse> + Send + 'static,
+) -> AssistantMessageEventStream {
     let stream = create_assistant_message_event_stream();
     let handle = stream.handle();
     let model = model.clone();
 
     tokio::spawn(async move {
-        match response {
+        match response.await {
             FauxResponse::Text(text) => {
                 let mut partial = AssistantMessage::pending(&model);
                 handle.push(AssistantMessageEvent::Start {
@@ -182,6 +197,21 @@ fn emit(model: &Model, response: FauxResponse) -> AssistantMessageEventStream {
 
 /// Build a faux provider with a shared script.
 pub fn faux_provider(script: FauxScript) -> Provider {
+    build(FauxAdapter {
+        script,
+        responder: None,
+    })
+}
+
+/// Build a faux provider whose response is a function of each request.
+pub fn faux_provider_fn(responder: FauxResponder) -> Provider {
+    build(FauxAdapter {
+        script: FauxScript::new(),
+        responder: Some(responder),
+    })
+}
+
+fn build(adapter: FauxAdapter) -> Provider {
     let model = Model {
         id: "faux-model".into(),
         name: "Faux Model".into(),
@@ -205,7 +235,7 @@ pub fn faux_provider(script: FauxScript) -> Provider {
         headers: None,
         auth: ProviderAuth::keyless("faux"),
         models: vec![model],
-        api: CreateProviderApi::Single(Arc::new(FauxAdapter { script })),
+        api: CreateProviderApi::Single(Arc::new(adapter)),
         fetch_models: None,
     })
 }

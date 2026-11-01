@@ -494,18 +494,23 @@ impl SessionReader for SqliteReader {
     }
 }
 
-#[async_trait]
-impl SessionStore for SqliteSessionStore {
-    fn write_cancellation(&self) -> Option<tokio_util::sync::CancellationToken> {
-        self.resume_guard
-            .as_ref()
-            .map(|guard| guard.cancellation.clone())
-    }
-
-    async fn create(
+impl SqliteSessionStore {
+    /// Create a Session whose parent is recorded in the same transaction, as
+    /// for a Subagent. Unlike `fork`, no parent entries are copied.
+    pub async fn create_child(
         &self,
         cwd: Option<String>,
         name: Option<String>,
+        parent: &str,
+    ) -> Result<Arc<dyn SessionReader>, SessionError> {
+        self.create_row(cwd, name, Some(parent.to_owned())).await
+    }
+
+    async fn create_row(
+        &self,
+        cwd: Option<String>,
+        name: Option<String>,
+        parent: Option<String>,
     ) -> Result<Arc<dyn SessionReader>, SessionError> {
         let path = self.path.clone();
         let id = create_session_id();
@@ -514,7 +519,7 @@ impl SessionStore for SqliteSessionStore {
             id: id.clone(),
             cwd: cwd.clone(),
             name: name.clone(),
-            parent_session_id: None,
+            parent_session_id: parent.clone(),
             created_at,
             path: None,
         };
@@ -528,8 +533,8 @@ impl SessionStore for SqliteSessionStore {
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|e| SessionError::Storage(e.to_string()))?;
                 tx.execute(
-                    "INSERT INTO sessions(id, cwd, name, parent_session_id, active_leaf_id, created_at) VALUES (?1,?2,?3,NULL,NULL,?4)",
-                    params![id, cwd, name, created_at],
+                    "INSERT INTO sessions(id, cwd, name, parent_session_id, active_leaf_id, created_at) VALUES (?1,?2,?3,?4,NULL,?5)",
+                    params![id, cwd, name, parent, created_at],
                 )
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
                 tx.execute(
@@ -548,6 +553,23 @@ impl SessionStore for SqliteSessionStore {
         .await
         .map_err(|e| SessionError::Storage(e.to_string()))??;
         Ok(Arc::new(SqliteReader { meta, path }))
+    }
+}
+
+#[async_trait]
+impl SessionStore for SqliteSessionStore {
+    fn write_cancellation(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.resume_guard
+            .as_ref()
+            .map(|guard| guard.cancellation.clone())
+    }
+
+    async fn create(
+        &self,
+        cwd: Option<String>,
+        name: Option<String>,
+    ) -> Result<Arc<dyn SessionReader>, SessionError> {
+        self.create_row(cwd, name, None).await
     }
 
     async fn open_writer(&self, id: &str) -> Result<Arc<dyn SessionReader>, SessionError> {

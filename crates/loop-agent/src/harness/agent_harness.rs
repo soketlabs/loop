@@ -133,6 +133,7 @@ pub struct AgentHarness {
     tool_execution: Mutex<ToolExecutionMode>,
     before_tool_call: Mutex<Option<BeforeToolHook>>,
     after_tool_call: Mutex<Option<AfterToolHook>>,
+    should_stop_after_turn: Mutex<Option<crate::types::ShouldStopAfterTurnFn>>,
     bash_limits: Mutex<crate::harness::tools::BashLimits>,
     #[allow(dead_code)]
     steering_mode: Mutex<QueueMode>,
@@ -178,6 +179,7 @@ impl AgentHarness {
             tool_execution: Mutex::new(ToolExecutionMode::Parallel),
             before_tool_call: Mutex::new(None),
             after_tool_call: Mutex::new(None),
+            should_stop_after_turn: Mutex::new(None),
             bash_limits: Mutex::new(Default::default()),
             steering_mode: Mutex::new(QueueMode::OneAtATime),
             follow_up_mode: Mutex::new(QueueMode::OneAtATime),
@@ -723,6 +725,12 @@ impl AgentHarness {
     /// Set after-tool-call hook (e.g. interactive file-edit review).
     pub fn set_after_tool_call(&self, hook: Option<AfterToolHook>) {
         *self.after_tool_call.lock() = hook;
+    }
+
+    /// Decide after each model call whether the run ends there, even with
+    /// tool results pending (for example a Subagent's model-call limit).
+    pub fn set_should_stop_after_turn(&self, hook: Option<crate::types::ShouldStopAfterTurnFn>) {
+        *self.should_stop_after_turn.lock() = hook;
     }
 
     /// Register a harness hook.
@@ -1359,6 +1367,7 @@ impl AgentHarness {
         config.stream_options.reasoning = snapshot.thinking_level.to_reasoning();
         config.before_tool_call = self.before_tool_call.lock().clone();
         config.after_tool_call = self.after_tool_call.lock().clone();
+        config.should_stop_after_turn = self.should_stop_after_turn.lock().clone();
         config.run_labels = RunLabels {
             agent: Some(RunLabels::MAIN),
             skills: self.active_skill_names.read().await.clone(),

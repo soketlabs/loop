@@ -116,7 +116,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     )
     .await
     .map_err(|e| anyhow::anyhow!("could not start the Runtime: {e}"))?;
-    let runtime = Arc::new(runtime);
+    // Shared, so its Sessions are offered the `subagent` tool.
+    let runtime = runtime.into_shared();
 
     // Holding runtime.lock proves the previous Runtime is dead: free its leases.
     let store = SqliteSessionStore::open(&sessions_db)

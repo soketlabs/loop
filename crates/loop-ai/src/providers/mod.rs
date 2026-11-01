@@ -14,7 +14,7 @@ pub use anthropic::{
     ANTHROPIC_API_KEY_ENVS, ANTHROPIC_BASE_URL, ANTHROPIC_PROVIDER_ID,
 };
 pub use custom::{custom_provider, CustomModelSpec, CustomProviderConfig};
-pub use faux::{faux_provider, FauxResponse, FauxScript};
+pub use faux::{faux_provider, faux_provider_fn, FauxResponder, FauxResponse, FauxScript};
 pub use gemini::{
     gemini_models, gemini_provider, gemini_seed_models, list_gemini_models, GEMINI_API_KEY_ENVS,
     GEMINI_BASE_URL, GEMINI_PROVIDER_ID,
