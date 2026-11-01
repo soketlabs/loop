@@ -48,7 +48,7 @@ mod unix {
     };
     use loop_wire::{transport::Transport, RemoteBackend};
     use std::{
-        collections::{HashSet, VecDeque},
+        collections::VecDeque,
         io::{BufRead, Write},
         sync::Arc,
     };
@@ -393,6 +393,36 @@ mod unix {
     }
 
     /// "Subagent 1a2b3c4d (its task)" for a child Session's request.
+    /// Request bookkeeping that keeps only the newest entries, so requests
+    /// that never arrive (or are never withdrawn) cannot grow it without bound.
+    pub(super) struct Recent<T>(VecDeque<T>);
+    impl<T> Default for Recent<T> {
+        fn default() -> Self {
+            Self(VecDeque::new())
+        }
+    }
+    impl<T> Recent<T> {
+        pub(super) const CAP: usize = 256;
+        pub(super) fn push(&mut self, item: T) {
+            if self.0.len() == Self::CAP {
+                self.0.pop_front();
+            }
+            self.0.push_back(item);
+        }
+        /// Remove and return the oldest entry matching `pred`.
+        pub(super) fn take(&mut self, pred: impl Fn(&T) -> bool) -> Option<T> {
+            let index = self.0.iter().position(pred)?;
+            self.0.remove(index)
+        }
+        pub(super) fn any(&self, pred: impl Fn(&T) -> bool) -> bool {
+            self.0.iter().any(pred)
+        }
+        #[cfg(test)]
+        pub(super) fn len(&self) -> usize {
+            self.0.len()
+        }
+    }
+
     fn short_label(child: &SessionKey) -> String {
         let short: String = child.as_str().chars().take(8).collect();
         format!("Subagent {short}")
@@ -561,9 +591,9 @@ mod unix {
         // buffered answer remains tied to its original Escalation even if a
         // withdrawal wins the race with terminal input.
         let mut next_choice = 1;
-        let mut withdrawn = HashSet::new();
+        let mut withdrawn: Recent<(SessionKey, loop_protocol::InteractionId)> = Recent::default();
         // Origins of requests not yet received, in arrival order.
-        let mut origins: Vec<(loop_protocol::InteractionId, SessionRef)> = Vec::new();
+        let mut origins: Recent<(loop_protocol::InteractionId, SessionRef)> = Recent::default();
         let mut labels: std::collections::HashMap<SessionKey, String> = Default::default();
         let mut naming = tokio::task::JoinSet::new();
         let mut interrupted = false;
@@ -576,11 +606,10 @@ mod unix {
                     HostEvent::Request(request, reply) => {
                         let request = *request;
                         let from = origins
-                            .iter()
-                            .position(|(id, _)| id == request.id())
-                            .map(|i| origins.remove(i).1)
+                            .take(|(id, _)| id == request.id())
+                            .map(|(_, from)| from)
                             .unwrap_or_else(|| session.clone());
-                        if withdrawn.remove(&(from.key.clone(), request.id().clone())) { let _ = reply.send(InteractionOutcome::Cancelled); continue; }
+                        if withdrawn.take(|(key, id)| *key == from.key && id == request.id()).is_some() { let _ = reply.send(InteractionOutcome::Cancelled); continue; }
                         if !matches!(request, InteractionRequest::Permission {..} | InteractionRequest::Question {..}) {
                             let _ = reply.send(InteractionOutcome::Rejected { reason: "loop attach supports choices and text questions".into() }); continue;
                         }
@@ -610,9 +639,9 @@ mod unix {
                         if let Some(index) = held {
                             let item = pending.remove(index);
                             let _ = item.reply.send(InteractionOutcome::Cancelled);
-                        } else if key.0 == session.key || origins.iter().any(|(id, s)| s.key == key.0 && *id == key.1) {
+                        } else if key.0 == session.key || origins.any(|(id, s)| s.key == key.0 && *id == key.1) {
                             // It may arrive before its request does.
-                            withdrawn.insert(key.clone());
+                            withdrawn.push(key.clone());
                         }
                         if held.is_some() || key.0 == session.key {
                             terminal.write("\r\x1b[2KAnother client answered; Escalation withdrawn.\n")?;
@@ -703,7 +732,20 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
-        use super::ago;
+        use super::{ago, Recent};
+
+        #[test]
+        fn request_bookkeeping_keeps_only_the_newest_entries() {
+            let mut recent = Recent::default();
+            for n in 0..Recent::<u32>::CAP as u32 + 10 {
+                recent.push(n);
+            }
+            assert_eq!(recent.len(), Recent::<u32>::CAP);
+            assert_eq!(recent.take(|n| *n == 3), None, "the oldest are dropped");
+            assert_eq!(recent.take(|n| *n == 20), Some(20));
+            assert_eq!(recent.take(|n| *n == 20), None);
+            assert!(recent.any(|n| *n == 21));
+        }
 
         #[test]
         fn last_activity_reads_as_a_relative_time() {
