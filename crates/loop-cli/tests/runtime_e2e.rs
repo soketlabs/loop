@@ -22,8 +22,52 @@ use tokio::{
 
 const TEST_LIMIT: Duration = Duration::from_secs(120);
 const WAIT: Duration = Duration::from_secs(30);
-/// How long the model takes before asking for a tool when told `SLOW`.
-const SLOW: Duration = Duration::from_secs(3);
+const PROVIDER_ENV: &[&str] = &[
+    "SOKET_API_KEY",
+    "TENSORSTUDIO_API_KEY",
+    "LOOP_API_KEY",
+    "OPENROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+];
+
+/// Holds a `GATED` model reply until the test opens it.
+#[derive(Default)]
+struct Gate {
+    /// (a gated request arrived, the gate is open)
+    state: Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+impl Gate {
+    /// Called on the fake server's connection thread.
+    fn pass(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        self.changed.notify_all();
+        let (_state, _) = self
+            .changed
+            .wait_timeout_while(state, TEST_LIMIT, |s| !s.1)
+            .unwrap();
+    }
+    fn open(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
+    async fn arrived(&self) {
+        tokio::time::timeout(WAIT, async {
+            while !self.state.lock().unwrap().0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("gated model request never arrived");
+    }
+}
 
 async fn bounded<F: std::future::Future>(test: F) -> F::Output {
     tokio::time::timeout(TEST_LIMIT, test)
@@ -77,9 +121,9 @@ fn content_text(message: &Value) -> String {
     }
 }
 /// Replies depend only on the request, so parallel Sessions cannot swap them.
-/// `NEEDS-APPROVAL` asks for an approved `bash` call; anything else is echoed
-/// as `reply <last word>`.
-fn model(request: &RecordedRequest) -> FakeResponse {
+/// `NEEDS-APPROVAL` asks for an approved `bash` call (held at `gate` when the
+/// prompt also says `GATED`); anything else is echoed as `reply <last word>`.
+fn model(request: &RecordedRequest, gate: &Gate) -> FakeResponse {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/v1/models") => FakeResponse::json(r#"{"data":[{"id":"fake-model"}]}"#),
         ("POST", "/v1/chat/completions") => {
@@ -94,12 +138,10 @@ fn model(request: &RecordedRequest) -> FakeResponse {
             }
             let text = content_text(&last);
             if text.contains("NEEDS-APPROVAL") {
-                let reply = approval_reply();
-                return if text.contains("SLOW") {
-                    reply.with_body_delay(SLOW)
-                } else {
-                    reply
-                };
+                if text.contains("GATED") {
+                    gate.pass();
+                }
+                return approval_reply();
             }
             let word: String = text
                 .split_whitespace()
@@ -118,6 +160,8 @@ fn model(request: &RecordedRequest) -> FakeResponse {
 
 struct Fixture {
     _dir: tempfile::TempDir,
+    home: PathBuf,
+    gate: Arc<Gate>,
     agent: PathBuf,
     work: PathBuf,
     socket: PathBuf,
@@ -134,7 +178,11 @@ impl Fixture {
         let work = dir.path().join("work");
         std::fs::create_dir_all(&agent).unwrap();
         std::fs::create_dir_all(&work).unwrap();
-        let model = FakeHttpServer::start(model);
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let gate = Arc::new(Gate::default());
+        let route_gate = gate.clone();
+        let model = FakeHttpServer::start(move |r| model(r, &route_gate));
         std::fs::write(
             agent.join("models.json"),
             json!({"providers":[{"id":"fake","baseUrl":format!("{}/v1", model.base_url()),
@@ -151,6 +199,8 @@ impl Fixture {
             socket: agent.join("run/runtime.sock"),
             agent,
             work,
+            home,
+            gate,
             _dir: dir,
             model,
         }
@@ -160,6 +210,7 @@ impl Fixture {
         cmd.args(args)
             .env("LOOP_CODING_AGENT_DIR", &self.agent)
             .env("LOOP_CODING_AGENT_SESSION_DIR", self.agent.join("sessions"))
+            .env("HOME", &self.home)
             .env_remove("LOOP_DEBUG")
             .env_remove("RUST_LOG")
             .current_dir(&self.work)
@@ -167,6 +218,9 @@ impl Fixture {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        for key in PROVIDER_ENV {
+            cmd.env_remove(key);
+        }
         cmd
     }
     async fn serve(&self) -> Proc {
@@ -358,7 +412,10 @@ async fn session_updates(
     let mut seen: Vec<UpdateEnvelope> = Vec::new();
     tokio::time::timeout(WAIT, async {
         while seen.last().is_none_or(|e| e.seq < through) {
-            let envelope = updates.recv().await.unwrap();
+            let envelope = match updates.recv().await {
+                Ok(envelope) => envelope,
+                Err(error) => panic!("update stream failed after {} updates: {error}", seen.len()),
+            };
             if envelope.session == session.key {
                 seen.push(envelope);
             }
@@ -443,10 +500,12 @@ async fn approval_parked_without_clients_is_answered_by_one_of_two_surfaces() {
 
         // Start a turn, then detach before the model asks for approval.
         let mut starter = fx.attach(&["--new", "--cwd", work]);
-        starter.line("NEEDS-APPROVAL SLOW").await;
+        starter.line("NEEDS-APPROVAL GATED").await;
+        fx.gate.arrived().await;
         starter.finish().await;
         let raised = |e: &EventKind| matches!(e, EventKind::EscalationRaised(_));
         assert_eq!(count(&fx.events().await, raised), 0, "raised too early");
+        fx.gate.open();
         tokio::time::timeout(WAIT, async {
             while count(&fx.events().await, raised) == 0 {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -542,6 +601,26 @@ async fn kill_9_mid_turn_then_restart_ends_the_turn_uncertain_and_the_session_wo
             calls.iter().all(|c| answered.contains(c)),
             "unanswered tool call in {messages:#?}"
         );
+        if calls.contains(&json!("call-1")) {
+            // The interrupted call is reported as such, never as an empty success.
+            let result = messages
+                .iter()
+                .find(|m| m["role"] == "tool" && m["tool_call_id"] == "call-1")
+                .unwrap();
+            assert!(
+                content_text(result).contains("may or may not have run"),
+                "{result:#}"
+            );
+        } else {
+            // Otherwise the Session tree holds none of the interrupted turn
+            // (design §12: the tree may lack it until it projects the log).
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| content_text(m).contains("NEEDS-APPROVAL")),
+                "half an interrupted turn reached the model: {messages:#?}"
+            );
+        }
         let output = surface.finish().await;
         assert!(!output.contains("Escalation:"), "stale approval replayed: {output}");
 
