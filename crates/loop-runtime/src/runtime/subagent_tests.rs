@@ -989,8 +989,9 @@ async fn only_subagent_children_list_a_parent_and_their_end_says_they_closed() {
 
         let events = log.read_runtime_after(0).await.unwrap();
         let ended = payload(&events, &root.key, "subagent_ended").unwrap();
-        assert_eq!(ended["closed"], json!(true), "{ended}");
-        assert!(ended.get("close_error").is_none(), "{ended}");
+        // `closed` keeps its original meaning: the close error, or null.
+        assert_eq!(ended["closed"], json!(null), "{ended}");
+        assert_eq!(ended["closed_ok"], json!(true), "{ended}");
         rt.shutdown().await;
     })
     .await

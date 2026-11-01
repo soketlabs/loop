@@ -1017,9 +1017,9 @@ async fn a_finished_child_frees_its_session_slot() {
 
         let ended = ended_children(&fx.events().await);
         assert_eq!(ended.len(), 2, "{ended:?}");
-        assert!(ended
-            .iter()
-            .all(|(_, p)| p["status"] == "completed" && p["closed"] == true));
+        assert!(ended.iter().all(|(_, p)| p["status"] == "completed"
+            && p["closed"].is_null()
+            && p["closed_ok"] == true));
         let client = fx.client().await;
         let live = client
             .list()

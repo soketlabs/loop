@@ -428,13 +428,13 @@ impl Runtime {
             ),
             Err(error) => ("failed", Err(error)),
         };
-        let mut ended = json!({
+        // `closed` is the close error, or null when the child closed; older
+        // logs only have that field. `closed_ok` states the outcome directly.
+        let ended = json!({
             "child": child.key, "status": status, "model_calls": calls,
-            "closed": closed.is_ok(),
+            "closed": closed.as_ref().map_err(ToString::to_string).err(),
+            "closed_ok": closed.is_ok(),
         });
-        if let Err(error) = &closed {
-            ended["close_error"] = json!(error.to_string());
-        }
         self.log_parent(parent, EventKind::SubagentEnded(ended))
             .await;
         (result, halted)

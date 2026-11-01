@@ -184,6 +184,7 @@ JSON with lenient handling of unknown kinds.
 | `PromptSent`, `Cancelled` | Input and cancellation intent, with Session and turn correlation when known |
 | `EscalationRaised`, `EscalationAnswered`, `EscalationWithdrawn` | Request, winning answer, grants and withdrawal reason |
 | `SessionOpened`, `SessionClosed` | Session lifecycle, cwd and parent linkage where applicable |
+| `SubagentStarted`, `SubagentEnded` | On the parent: child id, task, status and model calls. In `SubagentEnded`, `closed` is the child's close error or null when it closed; `closed_ok` (newer logs only) is true when it closed |
 | `RuntimeStarted`, `RuntimeStopped` | Runtime lifecycle and generation |
 | `Unknown` | Future records retained without inventing their meaning |
 
