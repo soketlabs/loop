@@ -544,6 +544,16 @@ impl Runtime {
                 },
             );
             let reference = opened.native.current_session().await;
+            if !created {
+                // Turn ids stay unique per Session across Runtime generations.
+                let turns = self.log.turn_ids(&reference.key).await.map_err(failed)?;
+                let last = turns
+                    .iter()
+                    .filter_map(|turn| turn.as_str().strip_prefix("turn-")?.parse::<u64>().ok())
+                    .max()
+                    .unwrap_or(0);
+                opened.native.continue_turns_after(last);
+            }
             let escalations =
                 crate::EscalationHost::new(reference.clone(), self.log.clone(), self.generation);
             // Runtime grants are live Session state, never restored after a crash.

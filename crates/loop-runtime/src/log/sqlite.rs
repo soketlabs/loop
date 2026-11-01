@@ -10,6 +10,7 @@ enum Command {
     Append(Vec<Event>, Reply<Vec<LoggedEvent>>),
     Read(Option<SessionKey>, u64, Reply<Vec<LoggedEvent>>),
     Latest(SessionKey, Reply<u64>),
+    Turns(SessionKey, Reply<Vec<TurnId>>),
     Allocate(String, u32, i64, Reply<u64>),
     Finish(u64, i64, Reply<()>),
     Activity(Reply<std::collections::HashMap<SessionKey, i64>>),
@@ -80,6 +81,10 @@ impl EventLog for SqliteEventLog {
     }
     async fn latest_seq(&self, session: &SessionKey) -> Result<u64> {
         self.request(|reply| Command::Latest(session.clone(), reply))
+            .await
+    }
+    async fn turn_ids(&self, session: &SessionKey) -> Result<Vec<TurnId>> {
+        self.request(|reply| Command::Turns(session.clone(), reply))
             .await
     }
     async fn allocate_generation(&self, owner: &str, pid: u32, started_ms: i64) -> Result<u64> {
@@ -174,6 +179,9 @@ fn writer(mut conn: Connection, mut receiver: mpsc::Receiver<Command>) {
             Command::Latest(session, reply) => {
                 let _ = reply.send(latest(&conn, &session));
             }
+            Command::Turns(session, reply) => {
+                let _ = reply.send(turn_ids(&conn, &session));
+            }
             Command::Allocate(owner, pid, started, reply) => {
                 let _ = reply.send(allocate(&mut conn, &owner, pid, started));
             }
@@ -262,6 +270,16 @@ fn latest(conn: &Connection, session: &SessionKey) -> Result<u64> {
         [session.as_str()],
         |row| row.get(0),
     )?)
+}
+
+fn turn_ids(conn: &Connection, session: &SessionKey) -> Result<Vec<TurnId>> {
+    let mut statement =
+        conn.prepare("SELECT DISTINCT turn FROM events WHERE session_key=?1 AND turn IS NOT NULL")?;
+    let turns = statement
+        .query_map([session.as_str()], |row| row.get::<_, String>(0))?
+        .map(|turn| turn.map(TurnId))
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(turns)
 }
 
 fn append(conn: &mut Connection, events: Vec<Event>) -> Result<Vec<LoggedEvent>> {

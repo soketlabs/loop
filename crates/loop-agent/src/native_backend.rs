@@ -101,6 +101,13 @@ impl NativeBackend {
         self.session_ref(self.harness.session_id().await)
     }
 
+    /// Number this Session's next turns after `turns` earlier ones, recorded
+    /// elsewhere (for example in the Runtime's Event Log), so turn ids stay
+    /// unique across process restarts.
+    pub fn continue_turns_after(&self, turns: u64) {
+        self.stream.lock().mapper.continue_after(turns);
+    }
+
     /// Point the update stream at a session the harness switched to by
     /// itself (for example after forking).
     pub fn adopt_session(&self, native_id: &str) -> SessionRef {

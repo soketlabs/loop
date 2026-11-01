@@ -725,3 +725,55 @@ async fn list_reads_activity_from_memory_not_the_event_log() {
     );
     rt.shutdown().await;
 }
+
+fn turn_starts(records: &[loop_runtime::log::LoggedEvent]) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(|r| match &r.event.kind {
+            EventKind::Update(envelope) => match &envelope.update {
+                loop_protocol::SessionUpdate::TurnStarted { turn_id } => Some(turn_id.0.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn turn_ids_continue_across_runtime_restarts() {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite: Arc<dyn EventLog> = Arc::new(
+            loop_runtime::log::SqliteEventLog::open(dir.path())
+                .await
+                .unwrap(),
+        );
+        let memory: Arc<dyn EventLog> = Arc::new(MemoryEventLog::new());
+        for (n, log) in [sqlite, memory].into_iter().enumerate() {
+            let dir = dir.path().join(n.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            let rt = runtime(&dir, log.clone(), RuntimeLimits::default()).await;
+            let a = rt.new_session(SessionSpec::default()).await.unwrap();
+            for prompt in ["one", "two"] {
+                rt.prompt(&a, vec![ContentBlock::text(prompt)])
+                    .await
+                    .unwrap()
+                    .outcome()
+                    .await;
+            }
+            rt.shutdown().await;
+            let rt = runtime(&dir, log.clone(), RuntimeLimits::default()).await;
+            rt.load_session(&a, SessionSpec::default()).await.unwrap();
+            rt.prompt(&a, vec![ContentBlock::text("three")])
+                .await
+                .unwrap()
+                .outcome()
+                .await;
+            rt.shutdown().await;
+            let turns = turn_starts(&log.read_after(&a.key, 0).await.unwrap());
+            assert_eq!(turns, ["turn-1", "turn-2", "turn-3"], "log {n}");
+        }
+    })
+    .await
+    .unwrap();
+}

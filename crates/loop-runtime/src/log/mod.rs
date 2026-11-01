@@ -134,6 +134,19 @@ pub trait EventLog: Send + Sync {
     async fn mark_recovered(&self, _generation: u64, _recovered_ms: i64) -> Result<()> {
         Ok(())
     }
+    /// Distinct turn ids this Session's Updates belong to. Implementations
+    /// should answer without decoding payloads; the default reads every Update.
+    async fn turn_ids(&self, session: &SessionKey) -> Result<Vec<TurnId>> {
+        let mut turns = Vec::new();
+        for record in self.read_after(session, 0).await? {
+            if let Some(turn) = record.event.turn {
+                if !turns.contains(&turn) {
+                    turns.push(turn);
+                }
+            }
+        }
+        Ok(turns)
+    }
     /// Newest event timestamp per Session. Implementations should answer with an
     /// aggregate query; the default scans the whole log.
     async fn last_activity_ms(&self) -> Result<std::collections::HashMap<SessionKey, i64>> {

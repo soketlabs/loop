@@ -55,6 +55,12 @@ impl NativeEventMapper {
         self.next_turn
     }
 
+    /// Number later turns after `turns` earlier ones, so a reloaded Session
+    /// never repeats a turn id. Never moves the numbering back.
+    pub fn continue_after(&mut self, turns: u64) {
+        self.next_turn = self.next_turn.max(turns);
+    }
+
     /// Start a turn without an agent event, for a run that fails before the
     /// agent loop starts. Pair with [`NativeEventMapper::end_turn_with_error`].
     pub fn begin_turn(&mut self) -> TurnId {
@@ -589,6 +595,15 @@ mod tests {
     use loop_protocol::ErrorCategory;
 
     use super::*;
+
+    #[test]
+    fn turn_numbering_continues_after_earlier_turns_and_never_goes_back() {
+        let mut mapper = NativeEventMapper::new();
+        mapper.continue_after(4);
+        assert_eq!(mapper.begin_turn().as_str(), "turn-5");
+        mapper.continue_after(2);
+        assert_eq!(mapper.begin_turn().as_str(), "turn-6");
+    }
 
     #[test]
     fn errors_are_classified() {
