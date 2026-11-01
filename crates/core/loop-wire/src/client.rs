@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use loop_protocol::rpc::{
-    methods, ClientCapabilities, InitializeParams, InitializeResult, LoadParams, PeerInfo,
-    PromptParams, PromptResult, RpcErrorBody, SessionParams,
+    methods, AttachParams, AttachResult, ClientCapabilities, CloseParams, InitializeParams,
+    InitializeResult, LoadParams, PeerInfo, PromptParams, PromptResult, RpcErrorBody, SessionInfo,
+    SessionParams,
 };
 use loop_protocol::{
     AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, ContentBlock,
@@ -87,6 +88,49 @@ impl RemoteBackend {
     /// The server, as it introduced itself.
     pub fn server(&self) -> &PeerInfo {
         &self.server
+    }
+
+    /// Every Session the Runtime knows (`session/list`). Needs the
+    /// `multi_session` capability.
+    pub async fn list(&self) -> BackendResult<Vec<SessionInfo>> {
+        call(&self.conn, methods::SESSION_LIST, &serde_json::json!({})).await
+    }
+
+    /// Watch a Session (`session/attach`). Updates after `after_seq` arrive on
+    /// [`AgentBackend::subscribe`] as `origin: replay` and then live, with
+    /// contiguous `seq`; subscribe *before* calling so none is missed. Needs
+    /// the `attach` capability.
+    pub async fn attach(
+        &self,
+        session: &SessionRef,
+        after_seq: u64,
+    ) -> BackendResult<AttachResult> {
+        let params = AttachParams {
+            session: session.clone(),
+            after_seq,
+        };
+        call(&self.conn, methods::SESSION_ATTACH, &params).await
+    }
+
+    /// Stop receiving a Session's updates. The turn keeps running.
+    pub async fn detach(&self, session: &SessionRef) -> BackendResult<()> {
+        let params = SessionParams {
+            session: session.clone(),
+        };
+        call::<Value>(&self.conn, methods::SESSION_DETACH, &params)
+            .await
+            .map(|_| ())
+    }
+
+    /// Close a Session; a busy one needs `force`.
+    pub async fn close(&self, session: &SessionRef, force: bool) -> BackendResult<()> {
+        let params = CloseParams {
+            session: session.clone(),
+            force,
+        };
+        call::<Value>(&self.conn, methods::SESSION_CLOSE, &params)
+            .await
+            .map(|_| ())
     }
 }
 

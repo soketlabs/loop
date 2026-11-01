@@ -7,18 +7,27 @@
 //! comes first. A turn is recognised as the first `turn_started` on its
 //! session after the prompt was accepted; a backend runs one turn per session
 //! at a time, so that is unambiguous.
+//!
+//! With a [`RuntimeControl`] ([`serve_with_control`]) the connection is one of
+//! many on a shared Runtime: it receives updates only for Sessions it
+//! created, loaded, prompted or attached, and `session/attach` replays the
+//! Event Log with no gap and no duplicate (design §7).
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use loop_protocol::rpc::{
-    methods, negotiate, InitializeParams, InitializeResult, LoadParams, PeerInfo, PromptParams,
-    PromptResult, RpcErrorBody, SessionParams,
+    methods, negotiate, AttachParams, AttachResult, CloseParams, InitializeParams,
+    InitializeResult, LoadParams, PeerInfo, PromptParams, PromptResult, RpcErrorBody,
+    SessionParams,
 };
 use loop_protocol::{
-    AgentBackend, BackendInstanceId, HostServices, InteractionOutcome, InteractionRequest,
-    NoticeLevel, SessionKey, SessionUpdate, TurnId, TurnOutcome, UpdateEnvelope,
+    AgentBackend, BackendInstanceId, BackendResult, HostServices, InteractionOutcome,
+    InteractionRequest, NoticeLevel, Origin, SessionKey, SessionUpdate, TurnId, TurnOutcome,
+    UpdateEnvelope,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -26,6 +35,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::connection::{codes, Connection, Incoming, PeerRequestId, RpcError};
+use crate::control::{Attachment, RuntimeControl};
 use crate::transport::Transport;
 
 /// How long a prompt's response waits for its `turn_ended` after the
@@ -71,11 +81,38 @@ pub fn serve_with_options(
     info: PeerInfo,
     options: ServeOptions,
 ) -> Served {
+    start(backend, None, transport, info, options)
+}
+
+/// Serve one connection of a shared Runtime: multi-Session methods, per-
+/// connection update filtering and attach. `backend` and `control` are
+/// normally the same Runtime.
+pub fn serve_with_control(
+    backend: Arc<dyn AgentBackend>,
+    control: Arc<dyn RuntimeControl>,
+    transport: Transport,
+    info: PeerInfo,
+    options: ServeOptions,
+) -> Served {
+    start(backend, Some(control), transport, info, options)
+}
+
+fn start(
+    backend: Arc<dyn AgentBackend>,
+    runtime: Option<Arc<dyn RuntimeControl>>,
+    transport: Transport,
+    info: PeerInfo,
+    options: ServeOptions,
+) -> Served {
     let (conn, incoming) = Connection::new(transport);
+    let interact = Arc::new(AtomicBool::new(true));
     let host = Arc::new(ClientHost {
         conn: Arc::clone(&conn),
+        interact: Arc::clone(&interact),
     });
-    let done = tokio::spawn(run(backend, conn, incoming, info, options));
+    let done = tokio::spawn(run(
+        backend, runtime, conn, incoming, info, options, interact,
+    ));
     Served { host, done }
 }
 
@@ -92,14 +129,34 @@ enum Control {
     },
     /// The backend refused the prompt; the request loop answers it.
     Rejected { ticket: u64 },
+    /// A `session/new` or `session/load` is running: hold updates of
+    /// Sessions not yet known until it says which one it made.
+    RegisterBegin,
+    /// That Session is now this connection's.
+    Owned { key: SessionKey },
+    /// The `session/new` or `session/load` finished.
+    RegisterEnd,
+    /// An attach started: buffer live updates of `key` until it is answered.
+    Attaching { key: SessionKey },
+    /// The attach finished; answer `id`, replay, then go live.
+    Attached {
+        id: PeerRequestId,
+        key: SessionKey,
+        after_seq: u64,
+        result: BackendResult<Attachment>,
+    },
+    /// Stop forwarding `key`, then answer `id`.
+    Detach { id: PeerRequestId, key: SessionKey },
 }
 
 async fn run(
     backend: Arc<dyn AgentBackend>,
+    runtime: Option<Arc<dyn RuntimeControl>>,
     conn: Arc<Connection>,
     mut incoming: mpsc::UnboundedReceiver<Incoming>,
     info: PeerInfo,
     options: ServeOptions,
+    interact: Arc<AtomicBool>,
 ) {
     // Subscribe now so nothing between `initialize` and the first update is
     // missed; forwarding starts once the client is initialized.
@@ -110,6 +167,7 @@ async fn run(
         backend.instance().clone(),
         updates,
         control_rx,
+        runtime.is_some(),
     ));
     let mut initialized = false;
     while let Some(message) = incoming.recv().await {
@@ -126,11 +184,17 @@ async fn run(
                 if method == methods::INITIALIZE {
                     match parse::<InitializeParams>(params) {
                         Ok(params) => {
+                            interact.store(params.client_capabilities.interact, Ordering::Release);
+                            let mut capabilities = backend.capabilities();
+                            if runtime.is_some() {
+                                capabilities.multi_session = true;
+                                capabilities.attach = true;
+                            }
                             let result = InitializeResult {
                                 protocol_version: negotiate(params.protocol_version),
                                 server_info: info.clone(),
                                 instance: backend.instance().clone(),
-                                capabilities: backend.capabilities(),
+                                capabilities,
                             };
                             conn.respond(id, Ok(to_value(&result)));
                             if !initialized {
@@ -158,12 +222,22 @@ async fn run(
                     break;
                 }
                 let backend = Arc::clone(&backend);
+                let runtime = runtime.clone();
                 let conn = Arc::clone(&conn);
                 let control = control.clone();
                 // Each request runs on its own, so a long `session/load`
                 // doesn't hold up a `session/cancel`.
                 tokio::spawn(async move {
-                    handle(backend.as_ref(), &conn, &control, id, &method, params).await;
+                    handle(
+                        backend.as_ref(),
+                        runtime.as_deref(),
+                        &conn,
+                        &control,
+                        id,
+                        &method,
+                        params,
+                    )
+                    .await;
                 });
             }
         }
@@ -174,6 +248,7 @@ async fn run(
 
 async fn handle(
     backend: &dyn AgentBackend,
+    runtime: Option<&dyn RuntimeControl>,
     conn: &Connection,
     control: &mpsc::UnboundedSender<Control>,
     id: PeerRequestId,
@@ -182,14 +257,70 @@ async fn handle(
 ) {
     let result = match method {
         methods::SESSION_NEW => match parse(params) {
-            Ok(spec) => backend.new_session(spec).await.map(|s| to_value(&s)),
+            Ok(spec) => {
+                let _ = control.send(Control::RegisterBegin);
+                let made = backend.new_session(spec).await;
+                if let Ok(session) = &made {
+                    let _ = control.send(Control::Owned {
+                        key: session.key.clone(),
+                    });
+                }
+                let _ = control.send(Control::RegisterEnd);
+                made.map(|s| to_value(&s))
+            }
             Err(error) => return conn.respond(id, Err(error)),
         },
         methods::SESSION_LOAD => match parse::<LoadParams>(params) {
-            Ok(LoadParams { session, spec }) => backend
-                .load_session(&session, spec)
+            Ok(LoadParams { session, spec }) => {
+                let _ = control.send(Control::RegisterBegin);
+                let loaded = backend.load_session(&session, spec).await;
+                if let Ok(session) = &loaded {
+                    let _ = control.send(Control::Owned {
+                        key: session.key.clone(),
+                    });
+                }
+                let _ = control.send(Control::RegisterEnd);
+                loaded.map(|s| to_value(&s))
+            }
+            Err(error) => return conn.respond(id, Err(error)),
+        },
+        methods::SESSION_LIST if runtime.is_some() => {
+            runtime.unwrap().list().await.map(|l| to_value(&l))
+        }
+        methods::SESSION_CLOSE if runtime.is_some() => match parse::<CloseParams>(params) {
+            Ok(CloseParams { session, force }) => runtime
+                .unwrap()
+                .close(&session, force)
                 .await
-                .map(|s| to_value(&s)),
+                .map(|()| json!({})),
+            Err(error) => return conn.respond(id, Err(error)),
+        },
+        methods::SESSION_ATTACH if runtime.is_some() => match parse::<AttachParams>(params) {
+            Ok(AttachParams { session, after_seq }) => {
+                // The forwarder buffers this Session's live updates from here
+                // until it has sent the replay, then answers the request.
+                let _ = control.send(Control::Attaching {
+                    key: session.key.clone(),
+                });
+                let result = runtime.unwrap().attach(&session, after_seq).await;
+                let _ = control.send(Control::Attached {
+                    id,
+                    key: session.key,
+                    after_seq,
+                    result,
+                });
+                return;
+            }
+            Err(error) => return conn.respond(id, Err(error)),
+        },
+        methods::SESSION_DETACH if runtime.is_some() => match parse::<SessionParams>(params) {
+            Ok(SessionParams { session }) => {
+                let _ = control.send(Control::Detach {
+                    id,
+                    key: session.key,
+                });
+                return;
+            }
             Err(error) => return conn.respond(id, Err(error)),
         },
         methods::SESSION_TRANSCRIPT => match parse::<SessionParams>(params) {
@@ -254,7 +385,9 @@ async fn forward(
     instance: BackendInstanceId,
     mut updates: broadcast::Receiver<UpdateEnvelope>,
     mut control: mpsc::UnboundedReceiver<Control>,
+    filtering: bool,
 ) {
+    let mut feeds = Feeds::default();
     let mut started = false;
     // In the order the prompts were sent; a session's next `turn_started`
     // belongs to its oldest prompt without a turn.
@@ -269,7 +402,35 @@ async fn forward(
             command = control.recv() => match command {
                 Some(Control::Start) => started = true,
                 Some(Control::Rejected { ticket }) => waiting.retain(|w| w.ticket != ticket),
+                Some(Control::RegisterBegin) => feeds.registering += 1,
+                Some(Control::RegisterEnd) => {
+                    feeds.registering = feeds.registering.saturating_sub(1);
+                    if feeds.registering == 0 {
+                        feeds.pending.clear();
+                    }
+                }
+                Some(Control::Owned { key }) => {
+                    if feeds.own(key.clone()) {
+                        for envelope in feeds.take_pending(&key) {
+                            if feeds.deliver(&conn, envelope).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Some(Control::Attaching { key }) => feeds.start_attach(key),
+                Some(Control::Attached { id, key, after_seq, result }) => {
+                    if feeds.finish_attach(&conn, id, key, after_seq, result).is_err() {
+                        return;
+                    }
+                }
+                Some(Control::Detach { id, key }) => {
+                    feeds.map.remove(&key);
+                    conn.respond(id, Ok(json!({})));
+                }
                 Some(Control::Prompted { ticket, session, id, outcome }) => {
+                    // Prompting a Session makes it this connection's.
+                    feeds.own(session.clone());
                     let tx = outcome_tx.clone();
                     tokio::spawn(async move {
                         let outcome = outcome.await.unwrap_or(TurnOutcome::Uncertain);
@@ -311,7 +472,12 @@ async fn forward(
                         }
                         _ => {}
                     }
-                    if conn.notify(methods::SESSION_UPDATE, to_value(&envelope)).is_err() {
+                    let sent = if filtering {
+                        feeds.route(&conn, envelope)
+                    } else {
+                        conn.notify(methods::SESSION_UPDATE, to_value(&envelope))
+                    };
+                    if sent.is_err() {
                         return;
                     }
                 }
@@ -348,6 +514,144 @@ async fn forward(
     }
 }
 
+/// What a connection receives of one Session.
+enum Feed {
+    /// Forwarding; `last_sent` is the newest `session_seq` the client has.
+    Live { last_sent: u64 },
+    /// An attach is reading the Event Log; live updates wait in `buffer`.
+    /// `prior` is the cursor of an earlier feed, kept if the attach fails.
+    Attaching {
+        buffer: Vec<UpdateEnvelope>,
+        prior: Option<u64>,
+    },
+}
+
+/// The Sessions this connection created, loaded, prompted or attached.
+#[derive(Default)]
+struct Feeds {
+    map: HashMap<SessionKey, Feed>,
+    /// Running `session/new` / `session/load` calls.
+    registering: usize,
+    /// Updates of unknown Sessions seen while `registering`: one of them may
+    /// be the Session being made.
+    pending: Vec<UpdateEnvelope>,
+}
+
+/// Most updates held for a Session that is still being created or loaded.
+const PENDING_LIMIT: usize = 65_536;
+
+impl Feeds {
+    /// Make `key` this connection's. False if it already was.
+    fn own(&mut self, key: SessionKey) -> bool {
+        if self.map.contains_key(&key) {
+            return false;
+        }
+        self.map.insert(key, Feed::Live { last_sent: 0 });
+        true
+    }
+
+    fn take_pending(&mut self, key: &SessionKey) -> Vec<UpdateEnvelope> {
+        let (mine, rest) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|e| &e.session == key);
+        self.pending = rest;
+        mine
+    }
+
+    /// Forward, buffer or drop an update from the Runtime.
+    fn route(&mut self, conn: &Connection, envelope: UpdateEnvelope) -> Result<(), RpcError> {
+        match self.map.get_mut(&envelope.session) {
+            Some(Feed::Attaching { buffer, .. }) => buffer.push(envelope),
+            Some(Feed::Live { .. }) => return self.deliver(conn, envelope),
+            None if self.registering > 0 && self.pending.len() < PENDING_LIMIT => {
+                self.pending.push(envelope);
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Send a live update of a Live feed unless the client already has it.
+    fn deliver(&mut self, conn: &Connection, envelope: UpdateEnvelope) -> Result<(), RpcError> {
+        if let Some(Feed::Live { last_sent }) = self.map.get_mut(&envelope.session) {
+            if envelope.seq > *last_sent {
+                *last_sent = envelope.seq;
+                conn.notify(methods::SESSION_UPDATE, to_value(&envelope))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn start_attach(&mut self, key: SessionKey) {
+        let prior = match self.map.remove(&key) {
+            Some(Feed::Live { last_sent }) => Some(last_sent),
+            Some(Feed::Attaching { prior, .. }) => prior,
+            None => None,
+        };
+        self.map.insert(
+            key,
+            Feed::Attaching {
+                buffer: Vec::new(),
+                prior,
+            },
+        );
+    }
+
+    /// Answer the attach, then replay, then the updates buffered meanwhile.
+    fn finish_attach(
+        &mut self,
+        conn: &Connection,
+        id: PeerRequestId,
+        key: SessionKey,
+        after_seq: u64,
+        result: BackendResult<Attachment>,
+    ) -> Result<(), RpcError> {
+        let (buffer, prior) = match self.map.remove(&key) {
+            Some(Feed::Attaching { buffer, prior }) => (buffer, prior),
+            // Detached while reading the log: nothing to deliver.
+            _ => {
+                conn.respond(id, Ok(json!({})));
+                return Ok(());
+            }
+        };
+        let (last, buffer) = match result {
+            Ok(attachment) => {
+                conn.respond(
+                    id,
+                    Ok(to_value(&AttachResult {
+                        latest_seq: attachment.latest_seq,
+                        generation: attachment.generation,
+                    })),
+                );
+                // A cursor ahead of the log would hide new updates.
+                let mut last = after_seq.min(attachment.latest_seq);
+                for mut envelope in attachment.replay {
+                    if envelope.seq <= last {
+                        continue;
+                    }
+                    last = envelope.seq;
+                    envelope.origin = Origin::Replay;
+                    envelope.generation = attachment.generation;
+                    conn.notify(methods::SESSION_UPDATE, to_value(&envelope))?;
+                }
+                (last, buffer)
+            }
+            Err(error) => {
+                respond(conn, id, Err(RpcErrorBody::from(&error)));
+                match prior {
+                    Some(last) => (last, buffer),
+                    None => return Ok(()),
+                }
+            }
+        };
+        self.map.insert(key.clone(), Feed::Live { last_sent: last });
+        for envelope in buffer {
+            self.deliver(conn, envelope)?;
+        }
+        Ok(())
+    }
+}
+
 /// Tell the client it missed updates, then close the connection.
 fn lagged(conn: &Connection, instance: &BackendInstanceId, missed: u64) {
     let notice = UpdateEnvelope::live(
@@ -377,11 +681,18 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 /// Asks the connected client through `host/interact`.
 struct ClientHost {
     conn: Arc<Connection>,
+    /// Whether the client declared `interact` at `initialize`.
+    interact: Arc<AtomicBool>,
 }
 
 #[async_trait]
 impl HostServices for ClientHost {
     async fn interact(&self, request: InteractionRequest) -> InteractionOutcome {
+        if !self.interact.load(Ordering::Acquire) {
+            return InteractionOutcome::Rejected {
+                reason: "the client is an observer and cannot answer".into(),
+            };
+        }
         let result = self
             .conn
             .request(methods::HOST_INTERACT, to_value(&request))
