@@ -368,13 +368,16 @@ impl SqliteSessionStore {
     pub fn standalone_writer(&self) -> Self {
         static GENERATION: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
         let now = self.environment.now_ms();
-        let previous = GENERATION
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |previous| Some(now.max(previous.saturating_add(1))),
-            )
-            .expect("generation update always succeeds");
+        // A plain compare-exchange loop: `fetch_update` is deprecated on newer toolchains.
+        let mut previous = GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+        while let Err(actual) = GENERATION.compare_exchange_weak(
+            previous,
+            now.max(previous.saturating_add(1)),
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            previous = actual;
+        }
         let identity = LeaseIdentity {
             owner: "standalone".into(),
             pid: std::process::id(),
