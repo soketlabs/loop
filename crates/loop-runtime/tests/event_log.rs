@@ -401,3 +401,24 @@ shared_suite!(
     sqlite_subagent_sessions,
     subagent_sessions
 );
+
+async fn prompts_sent(log: &dyn EventLog) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let prompt = |key: &str| Event {
+            generation: 1,
+            session_key: Some(key.into()),
+            turn: None,
+            ts_ms: 1,
+            kind: EventKind::PromptSent(json!({"content": []})),
+        };
+        log.append_batch(vec![prompt("a"), update("a"), prompt("a"), prompt("b")])
+            .await
+            .unwrap();
+        assert_eq!(log.prompts_sent(&"a".into()).await.unwrap(), 2);
+        assert_eq!(log.prompts_sent(&"b".into()).await.unwrap(), 1);
+        assert_eq!(log.prompts_sent(&"c".into()).await.unwrap(), 0);
+    })
+    .await
+    .unwrap();
+}
+shared_suite!(memory_prompts_sent, sqlite_prompts_sent, prompts_sent);

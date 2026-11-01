@@ -11,6 +11,7 @@ enum Command {
     Read(Option<SessionKey>, u64, Reply<Vec<LoggedEvent>>),
     Latest(SessionKey, Reply<u64>),
     Turns(SessionKey, Reply<Vec<TurnId>>),
+    Prompts(SessionKey, Reply<u64>),
     Subagents(Reply<std::collections::HashSet<SessionKey>>),
     Allocate(String, u32, i64, Reply<u64>),
     Finish(u64, i64, Reply<()>),
@@ -86,6 +87,10 @@ impl EventLog for SqliteEventLog {
     }
     async fn subagent_sessions(&self) -> Result<std::collections::HashSet<SessionKey>> {
         self.request(Command::Subagents).await
+    }
+    async fn prompts_sent(&self, session: &SessionKey) -> Result<u64> {
+        self.request(|reply| Command::Prompts(session.clone(), reply))
+            .await
     }
     async fn turn_ids(&self, session: &SessionKey) -> Result<Vec<TurnId>> {
         self.request(|reply| Command::Turns(session.clone(), reply))
@@ -185,6 +190,16 @@ fn writer(mut conn: Connection, mut receiver: mpsc::Receiver<Command>) {
             }
             Command::Turns(session, reply) => {
                 let _ = reply.send(turn_ids(&conn, &session));
+            }
+            Command::Prompts(session, reply) => {
+                let _ = reply.send(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM events WHERE session_key=?1 AND kind='prompt_sent'",
+                        [session.as_str()],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into),
+                );
             }
             Command::Subagents(reply) => {
                 let _ = reply.send(subagents(&conn));

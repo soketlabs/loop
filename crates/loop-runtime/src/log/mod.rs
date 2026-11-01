@@ -149,6 +149,20 @@ pub trait EventLog: Send + Sync {
             })
             .collect())
     }
+    /// How many prompts this Session was sent. Each turn starts from one, so
+    /// this bounds the turns begun even when a turn left no Update.
+    /// Implementations should count in storage; the default scans the log.
+    async fn prompts_sent(&self, session: &SessionKey) -> Result<u64> {
+        Ok(self
+            .read_runtime_after(0)
+            .await?
+            .iter()
+            .filter(|r| {
+                r.event.session_key.as_ref() == Some(session)
+                    && matches!(r.event.kind, EventKind::PromptSent(_))
+            })
+            .count() as u64)
+    }
     /// Distinct turn ids this Session's Updates belong to. Implementations
     /// should answer without decoding payloads; the default reads every Update.
     async fn turn_ids(&self, session: &SessionKey) -> Result<Vec<TurnId>> {

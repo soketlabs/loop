@@ -552,7 +552,13 @@ impl Runtime {
                     .filter_map(|turn| turn.as_str().strip_prefix("turn-")?.parse::<u64>().ok())
                     .max()
                     .unwrap_or(0);
-                opened.native.continue_turns_after(last);
+                // A turn lost before its start was logged left only its prompt.
+                let prompts = self
+                    .log
+                    .prompts_sent(&reference.key)
+                    .await
+                    .map_err(failed)?;
+                opened.native.continue_turns_after(last.max(prompts));
             }
             let escalations =
                 crate::EscalationHost::new(reference.clone(), self.log.clone(), self.generation);
