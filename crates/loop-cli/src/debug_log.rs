@@ -1,4 +1,4 @@
-//! Debug session logging to `target/debug/logs`.
+//! Foreground debug logging and Runtime daemon logging.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -11,6 +11,22 @@ use tracing_subscriber::{fmt, EnvFilter, Layer, Registry};
 
 /// A layer installed next to the log layer, e.g. the trace exporter.
 pub type ExportLayer = Box<dyn Layer<Registry> + Send + Sync>;
+
+/// Destination and terminal behavior for tracing.
+#[derive(Debug, Clone, Copy)]
+pub enum TracingMode<'a> {
+    /// Existing CLI behavior: optional debug file, stderr outside the TUI.
+    Foreground { interactive: bool },
+    /// File-only logging for a Runtime, independent of the working directory.
+    Daemon { agent_dir: &'a Path },
+}
+
+// Preserve the existing foreground call sites while allowing an explicit daemon mode.
+impl From<bool> for TracingMode<'_> {
+    fn from(interactive: bool) -> Self {
+        Self::Foreground { interactive }
+    }
+}
 
 /// Whether debug mode is enabled via `--debug` or `LOOP_DEBUG=1`.
 pub fn debug_enabled(cli_flag: bool) -> bool {
@@ -26,24 +42,38 @@ pub fn debug_enabled(cli_flag: bool) -> bool {
 /// Initialize tracing. In debug mode, writes session logs under `cwd/target/debug/logs`.
 ///
 /// Interactive TUI mode never writes logs to stderr; `--debug` retains them in a file.
-/// Non-interactive mode keeps stderr logging. `export_layer` (the telemetry exporter, when built with
-/// the `telemetry` feature) sees observation spans independently of the log filter.
-pub fn init_tracing(
+/// Non-interactive foreground mode keeps stderr logging. Daemon mode always writes
+/// to the agent directory's `logs/runtime.log` without stderr output.
+/// `export_layer` (the telemetry exporter, when built with the `telemetry` feature)
+/// sees observation spans independently of the log filter.
+pub fn init_tracing<'a>(
     debug: bool,
     cwd: &Path,
-    interactive: bool,
+    mode: impl Into<TracingMode<'a>>,
     export_layer: Option<ExportLayer>,
 ) -> anyhow::Result<Option<PathBuf>> {
+    let mode = mode.into();
+    let interactive = matches!(mode, TracingMode::Foreground { interactive: true });
     let default_filter = if debug {
         "info,loop_agent=debug,loop_ai=debug,loop_cli=debug,loop_app_core=debug,loop_mcp=debug"
+    } else if matches!(mode, TracingMode::Daemon { .. }) {
+        "info"
     } else {
         "warn"
     };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
-    let (log_layer, path) = if debug {
-        let (writer, path) = debug_log_writer(cwd, interactive)?;
+    let (log_layer, path) = if debug || matches!(mode, TracingMode::Daemon { .. }) {
+        let (writer, path) = match mode {
+            TracingMode::Foreground { interactive } => debug_log_writer(cwd, interactive)?,
+            TracingMode::Daemon { agent_dir } => {
+                let path = loop_app_core::config::paths::runtime_log_path(agent_dir);
+                fs::create_dir_all(agent_dir.join("logs"))?;
+                let file = OpenOptions::new().create(true).append(true).open(&path)?;
+                (Box::new(file) as Box<dyn Write + Send>, path)
+            }
+        };
         let layer = fmt::layer()
             .with_writer(Mutex::new(writer))
             .with_ansi(false)
@@ -70,10 +100,16 @@ pub fn init_tracing(
         .init();
 
     if let Some(path) = &path {
+        let message = if matches!(mode, TracingMode::Daemon { .. }) {
+            "Runtime logging enabled"
+        } else {
+            "debug logging enabled"
+        };
         tracing::info!(
             path = %path.display(),
             interactive,
-            "debug logging enabled"
+            "{}",
+            message
         );
     }
     Ok(path)

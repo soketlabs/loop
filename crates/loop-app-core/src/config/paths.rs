@@ -107,3 +107,86 @@ pub fn system_md_path(dir: &Path) -> PathBuf {
 pub fn append_system_md_path(dir: &Path) -> PathBuf {
     dir.join("APPEND_SYSTEM.md")
 }
+
+/// Create/verify the Runtime directory, private to the current user.
+pub fn run_dir(agent_dir: &Path) -> std::io::Result<PathBuf> {
+    let path = agent_dir.join("run");
+    ensure_private_runtime_dir(&path)?;
+    Ok(path)
+}
+
+/// Default Runtime socket, falling back to a short, user-owned directory.
+/// Explicit socket overrides should be passed directly to the listener instead.
+pub fn runtime_socket_path(agent_dir: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let candidate = std::path::absolute(agent_dir)?.join("run/runtime.sock");
+        let capacity = std::mem::size_of::<libc::sockaddr_un>()
+            - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+        if candidate.as_os_str().as_bytes().len() < capacity {
+            return Ok(run_dir(agent_dir)?.join("runtime.sock"));
+        }
+        // SAFETY: geteuid has no arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let fallback = PathBuf::from(format!("/tmp/loop-{uid}"));
+        ensure_private_runtime_dir(&fallback)?;
+        Ok(fallback.join("runtime.sock"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = agent_dir;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Runtime Unix sockets are unsupported on this platform",
+        ))
+    }
+}
+
+/// Single-instance lock identity, always tied to the agent directory.
+pub fn runtime_lock_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("run/runtime.lock")
+}
+
+/// Diagnostic pid file, always tied to the agent directory.
+pub fn runtime_pid_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("run/runtime.pid")
+}
+
+/// Daemon log path.
+pub fn runtime_log_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("logs/runtime.log")
+}
+
+/// Create a private directory, rejecting symlinks and foreign ownership.
+pub(crate) fn ensure_private_runtime_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        // SAFETY: geteuid has no arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.is_dir() || metadata.uid() != uid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "Runtime directory must be a directory owned by the current user: {}",
+                    path.display()
+                ),
+            ));
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Runtime directories are unsupported on this platform",
+        ))
+    }
+}
