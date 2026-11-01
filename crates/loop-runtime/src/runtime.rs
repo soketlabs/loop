@@ -4,7 +4,11 @@ use async_trait::async_trait;
 use loop_agent::{
     harness::{
         create_session_repository,
-        session::sqlite::{LeaseIdentity, SqliteSessionStore},
+        session::{
+            sqlite::{LeaseIdentity, SqliteSessionStore},
+            SessionStore,
+        },
+        types::SessionError,
         Sandbox,
     },
     native_backend::NATIVE_INSTANCE,
@@ -20,6 +24,7 @@ use loop_protocol::{
 use serde_json::json;
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -29,7 +34,7 @@ use std::{
 };
 use tokio::{
     sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
-    task::JoinHandle,
+    task::{AbortHandle, JoinHandle},
 };
 
 /// Admission limits. Active turns queue when all permits are occupied.
@@ -63,7 +68,22 @@ pub struct Runtime {
     store: Arc<SqliteSessionStore>,
     identity: LeaseIdentity,
     updates: broadcast::Sender<UpdateEnvelope>,
+    activity: Activity,
+    close_grace: Duration,
 }
+/// Newest event timestamp per Session, kept in memory so listing never scans the log.
+type Activity = Arc<Mutex<HashMap<SessionKey, i64>>>;
+fn touch(activity: &Activity, key: &SessionKey, ts_ms: i64) {
+    let mut map = activity.lock().unwrap();
+    let slot = map.entry(key.clone()).or_insert(ts_ms);
+    *slot = (*slot).max(ts_ms);
+}
+/// How long a close waits for each settling step before giving up on a stuck turn.
+const CLOSE_GRACE: Duration = Duration::from_secs(10);
+/// Lease renewals run every interval; the lease turns stale at 30 s, so give up
+/// on transient errors a little before that.
+const RENEW_INTERVAL: Duration = Duration::from_secs(5);
+const RENEW_GIVE_UP: Duration = Duration::from_secs(25);
 // Own admission's lease until the pump and Session map take responsibility.
 // A Surface can drop its request future at any await point during construction.
 struct OpeningLease {
@@ -123,6 +143,8 @@ struct LiveSession {
     cancel: watch::Sender<u64>,
     commands: mpsc::UnboundedSender<Command>,
     pump: AsyncMutex<Option<JoinHandle<()>>>,
+    turn_task: Mutex<Option<AbortHandle>>,
+    activity: Activity,
     tail: Mutex<VecDeque<UpdateEnvelope>>,
 }
 enum Command {
@@ -183,6 +205,7 @@ impl Runtime {
         }])
         .await
         .map_err(failed)?;
+        let activity = Arc::new(Mutex::new(log.last_activity_ms().await.map_err(failed)?));
         let (updates, _) = broadcast::channel(4096);
         Ok(Self {
             instance: NATIVE_INSTANCE.into(),
@@ -199,7 +222,14 @@ impl Runtime {
             store,
             identity,
             updates,
+            activity,
+            close_grace: CLOSE_GRACE,
         })
+    }
+    /// Bound each step of closing a Session whose turn ignores cancellation.
+    pub fn with_close_grace(mut self, grace: Duration) -> Self {
+        self.close_grace = grace;
+        self
     }
     pub fn generation(&self) -> u64 {
         self.generation
@@ -232,6 +262,9 @@ impl Runtime {
                 return Err(BackendError::SessionNotFound(session.key.clone()));
             }
             if let Ok(live) = self.route(session) {
+                if live.closing.load(Ordering::Acquire) {
+                    return Err(BackendError::Busy);
+                }
                 return Ok(live.reference.clone());
             }
         }
@@ -272,6 +305,7 @@ impl Runtime {
             }
         }
         let workspace = self.factory.workspace(&opts).await.map_err(failed)?;
+        let created = existing.is_none();
         let id = match existing {
             Some(session) => session.native_id.clone(),
             None => self
@@ -288,8 +322,19 @@ impl Runtime {
                 .id
                 .clone(),
         };
-        let mut lease =
-            OpeningLease::acquire(self.store.clone(), self.identity.clone(), id.clone()).await?;
+        let mut lease = match OpeningLease::acquire(
+            self.store.clone(),
+            self.identity.clone(),
+            id.clone(),
+        )
+        .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.discard_new_row(created, &id).await;
+                return Err(error);
+            }
+        };
         opts.session_id = Some(id.clone());
         let result = async {
             let opened = self.factory.open(workspace, &opts).await.map_err(failed)?;
@@ -309,16 +354,18 @@ impl Runtime {
             let receiver = opened.native.subscribe();
             let (commands, rx) = mpsc::unbounded_channel();
             let (cancel, _) = watch::channel(0);
+            let ts_ms = now();
             self.log
                 .append_batch(vec![Event {
                     generation: self.generation,
                     session_key: Some(reference.key.clone()),
                     turn: None,
-                    ts_ms: now(),
+                    ts_ms,
                     kind: EventKind::SessionOpened(json!({"cwd": opened.workspace.cwd})),
                 }])
                 .await
                 .map_err(failed)?;
+            touch(&self.activity, &reference.key, ts_ms);
             let live = Arc::new(LiveSession {
                 opened,
                 reference: reference.clone(),
@@ -329,6 +376,8 @@ impl Runtime {
                 cancel,
                 commands,
                 pump: AsyncMutex::new(None),
+                turn_task: Mutex::new(None),
+                activity: Arc::clone(&self.activity),
                 tail: Mutex::new(VecDeque::new()),
             });
             let task = tokio::spawn(pump(
@@ -364,7 +413,18 @@ impl Runtime {
                 .map_err(failed)?;
             lease.armed = false;
         }
+        if result.is_err() {
+            self.discard_new_row(created, &id).await;
+        }
         result
+    }
+    // A failed open of a Session this call created must not leave an empty row.
+    async fn discard_new_row(&self, created: bool, id: &str) {
+        if created {
+            if let Err(error) = self.store.delete(id).await {
+                eprintln!("Runtime could not discard Session {id}: {error}");
+            }
+        }
     }
     /// Read all known Sessions without acquiring their leases.
     pub async fn list(&self) -> BackendResult<Vec<SessionInfo>> {
@@ -375,18 +435,17 @@ impl Runtime {
             .list(None)
             .await
             .map_err(failed)?;
-        let events = self.log.read_runtime_after(0).await.map_err(failed)?;
+        let activity = self.activity.lock().unwrap().clone();
         let sessions = self.sessions.lock().unwrap();
         Ok(known
             .into_iter()
             .map(|meta| {
                 let r = reference(&meta.id);
                 let live = sessions.get(&r.key);
-                let last_active_ms = events
-                    .iter()
-                    .rev()
-                    .find(|e| e.event.session_key.as_ref() == Some(&r.key))
-                    .map_or(meta.created_at, |e| e.event.ts_ms)
+                let last_active_ms = activity
+                    .get(&r.key)
+                    .copied()
+                    .unwrap_or(meta.created_at)
                     .max(0) as u64;
                 SessionInfo {
                     r#ref: r,
@@ -439,8 +498,9 @@ impl Runtime {
         Ok(())
     }
     /// Unload a Session, settling any forced cancellation before releasing ownership.
+    /// Every wait is bounded by the close grace; a turn that ignores cancellation
+    /// is aborted so the lease is always released.
     pub async fn close(&self, key: &SessionKey, force: bool) -> BackendResult<()> {
-        let _admission = self.admission.lock().await;
         self.close_inner(key, force).await
     }
     async fn close_inner(&self, key: &SessionKey, force: bool) -> BackendResult<()> {
@@ -451,42 +511,78 @@ impl Runtime {
             .get(key)
             .cloned()
             .ok_or_else(|| BackendError::SessionNotFound(key.clone()))?;
-        live.closing.store(true, Ordering::Release);
-        if live.busy.load(Ordering::Acquire) && !force {
-            live.closing.store(false, Ordering::Release);
+        if !force && live.busy.load(Ordering::Acquire) {
             return Err(BackendError::Busy);
         }
+        if live.closing.swap(true, Ordering::AcqRel) {
+            // Another close owns the teardown; wait for it instead of repeating it.
+            while self.sessions.lock().unwrap().contains_key(key) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            return Ok(());
+        }
+        let grace = self.close_grace;
         if force && live.commands.send(Command::Cancel).is_err() {
             live.cancel.send_modify(|n| *n += 1);
             live.opened.native.cancel(&live.reference);
         }
-        while live.busy.load(Ordering::Acquire) {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        let settled = tokio::time::timeout(grace, async {
+            while live.busy.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !settled {
+            eprintln!(
+                "Runtime close: turn of Session {} ignored cancellation; aborting",
+                key.0
+            );
+            if let Some(turn) = live.turn_task.lock().unwrap().take() {
+                turn.abort();
+            }
+            live.permit.lock().await.take();
+            live.busy.store(false, Ordering::Release);
         }
-        live.opened.native.shutdown().await;
+        let _ = tokio::time::timeout(grace, live.opened.native.shutdown()).await;
         let (tx, rx) = oneshot::channel();
         let _ = live.commands.send(Command::Stop(tx));
-        let _ = rx.await;
+        let stopped = tokio::time::timeout(grace, rx).await.is_ok();
+        let mut pump_error = None;
         if let Some(task) = live.pump.lock().await.take() {
-            task.await.map_err(failed)?;
+            if !stopped {
+                task.abort();
+            }
+            if let Err(error) = task.await {
+                if !error.is_cancelled() {
+                    pump_error = Some(failed(error));
+                }
+            }
         }
+        let ts_ms = now();
         let logged = self
             .log
             .append_batch(vec![Event {
                 generation: self.generation,
                 session_key: Some(key.clone()),
                 turn: None,
-                ts_ms: now(),
-                kind: EventKind::SessionClosed(json!({"force": force})),
+                ts_ms,
+                kind: EventKind::SessionClosed(
+                    json!({"force": force, "aborted": !settled || !stopped}),
+                ),
             }])
             .await
             .map_err(failed);
+        touch(&self.activity, key, ts_ms);
         let released = self
             .store
             .release_lease(&key.0, &self.identity)
             .await
             .map_err(failed);
         self.sessions.lock().unwrap().remove(key);
+        if let Some(error) = pump_error {
+            return Err(error);
+        }
         logged?;
         released?;
         if let Some(error) = live.failure.lock().unwrap().clone() {
@@ -495,18 +591,22 @@ impl Runtime {
         Ok(())
     }
     /// Stop admission, settle work, drain pumps and release all Session leases.
+    /// Sessions are cancelled together and settle concurrently, each bounded.
     pub async fn shutdown(&self) {
-        let _admission = self.admission.lock().await;
-        if self.stopped.swap(true, Ordering::AcqRel) {
-            return;
+        {
+            let _admission = self.admission.lock().await;
+            if self.stopped.swap(true, Ordering::AcqRel) {
+                return;
+            }
         }
         self.turns.close();
         let keys: Vec<_> = self.sessions.lock().unwrap().keys().cloned().collect();
-        for key in keys {
-            if let Err(error) = self.close_inner(&key, true).await {
+        futures::future::join_all(keys.iter().map(|key| async move {
+            if let Err(error) = self.close_inner(key, true).await {
                 eprintln!("Runtime shutdown: {error}");
             }
-        }
+        }))
+        .await;
         let workspaces: Vec<_> = self
             .workspaces
             .lock()
@@ -595,17 +695,21 @@ impl AgentBackend for Runtime {
         // Admission and execution belong to the Runtime, even if a Surface drops
         // the request future or its TurnHandle while waiting for a permit.
         let mut cancelled = live.cancel.subscribe();
-        tokio::spawn(async move {
+        let task_live = Arc::clone(&live);
+        let task = tokio::spawn(async move {
+            let live = task_live;
             let result = async {
+                let ts_ms = now();
                 log.append_batch(vec![Event {
                     generation,
                     session_key: Some(live.reference.key.clone()),
                     turn: None,
-                    ts_ms: now(),
+                    ts_ms,
                     kind: EventKind::PromptSent(json!({"content": input})),
                 }])
                 .await
                 .map_err(failed)?;
+                touch(&live.activity, &live.reference.key, ts_ms);
                 let permit = tokio::select! {
                     p = turns.acquire_owned() => p.map_err(failed)?,
                     _ = cancelled.changed() => return Ok(TurnOutcome::Cancelled),
@@ -618,6 +722,10 @@ impl AgentBackend for Runtime {
                     return Ok(TurnOutcome::Cancelled);
                 }
                 let turn = live.opened.native.prompt(&live.reference, input).await?;
+                // A cancel that raced the turn's registration hit an idle backend.
+                if cancelled.has_changed().unwrap_or(true) {
+                    live.opened.native.cancel(&live.reference);
+                }
                 let outcome = turn.outcome().await;
                 barrier(&live).await?;
                 if let Some(error) = live.failure.lock().unwrap().clone() {
@@ -638,6 +746,7 @@ impl AgentBackend for Runtime {
             };
             let _ = done.send(outcome);
         });
+        *live.turn_task.lock().unwrap() = Some(task.abort_handle());
         Ok(handle)
     }
     fn cancel(&self, session: &SessionRef) {
@@ -674,10 +783,12 @@ async fn publish(
     if envelope.origin == Origin::Replay {
         return Ok(());
     }
+    let ts_ms = now();
     let committed = log
-        .append_batch(vec![Event::update(generation, now(), envelope)])
+        .append_batch(vec![Event::update(generation, ts_ms, envelope)])
         .await
         .map_err(failed)?;
+    touch(&live.activity, &live.reference.key, ts_ms);
     if let Some(error) = live.failure.lock().unwrap().clone() {
         return Err(failed(error));
     }
@@ -692,6 +803,36 @@ async fn publish(
         }
     }
     Ok(())
+}
+#[derive(Debug)]
+enum RenewEnd {
+    /// The lease is no longer ours.
+    Lost(String),
+    /// Renewals kept failing for the whole give-up window.
+    Stale(String),
+}
+/// Renew on every tick. Only a lost lease is fatal at once; transient storage
+/// errors are retried until no renewal has succeeded for `give_up`.
+async fn renew_loop<F, Fut>(mut renew: F, interval: Duration, give_up: Duration) -> RenewEnd
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), SessionError>>,
+{
+    let mut ticker = tokio::time::interval(interval);
+    let mut last_ok = tokio::time::Instant::now();
+    loop {
+        ticker.tick().await;
+        match renew().await {
+            Ok(()) => last_ok = tokio::time::Instant::now(),
+            Err(SessionError::Storage(error)) => {
+                eprintln!("Runtime: lease renewal failed, will retry: {error}");
+                if last_ok.elapsed() >= give_up {
+                    return RenewEnd::Stale(error);
+                }
+            }
+            Err(error) => return RenewEnd::Lost(error.to_string()),
+        }
+    }
 }
 fn fail(live: &LiveSession, error: impl std::fmt::Display) {
     *live.failure.lock().unwrap() = Some(error.to_string());
@@ -714,17 +855,34 @@ async fn pump(
     let mut renewals = tokio::task::JoinSet::new();
     let renewing = Arc::downgrade(&live);
     let id = live.reference.native_id.clone();
+    let key = live.reference.key.clone();
+    let renew_log = Arc::clone(&log);
     renewals.spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        loop {
-            interval.tick().await;
-            if let Err(error) = store.renew_lease(&id, &identity).await {
-                if let Some(live) = renewing.upgrade() {
-                    fail(&live, error);
-                }
-                return;
-            }
+        let end = renew_loop(
+            || store.renew_lease(&id, &identity),
+            RENEW_INTERVAL,
+            RENEW_GIVE_UP,
+        )
+        .await;
+        let (state, reason) = match end {
+            RenewEnd::Lost(reason) => ("lost", reason),
+            RenewEnd::Stale(reason) => ("stale", reason),
+        };
+        eprintln!("Runtime: lease of Session {id} is {state}: {reason}");
+        if let Some(live) = renewing.upgrade() {
+            fail(&live, format!("lease {state}: {reason}"));
         }
+        let _ = renew_log
+            .append_batch(vec![Event {
+                generation,
+                session_key: Some(key),
+                turn: None,
+                ts_ms: now(),
+                kind: EventKind::Cancelled(
+                    json!({"reason": format!("lease {state}"), "detail": reason}),
+                ),
+            }])
+            .await;
     });
     loop {
         let result: BackendResult<()> = tokio::select! {
@@ -775,6 +933,71 @@ mod tests {
     // Trigger the actual NativeBackend replay producer at the pump boundary.
     // Runtime loading uses the already-opened factory Session and does not need
     // to switch the harness to the same Session a second time.
+    use std::sync::atomic::AtomicUsize;
+
+    async fn run_renew(
+        script: impl Fn(usize) -> Result<(), SessionError> + Send + 'static,
+        within: Duration,
+    ) -> (Option<RenewEnd>, usize) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let end = tokio::time::timeout(
+            within,
+            renew_loop(
+                move || {
+                    let n = seen.fetch_add(1, Ordering::AcqRel);
+                    let result = script(n);
+                    async move { result }
+                },
+                Duration::from_millis(5),
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .ok();
+        (end, calls.load(Ordering::Acquire))
+    }
+
+    #[tokio::test]
+    async fn transient_renewal_errors_are_retried() {
+        let (end, calls) = run_renew(
+            |n| {
+                if n < 3 {
+                    Err(SessionError::Storage("busy".into()))
+                } else {
+                    Ok(())
+                }
+            },
+            Duration::from_millis(150),
+        )
+        .await;
+        assert!(end.is_none(), "must keep renewing: {end:?}");
+        assert!(calls > 4);
+    }
+
+    #[tokio::test]
+    async fn renewal_gives_up_only_once_the_lease_is_stale() {
+        let started = std::time::Instant::now();
+        let (end, _) = run_renew(
+            |_| Err(SessionError::Storage("busy".into())),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(matches!(end, Some(RenewEnd::Stale(_))));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn lost_ownership_is_fatal_immediately() {
+        let (end, calls) = run_renew(
+            |_| Err(SessionError::Invalid("lease ownership was lost".into())),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(matches!(end, Some(RenewEnd::Lost(_))));
+        assert_eq!(calls, 1);
+    }
+
     #[tokio::test]
     async fn native_replay_never_becomes_new_event_log_activity() {
         let dir = tempfile::tempdir().unwrap();

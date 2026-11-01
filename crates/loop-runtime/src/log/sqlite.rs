@@ -12,6 +12,7 @@ enum Command {
     Latest(SessionKey, Reply<u64>),
     Allocate(String, u32, i64, Reply<u64>),
     Finish(u64, i64, Reply<()>),
+    Activity(Reply<std::collections::HashMap<SessionKey, i64>>),
 }
 
 /// SQLite Event Log at `<agent_dir>/events.db` (independent of Session storage).
@@ -86,6 +87,9 @@ impl EventLog for SqliteEventLog {
         self.request(|reply| Command::Finish(generation, stopped_ms, reply))
             .await
     }
+    async fn last_activity_ms(&self) -> Result<std::collections::HashMap<SessionKey, i64>> {
+        self.request(Command::Activity).await
+    }
 }
 
 const MIGRATIONS: &[(&str, &str)] = &[(
@@ -153,6 +157,9 @@ fn writer(mut conn: Connection, mut receiver: mpsc::Receiver<Command>) {
             Command::Allocate(owner, pid, started, reply) => {
                 let _ = reply.send(allocate(&mut conn, &owner, pid, started));
             }
+            Command::Activity(reply) => {
+                let _ = reply.send(activity(&conn));
+            }
             Command::Finish(generation, stopped, reply) => {
                 let result = (|| {
                     let changed = conn.execute(
@@ -168,6 +175,19 @@ fn writer(mut conn: Connection, mut receiver: mpsc::Receiver<Command>) {
             }
         }
     }
+}
+
+fn activity(conn: &Connection) -> Result<std::collections::HashMap<SessionKey, i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_key, MAX(ts_ms) FROM events WHERE session_key IS NOT NULL GROUP BY session_key",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            SessionKey::from(row.get::<_, String>(0)?),
+            row.get::<_, i64>(1)?,
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 fn append_group(

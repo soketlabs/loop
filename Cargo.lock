@@ -4747,6 +4747,7 @@ name = "loop-runtime"
 version = "0.6.0"
 dependencies = [
  "async-trait",
+ "futures",
  "loop-agent",
  "loop-ai",
  "loop-app-core",

@@ -371,6 +371,8 @@ struct FailingLog {
     hold_updates: std::sync::atomic::AtomicBool,
     update_started: tokio::sync::Notify,
     update_release: tokio::sync::Notify,
+    runtime_reads: std::sync::atomic::AtomicUsize,
+    finished: std::sync::atomic::AtomicUsize,
 }
 #[async_trait::async_trait]
 impl EventLog for FailingLog {
@@ -416,6 +418,8 @@ impl EventLog for FailingLog {
         &self,
         n: u64,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
+        self.runtime_reads
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.inner.read_runtime_after(n).await
     }
     async fn latest_seq(&self, s: &loop_protocol::SessionKey) -> loop_runtime::log::Result<u64> {
@@ -425,6 +429,8 @@ impl EventLog for FailingLog {
         self.inner.allocate_generation(o, p, t).await
     }
     async fn finish_generation(&self, g: u64, t: i64) -> loop_runtime::log::Result<()> {
+        self.finished
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.inner.finish_generation(g, t).await
     }
 }
@@ -488,14 +494,9 @@ async fn failed_factory_releases_lease_and_capacity() {
         dir.path().join("agent/sessions.db"),
     )
     .unwrap();
-    for session in rt.list().await.unwrap() {
-        assert!(!session.live);
-        assert!(store
-            .lease(&session.r#ref.native_id)
-            .await
-            .unwrap()
-            .is_none());
-    }
+    // A failed open must not leave an empty Session row behind.
+    assert!(rt.list().await.unwrap().is_empty());
+    let _ = store;
     rt.shutdown().await;
 }
 
@@ -589,5 +590,138 @@ async fn interrupted_session_open_releases_ownership() {
     })
     .await
     .expect("interrupted admission leaked its Session lease");
+    rt.shutdown().await;
+}
+
+fn store(dir: &std::path::Path) -> loop_agent::harness::session::sqlite::SqliteSessionStore {
+    loop_agent::harness::session::sqlite::SqliteSessionStore::open(dir.join("agent/sessions.db"))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn shutdown_releases_leases_logs_stop_finishes_generation_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(FailingLog::default());
+    let rt = runtime(dir.path(), log.clone(), RuntimeLimits::default()).await;
+    let a = rt.new_session(SessionSpec::default()).await.unwrap();
+    let b = rt.new_session(SessionSpec::default()).await.unwrap();
+    rt.shutdown().await;
+    rt.shutdown().await;
+    let store = store(dir.path());
+    for s in [&a, &b] {
+        assert!(store.lease(&s.native_id).await.unwrap().is_none());
+    }
+    let records = log.read_runtime_after(0).await.unwrap();
+    let count = |f: fn(&EventKind) -> bool| records.iter().filter(|e| f(&e.event.kind)).count();
+    assert_eq!(count(|k| matches!(k, EventKind::RuntimeStopped(_))), 1);
+    assert_eq!(count(|k| matches!(k, EventKind::SessionClosed(_))), 2);
+    assert_eq!(log.finished.load(std::sync::atomic::Ordering::Acquire), 1);
+    assert!(rt.new_session(SessionSpec::default()).await.is_err());
+}
+
+// A pump blocked in a log write never settles a turn: cancellation cannot reach it.
+async fn stuck_turn(
+    dir: &std::path::Path,
+) -> (
+    Arc<FailingLog>,
+    Runtime,
+    loop_protocol::SessionRef,
+    loop_protocol::TurnHandle,
+) {
+    let log = Arc::new(FailingLog::default());
+    let models = Arc::new(loop_ai::Models::create(Default::default()));
+    models.set_provider(loop_ai::providers::faux_provider(Default::default()));
+    let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
+    let rt = Runtime::new(globals, opts(dir), log.clone(), RuntimeLimits::default())
+        .await
+        .unwrap()
+        .with_close_grace(std::time::Duration::from_millis(300));
+    let a = rt.new_session(SessionSpec::default()).await.unwrap();
+    log.hold_updates
+        .store(true, std::sync::atomic::Ordering::Release);
+    let turn = rt
+        .prompt(&a, vec![ContentBlock::text("stuck")])
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        log.update_started.notified(),
+    )
+    .await
+    .unwrap();
+    (log, rt, a, turn)
+}
+
+#[tokio::test]
+async fn forced_close_gives_up_on_a_turn_that_ignores_cancellation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, rt, a, _turn) = stuck_turn(dir.path()).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), rt.close(&a.key, true))
+        .await
+        .expect("forced close must be bounded")
+        .ok();
+    assert!(store(dir.path())
+        .lease(&a.native_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!rt.is_busy(&a));
+    assert!(rt.tail(&a).is_err());
+    let records = log.read_runtime_after(0).await.unwrap();
+    assert!(records
+        .iter()
+        .any(|e| matches!(e.event.kind, EventKind::SessionClosed(_))));
+    rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_is_bounded_and_does_not_block_admission_while_settling() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_log, rt, a, _turn) = stuck_turn(dir.path()).await;
+    let rt = Arc::new(rt);
+    let closing = {
+        let rt = rt.clone();
+        let key = a.key.clone();
+        tokio::spawn(async move { rt.close(&key, true).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // The forced close is still settling: admission and listing stay responsive.
+    tokio::time::timeout(std::time::Duration::from_millis(200), rt.list())
+        .await
+        .expect("list must not wait for close")
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), rt.shutdown())
+        .await
+        .expect("shutdown must be bounded");
+    let _ = closing.await;
+    assert!(store(dir.path())
+        .lease(&a.native_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn list_reads_activity_from_memory_not_the_event_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(FailingLog::default());
+    let rt = runtime(dir.path(), log.clone(), RuntimeLimits::default()).await;
+    let a = rt.new_session(SessionSpec::default()).await.unwrap();
+    let before = rt.list().await.unwrap()[0].last_active_ms;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    rt.prompt(&a, vec![ContentBlock::text("hi")])
+        .await
+        .unwrap()
+        .outcome()
+        .await;
+    let reads = log.runtime_reads.load(std::sync::atomic::Ordering::Acquire);
+    for _ in 0..3 {
+        let listed = rt.list().await.unwrap();
+        assert!(listed[0].last_active_ms > before);
+    }
+    assert_eq!(
+        log.runtime_reads.load(std::sync::atomic::Ordering::Acquire),
+        reads
+    );
     rt.shutdown().await;
 }

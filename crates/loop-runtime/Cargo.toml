@@ -8,6 +8,7 @@ description = "Runtime ownership and durable Session Event Log"
 
 [dependencies]
 async-trait.workspace = true
+futures.workspace = true
 loop-agent = { workspace = true, features = ["sqlite"] }
 loop-app-core.workspace = true
 loop-protocol.workspace = true
