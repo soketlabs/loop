@@ -451,6 +451,7 @@ mod unix {
         let mut next_choice = 1;
         let mut withdrawn = HashSet::new();
         let mut interrupted = false;
+        let mut renderer = crate::print_mode::TextRenderer::default();
         let mut prompts = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -486,9 +487,9 @@ mod unix {
                     let envelope = update.map_err(|e| anyhow::anyhow!("Runtime updates interrupted ({e}); reattach to replay"))?;
                     if envelope.session != session.key { continue; }
                     last_seq = envelope.seq;
-                    if let Some(text) = crate::print_mode::agent_text_chunk(&envelope.update) { terminal.write(text)?; }
+                    let text = renderer.render(&envelope.update);
+                    if !text.is_empty() { terminal.write(&text)?; }
                     if let loop_protocol::SessionUpdate::TurnEnded { error, stop, .. } = envelope.update {
-                        terminal.write("\n")?;
                         if stop == loop_protocol::StopReason::RuntimeRestarted {
                             terminal.write("Turn ended uncertain — Runtime restarted. Its tools may or may not have run; nothing was retried.\n")?;
                         }

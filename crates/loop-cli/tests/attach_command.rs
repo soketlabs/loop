@@ -53,10 +53,17 @@ async fn runtime_with_log(
     dir: &std::path::Path,
     log: Arc<dyn loop_runtime::log::EventLog>,
 ) -> Arc<Runtime> {
-    let models = Arc::new(loop_ai::Models::create(Default::default()));
     let responses = loop_ai::providers::FauxScript::new();
     responses.push(loop_ai::providers::FauxResponse::Text("replayed".into()));
     responses.push(loop_ai::providers::FauxResponse::Text("live-input".into()));
+    runtime_with_script(dir, log, responses).await
+}
+async fn runtime_with_script(
+    dir: &std::path::Path,
+    log: Arc<dyn loop_runtime::log::EventLog>,
+    responses: loop_ai::providers::FauxScript,
+) -> Arc<Runtime> {
+    let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(loop_ai::providers::faux_provider(responses));
     let globals =
         loop_app_core::runtime::GlobalResources::with_models(dir.join("agent"), models).unwrap();
@@ -765,6 +772,60 @@ async fn attaching_to_a_session_held_by_another_loop_says_what_to_do() {
         assert!(error.contains("in use"), "{error}");
         assert!(!error.contains("loop attach"), "circular hint: {error}");
         assert!(error.contains("Close it there"), "{error}");
+        served.done.await.unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn attach_shows_tool_calls_and_starts_each_message_on_its_own_line() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let responses = loop_ai::providers::FauxScript::new();
+        responses.push(loop_ai::providers::FauxResponse::Text("LIVE-OK".into()));
+        responses.push(loop_ai::providers::FauxResponse::ToolCalls(vec![
+            loop_ai::ToolCall {
+                id: "call-ls".into(),
+                name: "ls".into(),
+                arguments: serde_json::json!({"path": "."}),
+                thought_signature: None,
+            },
+        ]));
+        responses.push(loop_ai::providers::FauxResponse::Text(
+            "The folder is empty.".into(),
+        ));
+        let rt = runtime_with_script(dir.path(), Arc::new(MemoryEventLog::new()), responses).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        for prompt in ["first", "second"] {
+            rt.prompt(&session, vec![ContentBlock::text(prompt)])
+                .await
+                .unwrap()
+                .outcome()
+                .await;
+        }
+        let (server, client) = loop_wire::transport::memory();
+        let served = serve(rt.clone(), server);
+        let (backend, events) = connect(client).await.unwrap();
+        let (tx, mut terminal, output) = script();
+        tx.send(Input::Eof).unwrap();
+        drive(
+            backend,
+            events,
+            AttachArgs {
+                id: Some(session.key.to_string()),
+                ..Default::default()
+            },
+            &mut terminal,
+        )
+        .await
+        .unwrap();
+        let text = output.lock().unwrap().clone();
+        assert!(
+            text.ends_with("LIVE-OK\n• ls .\n  └ done\nThe folder is empty.\n"),
+            "{text:?}"
+        );
         served.done.await.unwrap();
         rt.shutdown().await;
     })
