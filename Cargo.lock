@@ -4813,6 +4813,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "loop-visual"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "loop-agent",
+ "loop-ai",
+ "loop-app-core",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "loop-wire"
 version = "0.6.0"
 dependencies = [

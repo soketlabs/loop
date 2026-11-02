@@ -1,4 +1,6 @@
 /target/
+node_modules/
+apps/loop-visual/.qa/
 **/*.rs.bk
 .idea/
 .vscode/
@@ -17,3 +19,5 @@
 
 # Local toolchain and cache files
 .tmp/
+
+apps/loop-visual/three-bundle.js

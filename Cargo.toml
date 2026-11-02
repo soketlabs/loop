@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/loop-visual",
     "crates/loop-ai",
     "crates/loop-orchestration",
     "crates/loop-runtime",
