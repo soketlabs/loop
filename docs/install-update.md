@@ -131,6 +131,19 @@ other files in the installation directory. On Windows, deletion of the running
 binary completes after the command exits. PATH entries are kept because the
 directory can hold other commands; remove them manually if no longer needed.
 
+The command prints where the agent data is kept so it can be removed by hand.
+
+```bash
+loop uninstall --purge
+```
+
+`--purge` also removes the agent data directory, which holds settings,
+credentials, skills, sessions and the usage log. It resolves
+`$LOOP_CODING_AGENT_DIR` when set and `~/.loop/agent` otherwise, and asks for
+confirmation before deleting anything. `--yes` answers that confirmation for scripted use; without a
+terminal, `--purge` fails instead of prompting. Keeping stale credentials is
+what makes a later reinstall authenticate as the old account.
+
 ## Validation
 
 `cargo test -p loop-update --locked` runs a local release fixture and checks:
