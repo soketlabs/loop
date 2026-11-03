@@ -3238,7 +3238,11 @@ async fn handle_key(
                         command,
                     )
                     .await;
-                } else if line.starts_with('/') {
+                } else if let Some(cmd) = commands::parse_command(&line) {
+                    // `line` starts with `/` *and* parses as a real command
+                    // (not, e.g., an absolute file path inserted by an
+                    // `@mention` that happened to sit at the start of the
+                    // line — see `parse_command`'s doc comment).
                     let skill_names: Vec<_> = runtime
                         .resources
                         .skills
@@ -3251,35 +3255,33 @@ async fn handle_key(
                         .iter()
                         .map(|p| p.name.clone())
                         .collect();
-                    if let Some(cmd) = commands::parse_command(&line) {
-                        let effect = commands::dispatch(&cmd, &skill_names, &template_names);
-                        *should_quit = apply_effect(
-                            effect,
-                            runtime,
-                            chat,
-                            status,
-                            turn_step,
-                            pending_setup,
-                            model_picker,
-                            fork_picker,
-                            skill_picker,
-                            mcp_picker,
-                            session_picker,
-                            tree_picker,
-                            hide_thinking,
-                            working,
-                            message_queue,
-                            streaming_assistant,
-                            streaming_thinking,
-                            redraw_request,
-                            purge_ui_events,
-                            input,
-                            tx,
-                            token_bar,
-                            refresh_token_bar,
-                        )
-                        .await?;
-                    }
+                    let effect = commands::dispatch(&cmd, &skill_names, &template_names);
+                    *should_quit = apply_effect(
+                        effect,
+                        runtime,
+                        chat,
+                        status,
+                        turn_step,
+                        pending_setup,
+                        model_picker,
+                        fork_picker,
+                        skill_picker,
+                        mcp_picker,
+                        session_picker,
+                        tree_picker,
+                        hide_thinking,
+                        working,
+                        message_queue,
+                        streaming_assistant,
+                        streaming_thinking,
+                        redraw_request,
+                        purge_ui_events,
+                        input,
+                        tx,
+                        token_bar,
+                        refresh_token_bar,
+                    )
+                    .await?;
                 } else {
                     let images = images_for(runtime, attachments, chat, &line);
                     submit_user_text(
