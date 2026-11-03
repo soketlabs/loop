@@ -1,6 +1,8 @@
 //! Pi-style inline UI: transcript in terminal scrollback, footer redrawn in place.
 
 pub mod attachments;
+pub mod diff_actions;
+pub mod diff_view;
 pub mod editor;
 pub mod file_mentions;
 pub mod highlight;

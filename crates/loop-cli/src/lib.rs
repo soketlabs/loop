@@ -7,6 +7,8 @@ pub mod app;
 pub mod clipboard;
 pub mod commands;
 pub mod debug_log;
+pub mod diff_model;
+pub mod git_diff;
 pub mod keybindings;
 pub mod mcp_serve;
 pub mod print_mode;
@@ -56,6 +58,9 @@ pub struct CliRuntime {
     pub startup_sessions: Option<StartupSessions>,
     /// `/usage` asked for the usage view; the chat loop opens it.
     pub usage_requested: bool,
+    /// True while a `/workflow` run is editing files; the diff viewer blocks
+    /// mutations on it (not visible via `backend.is_busy`).
+    pub workflow_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Session choice to make when the TUI starts.
@@ -114,5 +119,6 @@ pub async fn bootstrap_cli(opts: BootstrapOpts) -> anyhow::Result<CliRuntime> {
         confirm_full_access: false,
         confirm_export: None,
         usage_requested: false,
+        workflow_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }

@@ -72,9 +72,33 @@ Context files are loaded automatically from the agent dir, `~/.claude/CLAUDE.md`
 
 ## Slash commands (highlights)
 
-`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/websearch`, `/new`, `/review`, `/compact`, `/sessions`, `/resume`, `/name`, `/export`, `/import`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/changelog`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
+`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/websearch`, `/new`, `/review`, `/diff`, `/compact`, `/sessions`, `/resume`, `/name`, `/export`, `/import`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/changelog`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
 
 `/changelog` shows the notes published with this version's GitHub release. It needs network access; a build from source that isn't a release has none and says so.
+
+## Diff viewer (`/diff`)
+
+`/diff` opens a full-screen review of your uncommitted changes, and `/diff --staged` shows staged changes. Review them one hunk at a time.
+
+| Key | Action |
+|-----|--------|
+| `up` / `down` | Previous / next hunk |
+| `tab` / `shift+tab` | Next / previous file |
+| `j` / `k` | Scroll the hunk one line |
+| `pageup` / `pagedown` | Scroll the hunk one page |
+| `g` / `G` | First / last hunk |
+| `enter` or `a` | Accept: stage the hunk |
+| `r` or `backspace` | Reject: discard the hunk, after confirming |
+| `u` or `backspace` (in `--staged`) | Unstage the hunk |
+| `q` or `escape` | Close the viewer |
+
+The buttons can also be clicked with the mouse, and the mouse wheel scrolls.
+
+Reject saves a backup first, in `diff-backups` inside the agent config folder (`~/.loop/agent` by default), and prints an undo command in the chat when the viewer closes. Backups older than 30 days are deleted.
+
+While an agent or `/workflow` is running, the viewer is read-only. If a hunk changed after you opened it, the viewer refreshes it instead of acting on it, so you can review it again.
+
+Accept, Reject and Unstage work on text hunks only. Binary files, new files over 1 MiB or 10,000 lines, permission-only changes, renames and merge conflicts are listed but must be handled with `git` directly.
 
 ## Sessions
 

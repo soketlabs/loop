@@ -70,6 +70,10 @@
     "thinkingMedium": "#81a2be",
     "thinkingHigh": "#b294bb",
     "thinkingXhigh": "#d183e8",
-    "bashMode": "green"
+    "bashMode": "green",
+    "diffAddedBg": "#1f3324",
+    "diffRemovedBg": "#3a1f22",
+    "diffAddedFg": "#7ee787",
+    "diffRemovedFg": "#ff7b72"
   }
 }

@@ -124,6 +124,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: None,
         },
         SlashCommand {
+            name: "diff",
+            description: "Review uncommitted changes hunk by hunk",
+            args_hint: Some("[--staged]"),
+        },
+        SlashCommand {
             name: "trust",
             description: "Trust or untrust this project",
             args_hint: Some("[yes|no]"),
@@ -392,6 +397,11 @@ pub enum CommandEffect {
     Resume(Option<String>),
     /// Tree view.
     Tree,
+    /// Open the diff viewer; `staged` selects index-vs-HEAD (`/diff --staged`).
+    Diff {
+        /// Diff the staged (index) side instead of the worktree.
+        staged: bool,
+    },
     /// Set session name.
     SetName(String),
     /// Export path.
@@ -630,6 +640,11 @@ pub fn dispatch(
         }
         "sessions" => CommandEffect::Resume(None),
         "tree" => CommandEffect::Tree,
+        "diff" => match cmd.args.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [] => CommandEffect::Diff { staged: false },
+            ["--staged"] => CommandEffect::Diff { staged: true },
+            _ => CommandEffect::Status("Usage: /diff [--staged]".into()),
+        },
         "name" => CommandEffect::SetName(cmd.args.clone()),
         "export" => CommandEffect::Export(if cmd.args.is_empty() {
             None
@@ -727,6 +742,23 @@ pub type SharedCommands = Arc<Vec<SlashCommand>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_diff_maps_args_to_staged_flag() {
+        let none = &[];
+        for (args, staged) in [("", false), ("--staged", true)] {
+            let parsed = parse_command(&format!("/diff {args}")).expect("parses");
+            match dispatch(&parsed, none, none) {
+                CommandEffect::Diff { staged: got } => assert_eq!(got, staged, "args {args:?}"),
+                other => panic!("expected Diff, got {other:?}"),
+            }
+        }
+        let bogus = parse_command("/diff --bogus").expect("parses");
+        match dispatch(&bogus, none, none) {
+            CommandEffect::Status(s) => assert!(s.contains("Usage: /diff"), "{s}"),
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
 
     #[test]
     fn parse_mcp_matches_skills_shape() {

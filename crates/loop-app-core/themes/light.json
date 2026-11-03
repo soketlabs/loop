@@ -71,6 +71,10 @@
     "thinkingMedium": "teal",
     "thinkingHigh": "#875f87",
     "thinkingXhigh": "#8b008b",
-    "bashMode": "green"
+    "bashMode": "green",
+    "diffAddedBg": "#dafbe1",
+    "diffRemovedBg": "#ffebe9",
+    "diffAddedFg": "#1a7f37",
+    "diffRemovedFg": "#cf222e"
   }
 }

@@ -42,6 +42,7 @@ use crate::commands::{self, AutocompleteEntry, CommandEffect, McpCommand, Skills
 #[cfg(feature = "telemetry")]
 use crate::config::describe_tracing_status;
 use crate::config::ProviderLoginRequest;
+use crate::diff_model::DiffSide;
 use crate::keybindings::{
     hotkey_help, multiline_paste_text, normalize_pasted_text, paste_burst_pending,
     pasted_single_line, Action,
@@ -5121,6 +5122,63 @@ async fn apply_effect(
 ) -> anyhow::Result<bool> {
     match effect {
         CommandEffect::Quit => return Ok(true),
+        CommandEffect::Diff { staged } => {
+            // §3.4: discover the repo, read the side, hand the model to the
+            // full-screen viewer. Any git failure becomes one system line.
+            let side = if staged {
+                DiffSide::Index
+            } else {
+                DiffSide::WorkingTree
+            };
+            // Busy means the main agent OR a running workflow (workflow
+            // agents are invisible to backend.is_busy).
+            let busy_now = agent_is_busy(runtime, *working)
+                || runtime
+                    .workflow_active
+                    .load(std::sync::atomic::Ordering::Acquire);
+            match crate::git_diff::GitDiff::discover(&runtime.cwd).await {
+                Ok(git) => match git.read(side).await {
+                    Ok(model) => {
+                        // Viewing is read-only, so a busy agent does not
+                        // block opening; §3.7 notice explains the pause.
+                        let notice = busy_now.then(|| {
+                            "agent updates and approval requests resume when you close \
+                                 the viewer"
+                                .to_string()
+                        });
+                        // Undo/backup notices collected inside the viewer
+                        // are echoed into the chat so a truncated footer
+                        // never loses them.
+                        let mut undo_notes = Vec::new();
+                        let result = crate::tui::diff_view::run(
+                            model,
+                            &runtime.theme,
+                            git,
+                            || {
+                                runtime.backend.is_busy(&runtime.session_ref())
+                                    || runtime
+                                        .workflow_active
+                                        .load(std::sync::atomic::Ordering::Acquire)
+                            },
+                            runtime.agent_dir.join("diff-backups"),
+                            notice,
+                            &mut undo_notes,
+                        )
+                        .await;
+                        for note in &undo_notes {
+                            chat.push(sys(note.clone()));
+                        }
+                        if let Err(err) = result {
+                            chat.push(sys(format!("diff: {err}")));
+                        }
+                    }
+                    Err(err) => chat.push(sys(format!("diff: {err}"))),
+                },
+                Err(err) => chat.push(sys(format!("diff: {err}"))),
+            }
+            // The viewer owned the whole screen; always repaint the chat.
+            *redraw_request = true;
+        }
         CommandEffect::Status(s) => {
             if s.contains("Usage: /theme") {
                 let dirs = crate::theme::theme_search_dirs(
@@ -6054,6 +6112,10 @@ async fn start_workflow(
 
     let harness = Arc::clone(&runtime.harness);
     let goal = goal.to_string();
+    // Workflow agents edit files: flip the shared busy flag before spawning
+    // so the diff viewer blocks Accept/Reject for the whole run.
+    let workflow_active = Arc::clone(&runtime.workflow_active);
+    workflow_active.store(true, std::sync::atomic::Ordering::Release);
 
     let config = concurrency.map(|n| SchedulerConfig {
         max_concurrency: n,
@@ -6095,6 +6157,11 @@ async fn start_workflow(
         let result = harness
             .start_workflow_from_goal(&goal, None, config, Some(progress_tx))
             .await;
+
+        // Clear the busy flag BEFORE sending the UI event: while the diff
+        // viewer owns the screen, UI events are not drained, but the flag
+        // must still read false once the workflow is done.
+        workflow_active.store(false, std::sync::atomic::Ordering::Release);
 
         let event = match result {
             Ok(wf_result) => UiEvent::WorkflowDone(Ok(WorkflowDoneOk {
