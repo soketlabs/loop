@@ -209,6 +209,8 @@ Nothing user-facing jumps ahead of step 1.
 
 Before each step is built, the experiments in [Stress tests](stress-tests.md) check the ideas it depends on.
 
+The task list and current status are in [Roadmap and status](roadmap.md).
+
 ## Where the code stands (v0.5.0)
 
 | Today | Gap to the vision |
