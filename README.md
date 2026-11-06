@@ -216,3 +216,7 @@ Contributions are welcome. Read [CONTRIBUTING.md](.github/CONTRIBUTING.md) befor
 Copyright 2026 Soket AI.
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+
+## Loop Visual desktop companion
+
+Turn your current screen and a question into an interactive Three.js explanation using Loop and GPT-6.1 Sol. See [setup and usage](apps/loop-visual/README.md).
