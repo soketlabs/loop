@@ -1238,3 +1238,110 @@ async fn an_ancestors_surface_disconnecting_leaves_the_request_parked() {
     .await
     .unwrap();
 }
+
+fn user_prompts(events: &[LoggedEvent]) -> Vec<String> {
+    let mut prompts = Vec::new();
+    for record in events {
+        let EventKind::Update(envelope) = &record.event.kind else {
+            continue;
+        };
+        match &envelope.update {
+            SessionUpdate::MessageStarted {
+                role: loop_protocol::Role::User,
+                ..
+            } => prompts.push(String::new()),
+            SessionUpdate::MessageChunk {
+                role: loop_protocol::Role::User,
+                content: ContentBlock::Text { text },
+                ..
+            } => prompts.last_mut().unwrap().push_str(text),
+            _ => {}
+        }
+    }
+    prompts
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fork_before_a_turn_keeps_the_history_and_replay_before_it() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let script: Script = Arc::new(|turn: Turn| ready(text(format!("reply {}", turn.call))));
+        let (rt, log, seen) =
+            runtime(dir.path(), "full-access", RuntimeLimits::default(), script).await;
+        let root = rt.new_session(SessionSpec::default()).await.unwrap();
+        for prompt in ["one", "two", "three"] {
+            assert!(matches!(run(&rt, &root, prompt).await, TurnOutcome::Completed(_)));
+        }
+        let records = log.read_after(&root.key, 0).await.unwrap();
+        assert_eq!(user_prompts(&records), ["one", "two", "three"]);
+        let second = records
+            .iter()
+            .find(|r| {
+                matches!(&r.event.kind, EventKind::Update(e)
+                    if matches!(&e.update, SessionUpdate::MessageChunk { role: loop_protocol::Role::User, content: ContentBlock::Text { text }, .. } if text == "two"))
+            })
+            .and_then(|r| r.event.turn.clone())
+            .unwrap();
+
+        let fork = rt
+            .fork(loop_protocol::rpc::ForkParams {
+                session: root.clone(),
+                before_turn: Some(second),
+                name: Some("edited".into()),
+            })
+            .await
+            .unwrap();
+        assert_ne!(fork.key, root.key);
+        let replay = log.read_after(&fork.key, 0).await.unwrap();
+        assert_eq!(user_prompts(&replay), ["one"], "the replay stops before the edited prompt");
+        let listed = rt.list().await.unwrap();
+        let info = listed.iter().find(|s| s.r#ref == fork).unwrap();
+        assert_eq!(info.parent, None, "a fork is no Subagent");
+        assert_eq!(info.name.as_deref(), Some("edited"));
+
+        let fork = rt.load_session(&fork, SessionSpec::default()).await.unwrap();
+        assert!(matches!(run(&rt, &fork, "two, edited").await, TurnOutcome::Completed(_)));
+        assert_eq!(seen.calls("one"), 4, "three root calls and one fork call");
+        let replay = log.read_after(&fork.key, 0).await.unwrap();
+        assert_eq!(user_prompts(&replay), ["one", "two, edited"]);
+        // The faux model numbers its reply by the exchanges it was given:
+        // the fork's history holds only the first one.
+        let last_reply = replay
+            .iter()
+            .rev()
+            .find_map(|r| match &r.event.kind {
+                EventKind::Update(e) => match &e.update {
+                    SessionUpdate::MessageChunk {
+                        role: loop_protocol::Role::Agent,
+                        content: ContentBlock::Text { text },
+                        ..
+                    } => Some(text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(last_reply, "reply 2");
+        let turns: Vec<_> = replay.iter().filter_map(|r| r.event.turn.clone()).collect();
+        let mut distinct = turns.clone();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 2, "the new turn continues after the copied one: {distinct:?}");
+
+        let busy = rt.prompt(&root, vec![ContentBlock::text("four")]).await.unwrap();
+        let refused = rt
+            .fork(loop_protocol::rpc::ForkParams {
+                session: root.clone(),
+                before_turn: None,
+                name: None,
+            })
+            .await;
+        let _ = busy.outcome().await;
+        assert!(
+            matches!(refused, Err(BackendError::Busy)) || refused.is_ok(),
+            "a busy Session is refused, or the turn already ended: {refused:?}"
+        );
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

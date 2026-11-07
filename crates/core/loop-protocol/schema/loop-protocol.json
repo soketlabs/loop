@@ -299,6 +299,37 @@
       ],
       "type": "object"
     },
+    "ForkParams": {
+      "description": "`session/fork` params. The fork is a new, unloaded Session with the\nsource's history and replay up to `before_turn`; it keeps the source's\nworking directory. The source must not be mid-turn.",
+      "properties": {
+        "before_turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Leave out this turn and everything after it: its prompt is the one\nbeing edited. Absent copies the whole Session."
+        },
+        "name": {
+          "description": "Display name for the fork.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session to fork."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
     "InitializeParams": {
       "description": "`initialize` params.",
       "properties": {
@@ -2116,6 +2147,16 @@
       },
       "result": {
         "type": "object"
+      }
+    },
+    "session/fork": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/ForkParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionRef"
       }
     },
     "session/list": {

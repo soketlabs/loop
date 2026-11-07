@@ -35,6 +35,9 @@ pub mod methods {
     /// Client → server request: [`super::SessionParams`] →
     /// `[SessionUpdate]`.
     pub const SESSION_TRANSCRIPT: &str = "session/transcript";
+    /// Client → server request: [`super::ForkParams`] → [`crate::SessionRef`].
+    /// Served only by a shared Runtime.
+    pub const SESSION_FORK: &str = "session/fork";
     /// Client → server request: [`super::PromptParams`] →
     /// [`super::PromptResult`], sent after the turn's `turn_ended` update.
     pub const SESSION_PROMPT: &str = "session/prompt";
@@ -236,6 +239,23 @@ pub struct LoadParams {
     pub spec: SessionSpec,
 }
 
+/// `session/fork` params. The fork is a new, unloaded Session with the
+/// source's history and replay up to `before_turn`; it keeps the source's
+/// working directory. The source must not be mid-turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ForkParams {
+    /// The Session to fork.
+    pub session: SessionRef,
+    /// Leave out this turn and everything after it: its prompt is the one
+    /// being edited. Absent copies the whole Session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_turn: Option<crate::ids::TurnId>,
+    /// Display name for the fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 /// `session/prompt` params.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -405,6 +425,7 @@ pub fn json_schema() -> Value {
     let attached = reference(generator.subschema_for::<AttachResult>());
     let withdrawn = reference(generator.subschema_for::<InteractWithdrawnParams>());
     let transcript = reference(generator.subschema_for::<Vec<SessionUpdate>>());
+    let fork = reference(generator.subschema_for::<ForkParams>());
     let prompt_params = reference(generator.subschema_for::<PromptParams>());
     let prompt_result = reference(generator.subschema_for::<PromptResult>());
     let envelope = reference(generator.subschema_for::<UpdateEnvelope>());
@@ -439,6 +460,7 @@ pub fn json_schema() -> Value {
             methods::SESSION_DETACH: method(up, "request", &session_params, Some(&empty)),
             methods::SESSION_LOAD: method(up, "request", &load, Some(&session)),
             methods::SESSION_TRANSCRIPT: method(up, "request", &session_params, Some(&transcript)),
+            methods::SESSION_FORK: method(up, "request", &fork, Some(&session)),
             methods::SESSION_PROMPT: method(up, "request", &prompt_params, Some(&prompt_result)),
             methods::SESSION_CANCEL: method(up, "notification", &session_params, None),
             methods::SESSION_UPDATE: method(down, "notification", &envelope, None),

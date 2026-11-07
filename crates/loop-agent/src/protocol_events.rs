@@ -26,6 +26,9 @@ const MAX_TITLE_CHARS: usize = 80;
 pub struct NativeEventMapper {
     next_turn: u64,
     next_message: u64,
+    /// Turns recorded before this mapper took over; set when they are
+    /// continued, so message ids differ from the earlier mapper's.
+    resumed_after: u64,
     turn: Option<TurnId>,
     message: Option<OpenMessage>,
     last_assistant: Option<AssistantMessage>,
@@ -56,8 +59,11 @@ impl NativeEventMapper {
     }
 
     /// Number later turns after `turns` earlier ones, so a reloaded Session
-    /// never repeats a turn id. Never moves the numbering back.
+    /// never repeats a turn or message id. Never moves the numbering back.
     pub fn continue_after(&mut self, turns: u64) {
+        if turns > self.next_turn && self.next_message == 0 {
+            self.resumed_after = turns;
+        }
         self.next_turn = self.next_turn.max(turns);
     }
 
@@ -274,7 +280,12 @@ impl NativeEventMapper {
 
     fn open_message(&mut self, role: Role) -> MessageId {
         self.next_message += 1;
-        let id = MessageId(format!("msg-{}", self.next_message));
+        // Messages only open inside turns, and the turn count only grows, so an
+        // id scoped by the turns before this mapper is never reused.
+        let id = match self.resumed_after {
+            0 => MessageId(format!("msg-{}", self.next_message)),
+            turns => MessageId(format!("msg-{turns}.{}", self.next_message)),
+        };
         self.message = Some(OpenMessage {
             id: id.clone(),
             role,
@@ -603,6 +614,18 @@ mod tests {
         assert_eq!(mapper.begin_turn().as_str(), "turn-5");
         mapper.continue_after(2);
         assert_eq!(mapper.begin_turn().as_str(), "turn-6");
+    }
+
+    #[test]
+    fn message_ids_after_a_reload_differ_from_the_earlier_ones() {
+        let mut fresh = NativeEventMapper::new();
+        fresh.begin_turn();
+        assert_eq!(fresh.open_message(Role::User).as_str(), "msg-1");
+        let mut reloaded = NativeEventMapper::new();
+        reloaded.continue_after(3);
+        reloaded.begin_turn();
+        assert_eq!(reloaded.open_message(Role::User).as_str(), "msg-3.1");
+        assert_eq!(reloaded.open_message(Role::Agent).as_str(), "msg-3.2");
     }
 
     #[test]

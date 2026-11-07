@@ -341,6 +341,12 @@ impl loop_wire::RuntimeControl for Control {
     ) -> loop_protocol::BackendResult<()> {
         loop_wire::RuntimeControl::close(self.runtime.as_ref(), session, force).await
     }
+    async fn fork(
+        &self,
+        params: loop_protocol::rpc::ForkParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::SessionRef> {
+        loop_wire::RuntimeControl::fork(self.runtime.as_ref(), params).await
+    }
     async fn attach(
         &self,
         session: &loop_protocol::SessionRef,

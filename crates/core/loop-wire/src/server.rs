@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use loop_protocol::rpc::{
-    methods, negotiate, AttachParams, AttachResult, CloseParams, InitializeParams,
+    methods, negotiate, AttachParams, AttachResult, CloseParams, ForkParams, InitializeParams,
     InitializeResult, LoadParams, PeerInfo, PromptParams, PromptResult, RpcErrorBody,
     SessionParams,
 };
@@ -317,6 +317,10 @@ async fn handle(
                 .close(&session, force)
                 .await
                 .map(|()| json!({})),
+            Err(error) => return conn.respond(id, Err(error)),
+        },
+        methods::SESSION_FORK if runtime.is_some() => match parse::<ForkParams>(params) {
+            Ok(params) => runtime.unwrap().fork(params).await.map(|s| to_value(&s)),
             Err(error) => return conn.respond(id, Err(error)),
         },
         methods::SESSION_ATTACH if runtime.is_some() => match parse::<AttachParams>(params) {

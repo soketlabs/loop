@@ -65,6 +65,10 @@ pub trait RuntimeControl: Send + Sync {
     ) -> BackendResult<Attachment> {
         self.attach(session, after_seq).await
     }
+    /// Copy a Session into a new, unloaded one (`session/fork`).
+    async fn fork(&self, _params: loop_protocol::rpc::ForkParams) -> BackendResult<SessionRef> {
+        Err(unsupported("session/fork"))
+    }
     /// The Runtime process and its Session counts (`runtime/status`).
     async fn status(&self) -> BackendResult<RuntimeStatus> {
         Err(unsupported("runtime/status"))

@@ -823,6 +823,143 @@ impl Runtime {
             })
             .collect())
     }
+    /// Copy a Session into a new, unloaded one: its stored history and its
+    /// replay, both cut before `before_turn`'s prompt when one is given. The
+    /// fork records the source as its parent, so it is a fork, not a Subagent.
+    pub async fn fork(&self, params: loop_protocol::rpc::ForkParams) -> BackendResult<SessionRef> {
+        use loop_agent::harness::session::{
+            fork_points_from_branch, read_session_entries_for_fork, SessionForkSelection,
+        };
+        let session = params.session;
+        if session.instance != self.instance || session.key.0 != session.native_id {
+            return Err(BackendError::SessionNotFound(session.key.clone()));
+        }
+        if self.subagent_keys().await?.contains(&session.key) {
+            return Err(failed("a Subagent's Session cannot be forked"));
+        }
+        if let Ok(live) = self.route(&session) {
+            if live.busy.load(Ordering::Acquire) {
+                return Err(BackendError::Busy);
+            }
+        }
+        let reader = self
+            .store
+            .load(&session.native_id)
+            .await
+            .map_err(|error| match error {
+                SessionError::NotFound(_) => BackendError::SessionNotFound(session.key.clone()),
+                other => failed(other),
+            })?;
+
+        let records = self.log.read_after(&session.key, 0).await.map_err(failed)?;
+        let cut = match &params.before_turn {
+            Some(turn) => records
+                .iter()
+                .position(|r| r.event.turn.as_ref() == Some(turn))
+                .ok_or_else(|| failed(format!("this Session has no turn {turn}")))?,
+            None => records.len(),
+        };
+        // Every user message the replay shows, how many precede the cut, and
+        // the edited one.
+        let mut users: Vec<loop_protocol::MessageId> = Vec::new();
+        let mut before = 0;
+        let mut texts: HashMap<loop_protocol::MessageId, String> = HashMap::new();
+        let mut edited: Option<loop_protocol::MessageId> = None;
+        for (index, record) in records.iter().enumerate() {
+            let EventKind::Update(envelope) = &record.event.kind else {
+                continue;
+            };
+            match &envelope.update {
+                SessionUpdate::MessageStarted {
+                    message_id,
+                    role: loop_protocol::Role::User,
+                } => {
+                    if index < cut {
+                        before += 1;
+                    } else if edited.is_none() && envelope.turn == params.before_turn {
+                        edited = Some(message_id.clone());
+                    }
+                    users.push(message_id.clone());
+                }
+                SessionUpdate::MessageChunk {
+                    message_id,
+                    role: loop_protocol::Role::User,
+                    content: ContentBlock::Text { text },
+                } => texts.entry(message_id.clone()).or_default().push_str(text),
+                _ => {}
+            }
+        }
+
+        let (selection, through) = if params.before_turn.is_some() {
+            let entries = reader.read_entries(None).await.map_err(failed)?;
+            let head = reader.read_head().await.map_err(failed)?;
+            let branch = read_session_entries_for_fork(
+                &entries,
+                head.as_deref(),
+                SessionForkSelection::All,
+                None,
+            )
+            .map_err(failed)?;
+            let points = fork_points_from_branch(&branch);
+            // Older history may be stored without replay, so line the two up
+            // from the newest prompt, and confirm by the prompt's text.
+            let expected = before as i64 + points.len() as i64 - users.len() as i64;
+            let want = edited
+                .as_ref()
+                .and_then(|id| texts.get(id))
+                .map(|t| t.trim());
+            let found = (0..points.len())
+                .filter(|&i| want.is_none_or(|w| points[i].text.trim() == w))
+                .min_by_key(|&i| (i as i64 - expected).abs());
+            match found {
+                Some(i) => (
+                    SessionForkSelection::BeforeEntry,
+                    Some(points[i].entry_id.clone()),
+                ),
+                // The newest prompt can be missing from the history when its
+                // turn failed first; everything stored then precedes it.
+                None if before + 1 >= users.len() => (SessionForkSelection::All, None),
+                None => {
+                    return Err(failed(
+                        "could not find that message in the Session's history",
+                    ))
+                }
+            }
+        } else {
+            (SessionForkSelection::All, None)
+        };
+
+        let forked = self
+            .store
+            .fork(
+                &session.native_id,
+                selection,
+                through.as_deref(),
+                params.name,
+            )
+            .await
+            .map_err(failed)?;
+        let reference = reference(&forked.metadata().id);
+        let copied: Vec<Event> = records
+            .into_iter()
+            .take(cut)
+            .filter_map(|record| match record.event.kind {
+                EventKind::Update(mut envelope) => {
+                    envelope.session = reference.key.clone();
+                    Some(Event::update(self.generation, record.event.ts_ms, envelope))
+                }
+                _ => None,
+            })
+            .collect();
+        for batch in copied.chunks(crate::log::MAX_BATCH_EVENTS) {
+            if let Err(error) = self.log.append_batch(batch.to_vec()).await {
+                self.discard_new_row(true, &reference.native_id).await;
+                return Err(failed(error));
+            }
+        }
+        touch(&self.activity, &reference.key, now());
+        Ok(reference)
+    }
     /// Recent committed updates; the Event Log remains the replay authority.
     pub fn tail(&self, session: &SessionRef) -> BackendResult<Vec<UpdateEnvelope>> {
         Ok(self
@@ -1306,6 +1443,9 @@ impl loop_wire::RuntimeControl for Runtime {
     }
     async fn status(&self) -> BackendResult<loop_protocol::rpc::RuntimeStatus> {
         Ok(Runtime::status(self))
+    }
+    async fn fork(&self, params: loop_protocol::rpc::ForkParams) -> BackendResult<SessionRef> {
+        Runtime::fork(self, params).await
     }
     async fn close(&self, session: &SessionRef, force: bool) -> BackendResult<()> {
         if session.instance != self.instance || session.key.0 != session.native_id {
