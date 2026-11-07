@@ -41,6 +41,13 @@ regex = { workspace = true }
 base64 = { workspace = true }
 mime_guess = { workspace = true }
 walkdir = { workspace = true }
+zip = { workspace = true }
+quick-xml = { workspace = true }
+pulldown-cmark = { workspace = true }
+calamine = { workspace = true }
+rust_xlsxwriter = { workspace = true }
+pdf-extract = { workspace = true }
+encoding_rs = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 eventsource-stream = { workspace = true, optional = true }

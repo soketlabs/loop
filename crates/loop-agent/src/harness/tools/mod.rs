@@ -1,5 +1,6 @@
 //! Built-in coding tools over [`ExecutionEnv`](crate::harness::types::ExecutionEnv).
 
+mod documents;
 mod file_mutation_queue;
 mod plan;
 mod search;
@@ -47,7 +48,10 @@ pub fn create_read_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     AgentTool::simple(
         "read",
         "Read",
-        "Read a file's contents (text or image).",
+        format!(
+            "Read a file's contents (text or image).{}",
+            documents::READ_GUIDE
+        ),
         schema_object(
             json!({"path": {"type": "string", "description": "File path"}}),
             &["path"],
@@ -82,6 +86,9 @@ pub fn create_read_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         terminate: None,
                     });
                 }
+                if let Some(result) = documents::read(env.as_ref(), &abs).await {
+                    return result;
+                }
                 let text = env.read_text_file(&abs).await.map_err(|e| e.to_string())?;
                 let (text, truncated) = truncate_head(&text, DEFAULT_MAX_BYTES);
                 Ok(AgentToolResult {
@@ -104,7 +111,10 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     AgentTool::simple(
         "write",
         "Write",
-        "Write contents to a file (create or overwrite).",
+        format!(
+            "Write contents to a file (create or overwrite).{}",
+            documents::WRITE_GUIDE
+        ),
         schema_object(
             json!({
                 "path": {"type": "string"},
@@ -124,24 +134,26 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                     let env = Arc::clone(&env);
                     let content = content.clone();
                     async move {
-                        let (created, previous) = match env.read_text_file(&abs).await {
-                            Ok(text) => (false, text),
-                            Err(_) => (true, String::new()),
-                        };
+                        let bytes = documents::encode(&abs, &content).await?;
+                        let (created, (before, previous)) =
+                            match documents::previous(env.as_ref(), &abs).await {
+                                Some(found) => (false, found),
+                                None => (true, Default::default()),
+                            };
                         let previous_path =
-                            write_review_snapshot(&abs, &previous).map_err(|e| e.to_string())?;
+                            write_review_snapshot(&abs, &before).map_err(|e| e.to_string())?;
                         let diff = unified_diff(&previous, &content, &abs);
-                        env.write_file(&abs, content.as_bytes())
+                        env.write_file(&abs, &bytes)
                             .await
                             .map_err(|e| e.to_string())?;
                         Ok(AgentToolResult {
                             content: vec![ToolResultContent::Text(TextContent {
-                                text: format!("Wrote {} bytes to {}", content.len(), abs.display()),
+                                text: format!("Wrote {} bytes to {}", bytes.len(), abs.display()),
                                 text_signature: None,
                             })],
                             details: json!({
                                 "path": abs,
-                                "bytes": content.len(),
+                                "bytes": bytes.len(),
                                 "created": created,
                                 "previousPath": previous_path,
                                 "diff": diff,
@@ -192,14 +204,15 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                 with_file_mutation_queue(abs.clone(), || {
                     let env = Arc::clone(&env);
                     async move {
+                        documents::check_editable(&abs)?;
                         let original = env.read_text_file(&abs).await.map_err(|e| e.to_string())?;
                         let updated = if original.contains(&old_text) {
                             original.replacen(&old_text, &new_text, 1)
                         } else {
                             fuzzy_replace(&original, &old_text, &new_text)?
                         };
-                        let previous_path =
-                            write_review_snapshot(&abs, &original).map_err(|e| e.to_string())?;
+                        let previous_path = write_review_snapshot(&abs, original.as_bytes())
+                            .map_err(|e| e.to_string())?;
                         let diff = unified_diff(&original, &updated, &abs);
                         env.write_file(&abs, updated.as_bytes())
                             .await
@@ -228,7 +241,7 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
 }
 
 /// Persist pre-edit contents so the CLI can open a diff and revert on reject.
-fn write_review_snapshot(path: &Path, contents: &str) -> std::io::Result<PathBuf> {
+fn write_review_snapshot(path: &Path, contents: &[u8]) -> std::io::Result<PathBuf> {
     let dir = std::env::temp_dir().join("loop-file-review");
     std::fs::create_dir_all(&dir)?;
     let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
