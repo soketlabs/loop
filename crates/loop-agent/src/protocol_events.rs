@@ -390,6 +390,9 @@ pub fn replay(messages: &[AgentMessage]) -> Vec<SessionUpdate> {
                     ToolCallStatus::Completed
                 });
                 update.content = Some(text_content(&result.content));
+                if !result.is_error {
+                    update.locations = result.details.as_ref().and_then(written_locations);
+                }
                 updates.push(SessionUpdate::ToolCallUpdate(update));
                 if let Some(details) = &result.details {
                     updates.extend(plan_update(&result.tool_name, details, result.is_error));
@@ -516,10 +519,24 @@ fn tool_call_end(id: &str, result: &AgentToolResult, is_error: bool) -> ToolCall
         ToolCallStatus::Completed
     });
     update.content = Some(content);
+    if !is_error {
+        update.locations = written_locations(&result.details);
+    }
     if result.details.as_object().is_some_and(|d| !d.is_empty()) {
         update.raw_output = Some(result.details.clone());
     }
     update
+}
+
+/// The absolute path a successful `write` or `edit` reports, which replaces
+/// the path as the model typed it.
+fn written_locations(details: &Value) -> Option<Vec<ToolLocation>> {
+    details.get("diff")?;
+    let path = details.get("path").and_then(Value::as_str)?;
+    Some(vec![ToolLocation {
+        path: path.to_owned(),
+        line: None,
+    }])
 }
 
 fn text_content(content: &[ToolResultContent]) -> Vec<ToolContent> {

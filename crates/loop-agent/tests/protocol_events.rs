@@ -182,6 +182,8 @@ async fn write_tool_reports_kind_location_and_diff() {
         matches!(&content[0], ToolContent::UnifiedDiff { path, diff } if path.ends_with("hello.txt") && diff.contains("+hi")),
         "diff first: {content:#?}"
     );
+    let written = &finished.locations.as_ref().expect("written path reported")[0].path;
+    assert_eq!(std::path::Path::new(written), dir.path().join("hello.txt"));
 
     assert_eq!(agent_text(&updates), "Created hello.txt.");
     assert!(matches!(
