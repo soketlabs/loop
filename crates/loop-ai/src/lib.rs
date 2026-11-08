@@ -53,10 +53,10 @@ pub mod types;
 pub mod utils;
 
 pub use api::{
-    detect_compat, http_client, list_openai_models, map_remote_model, resolve_compat,
-    streaming_http_client, transform_messages, verify_api_key, AnthropicMessagesAdapter,
-    GoogleGenerativeAiAdapter, ListModelsError, MapRemoteModelOptions, OpenAICompletionsAdapter,
-    OpenAIResponsesAdapter,
+    api_proxy_socket, api_proxy_url, detect_compat, http_client, list_openai_models,
+    map_remote_model, resolve_compat, streaming_http_client, transform_messages, verify_api_key,
+    AnthropicMessagesAdapter, GoogleGenerativeAiAdapter, ListModelsError, MapRemoteModelOptions,
+    OpenAICompletionsAdapter, OpenAIResponsesAdapter, API_PROXY_SOCKET_ENV,
 };
 pub use auth::{
     env_api_key_auth, AuthCheck, AuthResult, Credential, CredentialStore, InMemoryCredentialStore,

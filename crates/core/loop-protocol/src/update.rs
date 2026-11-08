@@ -108,6 +108,17 @@ pub enum SessionUpdate {
         /// Content to append.
         content: ContentBlock,
     },
+    /// The model has started writing a tool call; its input is still
+    /// arriving. A `ToolCall` with the same id follows if the call completes.
+    /// Readers may ignore this.
+    ToolCallPreparing {
+        /// Tool call id.
+        id: ToolCallId,
+        /// The tool's own name.
+        name: String,
+        /// What kind of action the tool performs.
+        kind: ToolKind,
+    },
     /// A tool call began.
     ToolCall(ToolCall),
     /// A tool call changed. Only changed fields are set.

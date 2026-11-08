@@ -128,7 +128,11 @@ impl SoketWebApi {
 #[derive(Clone)]
 enum FetchRoute {
     Direct,
-    Soket { endpoint: Url, api_key: String },
+    Soket {
+        endpoint: Url,
+        api_key: String,
+        client: reqwest::Client,
+    },
 }
 
 impl WebFetchConfig {
@@ -169,6 +173,25 @@ fn build_client(policy: FetchPolicy) -> Option<reqwest::Client> {
     client.ok()
 }
 
+/// The client for keyed web APIs (search backends, Soket's fetch API): Loop's
+/// API proxy when it runs behind one ([`loop_ai::API_PROXY_SOCKET_ENV`]),
+/// otherwise the guarded shared client.
+fn keyed_api_client(policy: FetchPolicy) -> Result<reqwest::Client, String> {
+    match loop_ai::api_proxy_socket() {
+        Some(_) => Ok(loop_ai::http_client()),
+        None => shared_client(policy),
+    }
+}
+
+/// A keyed web API URL as sent to the API proxy (`https` becomes `http`; the
+/// proxy speaks TLS upstream). Unchanged without a proxy.
+fn keyed_api_url(mut url: Url) -> Url {
+    if loop_ai::api_proxy_socket().is_some() && url.scheme() == "https" {
+        let _ = url.set_scheme("http");
+    }
+    url
+}
+
 /// Build the `web_fetch` tool. `soket` (when resolved) routes fetches through
 /// Soket's fetch API per [`WebFetchProvider`]. `Err` covers HTTP client init
 /// failure, a bad Soket base URL, and `provider: soket` without a key.
@@ -192,8 +215,12 @@ pub fn create_web_fetch_tool(
     let route = match soket {
         None => FetchRoute::Direct,
         Some(api) => FetchRoute::Soket {
-            endpoint: search::endpoint(&search::resolve_base_url(&api.base_url, policy)?, "fetch"),
+            endpoint: keyed_api_url(search::endpoint(
+                &search::resolve_base_url(&api.base_url, policy)?,
+                "fetch",
+            )),
             api_key: api.api_key,
+            client: keyed_api_client(policy)?,
         },
     };
     Ok(AgentTool::simple(
@@ -213,9 +240,12 @@ pub fn create_web_fetch_tool(
                 let raw_url = arg_str(&args, "url")?;
                 match &route {
                     FetchRoute::Direct => fetch_url(&client, &raw_url, policy, cancel.as_ref()).await,
-                    FetchRoute::Soket { endpoint, api_key } => {
-                        fetch_via_soket(&client, endpoint, api_key, &raw_url, cancel.as_ref())
-                            .await
+                    FetchRoute::Soket {
+                        endpoint,
+                        api_key,
+                        client,
+                    } => {
+                        fetch_via_soket(client, endpoint, api_key, &raw_url, cancel.as_ref()).await
                     }
                 }
             }

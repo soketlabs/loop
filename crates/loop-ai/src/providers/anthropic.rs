@@ -248,7 +248,7 @@ pub async fn list_anthropic_models(
 ) -> Result<Vec<Model>, ListModelsError> {
     let base_url = base_url.trim_end_matches('/');
     let resp = crate::api::http_client()
-        .get(format!("{base_url}/models?limit=1000"))
+        .get(crate::api::api_proxy_url(&format!("{base_url}/models?limit=1000")).as_ref())
         .header("x-api-key", api_key)
         .header("anthropic-version", ANTHROPIC_VERSION)
         .send()

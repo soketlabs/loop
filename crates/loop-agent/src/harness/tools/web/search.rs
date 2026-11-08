@@ -262,10 +262,10 @@ impl SearchBackend {
         let policy = FetchPolicy {
             allow_private_addresses: config.allow_private_addresses,
         };
-        let base_url = resolve_base_url(
+        let base_url = super::keyed_api_url(resolve_base_url(
             config.base_url.as_deref().unwrap_or(info.default_base_url),
             policy,
-        )?;
+        )?);
         Ok(Self {
             kind,
             id: info.id,
@@ -467,7 +467,7 @@ pub fn create_web_search_tool(
     let policy = FetchPolicy {
         allow_private_addresses: config.allow_private_addresses,
     };
-    let client = super::shared_client(policy)?;
+    let client = super::keyed_api_client(policy)?;
     Ok(crate::types::AgentTool::simple(
         "web_search",
         "Web search",
@@ -536,7 +536,7 @@ pub async fn verify_web_search_key(config: &WebSearchConfig, api_key: &str) -> R
     let policy = FetchPolicy {
         allow_private_addresses: config.allow_private_addresses,
     };
-    let client = super::shared_client(policy)?;
+    let client = super::keyed_api_client(policy)?;
     match backend
         .search(&client, "loop agent connectivity check", 1, None)
         .await

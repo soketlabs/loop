@@ -191,7 +191,7 @@ pub async fn list_openai_models(
 ) -> Result<Vec<Model>, ListModelsError> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = super::http::http_client();
-    let mut req = client.get(&url);
+    let mut req = client.get(super::http::api_proxy_url(&url).as_ref());
     if let Some(key) = api_key {
         if !key.is_empty() {
             req = req.bearer_auth(key);
@@ -224,7 +224,7 @@ pub async fn verify_api_key(
 ) -> Result<(), ListModelsError> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
     let resp = super::http::http_client()
-        .get(&url)
+        .get(super::http::api_proxy_url(&url).as_ref())
         .bearer_auth(api_key)
         .send()
         .await?;

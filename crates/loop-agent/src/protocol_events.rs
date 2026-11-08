@@ -40,6 +40,8 @@ struct OpenMessage {
     role: Role,
     /// Whether any text has been sent for this message as chunks.
     streamed_text: bool,
+    /// Tool calls already announced as preparing.
+    preparing: Vec<String>,
 }
 
 impl NativeEventMapper {
@@ -207,6 +209,15 @@ impl NativeEventMapper {
         let (delta, thought) = match event {
             AssistantMessageEvent::TextDelta { delta, .. } => (delta, false),
             AssistantMessageEvent::ThinkingDelta { delta, .. } => (delta, true),
+            AssistantMessageEvent::ToolcallStart {
+                content_index,
+                partial,
+            }
+            | AssistantMessageEvent::ToolcallDelta {
+                content_index,
+                partial,
+                ..
+            } => return self.tool_call_preparing(partial, *content_index),
             _ => return Vec::new(),
         };
         if delta.is_empty() {
@@ -240,6 +251,33 @@ impl NativeEventMapper {
             });
         }
         updates
+    }
+
+    /// Announces a tool call the model is still writing, once its id and name
+    /// are known. Some providers send them only after the call has opened.
+    fn tool_call_preparing(
+        &mut self,
+        partial: &AssistantMessage,
+        content_index: usize,
+    ) -> Vec<SessionUpdate> {
+        let Some(AssistantContent::ToolCall(call)) = partial.content.get(content_index) else {
+            return Vec::new();
+        };
+        if call.id.is_empty() || call.name.is_empty() {
+            return Vec::new();
+        }
+        let Some(open) = self.message.as_mut().filter(|m| m.role == Role::Agent) else {
+            return Vec::new();
+        };
+        if open.preparing.contains(&call.id) {
+            return Vec::new();
+        }
+        open.preparing.push(call.id.clone());
+        vec![SessionUpdate::ToolCallPreparing {
+            id: ToolCallId::from(call.id.as_str()),
+            name: call.name.clone(),
+            kind: tool_kind(&call.name),
+        }]
     }
 
     fn message_end(&mut self, message: &AgentMessage) -> Vec<SessionUpdate> {
@@ -290,6 +328,7 @@ impl NativeEventMapper {
             id: id.clone(),
             role,
             streamed_text: false,
+            preparing: Vec::new(),
         });
         id
     }

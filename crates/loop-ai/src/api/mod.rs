@@ -13,7 +13,9 @@ pub mod transform_messages;
 pub use anthropic_messages::AnthropicMessagesAdapter;
 pub use detect_compat::{detect_compat, resolve_compat};
 pub use google_generative_ai::GoogleGenerativeAiAdapter;
-pub use http::{http_client, streaming_http_client};
+pub use http::{
+    api_proxy_socket, api_proxy_url, http_client, streaming_http_client, API_PROXY_SOCKET_ENV,
+};
 pub use openai_completions::OpenAICompletionsAdapter;
 pub use openai_models::{
     list_openai_models, map_remote_model, verify_api_key, ListModelsError, MapRemoteModelOptions,

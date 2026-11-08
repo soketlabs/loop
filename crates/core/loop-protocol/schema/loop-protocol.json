@@ -1385,6 +1385,34 @@
           "type": "object"
         },
         {
+          "description": "The model has started writing a tool call; its input is still\narriving. A `ToolCall` with the same id follows if the call completes.\nReaders may ignore this.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/ToolCallId",
+              "description": "Tool call id."
+            },
+            "kind": {
+              "$ref": "#/$defs/ToolKind",
+              "description": "What kind of action the tool performs."
+            },
+            "name": {
+              "description": "The tool's own name.",
+              "type": "string"
+            },
+            "type": {
+              "const": "tool_call_preparing",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
           "$ref": "#/$defs/ToolCall",
           "description": "A tool call began.",
           "properties": {

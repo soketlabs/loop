@@ -49,3 +49,4 @@ Environment variables:
 | `LOOP_CODING_AGENT_DIR` | Use a different config directory |
 | `LOOP_CODING_AGENT_SESSION_DIR` | Use a different directory for `sessions.db` |
 | `LOOP_DEBUG=1` | Write debug logs (same as `--debug`) |
+| `LOOP_API_PROXY_SOCKET` | For hosting: a Unix socket served by a proxy that holds the API keys. Model and web search API requests go there as plain HTTP addressed to the provider's host, and the proxy adds the key and TLS. Unset, requests go straight to the provider |

@@ -4514,6 +4514,11 @@ fn handle_update(
                 card_status(call.status),
             );
         }
+        SessionUpdate::ToolCallPreparing { name, .. } => {
+            if live {
+                *turn_step = format!("tool · {}", tool_display_name(source, &name));
+            }
+        }
         SessionUpdate::ToolCallUpdate(mut update) => {
             let todo_done = source.is_none()
                 && matches!(

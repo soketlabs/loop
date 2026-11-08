@@ -153,6 +153,23 @@ async fn write_tool_reports_kind_location_and_diff() {
         "hi\n"
     );
 
+    let position = |want: fn(&SessionUpdate) -> bool| updates.iter().position(want);
+    let preparing = position(|u| {
+        matches!(u, SessionUpdate::ToolCallPreparing { id, name, kind }
+            if id.as_str() == "call-1" && name == "write" && *kind == ToolKind::Edit)
+    })
+    .expect("tool call announced while its input streams");
+    let reported = position(|u| matches!(u, SessionUpdate::ToolCall(_))).unwrap();
+    assert!(preparing < reported, "announced before it is reported");
+    assert_eq!(
+        updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::ToolCallPreparing { .. }))
+            .count(),
+        1,
+        "announced once"
+    );
+
     let started = updates
         .iter()
         .find_map(|u| match u {
