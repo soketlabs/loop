@@ -12,12 +12,12 @@ checksum mismatch, or failed binary check stops the operation.
 From a clone:
 
 ```bash
-./install.sh --version 0.3.4
+./install.sh --version 0.6.0
 ./install.sh --no-modify-path
 ```
 
 ```powershell
-.\install.ps1 -Version 0.3.4
+.\install.ps1 -Version 0.6.0
 .\install.ps1 -NoModifyPath
 ```
 
@@ -54,7 +54,7 @@ stable GitHub release in the background. Source and package-manager launches
 skip it. A newer version produces a chat notice:
 
 ```text
-Loop 0.3.5 is available (installed: 0.3.4).
+Loop 0.6.0 is available (installed: 0.5.0).
 Exit this session and run `loop update` to install it.
 ```
 
@@ -69,8 +69,8 @@ and version commands do not perform a startup check or alter their output.
 ```bash
 loop update --check
 loop update
-loop update --version 0.3.5
-loop update --version 0.3.4 --force
+loop update --version 0.6.0
+loop update --version 0.5.0 --force
 ```
 
 Version comparisons use semantic versions. Normal updates never downgrade.

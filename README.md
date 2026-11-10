@@ -21,8 +21,9 @@ loop is a **developer preview (alpha)**. Settings, session files and CLI flags c
 
 | Crate | Path | Role |
 |-------|------|------|
-| **loop-ai** | [`crates/loop-ai`](crates/loop-ai) | Unified LLM API, Soket provider (`/v1/models` refresh), OpenAI-compat + faux |
+| **loop-ai** | [`crates/loop-ai`](crates/loop-ai) | Unified LLM API: Soket (`/v1/models` refresh), native Anthropic Messages, OpenAI Responses and Gemini adapters, OpenAI-compatible Chat Completions, faux |
 | **loop-agent** | [`crates/loop-agent`](crates/loop-agent) | Agent loop, AgentHarness, tools, sessions, sandbox, skills |
+| **loop-runtime** | [`crates/loop-runtime`](crates/loop-runtime) | Shared Runtime: owns Sessions and their durable event log (`loop runtime`) |
 | **loop-cli** | [`crates/loop-cli`](crates/loop-cli) | Interactive `loop` TUI (ratatui) |
 | **loop-update** | [`crates/ops/loop-update`](crates/ops/loop-update) | Release checks, verified updates, rollback and uninstall |
 | **loop-protocol** | [`crates/core/loop-protocol`](crates/core/loop-protocol) | Versioned event model and backend interface shared by every agent and surface |
@@ -41,7 +42,7 @@ curl -fsSL https://loop.soket.ai/install | bash
 That downloads the latest `loop` binary for your OS into `~/.loop/bin` and adds it to `PATH`. Pin a version or skip PATH edits:
 
 ```bash
-curl -fsSL https://loop.soket.ai/install | bash -s -- --version 0.3.4
+curl -fsSL https://loop.soket.ai/install | bash -s -- --version 0.6.0
 curl -fsSL https://loop.soket.ai/install | bash -s -- --no-modify-path
 ```
 
@@ -51,7 +52,7 @@ On native Windows, run the PowerShell installer from a clone:
 
 ```powershell
 .\install.ps1
-.\install.ps1 -Version 0.3.4 -NoModifyPath
+.\install.ps1 -Version 0.6.0 -NoModifyPath
 ```
 
 For installer-owned binaries, opening the terminal chat checks GitHub in the background. If a newer
@@ -165,6 +166,12 @@ All of this is the `telemetry` feature, which is on by default. To build without
 
 ```bash
 cargo build -p loop-cli --release --no-default-features
+```
+
+The optional `orchestration` feature (off by default) adds `/workflow`, which runs a multi-agent workflow from a goal:
+
+```bash
+cargo build -p loop-cli --release --features orchestration
 ```
 
 Maintainers: see [docs/releasing.md](docs/releasing.md) to cut a release.

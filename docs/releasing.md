@@ -24,8 +24,8 @@ Supported release targets:
 3. Tag and push the tag:
 
 ```bash
-git tag v0.3.4
-git push origin v0.3.4
+git tag v0.6.1
+git push origin v0.6.1
 ```
 
 That starts the Release workflow, builds all targets, and creates a GitHub Release

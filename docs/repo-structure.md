@@ -26,3 +26,12 @@ Dependency rules for new work:
   in `loop-update`.
 - Updater code does not import runtime settings or perform data migrations.
 - Add optional components through features and keep the default build small.
+
+## Current layout
+
+Crates are grouped by the dependency rules above:
+
+- `crates/core/`: `loop-protocol` (the versioned event model and backend interface) and `loop-wire` (JSON-RPC and the transports that carry it).
+- `crates/extend/`: optional surfaces and integrations, `loop-acp` and `loop-dashboard`.
+- `crates/ops/`: distribution operations, `loop-update`.
+- `crates/`: the remaining crates keep their original paths: `loop-agent`, `loop-ai`, `loop-app-core`, `loop-cli`, `loop-desktop`, `loop-mcp`, `loop-orchestration`, `loop-runtime` (the shared Runtime and its durable Session Event Log) and `loop-telemetry`.

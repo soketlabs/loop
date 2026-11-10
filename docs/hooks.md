@@ -21,7 +21,7 @@ A hook is a JSON file in `~/.loop/agent/hooks/` or, in a trusted project, `.loop
 | `session_before_compact`, `session_before_tree` | Before compaction or tree navigation | `block` cancels; `summary` supplies one |
 | `settled`, `queue_update`, `shutdown_requested` | Lifecycle | — |
 
-Tool events cover Loop's own tools, MCP tools, `mcp serve` clients and `/workflow` tasks, in every mode. For subscription agents (ChatGPT):
+Tool events cover Loop's own tools, MCP tools, `--serve-mcp` clients and `/workflow` tasks, in every mode. For subscription agents (ChatGPT):
 
 - **`tool_call`** fires when the agent asks permission. A block or allow picks the agent's own "reject once" or "allow once" option.
 - **`tool_result`** fires for every agent tool call that finishes, as an observer only: the agent has already run it.
