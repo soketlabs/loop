@@ -16,11 +16,33 @@ The research found five facts that change the plan:
 
 Delivery evidence: one maintainer with coding agents built S2 in about 1.5 days and S3 in about 1.5 days. Build speed is not the limit. Review, live tests and decisions are the limit.
 
+## Status on 2026-11-11
+
+- **PR #107 is merged to `main`.** It brings S3 to `main`.
+  - E1 passes 400 trials after the D0 to D3 fixes and the review fixes.
+  - E3 enforcement shows 0 leaks for L1 to L5. L6 and L7 stay open for S4.
+  - New CI: no Windows, no CI on pushes to `staging`, orchestration and desktop checks, a CI gate, and pinned actions.
+- **Decision: no TLS in the Loop Runtime now.** The maintainer decided today that Phase 0 adds no `wss://` and no certificates.
+  - S3.8b part 1 is replaced by SSH-tunnel documentation. Remote access is an SSH tunnel to the Runtime's loopback WebSocket listener (`docs/runtime.md`).
+  - S3.8b part 2 (URL or QR remote control) moves to Phase 2 as a relay. The Runtime opens an authenticated outbound connection to the Soket edge gateway. A phone or browser pairs by QR with a one-time code. No inbound port and no certificates on user machines.
+  - Optional later: `--tls-cert` and `--tls-key` for self-hosters, if users ask.
+  - The security rules stay: non-loopback binds are refused, a token is required even on loopback, and host-only methods are refused for WebSocket clients.
+- **Linux live check is postponed.** A Linux machine comes later.
+- **Q1b analysis is done** (`docs/probes/q1b-loop-failure-analysis.md`). Fixes are in progress.
+- **Current wave A tasks:**
+  - split of PR #105;
+  - Loop correctness fixes (block list, silent output-limit stop, permission hints, TUI running state);
+  - E3 data-leak arm on GLM-5.3;
+  - S4 design and ADRs;
+  - PR triage;
+  - parity list;
+  - these documents.
+
 ## Principles of the plan
 
 - **Measure first, but cheaply.** Each step has a gate with numbers. A failed gate stops the step.
 - **Test budget rule.** Each test run completes in 15 to 30 minutes. Tests use the `faux` provider (no tokens) where possible. Tests that need a real model use GLM-5.3 (Soket or OpenRouter). No test needs OpenAI or Anthropic tokens. A test that cannot obey this rule is made smaller, not longer.
-- **Keep the vision order, with three changes** (see "Changes to the roadmap").
+- **Keep the vision order, with four changes** (see "Changes to the roadmap").
 - **Do not make one Runtime large. Make many Runtimes.** Scale comes from many small Runtime nodes ("cells") behind a router. Each Session has one owner node.
 - **Put the expensive seams in early.** Identity fields, the storage driver and the Workspace driver cost little now and much later.
 - **Inference capacity is outside Loop, but it gates everything.** The Soket endpoint has timeouts today. Treat it as a tracked dependency.
@@ -30,6 +52,7 @@ Delivery evidence: one maintainer with coding agents built S2 in about 1.5 days 
 1. **Add Track Q (quality parity) now.** The roadmap has no step for agent quality. It is the largest parity risk.
 2. **Move identity fields forward to S4.** Add `principal` (person or Service Identity) and `tenant` to the protocol, the Event Log and the Policy decision record in S4. OIDC, SCIM and Admin stay in Step 5.
 3. **Move the TypeScript SDK forward to Step 2.** The Web Surface must use only the public protocol. Thus the Web client *is* the first SDK. Build it as a package.
+4. **Add remote control by relay to Phase 2.** The Runtime gets no TLS in Phase 0. Remote access uses an SSH tunnel until the relay exists. URL or QR control comes through the relay (see Phase 2).
 
 ## Phase 0: make the base true (about 1 week)
 
@@ -42,7 +65,7 @@ Delivery evidence: one maintainer with coding agents built S2 in about 1.5 days 
 | E7 turn queue | `faux` provider. 1,000 schedules: 0 deadlocks, 0 lost permits. |
 | Merge | Merge `staging` to `main` after E1 and E3 pass. (`docs/loop-vision` stays a separate documents branch.) |
 | Triage | Decide on the 10 open PRs. Divide PR #105: keep the document tools and `ToolCallPreparing` as small PRs on `staging`; remove its `session/fork` change. Fix the settings bug from #106 (`project_overlay` in `settings.rs`). |
-| S3.8b | TLS (`wss://`) and connection by URL or QR code. This can run in parallel. |
+| S3.8b | Part 1 (TLS) is replaced by SSH-tunnel documentation: done when `docs/runtime.md` has the recipe. Part 2 (connection by URL or QR code) moves to Phase 2 as a relay. |
 
 ## Track Q: quality parity (starts in Phase 0, continues always)
 
@@ -111,6 +134,7 @@ Browser / TUI / SDK ── wss ──> Edge gateway (stateless: TLS, auth, rate 
 - Chat parity: streaming, file upload, web search, projects, share links, artifacts and previews.
 - Agent mode parity (Claude Code on the web, Codex cloud): connect a GitHub repository, run a task in a microVM, show the diff, open a PR, run tasks in parallel, steer from a phone.
 - Google sign-in for identity only.
+- Remote control by relay (replaces S3.8b part 2). The Runtime opens an authenticated outbound connection to the Soket edge gateway. A phone or browser pairs by QR with a one-time code. No inbound port and no certificates on user machines. Until then, remote access is an SSH tunnel.
 
 Gates: N2 to N6 in the table below pass on 3 local nodes with the `faux` provider. Then a closed beta. Real volume data comes from the beta, not from a large test cluster.
 
@@ -168,7 +192,7 @@ Security items to correct before any public use:
 |---|---|---|---|---|
 | E1 recovery probe | High | Opus | Yes | 0A |
 | E3 enforcement and data-leak probe | High | Opus | Yes | 0A |
-| S3.8b TLS (`wss://`, tokens) | High | Opus | Yes | 0A |
+| S3.8b SSH-tunnel documentation (replaces TLS) | Low | Sonnet | No | 0A |
 | Q1b cause analysis of the 12 incorrect trials | High | Opus | No | 0A |
 | CI on `staging` (`ci.yml`) | Low | Sonnet | No | 0A |
 | Q1a feature list | Low | Sonnet | No | 0A |
@@ -178,7 +202,7 @@ Security items to correct before any public use:
 | E7 turn-queue probe | Low | Sonnet | Yes | 0B |
 | Settings bug from #106 (`project_overlay`) | Low | Sonnet | Yes | 0B |
 | Document tools and `ToolCallPreparing` from PR #105 as small PRs | Low | Sonnet | Yes | 0B |
-| S3.8b connection by URL or QR code (after TLS) | Low | Sonnet | Yes | 0B |
+| S3.8b connection by URL or QR code: moved to Phase 2 (remote control by relay) | — | — | — | — |
 | Linux live check | Low | Sonnet | On a Linux machine | 0B |
 | PR decisions, merge of `staging` to `main` (after E1 and E3) | — | Maintainer | — | End |
 
@@ -232,6 +256,7 @@ Run 3 chains at a time: S4, A and B first. Then C and D. Chain A and chain B mus
 | Plain chat as the default, Google sign-in, sandboxed previews | Low | Sonnet | No | Parallel |
 | Protocol methods for files and completion | Low | Sonnet | Yes | Parallel |
 | Stateless gateway and Session routing | High | Opus | Yes | Parallel |
+| Remote control by relay (outbound Runtime connection to the edge gateway, QR pairing with a one-time code) | High | Opus | Yes | After the gateway |
 | Provider gateway (from `key_proxy`) | High | Opus | Yes | Parallel |
 | microVM Workspace driver | High | Opus | On Linux | Parallel |
 | Repository connection, diff view, PR flow | High | Opus | Small | After the gateway |
