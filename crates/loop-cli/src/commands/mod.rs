@@ -268,6 +268,13 @@ pub struct ParsedCommand {
 }
 
 /// Parse `/cmd args`.
+///
+/// Returns `None` for lines that merely *start* with `/` but aren't a
+/// command attempt — most notably an absolute file path inserted by the
+/// `@mention` picker when the mention sat at the start of the line (e.g.
+/// `/home/user/project/README.md`). No built-in command, skill, or
+/// template name ever contains `/`, so a slash in the name rules out a
+/// genuine command and lets the line fall through to the chat prompt.
 pub fn parse_command(line: &str) -> Option<ParsedCommand> {
     let line = line.trim();
     if !line.starts_with('/') {
@@ -278,7 +285,7 @@ pub fn parse_command(line: &str) -> Option<ParsedCommand> {
         Some((n, a)) => (n.to_string(), a.trim().to_string()),
         None => (rest.to_string(), String::new()),
     };
-    if name.is_empty() {
+    if name.is_empty() || name.contains('/') {
         return None;
     }
     Some(ParsedCommand { name, args })
@@ -712,6 +719,21 @@ mod tests {
         assert!(parse_mcp("enable").is_err());
         assert!(parse_mcp("login").is_err());
         assert!(parse_mcp("nope").is_err());
+    }
+
+    #[test]
+    fn parse_command_rejects_absolute_file_paths() {
+        // A `/home/user/project/README.md`-shaped line is what the
+        // `@mention` file picker inserts when the mention sat at the very
+        // start of the input. It must not be mistaken for a slash command
+        // (see soketlabs/loop#40).
+        assert!(parse_command("/home/user/project/README.md").is_none());
+        assert!(parse_command("/home/user/project/README.md review this").is_none());
+        assert!(parse_command("/src/app.rs").is_none());
+
+        // A real command with no slash in its name still parses normally.
+        assert!(parse_command("/help").is_some());
+        assert!(parse_command("/model gpt-4").is_some());
     }
 
     #[test]
