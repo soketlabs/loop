@@ -15,13 +15,13 @@ pub(super) fn read(bytes: &[u8]) -> Result<String, String> {
         .text("ppt/presentation.xml")?
         .ok_or("not a PowerPoint file: ppt/presentation.xml is missing")?;
     let rels = match package.text("ppt/_rels/presentation.xml.rels")? {
-        Some(rels) => xml::relationships(&rels)?,
+        Some(rels) => xml::relationships(&rels, "ppt/_rels/presentation.xml.rels")?,
         None => HashMap::new(),
     };
     // Each slide part is read once, however often the list names it.
     let mut parts = Vec::new();
     let mut seen = HashSet::new();
-    for node in xml::nodes(&presentation) {
+    for node in xml::nodes(&presentation).in_part("ppt/presentation.xml") {
         let Node::Open { name, attrs } = node? else {
             continue;
         };
@@ -48,7 +48,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<String, String> {
             continue;
         };
         number += 1;
-        read_slide(&mut md, number, &slide)?;
+        read_slide(&mut md, number, &part, &slide)?;
         if md.full() {
             break;
         }
@@ -78,7 +78,7 @@ enum Content {
     Table(Vec<Vec<String>>),
 }
 
-fn read_slide(md: &mut Markdown, number: usize, slide: &str) -> Result<(), String> {
+fn read_slide(md: &mut Markdown, number: usize, part: &str, slide: &str) -> Result<(), String> {
     let mut title: Option<String> = None;
     let mut content = Vec::new();
     let mut shape: Option<Shape> = None;
@@ -86,7 +86,7 @@ fn read_slide(md: &mut Markdown, number: usize, slide: &str) -> Result<(), Strin
     let (mut bold, mut italic, mut in_text) = (false, false, false);
     let mut table: Option<Vec<Vec<String>>> = None;
     let (mut row, mut cell) = (Vec::new(), Vec::new());
-    for node in xml::nodes(slide) {
+    for node in xml::nodes(slide).in_part(part) {
         let node = node?;
         match node {
             Node::Open { name, attrs } => match name.as_str() {
