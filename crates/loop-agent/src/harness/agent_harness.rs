@@ -492,6 +492,22 @@ impl AgentHarness {
         }
     }
 
+    /// Disable and destroy the sandbox only when it would outlive this
+    /// process (a container); any other sandbox is left as it is.
+    pub async fn clear_sandbox_outliving_process(&self) {
+        let mut slot = self.sandbox.write().await;
+        let outlives =
+            matches!(&*slot, SandboxMode::Enabled { sandbox } if sandbox.outlives_process());
+        if !outlives {
+            return;
+        }
+        let prev = std::mem::replace(&mut *slot, SandboxMode::Disabled);
+        drop(slot);
+        if let SandboxMode::Enabled { sandbox } = prev {
+            let _ = sandbox.destroy().await;
+        }
+    }
+
     /// Printable sandbox status for `/sandbox status` (CLI only; not sent to the model).
     pub async fn sandbox_info(&self) -> SandboxInfo {
         match &*self.sandbox.read().await {

@@ -28,6 +28,12 @@ impl From<bool> for TracingMode<'_> {
     }
 }
 
+/// Default filter of the foreground stderr log layer: warnings, except the
+/// log copies of notices that the user's terminal already shows.
+fn stderr_filter() -> String {
+    format!("warn,{}=off", loop_app_core::USER_NOTICE_TARGET)
+}
+
 /// Whether debug mode is enabled via `--debug` or `LOOP_DEBUG=1`.
 pub fn debug_enabled(cli_flag: bool) -> bool {
     if cli_flag {
@@ -54,12 +60,15 @@ pub fn init_tracing<'a>(
 ) -> anyhow::Result<Option<PathBuf>> {
     let mode = mode.into();
     let interactive = matches!(mode, TracingMode::Foreground { interactive: true });
+    let stderr_default = stderr_filter();
     let default_filter = if debug {
         "info,loop_agent=debug,loop_ai=debug,loop_cli=debug,loop_app_core=debug,loop_mcp=debug"
     } else if matches!(mode, TracingMode::Daemon { .. }) {
         "info"
     } else {
-        "warn"
+        // Stderr is the user's terminal here: a user notice is printed there
+        // already, so its log copy is skipped.
+        stderr_default.as_str()
     };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
@@ -162,5 +171,44 @@ impl Write for TeeWriter {
             .lock()
             .map_err(|_| io::Error::other("debug log lock poisoned"))?
             .flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<StdMutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The sandbox warning is printed to the terminal by `eprintln!`; the
+    /// stderr log layer must not print its log copy a second time.
+    #[test]
+    fn stderr_layer_skips_user_notices_but_keeps_other_warnings() {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_filter(EnvFilter::new(stderr_filter())),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: loop_app_core::USER_NOTICE_TARGET, "notice-copy");
+            tracing::warn!("other-warning");
+        });
+        let out = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(!out.contains("notice-copy"), "{out}");
+        assert!(out.contains("other-warning"), "{out}");
     }
 }

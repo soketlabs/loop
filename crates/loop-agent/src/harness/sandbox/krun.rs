@@ -118,6 +118,9 @@ pub struct KrunSandbox {
     status: RwLock<SandboxStatus>,
     container_id: RwLock<Option<String>>,
     env: RwLock<Option<Arc<dyn ExecutionEnv>>>,
+    /// Set by [`Sandbox::destroy`]: a start still in progress removes the
+    /// container it gets, and a later start is refused.
+    destroyed: std::sync::atomic::AtomicBool,
 }
 
 impl KrunSandbox {
@@ -184,7 +187,12 @@ impl KrunSandbox {
             status: RwLock::new(SandboxStatus::Created),
             container_id: RwLock::new(None),
             env: RwLock::new(None),
+            destroyed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn is_destroyed(&self) -> bool {
+        self.destroyed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Host workdir bind-mounted into the guest.
@@ -266,6 +274,9 @@ impl Sandbox for KrunSandbox {
         if *self.status.read() == SandboxStatus::Ready {
             return Ok(());
         }
+        if self.is_destroyed() {
+            return Err(SandboxError::NotReady("sandbox was removed".into()));
+        }
         *self.status.write() = SandboxStatus::Starting;
 
         self.client.preflight(&self.runtime).await?;
@@ -291,6 +302,15 @@ impl Sandbox for KrunSandbox {
             .inspect_err(|_e| {
                 *self.status.write() = SandboxStatus::Failed;
             })?;
+        // Destroyed while `podman run` ran (an exit during an image pull):
+        // nothing else will remove this container.
+        if self.is_destroyed() {
+            let _ = self.client.rm(&container_id).await;
+            *self.status.write() = SandboxStatus::Stopped;
+            return Err(SandboxError::NotReady(
+                "sandbox was removed while it started".into(),
+            ));
+        }
 
         let env: Arc<dyn ExecutionEnv> = Arc::new(KrunExecutionEnv::new(
             Arc::clone(&self.client),
@@ -305,6 +325,10 @@ impl Sandbox for KrunSandbox {
         Ok(())
     }
 
+    fn outlives_process(&self) -> bool {
+        true
+    }
+
     async fn stop(&self) -> Result<(), SandboxError> {
         *self.status.write() = SandboxStatus::Stopping;
         *self.env.write() = None;
@@ -317,10 +341,13 @@ impl Sandbox for KrunSandbox {
     }
 
     async fn destroy(&self) -> Result<(), SandboxError> {
+        self.destroyed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         *self.env.write() = None;
         let id = self.container_id.write().take();
         if let Some(id) = id {
-            let _ = self.client.stop(&id).await;
+            // A forced remove stops the container at once; a graceful stop
+            // first only waits for its timeout, which slows every exit.
             let _ = self.client.rm(&id).await;
         }
         *self.status.write() = SandboxStatus::Stopped;

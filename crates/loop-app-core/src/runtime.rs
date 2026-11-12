@@ -154,10 +154,11 @@ impl SessionShutdown {
     }
 
     /// Stop admission, cancel the current turn and wait for it to finish:
-    /// its tools, writes and `Settled` hooks. Only then release this store's
-    /// leases. A turn still running after the grace keeps them, and this
-    /// returns an error: the Session is not handed on while work in this
-    /// process may still touch it. Safe to repeat.
+    /// its tools, writes and `Settled` hooks. Remove the harness's sandbox
+    /// container (Podman), also when the turn did not stop. Only then release this
+    /// store's leases. A turn still running after the grace keeps them, and
+    /// this returns an error: the Session is not handed on while work in
+    /// this process may still touch it. Safe to repeat.
     pub async fn run(&self) -> anyhow::Result<()> {
         // Requested once per harness: it clears queued work and runs the
         // `shutdown_requested` hooks, which must not fire again on a repeat.
@@ -167,10 +168,14 @@ impl SessionShutdown {
         if let Some(native) = &self.native {
             native.release_next_turn().await;
         }
-        if tokio::time::timeout(self.grace, self.harness.wait_for_settled())
+        let settled = tokio::time::timeout(self.grace, self.harness.wait_for_settled())
             .await
-            .is_err()
-        {
+            .is_ok();
+        // This process ends next: remove its sandbox container, also when the
+        // turn did not stop. Safe to repeat: the harness then keeps no
+        // container. Other sandboxes (Seatbelt) end with the process.
+        self.harness.clear_sandbox_outliving_process().await;
+        if !settled {
             anyhow::bail!(
                 "the turn did not stop within {} s; its Session lease is kept until this process exits and expires 30 s later",
                 self.grace.as_secs_f32()
@@ -1496,7 +1501,14 @@ pub async fn bootstrap(mut opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     // Standalone context discovery has already walked the caller's lexical path.
     // Session identity and execution use the normalized workspace from here on.
     opts.cwd = workspace.cwd.clone();
-    let opened = factory.open(Arc::clone(&workspace), &opts).await?;
+    let opened = match factory.open(Arc::clone(&workspace), &opts).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            // The sandbox may have started before the open failed.
+            workspace.destroy_sandbox().await;
+            return Err(error);
+        }
+    };
     let OpenedSession {
         harness,
         native,
