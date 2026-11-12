@@ -257,7 +257,8 @@ impl Stopped {
 }
 
 /// Wait for `fut`, or stop at the first of `cancel` and `timeout_ms`. Both
-/// apply together. On a stop, `fut` is dropped before this returns.
+/// apply together. On a stop, `fut` is left as it is, so the caller decides
+/// when to drop it.
 async fn wait_or_stop<F: std::future::Future>(
     fut: F,
     cancel: Option<&tokio_util::sync::CancellationToken>,
@@ -584,27 +585,25 @@ impl PodmanClient for RealPodmanClient {
 
         let spawned = std::time::Instant::now();
         let stdin = child.stdin.take();
-        let output = wait_or_stop(
-            async move {
-                if let (Some(data), Some(mut stdin)) = (&opts.stdin, stdin) {
-                    stdin.write_all(data).await.map_err(|e| {
-                        ExecutionError::new(ExecutionErrorCode::Io, format!("stdin: {e}"))
-                    })?;
-                }
-                child
-                    .wait_with_output()
-                    .await
-                    .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))
-            },
-            opts.cancel.as_ref(),
-            opts.timeout_ms,
-        )
-        .await;
-        let output = match output {
+        let output = async move {
+            if let (Some(data), Some(mut stdin)) = (&opts.stdin, stdin) {
+                stdin.write_all(data).await.map_err(|e| {
+                    ExecutionError::new(ExecutionErrorCode::Io, format!("stdin: {e}"))
+                })?;
+            }
+            child
+                .wait_with_output()
+                .await
+                .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))
+        };
+        tokio::pin!(output);
+        let output = match wait_or_stop(&mut output, opts.cancel.as_ref(), opts.timeout_ms).await {
             Ok(output) => output?,
             Err(stopped) => {
-                // The host client is gone (dropped with the future); now stop
-                // the command itself in the container.
+                // Stop the command in the container first, while the host
+                // client still runs: no process loses its parent link before
+                // the kill has collected it. The client is dropped (killed)
+                // when this returns.
                 if let Some(marker) = &marker {
                     let early = spawned.elapsed() < EARLY_STOP;
                     self.kill_marked(&opts.container, marker, early).await;
