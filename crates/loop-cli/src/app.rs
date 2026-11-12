@@ -4354,6 +4354,11 @@ fn handle_update(
             NoticeLevel::Error => {
                 push_before_queued(chat, error_item(format!("error: {text}")));
             }
+            // A warning stays in the transcript (for example "context compacted"); plain
+            // info is only the transient status line.
+            NoticeLevel::Warning => {
+                push_before_queued(chat, ChatItem::System { text });
+            }
             _ if live => {
                 *turn_step = text;
                 *working = true;

@@ -92,6 +92,10 @@ impl NativeEventMapper {
                 level: NoticeLevel::Info,
                 text: message.clone(),
             }],
+            AgentEvent::Notice { message } => vec![SessionUpdate::Notice {
+                level: NoticeLevel::Warning,
+                text: message.clone(),
+            }],
             AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } => Vec::new(),
             AgentEvent::MessageStart { message } => self.message_start(message),
             AgentEvent::MessageUpdate {

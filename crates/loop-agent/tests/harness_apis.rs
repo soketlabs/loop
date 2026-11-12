@@ -89,6 +89,8 @@ async fn compact_with_aggressive_settings() {
             enabled: true,
             reserve_tokens: 0,
             keep_recent_tokens: 1,
+            trigger_tokens: None,
+            ..Default::default()
         })
         .await;
 
@@ -202,6 +204,8 @@ async fn hook_cancels_compact() {
             enabled: true,
             reserve_tokens: 0,
             keep_recent_tokens: 1,
+            trigger_tokens: None,
+            ..Default::default()
         })
         .await;
 
@@ -217,4 +221,180 @@ async fn hook_cancels_compact() {
         err,
         loop_agent::harness::AgentHarnessError::Hook(_)
     ));
+}
+
+/// A compaction made between turns of one run is saved in the session, so that rebuilding the
+/// session (a resume) gives the compacted context and not the full history.
+#[tokio::test]
+async fn in_loop_compaction_is_saved_in_the_session() {
+    use loop_ai::ToolCall;
+
+    let dir = std::env::temp_dir().join(format!("loop-inloop-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 1..=5 {
+        std::fs::write(
+            dir.join(format!("f{i}.txt")),
+            format!("file {i} {}", "z".repeat(4000)),
+        )
+        .unwrap();
+    }
+
+    let read = |i: usize| {
+        FauxResponse::ToolCalls(vec![ToolCall {
+            id: format!("call-{i}"),
+            name: "read".into(),
+            arguments: serde_json::json!({ "path": dir.join(format!("f{i}.txt")) }),
+            thought_signature: None,
+        }])
+    };
+    let script = FauxScript::new();
+    for i in 1..=4 {
+        script.push(read(i));
+    }
+    // Compaction triggers after the fourth read and takes the next response as its summary.
+    script.push(FauxResponse::Text(
+        "STATE: read f1..f4, nothing else to carry".into(),
+    ));
+    script.push(read(5));
+    script.push(FauxResponse::Text("all done".into()));
+
+    let models = Arc::new(Models::new());
+    models.set_provider(faux_provider(script));
+    let model = models.get_model("faux", "faux-model").unwrap();
+    let store = create_in_memory_session_store();
+    let repo = create_session_repository(store, None);
+    let session = repo.create(None, Some("inloop".into())).await.unwrap();
+    let host: Arc<dyn loop_agent::harness::ExecutionEnv> =
+        Arc::new(HostExecutionEnv::new(dir.clone()));
+    let harness = AgentHarness::new(AgentHarnessOptions {
+        models,
+        model: Some(model),
+        session,
+        host_env: Arc::clone(&host),
+        tools: vec![loop_agent::harness::tools::create_read_tool(host)],
+        system_prompt: "sys".into(),
+        sandbox: SandboxMode::Disabled,
+        resources: Default::default(),
+    });
+    harness
+        .set_compaction_settings(CompactionSettings {
+            enabled: true,
+            reserve_tokens: 0,
+            keep_recent_tokens: 800,
+            trigger_tokens: Some(3500),
+            ..Default::default()
+        })
+        .await;
+
+    let last = harness.prompt("read f1..f5, then say done").await.unwrap();
+    assert_eq!(last.role(), "assistant");
+
+    let rebuilt = harness.create_turn_state().await.unwrap().messages;
+    assert_eq!(
+        rebuilt[0].role(),
+        "compactionSummary",
+        "a resume starts from the saved summary: {:?}",
+        rebuilt.iter().map(|m| m.role()).collect::<Vec<_>>()
+    );
+    assert!(
+        format!("{:?}", rebuilt[0]).contains("nothing else to carry"),
+        "the saved summary is the one the model wrote"
+    );
+    // user prompt + 5 x (assistant call + result) + final answer = 12 messages without it.
+    assert!(
+        rebuilt.len() < 12,
+        "older messages are gone: {}",
+        rebuilt.len()
+    );
+    assert_eq!(
+        rebuilt.last().unwrap().role(),
+        "assistant",
+        "the final answer is kept"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A summary that cannot be made is reported once and then left alone for a few turns: the run
+/// goes on with the full context and without a failing extra request after every turn.
+#[tokio::test]
+async fn a_failed_in_loop_compaction_is_reported_once_and_backs_off() {
+    use loop_ai::ToolCall;
+
+    let dir = std::env::temp_dir().join(format!("loop-inloop-fail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("f.txt"), "z".repeat(4000)).unwrap();
+    let read = |i: usize| {
+        FauxResponse::ToolCalls(vec![ToolCall {
+            id: format!("call-{i}"),
+            name: "read".into(),
+            arguments: serde_json::json!({ "path": dir.join("f.txt") }),
+            thought_signature: None,
+        }])
+    };
+    let script = FauxScript::new();
+    for i in 1..=4 {
+        script.push(read(i));
+    }
+    // Over the trigger after the fourth read: the summary request fails.
+    script.push(FauxResponse::Error("summarizer down".into()));
+    // No summary is asked for after the next two turns, so these are the agent's own replies.
+    script.push(read(5));
+    script.push(read(6));
+    script.push(FauxResponse::Text("all done".into()));
+
+    let models = Arc::new(Models::new());
+    models.set_provider(faux_provider(script));
+    let model = models.get_model("faux", "faux-model").unwrap();
+    let store = create_in_memory_session_store();
+    let repo = create_session_repository(store, None);
+    let session = repo.create(None, Some("inloop-fail".into())).await.unwrap();
+    let host: Arc<dyn loop_agent::harness::ExecutionEnv> =
+        Arc::new(HostExecutionEnv::new(dir.clone()));
+    let harness = AgentHarness::new(AgentHarnessOptions {
+        models,
+        model: Some(model),
+        session,
+        host_env: Arc::clone(&host),
+        tools: vec![loop_agent::harness::tools::create_read_tool(host)],
+        system_prompt: "sys".into(),
+        sandbox: SandboxMode::Disabled,
+        resources: Default::default(),
+    });
+    harness
+        .set_compaction_settings(CompactionSettings {
+            enabled: true,
+            reserve_tokens: 0,
+            keep_recent_tokens: 800,
+            trigger_tokens: Some(3500),
+            ..Default::default()
+        })
+        .await;
+    let notices = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    harness.subscribe({
+        let notices = Arc::clone(&notices);
+        move |event| {
+            if let loop_agent::AgentEvent::Notice { message } = event {
+                notices.lock().push(message);
+            }
+            async {}
+        }
+    });
+
+    let last = harness
+        .prompt("read f.txt six times, then say done")
+        .await
+        .unwrap();
+    assert!(format!("{last:?}").contains("all done"), "{last:?}");
+    let notices = notices.lock().clone();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].contains("compaction failed") && notices[0].contains("summarizer down"),
+        "{notices:?}"
+    );
+    // Nothing was dropped: prompt + 6 x (call + result) + final answer.
+    assert_eq!(
+        harness.create_turn_state().await.unwrap().messages.len(),
+        14
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

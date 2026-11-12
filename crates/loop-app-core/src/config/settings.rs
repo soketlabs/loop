@@ -22,10 +22,19 @@ pub struct CompactionSettingsJson {
     /// Keep recent tokens.
     #[serde(default = "default_keep")]
     pub keep_recent_tokens: u64,
+    /// Compact once the context reaches this many tokens (unset: only near the window).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_tokens: Option<u64>,
+    /// Without `triggerTokens`, compact at this percentage of the model's context window.
+    #[serde(default = "default_trigger_percent")]
+    pub trigger_percent: u64,
 }
 
 fn default_true() -> bool {
     true
+}
+fn default_trigger_percent() -> u64 {
+    90
 }
 fn default_reserve() -> u64 {
     16_384
@@ -33,13 +42,14 @@ fn default_reserve() -> u64 {
 fn default_keep() -> u64 {
     20_000
 }
-
 impl Default for CompactionSettingsJson {
     fn default() -> Self {
         Self {
             enabled: true,
             reserve_tokens: default_reserve(),
             keep_recent_tokens: default_keep(),
+            trigger_tokens: None,
+            trigger_percent: default_trigger_percent(),
         }
     }
 }
@@ -1164,8 +1174,8 @@ mod tests {
             ("theme", json!("light"), json!("solarized")),
             (
                 "compaction",
-                json!({"enabled": false, "reserveTokens": 1000, "keepRecentTokens": 2000}),
-                json!({"enabled": true, "reserveTokens": 5000, "keepRecentTokens": 6000}),
+                json!({"enabled": false, "reserveTokens": 1000, "keepRecentTokens": 2000, "triggerPercent": 80}),
+                json!({"enabled": true, "reserveTokens": 5000, "keepRecentTokens": 6000, "triggerPercent": 85}),
             ),
             ("enableSkillCommands", json!(false), json!(true)),
             ("quietStartup", json!(true), json!(false)),

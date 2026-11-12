@@ -68,7 +68,7 @@ Common settings in `settings.json`:
 | `sandbox.allowWrite` | empty | Extra paths macOS sandboxed commands and file tools may write, such as `~/.cargo`. Secret paths remain denied under broad grants. The Linux sandbox does not enforce this setting yet (global only) |
 | `sandbox.denyHomeReads` | `false` | macOS: deny reading files under the home directory, except the project, `allowWrite`, `allowRead` and git/Rust toolchain settings. Credential files stay denied either way. A project may turn it on but not off |
 | `sandbox.allowRead` | empty | macOS, with `denyHomeReads`: paths under the home directory sandboxed commands and file tools may still read, such as `~/.npm` (global only) |
-| `compaction` | enabled | `reserveTokens`, `keepRecentTokens` for `/compact` |
+| `compaction` | enabled | Summarizes older messages when the context fills up, during a run and with `/compact`. `triggerPercent` (default `90`): the share of the model's context window at which it starts. `triggerTokens`: start at this many tokens instead, if that is earlier. It also starts early enough to leave room for the reply: never later than the window minus the model's `maxTokens`. `keepRecentTokens` (default `20000`): how much recent work stays word for word. `enabled: false` turns the automatic part off |
 | `skills`, `disabledSkills` | empty | Extra skill paths, and skills to hide |
 | `mcpServers`, `disabledMcpServers` | empty | MCP servers (stdio `command` or remote `url`) |
 | `providers` | empty | Custom providers added with `/login custom` |
