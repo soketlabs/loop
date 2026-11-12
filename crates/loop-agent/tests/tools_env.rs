@@ -201,6 +201,65 @@ async fn overwriting_a_document_warns_that_it_is_rebuilt_from_text() {
         std::fs::read(dir.path().join("broken.docx")).unwrap(),
         b"not a zip"
     );
+    // A valid zip whose document part is not well-formed XML is damaged,
+    // not empty: the write is refused and the bytes stay (Linux check D1).
+    let damaged = {
+        use std::io::Write as _;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file(
+            "word/document.xml",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(b"<w:document xmlns:w='x'><w:body><w:p><w:r><w:t>unclosed")
+            .unwrap();
+        zip.finish().unwrap().into_inner()
+    };
+    std::fs::write(dir.path().join("badxml.docx"), &damaged).unwrap();
+    let read = create_read_tool(Arc::clone(&env));
+    let err = (read.execute)("3a".into(), json!({"path": "badxml.docx"}), None, None)
+        .await
+        .map(|r| text(&r).to_owned())
+        .unwrap_or_else(|e| e);
+    assert!(err.contains("malformed XML"), "{err}");
+    let err = (write.execute)(
+        "3c".into(),
+        json!({"path": "badxml.docx", "content": "# New"}),
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("could not be read") && err.contains("malformed XML"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("badxml.docx")).unwrap(),
+        damaged
+    );
+    // A valid document with no text is empty, not damaged: it stays writable.
+    (write.execute)(
+        "3d".into(),
+        json!({"path": "blank.docx", "content": ""}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let blank = (read.execute)("3e".into(), json!({"path": "blank.docx"}), None, None)
+        .await
+        .unwrap();
+    assert_eq!(text(&blank).trim(), "");
+    (write.execute)(
+        "3f".into(),
+        json!({"path": "blank.docx", "content": "# Filled"}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
     // An empty file has nothing to lose.
     std::fs::write(dir.path().join("empty.docx"), b"").unwrap();
     (write.execute)(

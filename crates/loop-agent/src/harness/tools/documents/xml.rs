@@ -126,11 +126,18 @@ pub(super) enum Node {
 
 /// The events of `xml`, one at a time, with entities and character
 /// references resolved.
+///
+/// The stream is complete or it ends in an error: a document that stops
+/// inside an element, or has no element at all, is `malformed XML`, not a
+/// shorter document. (The reader itself reports neither.)
 pub(super) fn nodes(xml: &str) -> Nodes<'_> {
     Nodes {
         reader: quick_xml::Reader::from_str(xml),
         pending: None,
         done: false,
+        depth: 0,
+        elements: 0,
+        part: None,
     }
 }
 
@@ -140,6 +147,27 @@ pub(super) struct Nodes<'a> {
     /// The `Close` of an empty element just returned as `Open`.
     pending: Option<String>,
     done: bool,
+    /// Elements opened and not yet closed.
+    depth: usize,
+    /// Elements seen so far.
+    elements: usize,
+    /// The package part being read, named in errors.
+    part: Option<&'a str>,
+}
+
+impl<'a> Nodes<'a> {
+    /// Name the package part this XML comes from in errors.
+    pub(super) fn in_part(mut self, part: &'a str) -> Self {
+        self.part = Some(part);
+        self
+    }
+
+    fn error(&self, what: String) -> String {
+        match self.part {
+            Some(part) => format!("{part}: {what}"),
+            None => what,
+        }
+    }
 }
 
 impl Iterator for Nodes<'_> {
@@ -151,18 +179,40 @@ impl Iterator for Nodes<'_> {
         }
         while !self.done {
             let node = match self.reader.read_event() {
-                Err(e) => Err(format!("malformed XML: {e}")),
+                Err(e) => Err(self.error(format!("malformed XML: {e}"))),
                 Ok(Event::Eof) => {
                     self.done = true;
-                    return None;
+                    let what = if self.elements == 0 {
+                        "malformed XML: no root element".to_owned()
+                    } else if self.depth > 0 {
+                        format!(
+                            "malformed XML: the data ends inside an element ({} not closed)",
+                            self.depth
+                        )
+                    } else {
+                        return None;
+                    };
+                    return Some(Err(self.error(what)));
                 }
-                Ok(Event::Start(e)) => open(&e),
-                Ok(Event::Empty(e)) => open(&e).inspect(|node| {
-                    if let Node::Open { name, .. } = node {
-                        self.pending = Some(name.clone());
-                    }
-                }),
-                Ok(Event::End(e)) => Ok(Node::Close(local(e.local_name().as_ref()))),
+                Ok(Event::Start(e)) => {
+                    self.depth += 1;
+                    self.elements += 1;
+                    open(&e).map_err(|e| self.error(format!("malformed XML: {e}")))
+                }
+                Ok(Event::Empty(e)) => {
+                    self.elements += 1;
+                    open(&e)
+                        .map_err(|e| self.error(format!("malformed XML: {e}")))
+                        .inspect(|node| {
+                            if let Node::Open { name, .. } = node {
+                                self.pending = Some(name.clone());
+                            }
+                        })
+                }
+                Ok(Event::End(e)) => {
+                    self.depth = self.depth.saturating_sub(1);
+                    Ok(Node::Close(local(e.local_name().as_ref())))
+                }
                 Ok(Event::Text(e)) => Ok(Node::Text(e.xml10_content().into_owned())),
                 Ok(Event::CData(e)) => Ok(Node::Text(e.xml10_content().into_owned())),
                 Ok(Event::GeneralRef(e)) => {
@@ -267,9 +317,10 @@ pub(super) fn resolve(base: &str, target: &str) -> String {
 /// Relationship id to target from a `.rels` part.
 pub(super) fn relationships(
     xml: &str,
+    part: &str,
 ) -> Result<std::collections::HashMap<String, String>, String> {
     let mut out = std::collections::HashMap::new();
-    for node in nodes(xml) {
+    for node in nodes(xml).in_part(part) {
         if let Node::Open { name, attrs } = node? {
             if name == "Relationship" {
                 if let (Some(id), Some(target)) = (attr(&attrs, "Id"), attr(&attrs, "Target")) {
@@ -299,6 +350,29 @@ mod tests {
             .collect();
         assert_eq!(text, "a & b!");
         assert!(got.contains(&Node::Close("br".into())));
+    }
+
+    fn error_of(xml: &str) -> Option<String> {
+        nodes(xml).find_map(|n| n.err())
+    }
+
+    #[test]
+    fn unclosed_elements_and_a_missing_root_are_errors() {
+        // quick_xml reports none of these itself: it just reaches the end.
+        assert!(error_of("<a><b>text").unwrap().contains("malformed XML"));
+        assert!(error_of("<a><b/>").unwrap().contains("not closed"));
+        assert!(error_of("").unwrap().contains("no root element"));
+        assert!(error_of("<?xml version=\"1.0\"?>  ").is_some());
+        assert!(error_of("<a></b>").is_some());
+        assert_eq!(error_of("<a><b/>t</a>\n"), None);
+        assert_eq!(error_of("<?xml version=\"1.0\"?><a/>"), None);
+    }
+
+    #[test]
+    fn no_node_follows_the_error() {
+        let all: Vec<_> = nodes("<a><b>x").collect();
+        assert!(all.last().unwrap().is_err());
+        assert_eq!(all.iter().filter(|n| n.is_err()).count(), 1);
     }
 
     #[test]

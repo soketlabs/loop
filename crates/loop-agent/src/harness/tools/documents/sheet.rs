@@ -492,7 +492,7 @@ fn check_ods(bytes: &[u8]) -> Result<(), String> {
             .unwrap_or(1)
             .clamp(1, max)
     };
-    for node in xml::nodes(&content) {
+    for node in xml::nodes(&content).in_part("content.xml") {
         match node? {
             xml::Node::Open { name, attrs } => match name.as_str() {
                 "table" => {
