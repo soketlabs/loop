@@ -2,6 +2,7 @@
 
 mod krun;
 mod podman;
+mod protect;
 mod registry;
 pub mod seatbelt;
 mod tagged;
@@ -15,6 +16,7 @@ pub use podman::{
     check_krun_deps, check_local_sandbox_deps, PodmanClient, PodmanExecOpts, PodmanRunOpts,
     RealPodmanClient,
 };
+pub use protect::ProtectedBind;
 pub use registry::SandboxRegistry;
 pub use tagged::TaggedSandbox;
 pub use traits::{

@@ -25,6 +25,7 @@ struct FakePodman {
     dirs: Mutex<std::collections::HashSet<String>>,
     running: Mutex<Option<String>>,
     shell_log: Mutex<Vec<String>>,
+    runs: Mutex<Vec<PodmanRunOpts>>,
 }
 
 impl FakePodman {
@@ -34,6 +35,7 @@ impl FakePodman {
             dirs: Mutex::new(std::collections::HashSet::new()),
             running: Mutex::new(None),
             shell_log: Mutex::new(Vec::new()),
+            runs: Mutex::new(Vec::new()),
         }
     }
 
@@ -79,6 +81,7 @@ impl PodmanClient for FakePodman {
         Self::ensure_parent(&mut self.dirs.lock(), &opts.guest_workdir);
         self.dirs.lock().insert(opts.guest_workdir.clone());
         let id = format!("fake-{}", opts.name);
+        self.runs.lock().push(opts.clone());
         *self.running.lock() = Some(id.clone());
         Ok(id)
     }
@@ -426,4 +429,144 @@ async fn krun_integration_real_podman() {
         .unwrap();
     assert!(out.stdout.contains("seed"));
     sb.destroy().await.unwrap();
+}
+
+/// A git repository with a hook, and project settings, in a new directory.
+fn repo_project() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let project = std::fs::canonicalize(dir.path()).unwrap();
+    let git = project.join(".git");
+    std::fs::create_dir_all(git.join("hooks")).unwrap();
+    std::fs::create_dir_all(git.join("objects")).unwrap();
+    std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(git.join("config"), "[core]\n").unwrap();
+    std::fs::write(git.join("hooks/pre-commit"), "#!/bin/sh\n").unwrap();
+    std::fs::create_dir_all(project.join(".loop")).unwrap();
+    std::fs::write(project.join(".loop/settings.json"), "{}").unwrap();
+    (dir, project)
+}
+
+#[tokio::test]
+async fn linux_sandbox_mounts_and_file_tools_protect_git_metadata_and_loop() {
+    for isolation in ["partial", "full"] {
+        let (_dir, project) = repo_project();
+        let client = Arc::new(FakePodman::new());
+        let sb = KrunSandbox::with_client(
+            SandboxConfig {
+                workdir: project.clone(),
+                options: json!({"isolation": isolation}),
+                labels: Default::default(),
+            },
+            client.clone(),
+        );
+        sb.start().await.unwrap();
+        let binds: Vec<(PathBuf, bool)> = client.runs.lock()[0]
+            .binds
+            .iter()
+            .map(|b| (b.path.clone(), b.read_only))
+            .collect();
+        assert_eq!(
+            binds,
+            vec![
+                (project.join(".git"), false),
+                (project.join(".git/config"), true),
+                (project.join(".git/hooks"), true),
+                (project.join(".loop"), true),
+            ],
+            "{isolation}"
+        );
+        let env = sb.env();
+        for path in [
+            ".git/hooks/pre-commit",
+            ".git/hooks/post-merge",
+            ".git/config",
+            ".loop/settings.json",
+            ".loop/new.json",
+        ] {
+            let err = env
+                .write_file(Path::new(path), b"evil")
+                .await
+                .expect_err(path);
+            assert!(err.to_string().contains("sandbox denies"), "{path}: {err}");
+            assert!(env.append_file(Path::new(path), b"evil").await.is_err());
+            assert!(env.remove(Path::new(path)).await.is_err(), "{path}");
+        }
+        assert!(env.create_dir(Path::new(".git/hooks/d")).await.is_err());
+        assert!(env.remove(Path::new(".git")).await.is_err());
+        assert!(env.remove(Path::new(".")).await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(project.join(".git/hooks/pre-commit")).unwrap(),
+            "#!/bin/sh\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join(".loop/settings.json")).unwrap(),
+            "{}"
+        );
+        // Ordinary project files are still writable.
+        env.write_file(Path::new("src/main.rs"), b"fn main() {}")
+            .await
+            .unwrap();
+        sb.destroy().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn linux_sandbox_stubs_missing_git_and_loop_and_removes_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = std::fs::canonicalize(dir.path()).unwrap();
+    let client = Arc::new(FakePodman::new());
+    let sb = KrunSandbox::with_client(
+        SandboxConfig {
+            workdir: project.clone(),
+            options: json!({"isolation": "partial"}),
+            labels: Default::default(),
+        },
+        client.clone(),
+    );
+    sb.start().await.unwrap();
+    assert!(project.join(".git").is_dir() && project.join(".loop").is_dir());
+    let ro: Vec<PathBuf> = client.runs.lock()[0]
+        .binds
+        .iter()
+        .filter(|b| b.read_only)
+        .map(|b| b.path.clone())
+        .collect();
+    assert_eq!(ro, vec![project.join(".git"), project.join(".loop")]);
+    let env = sb.env();
+    for path in [
+        ".git/HEAD",
+        ".git/hooks/pre-commit",
+        ".git/config",
+        ".loop/settings.json",
+    ] {
+        assert!(
+            env.write_file(Path::new(path), b"x").await.is_err(),
+            "{path}"
+        );
+    }
+    sb.destroy().await.unwrap();
+    assert!(!project.join(".git").exists(), "stub .git left behind");
+    assert!(!project.join(".loop").exists(), "stub .loop left behind");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn linux_sandbox_refuses_a_symlinked_hooks_directory() {
+    let (_dir, project) = repo_project();
+    std::fs::remove_dir_all(project.join(".git/hooks")).unwrap();
+    std::fs::create_dir(project.join("githooks")).unwrap();
+    std::os::unix::fs::symlink(project.join("githooks"), project.join(".git/hooks")).unwrap();
+    let client = Arc::new(FakePodman::new());
+    let sb = KrunSandbox::with_client(
+        SandboxConfig {
+            workdir: project.clone(),
+            options: json!({"isolation": "partial"}),
+            labels: Default::default(),
+        },
+        client.clone(),
+    );
+    let err = sb.start().await.unwrap_err().to_string();
+    assert!(err.contains("is a symlink"), "{err}");
+    assert!(client.runs.lock().is_empty());
+    assert_eq!(sb.status(), loop_agent::harness::SandboxStatus::Failed);
 }

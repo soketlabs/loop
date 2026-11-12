@@ -12,6 +12,7 @@ use crate::harness::env::HostExecutionEnv;
 use crate::harness::sandbox::podman::{
     PodmanClient, PodmanExecOpts, PodmanRunOpts, RealPodmanClient,
 };
+use crate::harness::sandbox::protect::{self, ProtectedMounts};
 use crate::harness::sandbox::traits::{
     Sandbox, SandboxConfig, SandboxError, SandboxFactory, SandboxInfo, SandboxStatus,
 };
@@ -115,6 +116,10 @@ pub struct KrunSandbox {
     cpus: String,
     ram_mib: String,
     client: Arc<dyn PodmanClient>,
+    /// Loop's agent directory, write-protected when it lies in the project.
+    agent_dir: Option<PathBuf>,
+    /// The write-protected paths of the running container, and their stubs.
+    protected: parking_lot::Mutex<Option<ProtectedMounts>>,
     status: RwLock<SandboxStatus>,
     container_id: RwLock<Option<String>>,
     env: RwLock<Option<Arc<dyn ExecutionEnv>>>,
@@ -175,6 +180,12 @@ impl KrunSandbox {
             config.workdir
         };
         let workdir = std::fs::canonicalize(&workdir).unwrap_or(workdir);
+        let agent_dir = config
+            .options
+            .get("agentDir")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
         Self {
             id: loop_ai::new_id(),
             workdir,
@@ -184,6 +195,8 @@ impl KrunSandbox {
             cpus,
             ram_mib,
             client,
+            agent_dir,
+            protected: parking_lot::Mutex::new(None),
             status: RwLock::new(SandboxStatus::Created),
             container_id: RwLock::new(None),
             env: RwLock::new(None),
@@ -193,6 +206,14 @@ impl KrunSandbox {
 
     fn is_destroyed(&self) -> bool {
         self.destroyed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Remove the stubs of the protected paths. Call only after the
+    /// container is gone: its mounts hold the stubs.
+    fn remove_stubs(&self) {
+        if let Some(protected) = self.protected.lock().take() {
+            protected.remove_stubs();
+        }
     }
 
     /// Host workdir bind-mounted into the guest.
@@ -287,6 +308,19 @@ impl Sandbox for KrunSandbox {
         // Mount at the same absolute path inside the guest so host and container
         // paths match (e.g. `/home/u/proj/README.md` → `/home/u/proj/README.md`).
         let guest_workdir = self.workdir.to_string_lossy().into_owned();
+        let protected =
+            protect::plan(&self.workdir, self.agent_dir.as_deref()).inspect_err(|_| {
+                *self.status.write() = SandboxStatus::Failed;
+            })?;
+        let binds = protected.binds.clone();
+        let read_only: Vec<PathBuf> = binds
+            .iter()
+            .filter(|b| b.read_only)
+            .map(|b| b.path.clone())
+            .collect();
+        if let Some(old) = self.protected.lock().replace(protected) {
+            old.remove_stubs();
+        }
         let container_id = self
             .client
             .run(PodmanRunOpts {
@@ -297,27 +331,33 @@ impl Sandbox for KrunSandbox {
                 runtime: self.runtime.clone(),
                 cpus: self.cpus.clone(),
                 ram_mib: self.ram_mib.clone(),
+                binds,
             })
             .await
             .inspect_err(|_e| {
                 *self.status.write() = SandboxStatus::Failed;
+                self.remove_stubs();
             })?;
         // Destroyed while `podman run` ran (an exit during an image pull):
         // nothing else will remove this container.
         if self.is_destroyed() {
             let _ = self.client.rm(&container_id).await;
+            self.remove_stubs();
             *self.status.write() = SandboxStatus::Stopped;
             return Err(SandboxError::NotReady(
                 "sandbox was removed while it started".into(),
             ));
         }
 
-        let env: Arc<dyn ExecutionEnv> = Arc::new(KrunExecutionEnv::new(
-            Arc::clone(&self.client),
-            container_id.clone(),
-            self.workdir.clone(),
-            self.isolation,
-        ));
+        let env: Arc<dyn ExecutionEnv> = Arc::new(
+            KrunExecutionEnv::new(
+                Arc::clone(&self.client),
+                container_id.clone(),
+                self.workdir.clone(),
+                self.isolation,
+            )
+            .with_protected(self.agent_dir.clone(), read_only),
+        );
 
         *self.container_id.write() = Some(container_id);
         *self.env.write() = Some(env);
@@ -336,6 +376,7 @@ impl Sandbox for KrunSandbox {
         if let Some(id) = id {
             let _ = self.client.stop(&id).await;
         }
+        self.remove_stubs();
         *self.status.write() = SandboxStatus::Stopped;
         Ok(())
     }
@@ -350,6 +391,7 @@ impl Sandbox for KrunSandbox {
             // first only waits for its timeout, which slows every exit.
             let _ = self.client.rm(&id).await;
         }
+        self.remove_stubs();
         *self.status.write() = SandboxStatus::Stopped;
         Ok(())
     }
@@ -364,6 +406,11 @@ pub struct KrunExecutionEnv {
     isolation: KrunIsolation,
     /// Present when isolation is Partial.
     host_fs: Option<JailedHostFs>,
+    /// Loop's agent directory, write-protected for file tools.
+    agent_dir: Option<PathBuf>,
+    /// Paths mounted read-only in the container; file tools may not write
+    /// below them either.
+    read_only: Vec<PathBuf>,
 }
 
 impl KrunExecutionEnv {
@@ -387,7 +434,25 @@ impl KrunExecutionEnv {
             host_workdir,
             isolation,
             host_fs,
+            agent_dir: None,
+            read_only: Vec::new(),
         }
+    }
+
+    /// Also refuse file-tool writes to `agent_dir` and below the paths the
+    /// container mounts read-only.
+    pub fn with_protected(mut self, agent_dir: Option<PathBuf>, read_only: Vec<PathBuf>) -> Self {
+        self.agent_dir = agent_dir;
+        self.read_only = read_only;
+        self
+    }
+
+    /// Refuse a file-tool write, creation or removal of a write-protected
+    /// path ([`protect::write_denied`]) on the host, before either isolation
+    /// touches it.
+    fn check_write(&self, path: &Path) -> Result<(), FileError> {
+        protect::write_denied(&self.host_workdir, self.agent_dir.as_deref(), path)?;
+        protect::under_read_only(&self.host_workdir, &self.read_only, path)
     }
 
     /// Resolve a tool path to the absolute path used inside the guest.
@@ -549,6 +614,7 @@ impl FileSystem for KrunExecutionEnv {
     }
 
     async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
+        self.check_write(path)?;
         if let Some(fs) = &self.host_fs {
             return fs.write_file(path, data).await;
         }
@@ -577,6 +643,7 @@ impl FileSystem for KrunExecutionEnv {
     }
 
     async fn append_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
+        self.check_write(path)?;
         if let Some(fs) = &self.host_fs {
             return fs.append_file(path, data).await;
         }
@@ -697,6 +764,7 @@ impl FileSystem for KrunExecutionEnv {
     }
 
     async fn create_dir(&self, path: &Path) -> Result<(), FileError> {
+        self.check_write(path)?;
         if let Some(fs) = &self.host_fs {
             return fs.create_dir(path).await;
         }
@@ -719,6 +787,8 @@ impl FileSystem for KrunExecutionEnv {
     }
 
     async fn remove(&self, path: &Path) -> Result<(), FileError> {
+        protect::remove_denied(&self.host_workdir, self.agent_dir.as_deref(), path)?;
+        protect::under_read_only(&self.host_workdir, &self.read_only, path)?;
         if let Some(fs) = &self.host_fs {
             return fs.remove(path).await;
         }

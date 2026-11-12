@@ -92,6 +92,26 @@ directory; environment overrides cannot replace it. Network
 settings apply to shell subprocesses; host web/MCP services remain separate
 capabilities. See [the macOS sandbox decision](design/macos-sandbox.md).
 
+On Linux, `/sandbox local` runs shell commands in a Podman container that
+mounts the project at the same path. Project `.loop`, an agent directory
+inside the project, and the project repository's Git hooks, config and
+pointers (`.git/hooks`, `config`, `config.worktree`, `commondir`, `gitdir`
+and `info/attributes`, also in the existing submodule and worktree git
+directories below `.git/modules` and `.git/worktrees`) are mounted
+read-only, and `.git` itself cannot be renamed or removed. When `.git`,
+`.git/hooks` or `.loop` does not exist yet, Loop creates an empty directory
+there before the container starts and mounts it read-only, so `git init`
+fails (run `git init` and `git clone` outside the sandbox). Loop removes the
+directory when the sandbox stops, if it is still empty. A project whose
+`.git`, `.loop` or Git metadata entry is a symlink cannot start the sandbox.
+File tools refuse the same paths, and also Git metadata and `.git` entries
+in any other repository in the project, as on macOS. Limits: in the main
+`.git`, a shell command can still create a `commondir`, `gitdir`,
+`config.worktree` or `info/attributes` that did not exist when the sandbox
+started, and it can create or change a nested repository (a `.git` below the
+project root). Loop mounts nothing there, because an empty placeholder file
+would break Git on the host.
+
 Loop supports Linux and macOS only. If sandbox preflight fails, standalone Loop leaves
 the sandbox off with a warning, while a Runtime started with `loop runtime start`
 refuses to admit the Session with `required workspace sandbox failed`. Runtime
