@@ -183,6 +183,11 @@ pub trait Sandbox: Send + Sync {
     async fn stop(&self) -> Result<(), SandboxError>;
     /// Destroy / cleanup (idempotent).
     async fn destroy(&self) -> Result<(), SandboxError>;
+    /// Whether this sandbox keeps running after the Loop process exits unless
+    /// it is destroyed (a container). Such a sandbox is destroyed at exit.
+    fn outlives_process(&self) -> bool {
+        false
+    }
 }
 
 /// Factory for a sandbox kind.

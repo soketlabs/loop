@@ -94,8 +94,11 @@ impl RealPodmanClient {
     }
 
     /// Kill every process in `container` that carries `marker` in its
-    /// environment. Bounded: it never waits longer than [`KILL_EXEC_TIMEOUT`].
-    async fn kill_marked(&self, container: &str, marker: &str) {
+    /// environment, and every descendant of those processes. Bounded: it
+    /// never waits longer than [`KILL_EXEC_TIMEOUT`]. With `look_again`, an
+    /// empty first scan is repeated once after a short wait, for a stop that
+    /// came so early that the command may not have started yet.
+    async fn kill_marked(&self, container: &str, marker: &str, look_again: bool) {
         let mut cmd = Command::new(&self.program);
         cmd.args([
             "exec",
@@ -106,6 +109,7 @@ impl RealPodmanClient {
             "loop-kill",
             marker,
         ])
+        .arg(if look_again { "again" } else { "once" })
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -152,37 +156,81 @@ async fn run_capture(program: &Path, args: &[&str]) -> Result<(i32, String, Stri
     ))
 }
 
-/// Environment variable that tags every process of one `podman exec`, so a
-/// timeout or cancel can find and kill them inside the container. Children
-/// inherit it, also when they start a new process group or session.
+/// Environment variable that tags the top process of one `podman exec`, so
+/// a timeout or cancel can find it inside the container. Children inherit it
+/// unless they replace their environment (`env -i`, `sudo`, a program that
+/// sets its own); the kill therefore also follows the parent links from the
+/// tagged processes.
 pub const EXEC_MARKER_VAR: &str = "LOOP_SANDBOX_EXEC";
 
-/// Upper bound for the in-container kill after a timeout or cancel.
-const KILL_EXEC_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound for the in-container kill after a timeout or cancel. It stays
+/// below the 5 s shutdown grace.
+const KILL_EXEC_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Runs in the container as `sh -c SCRIPT loop-kill VAR=ID`. Finds the
-/// processes whose environment holds `VAR=ID` through `/proc` (no `ps` or
-/// `pkill` needed), sends TERM, waits a short time, then sends KILL until
-/// none is left. A zombie has an empty environment, so it is not matched.
-/// When nothing matches at first, it looks again once: a cancel can arrive
-/// before the command has started in the container.
+/// A stop this soon after the spawn may come before the command runs in the
+/// container; the kill then looks a second time if it finds nothing.
+const EARLY_STOP: Duration = Duration::from_secs(1);
+
+/// Runs in the container as `sh -c SCRIPT loop-kill VAR=ID once|again`.
+/// Needs only `/proc`, `grep` and `sed` (no `ps` or `pkill`).
+///
+/// 1. Targets: the processes whose environment holds `VAR=ID`, then every
+///    descendant of them through the `PPid:` lines of `/proc/*/status`,
+///    repeated until no pid is added. This is done before any signal: a
+///    killed parent hands its children to PID 1 and the link is lost.
+/// 2. TERM to the targets; wait up to 0.5 s.
+/// 3. KILL to what is still alive (old targets and new ones) until none is
+///    left. A zombie is not alive: it has nothing left to stop.
 const KILL_MARKED_SCRIPT: &str = r#"m="$1"
-found() {
-  for d in /proc/[0-9]*; do
-    tr '\0' '\n' < "$d/environ" 2>/dev/null | grep -qxF -- "$m" && printf '%s ' "${d#/proc/}"
+if printf 'a\0' | grep -qzxF a 2>/dev/null; then
+  marked() { grep -lzxsF -- "$m" /proc/[0-9]*/environ 2>/dev/null | sed -n 's#^/proc/\([0-9]*\)/environ$#\1#p'; }
+else
+  marked() {
+    for d in /proc/[0-9]*; do
+      tr '\0' '\n' < "$d/environ" 2>/dev/null | grep -qxF -- "$m" && echo "${d#/proc/}"
+    done
+  }
+fi
+targets() {
+  set_=" $(marked | tr '\n' ' ')"
+  [ "$set_" = " " ] && return 0
+  tree=$(grep -s '^PPid:' /proc/[0-9]*/status | sed -n 's#^/proc/\([0-9]*\)/status:PPid:[[:space:]]*\([0-9]*\)$#\1 \2#p')
+  while :; do
+    added=
+    while read -r pid ppid; do
+      case "$set_" in *" $ppid "*) case "$set_" in *" $pid "*) ;; *) set_="$set_$pid "; added=1 ;; esac ;; esac
+    done <<EOF
+$tree
+EOF
+    [ -n "$added" ] || break
+  done
+  echo $set_
+}
+alive() {
+  for x in $1; do
+    [ -r "/proc/$x/status" ] || continue
+    grep -qs '^State:[[:space:]]*Z' "/proc/$x/status" && continue
+    printf '%s ' "$x"
   done
 }
-p=$(found)
-if [ -z "$p" ]; then sleep 0.3; p=$(found); fi
+p=$(targets)
+if [ -z "$p" ] && [ "$2" = again ]; then sleep 0.3; p=$(targets); fi
 [ -n "$p" ] || exit 0
 kill -TERM $p 2>/dev/null
 i=0
 while [ $i -lt 5 ]; do
-  sleep 0.1; p=$(found); [ -n "$p" ] || exit 0; i=$((i+1))
+  sleep 0.1
+  p=$(alive "$p $(targets)")
+  [ -n "$p" ] || exit 0
+  i=$((i+1))
 done
 i=0
-while [ $i -lt 50 ]; do
-  kill -KILL $p 2>/dev/null; sleep 0.05; p=$(found); [ -n "$p" ] || exit 0; i=$((i+1))
+while [ $i -lt 30 ]; do
+  kill -KILL $p 2>/dev/null
+  sleep 0.05
+  p=$(alive "$p $(targets)")
+  [ -n "$p" ] || exit 0
+  i=$((i+1))
 done
 echo "still running: $p" >&2
 exit 1
@@ -534,6 +582,7 @@ impl PodmanClient for RealPodmanClient {
             ExecutionError::new(ExecutionErrorCode::SpawnFailed, format!("podman exec: {e}"))
         })?;
 
+        let spawned = std::time::Instant::now();
         let stdin = child.stdin.take();
         let output = wait_or_stop(
             async move {
@@ -557,7 +606,8 @@ impl PodmanClient for RealPodmanClient {
                 // The host client is gone (dropped with the future); now stop
                 // the command itself in the container.
                 if let Some(marker) = &marker {
-                    self.kill_marked(&opts.container, marker).await;
+                    let early = spawned.elapsed() < EARLY_STOP;
+                    self.kill_marked(&opts.container, marker, early).await;
                 }
                 return Err(stopped.into_error());
             }
@@ -572,7 +622,9 @@ impl PodmanClient for RealPodmanClient {
     }
 
     async fn stop(&self, container: &str) -> Result<(), SandboxError> {
-        let (code, _, stderr) = self.run_capture(&["stop", "-t", "5", container]).await?;
+        // `-t 0`: the keep-alive `sleep infinity` is PID 1 and ignores
+        // SIGTERM, so any grace period is only waited out.
+        let (code, _, stderr) = self.run_capture(&["stop", "-t", "0", container]).await?;
         if code != 0 && !stderr.contains("no such container") {
             return Err(SandboxError::Other(format!("podman stop: {stderr}")));
         }
@@ -777,7 +829,9 @@ exec "$@"
         let client = RealPodmanClient::with_program(&program);
         let started = std::time::Instant::now();
         let err = client
-            .exec(shell("sleep 25; echo finished", Some(1000)))
+            // `exec`: the host client is the `sleep` itself, so dropping it
+            // leaves nothing running where the kill script finds no `/proc`.
+            .exec(shell("exec sleep 25", Some(1000)))
             .await
             .expect_err("the command must time out");
         assert_eq!(err.code, ExecutionErrorCode::TimedOut);
@@ -841,6 +895,22 @@ exec "$@"
         found
     }
 
+    /// Live processes on this machine whose command line is `cmdline`.
+    #[cfg(target_os = "linux")]
+    fn processes_named(cmdline: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+            let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&raw).replace('\0', " ");
+            if text.trim_end() == cmdline {
+                found.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        found
+    }
+
     /// On Linux the fake runs the real kill script against `/proc`: after a
     /// timeout and after a cancel, no process of the command is left, also a
     /// background child, one in its own session and one that ignores TERM.
@@ -848,7 +918,8 @@ exec "$@"
     #[tokio::test]
     async fn real_client_stop_leaves_no_process_of_the_command() {
         let command = "sleep 301 & (trap '' TERM; sleep 302) & \
-                       if command -v setsid >/dev/null; then setsid sleep 303 & fi; sleep 304";
+                       if command -v setsid >/dev/null; then setsid sleep 303 & fi; \
+                       env -i sleep 305 & sleep 304";
         for cancel in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let (program, log) = fake_podman(dir.path());
@@ -871,6 +942,12 @@ exec "$@"
             let marker = exec_marker(&log);
             let left = marked_processes(&marker);
             assert!(left.is_empty(), "cancel={cancel}: still running: {left:?}");
+            // `env -i` drops the marker; the kill found it as a descendant.
+            let unmarked = processes_named("sleep 305");
+            assert!(
+                unmarked.is_empty(),
+                "cancel={cancel}: env -i child left: {unmarked:?}"
+            );
         }
     }
 

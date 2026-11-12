@@ -155,7 +155,7 @@ impl SessionShutdown {
 
     /// Stop admission, cancel the current turn and wait for it to finish:
     /// its tools, writes and `Settled` hooks. Remove the harness's sandbox
-    /// container, also when the turn did not stop. Only then release this
+    /// container (Podman), also when the turn did not stop. Only then release this
     /// store's leases. A turn still running after the grace keeps them, and
     /// this returns an error: the Session is not handed on while work in
     /// this process may still touch it. Safe to repeat.
@@ -172,8 +172,9 @@ impl SessionShutdown {
             .await
             .is_ok();
         // This process ends next: remove its sandbox container, also when the
-        // turn did not stop. Safe to repeat: the harness keeps no sandbox.
-        self.harness.clear_sandbox().await;
+        // turn did not stop. Safe to repeat: the harness then keeps no
+        // container. Other sandboxes (Seatbelt) end with the process.
+        self.harness.clear_sandbox_outliving_process().await;
         if !settled {
             anyhow::bail!(
                 "the turn did not stop within {} s; its Session lease is kept until this process exits and expires 30 s later",

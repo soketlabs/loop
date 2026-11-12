@@ -252,10 +252,13 @@ impl WorkspaceResources {
                                             "required workspace sandbox failed: {platform}{e}"
                                         ));
                                     }
-                                    // The warning goes to stderr once; the log keeps a
-                                    // copy below the default `warn` level, so it is
-                                    // not printed twice.
-                                    tracing::info!("local sandbox disabled at startup: {e}");
+                                    // The line below is the user's warning. The log keeps
+                                    // the record at warn; its target lets a terminal log
+                                    // layer skip it, so it is not printed twice.
+                                    tracing::warn!(
+                                        target: crate::USER_NOTICE_TARGET,
+                                        "local sandbox disabled at startup: {e}"
+                                    );
                                     eprintln!("warning: local sandbox not enabled:\n{e}");
                                     settings.sandbox.mode = "off".into();
                                     (SandboxMode::Disabled, Arc::clone(&self.host))
@@ -281,6 +284,9 @@ impl WorkspaceResources {
     /// a running Session removes it through its harness instead.
     pub async fn destroy_sandbox(&self) {
         if let Some((SandboxMode::Enabled { sandbox }, _, _)) = self.sandbox.get() {
+            if !sandbox.outlives_process() {
+                return;
+            }
             if let Err(error) = sandbox.destroy().await {
                 tracing::warn!(%error, "could not remove the workspace sandbox");
             }

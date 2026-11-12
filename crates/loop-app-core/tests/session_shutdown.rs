@@ -8,7 +8,7 @@ use loop_agent::harness::{
     types::{ExecutionError, ShellOutput},
     AgentHarness, AgentHarnessOptions, AgentHarnessResources, HostExecutionEnv, KrunIsolation,
     KrunSandbox, LocalSandboxRuntime, PodmanClient, PodmanExecOpts, PodmanRunOpts, Sandbox,
-    SandboxError, SandboxMode,
+    SandboxError, SandboxMode, TaggedSandbox,
 };
 use loop_ai::{
     providers::{faux_provider, FauxResponse, FauxScript},
@@ -172,9 +172,11 @@ async fn shutdown_returns_only_after_the_turn_has_finished() {
 }
 
 /// A Podman stand-in that only records which containers were removed.
+/// With `run_gate`, `podman run` waits for a permit (an image pull).
 #[derive(Default)]
 struct RecordingPodman {
     removed: parking_lot::Mutex<Vec<String>>,
+    run_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[async_trait::async_trait]
@@ -183,6 +185,9 @@ impl PodmanClient for RecordingPodman {
         Ok(())
     }
     async fn run(&self, opts: PodmanRunOpts) -> Result<String, SandboxError> {
+        if let Some(gate) = &self.run_gate {
+            gate.acquire().await.unwrap().forget();
+        }
         Ok(format!("id-{}", opts.name))
     }
     async fn exec(&self, _opts: PodmanExecOpts) -> Result<ShellOutput, ExecutionError> {
@@ -271,6 +276,66 @@ async fn shutdown_removes_the_sandbox_when_the_turn_does_not_stop() {
         assert_eq!(podman.removed.lock().len(), 1, "container not removed");
         tool.finish.notify_one();
         let _ = turn.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// A sandbox that ends with the process (Seatbelt on macOS) is left as it
+/// is: shutdown removes only a sandbox that would outlive it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_leaves_a_sandbox_that_ends_with_the_process() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let tagged = TaggedSandbox::new("plain");
+        let mode = SandboxMode::Enabled {
+            sandbox: Arc::new(tagged.clone()),
+        };
+        let (harness, store, _base, _id, _tool) = setup_with(dir.path(), mode).await;
+        SessionShutdown::new(harness.clone(), Some(store))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(tagged.destroy_count(), 0);
+        assert!(sandbox_on(&harness).await);
+    })
+    .await
+    .unwrap();
+}
+
+/// An exit while `podman run` still runs: the container it then gets is
+/// removed, and the start reports failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sandbox_destroyed_while_starting_removes_its_container() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let client = Arc::new(RecordingPodman {
+            run_gate: Some(gate.clone()),
+            ..Default::default()
+        });
+        let sandbox = Arc::new(KrunSandbox::with_client(
+            KrunSandbox::config_for(
+                dir.path().to_path_buf(),
+                KrunIsolation::Full,
+                LocalSandboxRuntime::Runc,
+            ),
+            client.clone(),
+        ));
+        let starting = tokio::spawn({
+            let sandbox = sandbox.clone();
+            async move { sandbox.start().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sandbox.destroy().await.unwrap();
+        assert!(client.removed.lock().is_empty(), "no container yet");
+        gate.add_permits(1);
+        assert!(starting.await.unwrap().is_err(), "start must fail");
+        assert_eq!(client.removed.lock().len(), 1, "container left running");
+        assert!(
+            sandbox.start().await.is_err(),
+            "a removed sandbox restarted"
+        );
     })
     .await
     .unwrap();
