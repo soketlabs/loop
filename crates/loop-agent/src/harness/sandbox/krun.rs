@@ -320,7 +320,8 @@ impl Sandbox for KrunSandbox {
         *self.env.write() = None;
         let id = self.container_id.write().take();
         if let Some(id) = id {
-            let _ = self.client.stop(&id).await;
+            // A forced remove stops the container at once; a graceful stop
+            // first only waits for its timeout, which slows every exit.
             let _ = self.client.rm(&id).await;
         }
         *self.status.write() = SandboxStatus::Stopped;

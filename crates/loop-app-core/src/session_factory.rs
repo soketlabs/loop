@@ -252,7 +252,10 @@ impl WorkspaceResources {
                                             "required workspace sandbox failed: {platform}{e}"
                                         ));
                                     }
-                                    tracing::warn!("local sandbox disabled at startup: {e}");
+                                    // The warning goes to stderr once; the log keeps a
+                                    // copy below the default `warn` level, so it is
+                                    // not printed twice.
+                                    tracing::info!("local sandbox disabled at startup: {e}");
                                     eprintln!("warning: local sandbox not enabled:\n{e}");
                                     settings.sandbox.mode = "off".into();
                                     (SandboxMode::Disabled, Arc::clone(&self.host))
@@ -269,6 +272,19 @@ impl WorkspaceResources {
                 Ok((sandbox, tool_env, disabled))
             })
             .await
+    }
+}
+
+impl WorkspaceResources {
+    /// Remove this workspace's sandbox container, if one was started. For a
+    /// standalone Surface whose startup failed after the sandbox started;
+    /// a running Session removes it through its harness instead.
+    pub async fn destroy_sandbox(&self) {
+        if let Some((SandboxMode::Enabled { sandbox }, _, _)) = self.sandbox.get() {
+            if let Err(error) = sandbox.destroy().await {
+                tracing::warn!(%error, "could not remove the workspace sandbox");
+            }
+        }
     }
 }
 
