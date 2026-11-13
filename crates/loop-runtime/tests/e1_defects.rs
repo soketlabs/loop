@@ -147,9 +147,12 @@ impl EventLog for AtTurnEnd {
 
 async fn runtime_with(dir: &Path, models: Arc<loop_ai::Models>, log: Arc<dyn EventLog>) -> Runtime {
     let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
-    Runtime::new(globals, opts(dir), log, RuntimeLimits::default())
-        .await
-        .unwrap()
+    {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(globals, opts(dir), log, store, RuntimeLimits::default())
+    }
+    .await
+    .unwrap()
 }
 
 /// D1. The Event Log says a turn ended normally before the Session tree
@@ -383,7 +386,12 @@ async fn runtime_limited(
     limits: RuntimeLimits,
 ) -> Runtime {
     let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
-    Runtime::new(globals, opts(dir), log, limits).await.unwrap()
+    {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(globals, opts(dir), log, store, limits)
+    }
+    .await
+    .unwrap()
 }
 
 /// The model waits for `gate` before it answers; `entered` is told first.

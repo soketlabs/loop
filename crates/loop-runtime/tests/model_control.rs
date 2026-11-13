@@ -65,10 +65,13 @@ async fn runtime(
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(provider);
     let globals = GlobalResources::with_models(agent, models).unwrap();
-    Runtime::new(globals, opts(dir), log, RuntimeLimits::default())
-        .await
-        .unwrap()
-        .into_shared()
+    {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(globals, opts(dir), log, store, RuntimeLimits::default())
+    }
+    .await
+    .unwrap()
+    .into_shared()
 }
 
 fn info() -> PeerInfo {

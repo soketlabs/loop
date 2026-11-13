@@ -20,6 +20,7 @@ use super::branch_cache::{
     read_cached_branch_rows, rebuild_cached_branch,
 };
 use super::materialize::{insert_empty_materialized, update_materialized_on_append};
+pub use crate::harness::session::lease::{DestinationCreation, SessionControlState};
 
 const MIGRATION_001: &str = include_str!("migrations/001_initial.sql");
 const MIGRATION_003: &str = include_str!("migrations/003_session_leases.sql");
@@ -1044,6 +1045,257 @@ impl SessionStore for SqliteSessionStore {
     }
 }
 
+/// The control trait of the Runtime. Each method is the inherent method of
+/// the same name: same SQL, same transactions, same errors.
+#[async_trait]
+impl crate::harness::session::lease::SessionControl for SqliteSessionStore {
+    async fn create_child(
+        &self,
+        cwd: Option<String>,
+        name: Option<String>,
+        parent: &str,
+    ) -> Result<Arc<dyn SessionReader>, SessionError> {
+        SqliteSessionStore::create_child(self, cwd, name, parent).await
+    }
+    async fn control_state(&self, id: &str) -> Result<SessionControlState, SessionError> {
+        SqliteSessionStore::control_state(self, id).await
+    }
+    async fn control_mutation(
+        &self,
+        id: &str,
+        identity: super::leases::LeaseIdentity,
+        branch: bool,
+        write: PendingSessionWrite,
+        marker: String,
+    ) -> Result<SessionControlState, SessionError> {
+        SqliteSessionStore::control_mutation(self, id, identity, branch, write, marker).await
+    }
+    async fn acknowledge_control(&self, id: &str, marker: &str) -> Result<(), SessionError> {
+        SqliteSessionStore::acknowledge_control(self, id, marker).await
+    }
+    async fn destination_receipt(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<Option<(String, String)>, SessionError> {
+        SqliteSessionStore::destination_receipt(self, key, fingerprint).await
+    }
+    async fn create_destination(
+        &self,
+        file: super::super::SessionFile,
+        cwd: String,
+        parent: Option<String>,
+        request_key: String,
+        fingerprint: String,
+        result: String,
+        identity: super::leases::LeaseIdentity,
+    ) -> Result<DestinationCreation, SessionError> {
+        SqliteSessionStore::create_destination(
+            self,
+            file,
+            cwd,
+            parent,
+            request_key,
+            fingerprint,
+            result,
+            identity,
+        )
+        .await
+    }
+}
+
+impl SqliteSessionStore {
+    /// Read revisions without acquiring a writer lease.
+    pub async fn control_state(&self, id: &str) -> Result<SessionControlState, SessionError> {
+        let path = self.path.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            open(&path)?
+                .query_row(
+                    "SELECT branch_revision, pending FROM session_control WHERE session_id=?1",
+                    [&id],
+                    |row| {
+                        Ok(SessionControlState {
+                            branch_revision: row.get(0)?,
+                            pending: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()
+                .map(|state| state.unwrap_or_default())
+                .map_err(|e| SessionError::Storage(e.to_string()))
+        })
+        .await
+        .map_err(|e| SessionError::Storage(e.to_string()))?
+    }
+
+    /// Commit a tree/metadata write and its recovery marker in one transaction.
+    /// The caller has checked the Session revision under its own lock.
+    pub async fn control_mutation(
+        &self,
+        id: &str,
+        identity: super::leases::LeaseIdentity,
+        branch: bool,
+        write: PendingSessionWrite,
+        marker: String,
+    ) -> Result<SessionControlState, SessionError> {
+        let path = self.path.clone();
+        let id = id.to_owned();
+        let gate = self.gate.clone();
+        let permit = gate.enter().await;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let conn = open(&path)?;
+            let tx =
+                begin_immediate(&conn, &gate).map_err(|e| SessionError::Storage(e.to_string()))?;
+            super::leases::check_write(&tx, &id, Some(&identity))?;
+            tx.execute(
+                "INSERT OR IGNORE INTO session_control(session_id) VALUES (?1)",
+                [&id],
+            )
+            .map_err(|e| SessionError::Storage(e.to_string()))?;
+            let (branch_revision, pending): (u64, Option<String>) = tx
+                .query_row(
+                    "SELECT branch_revision, pending FROM session_control WHERE session_id=?1",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|e| SessionError::Storage(e.to_string()))?;
+            if pending.is_some() {
+                return Err(SessionError::Invalid(
+                    "Session has an unannounced mutation; reopen it".into(),
+                ));
+            }
+            if let PendingSessionWrite::Leaf {
+                target_id: Some(target),
+            } = &write
+            {
+                if !load_all(&tx, &id)?.iter().any(|entry| {
+                    entry.id() == target && !matches!(entry, SessionTreeEntry::Leaf { .. })
+                }) {
+                    return Err(SessionError::Invalid("unknown branch target".into()));
+                }
+            }
+            let marker_value: serde_json::Value = serde_json::from_str(&marker)
+                .map_err(|error| SessionError::Invalid(error.to_string()))?;
+            if let Some(summary) = marker_value["summary"].as_str() {
+                append_entry_tx(
+                    &tx,
+                    &id,
+                    PendingSessionWrite::BranchSummary {
+                        summary: summary.into(),
+                    },
+                )?;
+            }
+            append_entry_tx(&tx, &id, write)?;
+            let branch_revision = branch_revision + u64::from(branch);
+            tx.execute(
+                "UPDATE session_control SET branch_revision=?2, pending=?3 WHERE session_id=?1",
+                params![id, branch_revision, marker],
+            )
+            .map_err(|e| SessionError::Storage(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| SessionError::Storage(e.to_string()))?;
+            Ok(SessionControlState {
+                branch_revision,
+                pending: Some(marker),
+            })
+        })
+        .await
+        .map_err(|e| SessionError::Storage(e.to_string()))?
+    }
+
+    /// Clear only the marker that was durably announced in the Event Log.
+    pub async fn acknowledge_control(&self, id: &str, marker: &str) -> Result<(), SessionError> {
+        let path = self.path.clone();
+        let id = id.to_owned();
+        let marker = marker.to_owned();
+        tokio::task::spawn_blocking(move || {
+            open(&path)?
+                .execute(
+                    "UPDATE session_control SET pending=NULL WHERE session_id=?1 AND pending=?2",
+                    params![id, marker],
+                )
+                .map(|_| ())
+                .map_err(|e| SessionError::Storage(e.to_string()))
+        })
+        .await
+        .map_err(|e| SessionError::Storage(e.to_string()))?
+    }
+
+    /// Read a destination retry receipt without changing ownership or capacity.
+    pub async fn destination_receipt(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<Option<(String, String)>, SessionError> {
+        let path = self.path.clone();
+        let key = key.to_owned();
+        let fingerprint = fingerprint.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let previous: Option<(String,String,String)> = open(&path)?.query_row(
+                "SELECT fingerprint,session_id,result FROM session_destinations WHERE request_key=?1", [&key],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).optional().map_err(|error| SessionError::Storage(error.to_string()))?;
+            previous.map(|(old,id,result)| {
+                if old != fingerprint { Err(SessionError::Invalid("request id already used with different parameters".into())) }
+                else { Ok((id,result)) }
+            }).transpose()
+        }).await.map_err(|error| SessionError::Storage(error.to_string()))?
+    }
+
+    /// Atomically create a validated branch and its retry receipt, with its own lease.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_destination(
+        &self,
+        file: super::super::SessionFile,
+        cwd: String,
+        parent: Option<String>,
+        request_key: String,
+        fingerprint: String,
+        result: String,
+        identity: super::leases::LeaseIdentity,
+    ) -> Result<DestinationCreation, SessionError> {
+        let store = self.clone();
+        let path = self.path.clone();
+        let gate = self.gate.clone();
+        let permit = gate.enter().await;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let conn = open(&path)?;
+            let tx = begin_immediate(&conn, &gate).map_err(|e| SessionError::Storage(e.to_string()))?;
+            let previous: Option<(String,String,String)> = tx.query_row(
+                "SELECT fingerprint,session_id,result FROM session_destinations WHERE request_key=?1", [&request_key],
+                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+            ).optional().map_err(|e| SessionError::Storage(e.to_string()))?;
+            if let Some((old,id,result)) = previous {
+                if old != fingerprint { return Err(SessionError::Invalid("request id already used with different parameters".into())); }
+                return Ok(DestinationCreation::new(id, result, Arc::new(store), identity, false));
+            }
+            let id = create_session_id();
+            tx.execute("INSERT INTO sessions(id,cwd,name,parent_session_id,active_leaf_id,created_at) VALUES (?1,?2,?3,?4,NULL,?5)",
+                params![id,cwd,file.name,parent,now_ms()]).map_err(|e| SessionError::Storage(e.to_string()))?;
+            tx.execute("INSERT INTO session_sequences(session_id,next_seq) VALUES (?1,1)",[&id]).map_err(|e| SessionError::Storage(e.to_string()))?;
+            insert_empty_materialized(&tx, &id)?;
+            let mut remap = std::collections::HashMap::new();
+            for entry in file.entries {
+                let old_id = entry.id().to_owned();
+                let Some(pending) = crate::harness::session::lease::destination_write(entry, &remap) else {
+                    continue;
+                };
+                let written = append_entry_tx(&tx, &id, pending)?;
+                remap.insert(old_id, written.id().to_owned());
+            }
+            tx.execute("INSERT INTO session_leases(session_id,owner,pid,generation,heartbeat_ms) VALUES (?1,?2,?3,?4,?5)",
+                params![id,identity.owner,identity.pid,identity.generation,self::now_ms()]).map_err(|e| SessionError::Storage(e.to_string()))?;
+            tx.execute("INSERT INTO session_destinations(request_key,fingerprint,session_id,result) VALUES (?1,?2,?3,?4)",
+                params![request_key,fingerprint,id,result]).map_err(|e| SessionError::Storage(e.to_string()))?;
+            tx.commit().map_err(|e| SessionError::Storage(e.to_string()))?;
+            Ok(DestinationCreation::new(id, result, Arc::new(store), identity, true))
+        }).await.map_err(|e| SessionError::Storage(e.to_string()))?
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,278 +1478,5 @@ mod tests {
             |_| Ok(()),
         )
         .expect("branch_tips table exists");
-    }
-}
-
-/// Owns an unadmitted destination; cancellation removes its row and lease.
-pub struct DestinationCreation {
-    /// The destination Session id.
-    pub id: String,
-    /// The retry receipt committed with it.
-    pub receipt: String,
-    store: SqliteSessionStore,
-    identity: super::leases::LeaseIdentity,
-    armed: bool,
-}
-impl DestinationCreation {
-    /// Transfer responsibility to the admitted Runtime Session.
-    pub fn admitted(&mut self) {
-        self.armed = false;
-    }
-    /// Remove an unadmitted destination, whether admission released its lease or not.
-    pub async fn rollback(&mut self) -> Result<(), SessionError> {
-        if !self.armed {
-            return Ok(());
-        }
-        rollback_destination(&self.store, &self.id, &self.identity).await?;
-        self.armed = false;
-        Ok(())
-    }
-}
-async fn rollback_destination(
-    store: &SqliteSessionStore,
-    id: &str,
-    identity: &super::leases::LeaseIdentity,
-) -> Result<(), SessionError> {
-    match store.lease(id).await? {
-        Some(lease) if &lease.identity == identity => store.release_lease(id, identity).await?,
-        Some(_) => {
-            return Err(SessionError::Invalid(
-                "destination has another writer; refusing rollback".into(),
-            ))
-        }
-        None => {}
-    }
-    store.delete(id).await
-}
-impl Drop for DestinationCreation {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let store = self.store.clone();
-        let identity = self.identity.clone();
-        let id = self.id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = rollback_destination(&store, &id, &identity).await {
-                eprintln!("could not remove unadmitted Session {id}: {error}");
-            }
-        });
-    }
-}
-
-/// Persisted branch revision and an unannounced mutation. The Session
-/// revision is counted from the tree itself.
-#[derive(Debug, Clone, Default)]
-pub struct SessionControlState {
-    /// Committed active-branch revision.
-    pub branch_revision: u64,
-    /// Marker of a committed mutation not yet announced in the Event Log.
-    pub pending: Option<String>,
-}
-
-impl SqliteSessionStore {
-    /// Read revisions without acquiring a writer lease.
-    pub async fn control_state(&self, id: &str) -> Result<SessionControlState, SessionError> {
-        let path = self.path.clone();
-        let id = id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            open(&path)?
-                .query_row(
-                    "SELECT branch_revision, pending FROM session_control WHERE session_id=?1",
-                    [&id],
-                    |row| {
-                        Ok(SessionControlState {
-                            branch_revision: row.get(0)?,
-                            pending: row.get(1)?,
-                        })
-                    },
-                )
-                .optional()
-                .map(|state| state.unwrap_or_default())
-                .map_err(|e| SessionError::Storage(e.to_string()))
-        })
-        .await
-        .map_err(|e| SessionError::Storage(e.to_string()))?
-    }
-
-    /// Commit a tree/metadata write and its recovery marker in one transaction.
-    /// The caller has checked the Session revision under its own lock.
-    pub async fn control_mutation(
-        &self,
-        id: &str,
-        identity: super::leases::LeaseIdentity,
-        branch: bool,
-        write: PendingSessionWrite,
-        marker: String,
-    ) -> Result<SessionControlState, SessionError> {
-        let path = self.path.clone();
-        let id = id.to_owned();
-        let gate = self.gate.clone();
-        let permit = gate.enter().await;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let conn = open(&path)?;
-            let tx =
-                begin_immediate(&conn, &gate).map_err(|e| SessionError::Storage(e.to_string()))?;
-            super::leases::check_write(&tx, &id, Some(&identity))?;
-            tx.execute(
-                "INSERT OR IGNORE INTO session_control(session_id) VALUES (?1)",
-                [&id],
-            )
-            .map_err(|e| SessionError::Storage(e.to_string()))?;
-            let (branch_revision, pending): (u64, Option<String>) = tx
-                .query_row(
-                    "SELECT branch_revision, pending FROM session_control WHERE session_id=?1",
-                    [&id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .map_err(|e| SessionError::Storage(e.to_string()))?;
-            if pending.is_some() {
-                return Err(SessionError::Invalid(
-                    "Session has an unannounced mutation; reopen it".into(),
-                ));
-            }
-            if let PendingSessionWrite::Leaf {
-                target_id: Some(target),
-            } = &write
-            {
-                if !load_all(&tx, &id)?.iter().any(|entry| {
-                    entry.id() == target && !matches!(entry, SessionTreeEntry::Leaf { .. })
-                }) {
-                    return Err(SessionError::Invalid("unknown branch target".into()));
-                }
-            }
-            let marker_value: serde_json::Value = serde_json::from_str(&marker)
-                .map_err(|error| SessionError::Invalid(error.to_string()))?;
-            if let Some(summary) = marker_value["summary"].as_str() {
-                append_entry_tx(
-                    &tx,
-                    &id,
-                    PendingSessionWrite::BranchSummary {
-                        summary: summary.into(),
-                    },
-                )?;
-            }
-            append_entry_tx(&tx, &id, write)?;
-            let branch_revision = branch_revision + u64::from(branch);
-            tx.execute(
-                "UPDATE session_control SET branch_revision=?2, pending=?3 WHERE session_id=?1",
-                params![id, branch_revision, marker],
-            )
-            .map_err(|e| SessionError::Storage(e.to_string()))?;
-            tx.commit()
-                .map_err(|e| SessionError::Storage(e.to_string()))?;
-            Ok(SessionControlState {
-                branch_revision,
-                pending: Some(marker),
-            })
-        })
-        .await
-        .map_err(|e| SessionError::Storage(e.to_string()))?
-    }
-
-    /// Clear only the marker that was durably announced in the Event Log.
-    pub async fn acknowledge_control(&self, id: &str, marker: &str) -> Result<(), SessionError> {
-        let path = self.path.clone();
-        let id = id.to_owned();
-        let marker = marker.to_owned();
-        tokio::task::spawn_blocking(move || {
-            open(&path)?
-                .execute(
-                    "UPDATE session_control SET pending=NULL WHERE session_id=?1 AND pending=?2",
-                    params![id, marker],
-                )
-                .map(|_| ())
-                .map_err(|e| SessionError::Storage(e.to_string()))
-        })
-        .await
-        .map_err(|e| SessionError::Storage(e.to_string()))?
-    }
-
-    /// Read a destination retry receipt without changing ownership or capacity.
-    pub async fn destination_receipt(
-        &self,
-        key: &str,
-        fingerprint: &str,
-    ) -> Result<Option<(String, String)>, SessionError> {
-        let path = self.path.clone();
-        let key = key.to_owned();
-        let fingerprint = fingerprint.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let previous: Option<(String,String,String)> = open(&path)?.query_row(
-                "SELECT fingerprint,session_id,result FROM session_destinations WHERE request_key=?1", [&key],
-                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-            ).optional().map_err(|error| SessionError::Storage(error.to_string()))?;
-            previous.map(|(old,id,result)| {
-                if old != fingerprint { Err(SessionError::Invalid("request id already used with different parameters".into())) }
-                else { Ok((id,result)) }
-            }).transpose()
-        }).await.map_err(|error| SessionError::Storage(error.to_string()))?
-    }
-
-    /// Atomically create a validated branch and its retry receipt, with its own lease.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_destination(
-        &self,
-        file: super::super::SessionFile,
-        cwd: String,
-        parent: Option<String>,
-        request_key: String,
-        fingerprint: String,
-        result: String,
-        identity: super::leases::LeaseIdentity,
-    ) -> Result<DestinationCreation, SessionError> {
-        let store = self.clone();
-        let path = self.path.clone();
-        let gate = self.gate.clone();
-        let permit = gate.enter().await;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let conn = open(&path)?;
-            let tx = begin_immediate(&conn, &gate).map_err(|e| SessionError::Storage(e.to_string()))?;
-            let previous: Option<(String,String,String)> = tx.query_row(
-                "SELECT fingerprint,session_id,result FROM session_destinations WHERE request_key=?1", [&request_key],
-                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-            ).optional().map_err(|e| SessionError::Storage(e.to_string()))?;
-            if let Some((old,id,result)) = previous {
-                if old != fingerprint { return Err(SessionError::Invalid("request id already used with different parameters".into())); }
-                return Ok(DestinationCreation { id,receipt:result,store,identity,armed:false });
-            }
-            let id = create_session_id();
-            tx.execute("INSERT INTO sessions(id,cwd,name,parent_session_id,active_leaf_id,created_at) VALUES (?1,?2,?3,?4,NULL,?5)",
-                params![id,cwd,file.name,parent,now_ms()]).map_err(|e| SessionError::Storage(e.to_string()))?;
-            tx.execute("INSERT INTO session_sequences(session_id,next_seq) VALUES (?1,1)",[&id]).map_err(|e| SessionError::Storage(e.to_string()))?;
-            insert_empty_materialized(&tx, &id)?;
-            let mut remap = std::collections::HashMap::new();
-            for entry in file.entries {
-                let old_id = entry.id().to_owned();
-                let pending = match entry {
-                    SessionTreeEntry::Message { message, .. } => PendingSessionWrite::Message { message },
-                    SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => PendingSessionWrite::ThinkingLevelChange { thinking_level },
-                    SessionTreeEntry::ModelChange { provider, model_id, .. } => PendingSessionWrite::ModelChange { provider, model_id },
-                    SessionTreeEntry::ActiveToolsChange { tool_names, .. } => PendingSessionWrite::ActiveToolsChange { tool_names },
-                    // Approval grants belong to the source Session, never to a copy.
-                    SessionTreeEntry::Label { label, .. }
-                        if label.starts_with(super::super::TOOL_APPROVAL_LABEL_NAMESPACE) => continue,
-                    SessionTreeEntry::Label { label, .. } => PendingSessionWrite::Label { label },
-                    SessionTreeEntry::SessionInfo { .. } => continue,
-                    SessionTreeEntry::Compaction { summary, first_kept_entry_id, .. } => PendingSessionWrite::Compaction {
-                        summary, first_kept_entry_id: first_kept_entry_id.and_then(|id| remap.get(&id).cloned()), details: None,
-                    },
-                    SessionTreeEntry::BranchSummary { summary, .. } => PendingSessionWrite::BranchSummary { summary },
-                    // Imported paths, custom data and grants never confer authority.
-                    _ => continue,
-                };
-                let written = append_entry_tx(&tx, &id, pending)?;
-                remap.insert(old_id, written.id().to_owned());
-            }
-            tx.execute("INSERT INTO session_leases(session_id,owner,pid,generation,heartbeat_ms) VALUES (?1,?2,?3,?4,?5)",
-                params![id,identity.owner,identity.pid,identity.generation,self::now_ms()]).map_err(|e| SessionError::Storage(e.to_string()))?;
-            tx.execute("INSERT INTO session_destinations(request_key,fingerprint,session_id,result) VALUES (?1,?2,?3,?4)",
-                params![request_key,fingerprint,id,result]).map_err(|e| SessionError::Storage(e.to_string()))?;
-            tx.commit().map_err(|e| SessionError::Storage(e.to_string()))?;
-            Ok(DestinationCreation { id,receipt:result,store,identity,armed:true })
-        }).await.map_err(|e| SessionError::Storage(e.to_string()))?
     }
 }

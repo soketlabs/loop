@@ -26,7 +26,12 @@ async fn runtime(dir: &std::path::Path, log: Arc<dyn EventLog>, limits: RuntimeL
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(loop_ai::providers::faux_provider(Default::default()));
     let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
-    Runtime::new(globals, opts(dir), log, limits).await.unwrap()
+    {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(globals, opts(dir), log, store, limits)
+    }
+    .await
+    .unwrap()
 }
 #[tokio::test]
 async fn two_sessions_commit_tagged_contiguous_streams_before_completion() {
@@ -260,15 +265,20 @@ async fn active_turn_limit_waits_and_parent_can_release_and_reacquire() {
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(loop_ai::providers::faux_provider(script));
     let log = Arc::new(MemoryEventLog::new());
-    let rt = Runtime::new(
-        GlobalResources::with_models(dir.path().join("agent"), models).unwrap(),
-        opts(dir.path()),
-        log.clone(),
-        RuntimeLimits {
-            max_sessions: 16,
-            max_active_turns: 1,
-        },
-    )
+    let rt = {
+        let globals = GlobalResources::with_models(dir.path().join("agent"), models).unwrap();
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(
+            globals,
+            opts(dir.path()),
+            log.clone(),
+            store,
+            RuntimeLimits {
+                max_sessions: 16,
+                max_active_turns: 1,
+            },
+        )
+    }
     .await
     .unwrap();
     let a = rt.new_session(SessionSpec::default()).await.unwrap();
@@ -506,15 +516,19 @@ async fn failed_factory_releases_lease_and_capacity() {
     let dir = tempfile::tempdir().unwrap();
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     let globals = GlobalResources::with_models(dir.path().join("agent"), models).unwrap();
-    let rt = Runtime::new(
-        globals,
-        opts(dir.path()),
-        Arc::new(MemoryEventLog::new()),
-        RuntimeLimits {
-            max_sessions: 1,
-            max_active_turns: 1,
-        },
-    )
+    let rt = {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(
+            globals,
+            opts(dir.path()),
+            Arc::new(MemoryEventLog::new()),
+            store,
+            RuntimeLimits {
+                max_sessions: 1,
+                max_active_turns: 1,
+            },
+        )
+    }
     .await
     .unwrap();
     for _ in 0..2 {
@@ -680,10 +694,19 @@ async fn stuck_turn(
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(loop_ai::providers::faux_provider(Default::default()));
     let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
-    let rt = Runtime::new(globals, opts(dir), log.clone(), RuntimeLimits::default())
-        .await
-        .unwrap()
-        .with_close_grace(std::time::Duration::from_millis(300));
+    let rt = {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(
+            globals,
+            opts(dir),
+            log.clone(),
+            store,
+            RuntimeLimits::default(),
+        )
+    }
+    .await
+    .unwrap()
+    .with_close_grace(std::time::Duration::from_millis(300));
     let a = rt.new_session(SessionSpec::default()).await.unwrap();
     log.hold_updates
         .store(true, std::sync::atomic::Ordering::Release);

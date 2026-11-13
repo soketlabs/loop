@@ -41,15 +41,19 @@ async fn runtime(dir: &std::path::Path, log: Arc<dyn EventLog>) -> Arc<Runtime> 
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(loop_ai::providers::faux_provider(Default::default()));
     let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
-    Runtime::new(
-        globals,
-        opts(dir),
-        log,
-        RuntimeLimits {
-            max_sessions: 1,
-            max_active_turns: 1,
-        },
-    )
+    {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(
+            globals,
+            opts(dir),
+            log,
+            store,
+            RuntimeLimits {
+                max_sessions: 1,
+                max_active_turns: 1,
+            },
+        )
+    }
     .await
     .unwrap()
     .into_shared()
