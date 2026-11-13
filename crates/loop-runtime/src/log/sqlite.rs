@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
 type Reply<T> = oneshot::Sender<Result<T>>;
@@ -117,6 +118,16 @@ enum Command {
 /// read-only connections, on blocking threads, never on the writer. WAL lets
 /// them read while the writer commits, so a long read never delays an
 /// append. Long reads are paged: each page is one short read transaction.
+///
+/// **WAL size.** Readers that overlap without a gap keep the automatic
+/// PASSIVE checkpoint from ever resetting the WAL, so it would grow without
+/// bound. Every 64 commits the writer reads the WAL size. Above 64 MiB it
+/// waits up to 50 ms for all reader permits (a reader holds one for one
+/// page; readers that come later queue behind the writer). With all of them
+/// held, no reader is in a transaction, and a TRUNCATE checkpoint resets
+/// the WAL at once. If the wait times out, it runs a PASSIVE checkpoint and
+/// tries again at the next check; it never waits on a busy reader inside
+/// SQLite. `journal_size_limit` is 64 MiB as well.
 ///
 /// **Read consistency.** A read that starts after an append returned sees
 /// that append. The writer replies only after COMMIT, and each read is a new
@@ -262,13 +273,18 @@ impl SqliteEventLog {
         let (sender, receiver) = mpsc::channel(WRITER_QUEUE_CAPACITY);
         let ack = Arc::clone(&acknowledged);
         let wal = PathBuf::from(format!("{}-wal", path.display()));
-        tokio::task::spawn_blocking(move || writer(conn, receiver, &ack, &wal));
+        let permits = Arc::new(Semaphore::new(READER_POOL_SIZE));
+        let writer_permits = Arc::clone(&permits);
+        let runtime = Handle::current();
+        tokio::task::spawn_blocking(move || {
+            writer(conn, receiver, &ack, &wal, &writer_permits, &runtime)
+        });
         Ok(Self {
             sender,
             readers: Arc::new(Readers {
                 path,
                 idle: Mutex::new(Vec::with_capacity(READER_POOL_SIZE)),
-                permits: Arc::new(Semaphore::new(READER_POOL_SIZE)),
+                permits,
                 acknowledged,
             }),
         })
@@ -516,6 +532,8 @@ fn writer(
     mut receiver: mpsc::Receiver<Command>,
     acknowledged: &AtomicU64,
     wal: &Path,
+    permits: &Arc<Semaphore>,
+    runtime: &Handle,
 ) {
     let mut pending = None;
     let mut commits = 0u32;
@@ -558,7 +576,7 @@ fn writer(
                 append_group(&mut conn, all, replies, acknowledged);
                 commits += 1;
                 if commits.is_multiple_of(WAL_CHECK_COMMITS) {
-                    bound_wal(&conn, wal);
+                    bound_wal(&conn, wal, permits, runtime);
                 }
             }
             Command::Allocate(owner, pid, started, reply) => {
@@ -729,7 +747,10 @@ const UPSERT_SUMMARY_SQL: &str = "INSERT INTO session_summary \
 
 /// What the projection needs of stored rows, read from the columns and two
 /// JSON paths; the payload is never decoded. The text test `instr` keeps
-/// JSON parsing to the few rows that can hold a revision. A row whose
+/// JSON parsing to the few rows that can hold a revision. It relies on the
+/// compact form that `serde_json` writes (`"type":"config_changed"`, no
+/// spaces). An importer that writes other JSON (ADR-0007 step B4) must
+/// write it compact, or this query must drop the `instr` test. A row whose
 /// needed JSON is not valid gives NULL for that field and 1 in `bad`.
 /// The rules equal the queries before step B2: prompts by the `kind`
 /// column, a parent by `json_extract` of `session_opened`, turns and
@@ -1040,29 +1061,34 @@ fn backfill(conn: &mut Connection, chunk: usize, max_chunks: Option<usize>) -> S
     result
 }
 
-/// WAL size above which the writer runs a TRUNCATE checkpoint. Readers
-/// that overlap without a gap keep the automatic PASSIVE checkpoint from
-/// ever resetting the WAL, so without this it grows without bound.
+/// WAL size above which the writer resets the WAL (see the type docs).
 const WAL_RESET_BYTES: u64 = 64 * 1024 * 1024;
 /// The writer checks the WAL size after this many commits.
 const WAL_CHECK_COMMITS: u32 = 64;
+/// How long the writer waits for the reader permits before it gives up.
+/// A reader holds its permit for one page.
+const WAL_RESET_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Keep the WAL bounded while readers overlap. Reading the file size costs
-/// one `stat`. Above the limit, a TRUNCATE checkpoint waits (busy timeout)
-/// for the read transactions open now, which are one page each, copies the
-/// WAL into the database and empties it. A busy or failed checkpoint is
-/// tried again at the next check.
-fn bound_wal(conn: &Connection, wal: &Path) {
-    if std::fs::metadata(wal).is_ok_and(|m| m.len() >= WAL_RESET_BYTES) {
-        // Retry every 1 ms (at most about 1 s): each reader holds its
-        // snapshot for one page, so the default busy sleeps, which grow to
-        // 100 ms, would stall appends far longer than needed.
-        let _ = conn.busy_handler(Some(|tries| {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            tries < 1000
-        }));
-        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
-        let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
+/// Keep the WAL bounded while readers overlap (the rule is in the docs of
+/// [`SqliteEventLog`]). Reading the file size costs one `stat`.
+fn bound_wal(conn: &Connection, wal: &Path, permits: &Arc<Semaphore>, runtime: &Handle) {
+    if !std::fs::metadata(wal).is_ok_and(|m| m.len() >= WAL_RESET_BYTES) {
+        return;
+    }
+    // A waiter for all permits takes them as readers finish their page;
+    // readers that come later queue behind it, so it cannot starve.
+    let all = u32::try_from(READER_POOL_SIZE).unwrap_or(u32::MAX);
+    let held = runtime.block_on(async {
+        tokio::time::timeout(WAL_RESET_WAIT, Arc::clone(permits).acquire_many_owned(all)).await
+    });
+    match held {
+        Ok(Ok(_permits)) => {
+            // No reader of this log is in a transaction: the reset does not wait.
+            let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        }
+        _ => {
+            let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
+        }
     }
 }
 

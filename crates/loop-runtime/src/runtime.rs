@@ -1089,6 +1089,8 @@ impl Runtime {
         let (at_seq, changed) = match committed {
             Some(committed) => committed,
             None => {
+                // An append abandoned while queued must count before `at_seq`.
+                self.log.sync().await.map_err(failed)?;
                 let at_seq = self.log.latest_seq(&session.key).await.map_err(failed)?;
                 (at_seq, self.recorded_config(session).await?)
             }

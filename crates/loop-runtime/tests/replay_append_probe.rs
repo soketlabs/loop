@@ -200,18 +200,23 @@ async fn wal_size_during_replay_and_appends() {
             }
         }));
     }
-    {
+    let appender = {
         let log = log.clone();
         let stop = stop.clone();
         let text = text.clone();
-        tasks.push(tokio::spawn(async move {
+        tokio::spawn(async move {
+            let mut latencies = Vec::new();
             while !stop.load(Ordering::Acquire) {
+                let start = Instant::now();
                 log.append_batch((0..8).map(|_| chunk("small", text.clone())).collect())
                     .await
                     .unwrap();
+                latencies.push(start.elapsed().as_secs_f64() * 1000.0);
             }
-        }));
-    }
+            latencies.sort_by(f64::total_cmp);
+            latencies
+        })
+    };
     let start = Instant::now();
     let mut max = 0;
     let mut samples = Vec::new();
@@ -225,16 +230,21 @@ async fn wal_size_during_replay_and_appends() {
     for task in tasks {
         task.await.unwrap();
     }
+    let latencies = appender.await.unwrap();
     let appended = log.latest_seq(&"small".into()).await.unwrap();
     let mib = |b: u64| b as f64 / 1048576.0;
     println!(
-        "PROBE|WAL| {secs} s: max {:.1} MiB, last {:.1} MiB, median {:.1} MiB; {appended} small events appended",
+        "PROBE|WAL| {secs} s: max {:.1} MiB, last {:.1} MiB, median {:.1} MiB; {appended} small events appended; append p50 {:.2} ms p95 {:.2} ms p99 {:.2} ms max {:.2} ms",
         mib(max),
         mib(*samples.last().unwrap_or(&0)),
         mib({
             let mut s = samples.clone();
             s.sort();
             s[s.len() / 2]
-        })
+        }),
+        percentile(&latencies, 0.5),
+        percentile(&latencies, 0.95),
+        percentile(&latencies, 0.99),
+        latencies.last().copied().unwrap_or(0.0)
     );
 }
