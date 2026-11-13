@@ -619,3 +619,61 @@ async fn linux_sandbox_refuses_a_symlinked_hooks_directory() {
     assert!(client.runs.lock().is_empty());
     assert_eq!(sb.status(), loop_agent::harness::SandboxStatus::Failed);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn partial_file_tools_do_not_follow_a_symlink_out_of_the_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("bashrc");
+    std::fs::write(&secret, "secret").unwrap();
+    let project = std::fs::canonicalize(dir.path()).unwrap();
+    std::os::unix::fs::symlink(&secret, project.join("x")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), project.join("d")).unwrap();
+    std::fs::write(project.join("real.txt"), "inside").unwrap();
+    std::os::unix::fs::symlink(project.join("real.txt"), project.join("in")).unwrap();
+    let client = Arc::new(FakePodman::new());
+    let sb = KrunSandbox::with_client(
+        SandboxConfig {
+            workdir: project.clone(),
+            options: json!({"isolation": "partial"}),
+            labels: Default::default(),
+        },
+        client,
+    );
+    sb.start().await.unwrap();
+    let env = sb.env();
+    assert!(env.write_file(Path::new("x"), b"evil").await.is_err());
+    assert!(env.append_file(Path::new("x"), b"evil").await.is_err());
+    assert!(env.read_text_file(Path::new("x")).await.is_err());
+    assert!(env
+        .write_file(Path::new("d/new.txt"), b"evil")
+        .await
+        .is_err());
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "secret");
+    assert!(!outside.path().join("new.txt").exists());
+    // A link that stays in the project still works.
+    assert_eq!(env.read_text_file(Path::new("in")).await.unwrap(), "inside");
+    env.write_file(Path::new("in"), b"changed").await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(project.join("real.txt")).unwrap(),
+        "changed"
+    );
+    env.write_file(Path::new("new/dir/f.txt"), b"ok")
+        .await
+        .unwrap();
+    assert_eq!(
+        env.read_text_file(Path::new("new/dir/f.txt"))
+            .await
+            .unwrap(),
+        "ok"
+    );
+    assert_eq!(
+        env.read_text_file(Path::new("missing.txt"))
+            .await
+            .unwrap_err()
+            .code,
+        loop_agent::harness::types::FileErrorCode::NotFound
+    );
+    sb.destroy().await.unwrap();
+}

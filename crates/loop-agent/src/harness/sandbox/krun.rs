@@ -982,15 +982,114 @@ impl JailedHostFs {
                 "path escape (..) rejected",
             ));
         }
-        let root = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
-        let canon = std::fs::canonicalize(&abs).unwrap_or(abs.clone());
-        if !canon.starts_with(&root) && !abs.starts_with(&self.root) {
+        self.resolved(&abs)?;
+        Ok(abs)
+    }
+
+    /// `abs` with every symlink resolved (missing children kept), which
+    /// must stay in the root. A symlink that leads out is refused.
+    fn resolved(&self, abs: &Path) -> Result<PathBuf, FileError> {
+        let root = super::seatbelt::resolve_path(&self.root)?;
+        let resolved = super::seatbelt::resolve_path(abs)?;
+        if !resolved.starts_with(&root) {
             return Err(FileError::new(
                 FileErrorCode::InvalidPath,
                 format!("path escapes sandbox root: {}", abs.display()),
             ));
         }
-        Ok(abs)
+        Ok(resolved)
+    }
+
+    /// Open the resolved form of `path` with no symlink followed in any
+    /// component, so a link swapped in after the check fails the call
+    /// instead of leading out of the root.
+    #[cfg(unix)]
+    fn open(
+        &self,
+        path: &Path,
+        flags: rustix::fs::OFlags,
+        create_parents: bool,
+    ) -> Result<std::fs::File, FileError> {
+        use rustix::fs::{mkdirat, open, openat, Mode, OFlags};
+        let abs = self.assert_in_root(path)?;
+        let resolved = self.resolved(&abs)?;
+        let err = |e: rustix::io::Errno| {
+            let code = match e {
+                rustix::io::Errno::NOENT => FileErrorCode::NotFound,
+                rustix::io::Errno::LOOP | rustix::io::Errno::ACCESS | rustix::io::Errno::PERM => {
+                    FileErrorCode::PermissionDenied
+                }
+                _ => FileErrorCode::Io,
+            };
+            FileError::new(code, format!("{}: {e}", abs.display()))
+        };
+        let mut fd = open(
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(err)?;
+        let parts: Vec<_> = resolved
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(p) => Some(p.to_owned()),
+                _ => None,
+            })
+            .collect();
+        for (i, part) in parts.iter().enumerate() {
+            let last = i + 1 == parts.len();
+            if create_parents && !last {
+                match mkdirat(&fd, part.as_os_str(), Mode::from_raw_mode(0o755)) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(e) => return Err(err(e)),
+                }
+            }
+            let opts = if last {
+                flags
+            } else {
+                OFlags::RDONLY | OFlags::DIRECTORY
+            } | OFlags::NOFOLLOW
+                | OFlags::CLOEXEC
+                // A FIFO must not block the open; it is refused below.
+                | OFlags::NONBLOCK;
+            fd = openat(&fd, part.as_os_str(), opts, Mode::from_raw_mode(0o644)).map_err(err)?;
+        }
+        let file = std::fs::File::from(fd);
+        if !file
+            .metadata()
+            .map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))?
+            .is_file()
+        {
+            return Err(FileError::new(
+                FileErrorCode::InvalidPath,
+                format!("not a regular file: {}", abs.display()),
+            ));
+        }
+        Ok(file)
+    }
+
+    #[cfg(unix)]
+    fn read_all(&self, path: &Path) -> Result<Vec<u8>, FileError> {
+        use std::io::Read;
+        let mut file = self.open(path, rustix::fs::OFlags::RDONLY, false)?;
+        let mut out = Vec::new();
+        file.read_to_end(&mut out)
+            .map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))?;
+        Ok(out)
+    }
+
+    #[cfg(unix)]
+    fn write_all(&self, path: &Path, data: &[u8], append: bool) -> Result<(), FileError> {
+        use rustix::fs::OFlags;
+        use std::io::Write;
+        let mode = if append {
+            OFlags::APPEND
+        } else {
+            OFlags::TRUNC
+        };
+        let mut file = self.open(path, OFlags::WRONLY | OFlags::CREATE | mode, true)?;
+        file.write_all(data)
+            .map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))
     }
 }
 
@@ -1008,21 +1107,46 @@ impl FileSystem for JailedHostFs {
         self.inner.join_path(base, child)
     }
 
+    #[cfg(unix)]
+    async fn read_text_file(&self, path: &Path) -> Result<String, FileError> {
+        let bytes = self.read_all(path)?;
+        String::from_utf8(bytes).map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))
+    }
+
+    #[cfg(unix)]
+    async fn read_binary_file(&self, path: &Path) -> Result<Vec<u8>, FileError> {
+        self.read_all(path)
+    }
+
+    #[cfg(unix)]
+    async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
+        self.write_all(path, data, false)
+    }
+
+    #[cfg(unix)]
+    async fn append_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
+        self.write_all(path, data, true)
+    }
+
+    #[cfg(not(unix))]
     async fn read_text_file(&self, path: &Path) -> Result<String, FileError> {
         let path = self.assert_in_root(path)?;
         self.inner.read_text_file(&path).await
     }
 
+    #[cfg(not(unix))]
     async fn read_binary_file(&self, path: &Path) -> Result<Vec<u8>, FileError> {
         let path = self.assert_in_root(path)?;
         self.inner.read_binary_file(&path).await
     }
 
+    #[cfg(not(unix))]
     async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
         let path = self.assert_in_root(path)?;
         self.inner.write_file(&path, data).await
     }
 
+    #[cfg(not(unix))]
     async fn append_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
         let path = self.assert_in_root(path)?;
         self.inner.append_file(&path, data).await
