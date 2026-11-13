@@ -9,15 +9,37 @@
 
 #![warn(missing_docs)]
 
+mod adapter;
+mod capabilities;
 mod env;
+mod error;
+mod path;
+mod platform;
+mod process;
 mod registry;
 mod sandbox;
+mod workspace;
+
+pub use adapter::{CapabilitiesFn, FactoryDriver, SandboxWorkspace};
+pub use capabilities::{Isolation, NetworkPolicy, ResourceLimits, WorkspaceCapabilities};
+pub use error::WorkspaceError;
+pub use path::WorkspacePath;
+pub use platform::HostOs;
+pub use process::{
+    ProcessEvent, ProcessExit, ProcessSignal, PtySize, SpawnRequest, WorkspaceProcess,
+};
+pub use registry::{
+    register_workspace_driver, registered_workspace_drivers, SandboxRegistry,
+    WorkspaceDriverRegistry,
+};
+pub use workspace::{
+    FileChunk, SnapshotId, Workspace, WorkspaceDriver, WorkspaceSpec, WorkspaceStatus,
+};
 
 pub use env::{
     ExecutionEnv, ExecutionError, ExecutionErrorCode, FileError, FileErrorCode, FileIdentity,
     FileInfo, FileSystem, Shell, ShellExecOptions, ShellOutput, ShellOutputCallback,
 };
-pub use registry::SandboxRegistry;
 pub use sandbox::{
     Sandbox, SandboxConfig, SandboxError, SandboxFactory, SandboxInfo, SandboxStatus,
 };
