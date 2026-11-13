@@ -10,6 +10,8 @@ impl Runtime {
         mut spec: SessionSpec,
         child: Option<subagent::ChildOpen>,
     ) -> BackendResult<SessionRef> {
+        // The connection's caller, read at entry: it does not cross spawns.
+        let caller = loop_protocol::Caller::current();
         // An attach checks this Surface's credentials, but never changes an
         // existing Session's environment while another Surface may use it.
         let caller_env = spec.env.clone();
@@ -284,6 +286,13 @@ impl Runtime {
                 None => (0, workspace_root(&opened.workspace.cwd), None),
             };
             let parent = child.as_ref().map(|c| c.parent.reference.key.clone());
+            // A Subagent acts for the person its parent acts for (ADR-0009),
+            // so it copies the parent's `loaded_by`. That is the parent's last
+            // loader, not an owner, and carries no authority (I3 adds owners).
+            let loaded_by = match &child {
+                Some(child) => child.parent.loaded_by.clone(),
+                None => caller.clone(),
+            };
             let receiver = opened.native.subscribe();
             let (commands, rx) = mpsc::unbounded_channel();
             let (cancel, _) = watch::channel(0);
@@ -358,6 +367,7 @@ impl Runtime {
                 generation: Mutex::new(None),
                 sandbox_choice: Mutex::new(sandbox_choice),
                 pending_sandbox: Mutex::new(None),
+                loaded_by,
             });
             if unannounced {
                 publish(

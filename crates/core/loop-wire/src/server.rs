@@ -25,9 +25,9 @@ use loop_protocol::rpc::{
     SessionParams, SetEffortParams, SetModeParams, SetModelParams,
 };
 use loop_protocol::{
-    AgentBackend, BackendInstanceId, BackendResult, HostServices, InteractionOutcome,
-    InteractionRequest, NoticeLevel, Origin, SessionKey, SessionUpdate, TurnId, TurnOutcome,
-    UpdateEnvelope,
+    AgentBackend, BackendInstanceId, BackendResult, Caller, HostServices, InteractionOutcome,
+    InteractionRequest, NoticeLevel, Origin, Principal, SessionKey, SessionUpdate, TurnId,
+    TurnOutcome, UpdateEnvelope,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -85,6 +85,71 @@ pub enum Authority {
     Remote,
 }
 
+/// The OS user that runs this process, as a principal in the `local`
+/// issuer: `{ person, local, uid:<euid> }` (ADR-0009), or
+/// [`Principal::local_os_user`] where there is no uid.
+pub fn local_principal() -> Principal {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no arguments or preconditions.
+        Principal::local_uid(unsafe { libc::geteuid() })
+    }
+    // No numeric user id: a distinct id, never `uid:0` (root).
+    #[cfg(not(unix))]
+    {
+        Principal::local_os_user()
+    }
+}
+
+/// The caller a connection gets when its acceptor names none: the host's
+/// user on a host-local connection, and none on any other. A Remote
+/// connection never gets the local identity by default; the acceptor that
+/// checked the bearer token names it with [`serve_with_caller`].
+fn default_caller(authority: Authority) -> Option<Caller> {
+    match authority {
+        Authority::HostLocal => Some(Caller::host(local_principal())),
+        Authority::Remote => None,
+    }
+}
+
+/// Why `method` is refused for this connection's caller when the caller is
+/// a user from outside the host ([`Caller::is_host_user`] is false), such as
+/// an Edge Gateway's end user. `None` serves it.
+///
+/// The rule (H1): an outside user is served only by a Runtime with a tool
+/// lock, and never gets `session/shell`. Without the lock a Session can run
+/// shell commands as the host's OS user, which reach the Runtime's 0600
+/// Unix socket (host-local authority), its credentials and its token files.
+/// The lock turns the shell, file writes and every non-chat tool off and
+/// confines reads to the Session's folder. The check fails closed: no
+/// Runtime, no admin service, or no lock offered all refuse.
+fn outside_user_refusal(
+    host: &ClientHost,
+    runtime: Option<&dyn RuntimeControl>,
+    method: &str,
+) -> Option<RpcErrorBody> {
+    if host.caller.as_ref().is_none_or(Caller::is_host_user) {
+        return None;
+    }
+    let forbidden = |message: &str| {
+        let mut body =
+            RpcErrorBody::from(&loop_protocol::BackendError::Forbidden(method.to_owned()));
+        body.message = format!("{method} is refused: {message}");
+        body
+    };
+    if admin_offered(runtime).tool_lock.is_none() {
+        return Some(forbidden(
+            "an Edge Gateway user is served only by a Runtime with a tool lock",
+        ));
+    }
+    if method == methods::SESSION_SHELL {
+        return Some(forbidden(
+            "an Edge Gateway user cannot run shell commands on the Runtime host",
+        ));
+    }
+    None
+}
+
 /// Whether `method` with `params` needs host-local authority: the host-only
 /// methods, and a `workspace/trust` change.
 fn host_only(method: &str, params: &Value) -> bool {
@@ -106,7 +171,8 @@ pub fn serve_with_options(
     info: PeerInfo,
     options: ServeOptions,
 ) -> Served {
-    start(backend, None, transport, info, options)
+    let caller = default_caller(options.authority);
+    start(backend, None, transport, info, options, caller)
 }
 
 /// Serve one connection of a shared Runtime: multi-Session methods, per-
@@ -119,7 +185,25 @@ pub fn serve_with_control(
     info: PeerInfo,
     options: ServeOptions,
 ) -> Served {
-    start(backend, Some(control), transport, info, options)
+    let caller = default_caller(options.authority);
+    start(backend, Some(control), transport, info, options, caller)
+}
+
+/// [`serve_with_control`] (or, without `control`, [`serve_with_options`])
+/// for a connection whose acceptor authenticated `caller`: the loopback
+/// WebSocket with the bearer token, or an Edge Gateway connection that
+/// asserted a principal at its handshake. The caller is fixed for the
+/// connection's life; no request can change it. It does not change
+/// `options.authority`: only a host-local transport serves host-only methods.
+pub fn serve_with_caller(
+    backend: Arc<dyn AgentBackend>,
+    control: Option<Arc<dyn RuntimeControl>>,
+    transport: Transport,
+    info: PeerInfo,
+    options: ServeOptions,
+    caller: Caller,
+) -> Served {
+    start(backend, control, transport, info, options, Some(caller))
 }
 
 fn start(
@@ -128,6 +212,7 @@ fn start(
     transport: Transport,
     info: PeerInfo,
     options: ServeOptions,
+    caller: Option<Caller>,
 ) -> Served {
     let (conn, incoming) = Connection::new(transport);
     let interact = Arc::new(AtomicBool::new(true));
@@ -136,8 +221,9 @@ fn start(
         interact: Arc::clone(&interact),
         branch_reset: AtomicBool::new(false),
         id: NEXT_TICKET.fetch_add(1, Ordering::Relaxed),
+        caller,
     });
-    let done = tokio::spawn(run(
+    let served = run(
         backend,
         runtime,
         conn,
@@ -145,8 +231,17 @@ fn start(
         info,
         options,
         host.clone(),
-    ));
+    );
+    let done = tokio::spawn(in_scope(host.caller.clone(), served));
     Served { host, done }
+}
+
+/// Run `future` with `caller` as [`Caller::current`], when there is one.
+async fn in_scope<F: std::future::Future>(caller: Option<Caller>, future: F) -> F::Output {
+    match caller {
+        Some(caller) => caller.scope(future).await,
+        None => future.await,
+    }
 }
 
 /// What the request loop tells the forwarder.
@@ -200,6 +295,8 @@ async fn run(
     // missed; forwarding starts once the client is initialized.
     let updates = backend.subscribe();
     let (control, control_rx) = mpsc::unbounded_channel();
+    // Not in the caller's scope: it only forwards updates and registers
+    // this connection for Escalations, and reads no identity.
     let forwarder = tokio::spawn(forward(
         Arc::clone(&conn),
         backend.instance().clone(),
@@ -213,7 +310,9 @@ async fn run(
         match message {
             Incoming::Response { id, result } => conn.resolve(id, result).await,
             Incoming::Notification { method, params } => {
-                if method == methods::SESSION_CANCEL {
+                if method == methods::SESSION_CANCEL
+                    && outside_user_refusal(&host, runtime.as_deref(), &method).is_none()
+                {
                     if let Ok(SessionParams { session }) = parse::<SessionParams>(params) {
                         backend.cancel(&session);
                     }
@@ -237,6 +336,8 @@ async fn run(
                                 capabilities.efforts = false;
                                 capabilities.modes = false;
                             }
+                            // From the connection, never from `params`.
+                            let caller = host.caller.clone();
                             let offered = admin_offered(runtime.as_deref());
                             let host = options.authority == Authority::HostLocal;
                             capabilities.workspace_settings = offered.workspace_settings;
@@ -270,11 +371,15 @@ async fn run(
                                 capabilities.host_usage = false;
                                 capabilities.host_defaults = false;
                             }
+                            let caller = caller.as_ref();
                             let result = InitializeResult {
                                 protocol_version: negotiate(params.protocol_version),
                                 server_info: info.clone(),
                                 instance: backend.instance().clone(),
                                 capabilities,
+                                principal: caller.map(|c| c.principal().clone()),
+                                tenant: caller.map(|c| c.tenant().clone()),
+                                via: caller.and_then(|c| c.via().cloned()),
                             };
                             conn.respond(id, Ok(to_value(&result)));
                             if !initialized {
@@ -291,6 +396,12 @@ async fn run(
                         id,
                         Err((codes::INVALID_REQUEST, "call initialize first".into())),
                     );
+                    continue;
+                }
+                // An outside user (an Edge Gateway assertion) is served only
+                // by a tool-locked Runtime, and never gets `session/shell`.
+                if let Some(refused) = outside_user_refusal(&host, runtime.as_deref(), &method) {
+                    respond(&conn, id, Err(refused));
                     continue;
                 }
                 // Refused before parsing or dispatch, whatever the params.
@@ -313,8 +424,10 @@ async fn run(
                 let control = control.clone();
                 let host = host.clone();
                 // Each request runs on its own, so a long `session/load`
-                // doesn't hold up a `session/cancel`.
-                tokio::spawn(async move {
+                // doesn't hold up a `session/cancel`. The connection's
+                // caller is in scope for the backend and the Runtime.
+                let caller = host.caller.clone();
+                tokio::spawn(in_scope(caller, async move {
                     handle(
                         backend.as_ref(),
                         runtime.as_deref(),
@@ -325,7 +438,7 @@ async fn run(
                         params,
                     )
                     .await;
-                });
+                }));
             }
         }
     }
@@ -1329,6 +1442,8 @@ struct ClientHost {
     /// Whether the client declared `interact` at `initialize`.
     interact: Arc<AtomicBool>,
     branch_reset: AtomicBool,
+    /// Who this connection acts for. Fixed when the connection was accepted.
+    caller: Option<Caller>,
 }
 
 async fn register_recipient(

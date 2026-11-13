@@ -184,6 +184,26 @@ enum RuntimeCommand {
         /// [default: the `LOOP_TOOL_LOCK_ROOT` environment variable].
         #[arg(long, value_name = "DIR")]
         tool_lock_root: Option<PathBuf>,
+        /// UNSTABLE, not for real users yet: serve a trusted Edge Gateway
+        /// on this loopback IP address and port. The gateway names the end
+        /// user of each connection at its handshake. Needs
+        /// `--unstable-edge-token-file` and `--tool-lock` [default: off].
+        #[arg(
+            long = "unstable-edge-listen",
+            value_name = "ADDR",
+            requires = "edge_token_file"
+        )]
+        edge_listen: Option<std::net::SocketAddr>,
+        /// UNSTABLE, with `--unstable-edge-listen`: a private (0600) file
+        /// of at least 32 bytes that holds the gateway's bearer token,
+        /// outside the agent directory. It must differ from the Runtime
+        /// token.
+        #[arg(
+            long = "unstable-edge-token-file",
+            value_name = "FILE",
+            requires = "edge_listen"
+        )]
+        edge_token_file: Option<PathBuf>,
     },
     /// Ask the running Runtime to stop, through its socket, and wait up to
     /// 10 s for it to go. Never signals a process.
@@ -388,6 +408,8 @@ async fn real_main() -> anyhow::Result<()> {
                         max_active_turns,
                         tool_lock,
                         tool_lock_root,
+                        edge_listen,
+                        edge_token_file,
                     } => {
                         let cwd = match &cli.cwd {
                             Some(cwd) => std::path::absolute(cwd)?,
@@ -403,6 +425,8 @@ async fn real_main() -> anyhow::Result<()> {
                             cwd,
                             tool_lock: tool_lock.clone(),
                             tool_lock_root: tool_lock_root.clone(),
+                            edge_listen: *edge_listen,
+                            edge_token_file: edge_token_file.clone(),
                         })
                         .await
                     }
@@ -848,6 +872,59 @@ mod tests {
         };
         assert_eq!(tool_lock.as_deref(), Some("chat"));
         assert_eq!(tool_lock_root, Some(PathBuf::from("/srv/users")));
+        let cli = parse(&[
+            "loop",
+            "runtime",
+            "start",
+            "--unstable-edge-listen",
+            "127.0.0.1:7801",
+            "--unstable-edge-token-file",
+            "/run/edge.token",
+        ]);
+        let Some(Commands::Runtime(RuntimeCommand::Start {
+            edge_listen,
+            edge_token_file,
+            ..
+        })) = cli.command
+        else {
+            panic!("not runtime start")
+        };
+        assert_eq!(edge_listen, Some("127.0.0.1:7801".parse().unwrap()));
+        assert_eq!(edge_token_file, Some(PathBuf::from("/run/edge.token")));
+        // Each needs the other.
+        for args in [
+            &[
+                "loop",
+                "runtime",
+                "start",
+                "--unstable-edge-listen",
+                "127.0.0.1:7801",
+            ][..],
+            &[
+                "loop",
+                "runtime",
+                "start",
+                "--unstable-edge-token-file",
+                "/run/edge.token",
+            ][..],
+            // The old, stable-sounding names are gone.
+            &[
+                "loop",
+                "runtime",
+                "start",
+                "--edge-listen",
+                "127.0.0.1:7801",
+            ][..],
+            &[
+                "loop",
+                "runtime",
+                "start",
+                "--edge-token-file",
+                "/run/edge.token",
+            ][..],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
         let cli = parse(&["loop", "runtime", "stop", "--socket", "/tmp/x.sock"]);
         assert!(matches!(
             cli.command,
