@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 pub use loop_workspace::{
-    Sandbox, SandboxConfig, SandboxError, SandboxFactory, SandboxInfo, SandboxStatus,
+    Sandbox, SandboxConfig, SandboxError, SandboxFactory, SandboxInfo, SandboxStatus, Workspace,
 };
 
 /// Harness sandbox mode.
@@ -18,7 +18,9 @@ pub enum SandboxMode {
     Disabled,
     /// Use the given sandbox env for tools.
     Enabled {
-        /// Sandbox instance.
-        sandbox: Arc<dyn Sandbox>,
+        /// Sandbox instance. A [`Workspace`] is a [`Sandbox`], so callers
+        /// that need only the lifecycle use it as before; `spawn`, transfer
+        /// and capabilities stay reachable.
+        sandbox: Arc<dyn Workspace>,
     },
 }

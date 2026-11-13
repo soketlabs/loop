@@ -37,3 +37,14 @@ pub use loop_workspace::{
     WorkspaceDriverRegistry, WorkspaceError, WorkspacePath, WorkspaceProcess, WorkspaceSpec,
     WorkspaceStatus,
 };
+
+/// Whether `sandbox` and `workspace` are the same object (address only).
+pub fn same_sandbox(
+    sandbox: &std::sync::Arc<dyn Sandbox>,
+    workspace: &std::sync::Arc<dyn Workspace>,
+) -> bool {
+    std::ptr::addr_eq(
+        std::sync::Arc::as_ptr(sandbox),
+        std::sync::Arc::as_ptr(workspace),
+    )
+}

@@ -18,9 +18,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use loop_agent::harness::sandbox::{builtin_workspace_drivers, HostOs};
+use loop_agent::harness::sandbox::{builtin_workspace_drivers, HostOs, Workspace};
 use loop_agent::harness::{
-    KrunIsolation, LocalSandboxRuntime, Sandbox, SandboxConfig, SandboxRegistry,
+    KrunIsolation, LocalSandboxRuntime, SandboxConfig, SandboxRegistry,
 };
 use serde_json::json;
 
@@ -443,7 +443,7 @@ impl SandboxBuilder {
         &self,
         workdir: &Path,
         request: &SandboxRequest,
-    ) -> Result<(Arc<dyn Sandbox>, SandboxPlan), SandboxBuildError> {
+    ) -> Result<(Arc<dyn Workspace>, SandboxPlan), SandboxBuildError> {
         let plan = self.resolve(request)?;
         // Settings -> registry lookup -> platform check. A kind with no driver
         // for this platform is "not available", as before.
@@ -458,7 +458,7 @@ impl SandboxBuilder {
             .create(plan.config_for_agent(workdir, &self.agent_dir))
             .await
             .map_err(|e| SandboxBuildError::Start(e.to_string()))?;
-        let sandbox: Arc<dyn Sandbox> = workspace;
+        let sandbox = workspace;
         if let Err(e) = sandbox.start().await {
             let _ = sandbox.destroy().await;
             return Err(SandboxBuildError::Start(e.to_string()));
@@ -472,7 +472,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use loop_agent::harness::{
-        ExecutionEnv, HostExecutionEnv, SandboxError, SandboxFactory, SandboxInfo, SandboxStatus,
+        ExecutionEnv, HostExecutionEnv, Sandbox, SandboxError, SandboxFactory, SandboxInfo,
+        SandboxStatus,
     };
     use parking_lot::Mutex;
 

@@ -67,7 +67,7 @@ impl PendingSandbox {
         if let SandboxMode::Enabled { sandbox } = self.mode {
             if !self
                 .shared
-                .is_some_and(|shared| Arc::ptr_eq(&shared, &sandbox))
+                .is_some_and(|shared| loop_agent::harness::sandbox::same_sandbox(&shared, &sandbox))
             {
                 let _ = sandbox.destroy().await;
             }
@@ -91,7 +91,7 @@ impl LiveSession {
         let previous = self.opened.harness.replace_sandbox(mode).await;
         // The workspace's own sandbox serves other Sessions; keep it.
         if let SandboxMode::Enabled { sandbox } = previous {
-            if !shared.is_some_and(|shared| Arc::ptr_eq(&shared, &sandbox)) {
+            if !shared.is_some_and(|shared| loop_agent::harness::sandbox::same_sandbox(&shared, &sandbox)) {
                 let _ = sandbox.destroy().await;
             }
         }
@@ -244,7 +244,7 @@ impl Runtime {
             .replace_sandbox(SandboxMode::Disabled)
             .await;
         if let SandboxMode::Enabled { sandbox } = own {
-            if !shared.is_some_and(|shared| Arc::ptr_eq(&shared, &sandbox)) {
+            if !shared.is_some_and(|shared| loop_agent::harness::sandbox::same_sandbox(&shared, &sandbox)) {
                 let _ = sandbox.destroy().await;
             }
         }
@@ -478,7 +478,7 @@ impl Runtime {
             .and_then(|state| state.sandbox.clone());
         let previous = opened.harness.replace_sandbox(mode).await;
         if let SandboxMode::Enabled { sandbox } = previous {
-            if !shared.is_some_and(|shared| Arc::ptr_eq(&shared, &sandbox)) {
+            if !shared.is_some_and(|shared| loop_agent::harness::sandbox::same_sandbox(&shared, &sandbox)) {
                 let _ = sandbox.destroy().await;
             }
         }
