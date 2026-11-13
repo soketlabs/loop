@@ -108,6 +108,23 @@ async fn over_the_wire(backend: Arc<NativeBackend>) -> (Arc<RemoteBackend>, loop
     over(backend, Wire::Memory).await
 }
 
+/// `backend` served to the host's own user: a remote connection with no
+/// named caller may not run shell commands.
+fn serve_host(
+    backend: Arc<dyn loop_protocol::AgentBackend>,
+    transport: loop_wire::Transport,
+) -> loop_wire::Served {
+    loop_wire::server::serve_with_options(
+        backend,
+        transport,
+        info("server"),
+        loop_wire::server::ServeOptions {
+            authority: loop_wire::Authority::HostLocal,
+            ..Default::default()
+        },
+    )
+}
+
 /// `backend` served over `wire`, and the client for it.
 async fn over(backend: Arc<NativeBackend>, wire: Wire) -> (Arc<RemoteBackend>, loop_wire::Served) {
     let (server_end, client_end) = match wire {
@@ -142,7 +159,7 @@ async fn over(backend: Arc<NativeBackend>, wire: Wire) -> (Arc<RemoteBackend>, l
             (accept.await.unwrap(), client)
         }
     };
-    let served = serve(backend, server_end, info("server"));
+    let served = serve_host(backend, server_end);
     let remote = RemoteBackend::connect(client_end, info("client"), Arc::new(FirstOption))
         .await
         .expect("initialize");
@@ -785,7 +802,7 @@ async fn modes_follow_the_capability_and_missing_ones_are_unsupported() {
             Err(BackendError::Unsupported(_))
         ));
         let (server_end, client_end) = memory();
-        let _served = serve(backend.clone(), server_end, info("server"));
+        let _served = serve_host(backend.clone(), server_end);
         let (conn, mut incoming) = Connection::new(client_end);
         tokio::spawn({
             let conn = conn.clone();
@@ -1009,7 +1026,7 @@ async fn compact_stats_and_shell_need_their_capabilities() {
         assert!(remote.local_shell().is_none());
         let session = backend.inner.current_session().await;
         let (server_end, client_end) = memory();
-        let _served = serve(backend.clone(), server_end, info("server"));
+        let _served = serve_host(backend.clone(), server_end);
         let (conn, mut incoming) = Connection::new(client_end);
         tokio::spawn({
             let conn = conn.clone();

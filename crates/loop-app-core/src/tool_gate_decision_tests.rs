@@ -695,3 +695,132 @@ async fn the_block_list_refusal_is_the_recorded_outcome() {
         .unwrap();
     assert_eq!(capture.take()[0].outcome, DecisionOutcome::Allow);
 }
+
+/// The effects of an approver's answer come only after the answer is
+/// recorded: with a sink that cannot write, approving a plan leaves the
+/// mode as it was, and "accept all" grants nothing.
+#[tokio::test]
+async fn an_answer_s_effects_wait_for_its_record() {
+    use crate::tool_approval::ApprovalDecision;
+    let (gate, mut prompts) = gate_with_approver_and_sink(&[("bash", "ask")]);
+    gate.set_decision_sink(Some(Arc::new(Capture {
+        fail: true,
+        ..Capture::default()
+    })));
+    gate.set_mode(Ask);
+    gate.set_mode(Plan);
+    let pending = {
+        let gate = Arc::clone(&gate);
+        tokio::spawn(async move {
+            gate.before_hook()(context("p", EXIT_PLAN_TOOL, json!({"plan": "x"})), None).await
+        })
+    };
+    let prompt = prompts.recv().await.unwrap();
+    prompt
+        .response_tx
+        .send(ApprovalDecision::AcceptSession)
+        .unwrap();
+    assert!(pending.await.unwrap().unwrap().block);
+    assert_eq!(gate.mode(), Plan, "the mode changed without a record");
+
+    gate.set_mode(Ask);
+    let pending = {
+        let gate = Arc::clone(&gate);
+        tokio::spawn(async move {
+            gate.before_hook()(context("b", "bash", json!({"command": "ls"})), None).await
+        })
+    };
+    let prompt = prompts.recv().await.unwrap();
+    prompt
+        .response_tx
+        .send(ApprovalDecision::AcceptSession)
+        .unwrap();
+    assert!(pending.await.unwrap().unwrap().block);
+    assert!(
+        gate.approver().unwrap().should_ask("bash"),
+        "a grant was made without a record"
+    );
+
+    // Control: with a sink that writes, both effects happen.
+    gate.set_decision_sink(Some(Arc::new(Capture::default())));
+    let pending = {
+        let gate = Arc::clone(&gate);
+        tokio::spawn(async move {
+            gate.before_hook()(context("b2", "bash", json!({"command": "ls"})), None).await
+        })
+    };
+    prompts
+        .recv()
+        .await
+        .unwrap()
+        .response_tx
+        .send(ApprovalDecision::AcceptSession)
+        .unwrap();
+    assert!(pending.await.unwrap().is_none());
+    assert!(!gate.approver().unwrap().should_ask("bash"));
+}
+
+/// A file edit that asks is reviewed after the write; its answer gets its
+/// own record, with the same call id.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_answer_to_a_file_review_is_recorded() {
+    use crate::tool_approval::ApprovalDecision;
+    let ws = tempfile::tempdir().unwrap();
+    let env: Arc<dyn loop_agent::harness::ExecutionEnv> = Arc::new(
+        loop_agent::harness::HostExecutionEnv::new(ws.path().to_path_buf()),
+    );
+    let gate = ToolGate::new(crate::tool_approval::permissions_from_settings(
+        &Default::default(),
+    ));
+    gate.set_workspace(ws.path().to_path_buf());
+    let (bridge, mut prompts) = ToolApprovalBridge::new(Arc::clone(&env), None, Default::default());
+    bridge.set_open_external_diff(false);
+    gate.set_approver(Some(Arc::new(bridge)));
+    let capture = Arc::new(Capture::default());
+    gate.set_decision_sink(Some(capture.clone()));
+    let args = json!({"path": "a.txt", "content": "agent text"});
+    let before = context("w1", "write", args.clone());
+    assert!(gate.before_hook()(before.clone(), None).await.is_none());
+    let tool = loop_agent::harness::tools::create_write_tool(Arc::clone(&env));
+    let result = (tool.execute)("w1".into(), args.clone(), None, None)
+        .await
+        .unwrap();
+    let after = loop_agent::AfterToolCallContext {
+        assistant_message: before.assistant_message,
+        tool_call: before.tool_call,
+        args,
+        result,
+        is_error: false,
+        context: Default::default(),
+    };
+    let reviewing = {
+        let gate = Arc::clone(&gate);
+        tokio::spawn(async move { gate.after_hook()(after, None).await })
+    };
+    prompts
+        .recv()
+        .await
+        .unwrap()
+        .response_tx
+        .send(ApprovalDecision::Reject { reason: None })
+        .unwrap();
+    let _ = reviewing.await.unwrap();
+    let records = capture.take();
+    let got: Vec<_> = records
+        .iter()
+        .map(|r| (r.call_id.as_deref(), r.outcome, r.answer, r.by))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (Some("w1"), DecisionOutcome::Ask, None, DecidedBy::Preset),
+            (
+                Some("w1"),
+                DecisionOutcome::Ask,
+                Some(DecisionAnswer::Deny),
+                DecidedBy::Approver
+            ),
+        ]
+    );
+}

@@ -199,6 +199,15 @@ impl Decided {
     }
 }
 
+/// An effect of the approver's answer, made only once the decision is
+/// recorded.
+pub(crate) enum After {
+    /// Approving a plan changes the mode.
+    Mode(PermissionMode),
+    /// "Accept all" grants a group for the rest of the Session.
+    Grant(&'static str),
+}
+
 /// The call a decision is about.
 pub(crate) struct Facts<'a> {
     pub(crate) source: DecisionSource,
@@ -671,7 +680,7 @@ impl ToolGate {
         &self,
         ctx: &BeforeToolCallContext,
         cancel: Option<CancellationToken>,
-    ) -> (Option<BeforeToolCallResult>, Decided) {
+    ) -> (Option<BeforeToolCallResult>, Decided, Option<After>) {
         let block = |reason: String| {
             Some(BeforeToolCallResult {
                 block: true,
@@ -684,6 +693,7 @@ impl ToolGate {
             return (
                 block(reason.into()),
                 Decided::deny(DecidedBy::NoApprover, reason),
+                None,
             );
         };
         let plan = ctx
@@ -700,12 +710,12 @@ impl ToolGate {
                 } else {
                     back
                 };
-                self.set_mode(mode);
-                let recorder = self.mode_recorder.lock().clone();
-                if let Some(recorder) = recorder {
-                    recorder(mode).await;
-                }
-                (None, Decided::answered(true, escalation))
+                // The mode changes once the decision is recorded.
+                (
+                    None,
+                    Decided::answered(true, escalation),
+                    Some(After::Mode(mode)),
+                )
             }
             PlanReview::KeepPlanning(reason) => {
                 let reason = match reason {
@@ -719,7 +729,7 @@ impl ToolGate {
                     ),
                 };
                 let decided = Decided::answered(false, escalation).because(Some(reason.clone()));
-                (block(reason), decided)
+                (block(reason), decided, None)
             }
         }
     }
@@ -904,7 +914,7 @@ impl ToolGate {
                 let args = ctx.args.clone();
                 let source = source.unwrap_or_else(|| source_of(&tool_call));
                 let kind = gate.kind(&tool_call.name).await;
-                let (result, decided, unasked) = gate.check(ctx, cancel).await;
+                let (result, decided, unasked, after) = gate.check(ctx, cancel).await;
                 let facts = Facts {
                     source,
                     tool: &tool_call.name,
@@ -923,6 +933,22 @@ impl ToolGate {
                 if unasked {
                     gate.mark_allowed(&tool_call, &args);
                 }
+                // Effects of the answer come only after it is recorded.
+                match after {
+                    Some(After::Mode(mode)) => {
+                        gate.set_mode(mode);
+                        let recorder = gate.mode_recorder.lock().clone();
+                        if let Some(recorder) = recorder {
+                            recorder(mode).await;
+                        }
+                    }
+                    Some(After::Grant(group)) => {
+                        if let Some(approver) = gate.approver() {
+                            approver.grant_and_persist(group).await;
+                        }
+                    }
+                    None => {}
+                }
                 result
             })
         })
@@ -935,7 +961,7 @@ impl ToolGate {
         &self,
         ctx: BeforeToolCallContext,
         cancel: Option<CancellationToken>,
-    ) -> (Option<BeforeToolCallResult>, Decided, bool) {
+    ) -> (Option<BeforeToolCallResult>, Decided, bool, Option<After>) {
         let block = |reason: String| {
             Some(BeforeToolCallResult {
                 block: true,
@@ -948,12 +974,13 @@ impl ToolGate {
                 block(reason.clone()),
                 Decided::from_verdict(&verdict),
                 false,
+                None,
             );
         }
         // Only the user ends plan mode: hooks don't decide this one.
         if ctx.tool_call.name == EXIT_PLAN_TOOL {
-            let (result, decided) = self.review_plan(&ctx, cancel).await;
-            return (result, decided, false);
+            let (result, decided, after) = self.review_plan(&ctx, cancel).await;
+            return (result, decided, false, after);
         }
         if let Some(hooks) = self.hooks() {
             let info = self.call_info(&ctx.tool_call, &ctx.args).await;
@@ -965,7 +992,12 @@ impl ToolGate {
                     outcome = emit => outcome,
                     () = cancel.cancelled() => {
                         let reason = "Operation aborted";
-                        return (block(reason.into()), Decided::deny(DecidedBy::Hook, reason), false);
+                        return (
+                            block(reason.into()),
+                            Decided::deny(DecidedBy::Hook, reason),
+                            false,
+                            None,
+                        );
                     }
                 },
                 None => emit.await,
@@ -973,20 +1005,20 @@ impl ToolGate {
             match outcome.decision {
                 Some(ToolDecision::Block { reason }) => {
                     let decided = Decided::deny(DecidedBy::Hook, reason.clone());
-                    return (block(reason), decided, false);
+                    return (block(reason), decided, false, None);
                 }
                 Some(ToolDecision::Allow) => {
                     // A Policy layer's "ask" holds even against a hook.
                     let call = self.call(&ctx.tool_call.name, &ctx.args).await;
                     if !self.effective_policy().requires_ask(&call) {
-                        return (None, Decided::allow(DecidedBy::Hook), true);
+                        return (None, Decided::allow(DecidedBy::Hook), true, None);
                     }
                 }
                 None => {}
             }
         }
         if verdict.decision == Decision::Allow {
-            return (None, Decided::from_verdict(&verdict), true);
+            return (None, Decided::from_verdict(&verdict), true, None);
         }
         match self.approver() {
             // Only some tools have an approval prompt; asking about the
@@ -1001,7 +1033,7 @@ impl ToolGate {
                     ctx.tool_call.name
                 );
                 let decided = Decided::deny(DecidedBy::NoApprover, reason.clone()).after(&verdict);
-                (block(reason), decided, false)
+                (block(reason), decided, false, None)
             }
             Some(approver) => {
                 let call = self.call(&ctx.tool_call.name, &ctx.args).await;
@@ -1009,24 +1041,26 @@ impl ToolGate {
                 let (result, review) = approver
                     .review_before_tool(ctx, cancel, ignore_grants)
                     .await;
+                let mut after = None;
                 let decided = match review {
                     Review::Granted => Decided::allow(DecidedBy::Grant).after(&verdict),
                     // A file tool: the review comes after the write, and its
-                    // answer is in the `escalation_answered` record.
+                    // answer gets its own record then.
                     Review::Later => Decided::from_verdict(&verdict),
-                    Review::Asked { escalation } => {
+                    Review::Asked { escalation, grant } => {
+                        after = grant.map(After::Grant);
                         let reason = result.as_ref().and_then(|r| r.reason.clone());
                         Decided::answered(result.is_none(), escalation)
                             .after(&verdict)
                             .because(reason)
                     }
                 };
-                (result, decided, false)
+                (result, decided, false, after)
             }
             None => {
                 let reason = headless_refusal(&ctx.tool_call.name, self.mode());
                 let decided = Decided::deny(DecidedBy::NoApprover, reason.clone()).after(&verdict);
-                (block(reason), decided, false)
+                (block(reason), decided, false, None)
             }
         }
     }
@@ -1042,9 +1076,28 @@ impl ToolGate {
                     Some(approver) if !allowed => {
                         let call = gate.call(&ctx.tool_call.name, &ctx.args).await;
                         let ignore_grants = gate.effective_policy().requires_ask(&call);
-                        approver
+                        let (patch, answer) = approver
                             .review_after_file_tool(ctx.clone(), cancel, ignore_grants)
-                            .await
+                            .await;
+                        // The answer to a review after the write gets its
+                        // own record. The write already happened; a reject
+                        // reverted it.
+                        if let Some(answer) = answer {
+                            let decided = Decided::answered(answer.accepted, answer.escalation);
+                            let facts = Facts {
+                                source: source_of(&ctx.tool_call),
+                                tool: &ctx.tool_call.name,
+                                kind: gate.kind(&ctx.tool_call.name).await,
+                                call_id: Some(&ctx.tool_call.id),
+                                args: &ctx.args,
+                                caller: None,
+                                session: None,
+                            };
+                            if let Err(error) = gate.record(facts, &decided).await {
+                                tracing::warn!(%error, "file review answer not recorded");
+                            }
+                        }
+                        patch
                     }
                     _ => None,
                 };

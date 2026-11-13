@@ -189,8 +189,23 @@ pub(crate) enum Review {
     /// Not asked: a Session grant ("accept all") covers it.
     Granted,
     /// The user was asked, through the Escalation `escalation` when the
-    /// approver is a Runtime host.
-    Asked { escalation: Option<String> },
+    /// approver is a Runtime host. `grant` is the group the user accepted
+    /// for the rest of the Session; the gate grants it once the decision
+    /// is recorded.
+    Asked {
+        escalation: Option<String>,
+        grant: Option<&'static str>,
+    },
+}
+
+/// The user's answer to a file review after the write, for its decision
+/// record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileAnswer {
+    /// Kept (`true`) or reverted.
+    pub(crate) accepted: bool,
+    /// The Escalation that asked, when the approver is a Runtime host.
+    pub(crate) escalation: Option<String>,
 }
 
 /// The user's answer to a plan (`exit_plan`).
@@ -451,20 +466,37 @@ impl ToolApprovalBridge {
                 block: true,
                 reason: Some("Approval cancelled".into()),
             };
-            return (Some(blocked), Review::Asked { escalation: None });
+            return (
+                Some(blocked),
+                Review::Asked {
+                    escalation: None,
+                    grant: None,
+                },
+            );
         }
 
         let (decision, escalation) = self
             .ask_user(kind, name, summary, detail, cancel.as_ref())
             .await;
-        let asked = Review::Asked { escalation };
+        let asked = Review::Asked {
+            escalation,
+            grant: None,
+        };
 
         match decision {
             ApprovalDecision::Accept => (None, asked),
-            ApprovalDecision::AcceptSession => {
-                self.grant_and_persist(kind.group()).await;
-                (None, asked)
-            }
+            // The grant is made after the decision is recorded
+            // ([`Review::Asked::grant`]).
+            ApprovalDecision::AcceptSession => (
+                None,
+                Review::Asked {
+                    escalation: match asked {
+                        Review::Asked { escalation, .. } => escalation,
+                        _ => None,
+                    },
+                    grant: Some(kind.group()),
+                },
+            ),
             ApprovalDecision::Reject { reason } => {
                 let msg = match reason.filter(|r| !r.trim().is_empty()) {
                     Some(r) => format!("User rejected {subject}. Reason: {r}"),
@@ -516,13 +548,13 @@ impl ToolApprovalBridge {
         ctx: AfterToolCallContext,
         cancel: Option<CancellationToken>,
         ignore_grants: bool,
-    ) -> Option<AfterToolCallResult> {
+    ) -> (Option<AfterToolCallResult>, Option<FileAnswer>) {
         if ctx.is_error {
-            return None;
+            return (None, None);
         }
         let name = ctx.tool_call.name.as_str();
         if name != "write" && name != "edit" {
-            return None;
+            return (None, None);
         }
         if !self.asks(name, ignore_grants) {
             // Still clean up review snapshots when not asking.
@@ -534,15 +566,18 @@ impl ToolApprovalBridge {
             {
                 cleanup_snapshot(Some(Path::new(prev)));
             }
-            return None;
+            return (None, None);
         }
 
-        let path = ctx
+        let Some(path) = ctx
             .result
             .details
             .get("path")
             .and_then(|v| v.as_str())
-            .map(PathBuf::from)?;
+            .map(PathBuf::from)
+        else {
+            return (None, None);
+        };
         let previous_path = ctx
             .result
             .details
@@ -554,17 +589,22 @@ impl ToolApprovalBridge {
         let _lock = self.gate.lock().await;
         if !self.asks(name, ignore_grants) {
             cleanup_snapshot(previous_path.as_deref());
-            return None;
+            return (None, None);
         }
         if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
             let _ = self
                 .revert_change(&path, previous_path.as_deref(), &review)
                 .await;
-            return Some(reject_file_patch(
+            let patch = reject_file_patch(
                 "File edit review cancelled",
                 &path,
                 previous_path.as_deref(),
-            ));
+            );
+            let answer = FileAnswer {
+                accepted: false,
+                escalation: None,
+            };
+            return (Some(patch), Some(answer));
         }
 
         if self.open_external_diff.load(Ordering::SeqCst) {
@@ -583,7 +623,7 @@ impl ToolApprovalBridge {
 
         let target = review.target_path.as_deref().filter(|_| review.via_link);
         let (summary, detail) = file_edit_prompt(&path, target);
-        let (decision, _escalation) = self
+        let (decision, escalation) = self
             .ask_user(
                 ApprovalKind::FileEdit,
                 name,
@@ -593,15 +633,21 @@ impl ToolApprovalBridge {
             )
             .await;
 
+        let answer = |accepted| {
+            Some(FileAnswer {
+                accepted,
+                escalation: escalation.clone(),
+            })
+        };
         match decision {
             ApprovalDecision::Accept => {
                 cleanup_snapshot(previous_path.as_deref());
-                None
+                (None, answer(true))
             }
             ApprovalDecision::AcceptSession => {
                 cleanup_snapshot(previous_path.as_deref());
                 self.grant_and_persist(ApprovalKind::FileEdit.group()).await;
-                None
+                (None, answer(true))
             }
             ApprovalDecision::Reject { reason } => {
                 if let Err(e) = self
@@ -615,7 +661,7 @@ impl ToolApprovalBridge {
                     Some(r) => format!("User rejected the edit to {}. Reason: {r}", path.display()),
                     None => format!("User rejected the edit to {}.", path.display()),
                 };
-                Some(reject_file_patch(&msg, &path, None))
+                (Some(reject_file_patch(&msg, &path, None)), answer(false))
             }
         }
     }
@@ -677,7 +723,7 @@ impl ToolApprovalBridge {
         (decision, escalation)
     }
 
-    async fn grant_and_persist(&self, group: &str) {
+    pub(crate) async fn grant_and_persist(&self, group: &str) {
         self.grant_session(group);
         let label = format!("{AUTO_APPROVE_LABEL_PREFIX}{group}");
         let persist = self.persist.lock().clone();
