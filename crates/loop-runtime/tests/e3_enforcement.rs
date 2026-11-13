@@ -2045,6 +2045,8 @@ async fn e3_enforcement() {
     for ((route, verdict), n) in &by {
         println!("E3|COUNT|{route}|{verdict}|{n}");
     }
+    // The leaks still open are listed in docs/probes/e3-results.md
+    // ("Expected leak list"): 086, 087, 089, 122-125. Any other id is new.
     let leaks = rows.iter().filter(|r| r.2 == "LEAK").count();
     assert_eq!(leaks, 0, "{leaks} leaks; see E3|LEAK lines");
 }

@@ -1,5 +1,27 @@
 # Probe E3 results: enforcement arm
 
+## Expected leak list (current)
+
+The E3 harness asserts 0 leaks, so a run "fails" until every leak is
+closed. Check a run against this list. Any id that is not on it is a new
+leak.
+
+**7 ids, all on the `embedded` route in `full-access` mode: 086, 087, 089,
+122, 123, 124, 125.**
+
+- 086, 087, 089: a wrapped or quoted command under a `tool_call` hook that
+  blocks `*touch*`. Hook matchers still read the command as text (S4 §7,
+  later step).
+- 122–125: the agent changes its own settings, hooks or MCP config (L7;
+  S4 §5 protected paths).
+
+Since branch `feat/one-gate` (I4, "Permissions: unreadable commands fail
+closed"), 074–079, 084 and 085 are closed. These are the wrapped commands
+under the deny rule `bash(touch*)`: `bash -c`, `sh -c`, `env`, `command`,
+an absolute program path, an upper-case program, a pipe into `sh` and a
+command substitution. Before that, the list had 15 ids:
+074–079, 084–087, 089, 122–125.
+
 ## Gate
 
 E3 gates the merge of `staging` to `main`. The enforcement arm must show:
