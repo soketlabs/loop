@@ -15,7 +15,11 @@
 //! - [`event`]: `Event`, `EventKind`, `LoggedEvent` (alias `Committed`),
 //!   `MAX_BATCH_EVENTS`, `WRITER_QUEUE_CAPACITY`, `is_recovery_record`,
 //!   `validate_batch`, `stamp`.
-//! - [`log`]: the present `EventLog` trait.
+//! - [`log`]: the present `EventLog` trait. Step B2 added the provided
+//!   methods `read_session_page`, `session_summary`, `recovery_page` and
+//!   `capabilities`.
+//! - [`page`]: `Cursor`, `Page`, `PageLimit` (B2).
+//! - [`store`]: `SessionSummary`, `SummaryDelta`, `summarize` (B2).
 //! - [`error`]: `StoreError` (was `EventLogError`) and `Result`.
 //!
 //! `loop_runtime::log` re-exports all of these at their old paths.
@@ -25,7 +29,6 @@
 //! - [`identity`]: `Tenant`, `Principal`, `PrincipalKind`, `Identity`,
 //!   `SystemScope` (B3).
 //! - [`lease`]: `Generation`, `OwnerInfo`, `Fence` (B4, chain D).
-//! - [`page`]: `Cursor`, `Page` (B2).
 //! - [`append`]: `Append` (B4, B5).
 //! - [`records`]: payloads of `policy_decision`, `tree`, `session_deleted`,
 //!   and the `session_opened` origin (A5, B5).
@@ -34,7 +37,8 @@
 //!   move to `loop-protocol`).
 //! - [`class`]: durable and live-only classes of updates and records (A0, A4).
 //! - [`store`]: `EventWriter`, `EventReader`, `TreeReader`, `LeaseStore`,
-//!   `ProjectionAdmin`, `Store`, `StoreCapabilities` (B1 to B7).
+//!   `ProjectionAdmin`, `Store` (B1 to B7). `StoreCapabilities` is returned
+//!   by `EventLog::capabilities`.
 
 pub mod append;
 pub mod class;
@@ -57,10 +61,10 @@ pub use event::{
 };
 pub use identity::{Identity, Principal, PrincipalKind, SystemScope, Tenant};
 pub use lease::{Fence, Generation, OwnerInfo};
-pub use log::EventLog;
-pub use page::{Cursor, Page};
+pub use log::{record_bytes, EventLog};
+pub use page::{Cursor, Page, PageLimit};
 pub use store::{
-    EventReader, EventWriter, LeaseStore, ProjectionAdmin, RebuildReport, SessionSummary, Store,
-    StoreCapabilities, TreeReader, VerifyReport,
+    summarize, EventReader, EventWriter, LeaseStore, ProjectionAdmin, RebuildReport,
+    SessionSummary, Store, StoreCapabilities, SummaryDelta, TreeReader, VerifyReport,
 };
 pub use tree::{SessionMetadata, SessionTreeEntry};
