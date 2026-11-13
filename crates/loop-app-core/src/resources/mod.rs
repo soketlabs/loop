@@ -3,10 +3,10 @@
 use std::path::{Path, PathBuf};
 
 use loop_agent::harness::prompt_templates::{load_prompt_templates, load_prompt_templates_in};
-use loop_agent::harness::skills::{load_skills, load_skills_in};
+use loop_agent::harness::skills::{host_global_gitignore, load_skills, load_skills_in};
 use loop_agent::harness::types::{FileSystem, PromptTemplate, Skill};
 
-use crate::config::paths::get_project_dir;
+use crate::config::paths::{get_project_dir, settings_path};
 use crate::config::Settings;
 
 /// Loaded resources for a session.
@@ -66,11 +66,15 @@ enum Scope {
 }
 
 /// The skill folders in precedence order (the first skill of a name wins).
+///
+/// `listed_in` says which settings file the `skills` list of `settings` came
+/// from ([`settings_layers`]).
 fn skill_dirs(
     agent_dir: &Path,
     cwd: &Path,
     project_trusted: bool,
     settings: &Settings,
+    listed_in: Scope,
 ) -> Vec<(PathBuf, Scope)> {
     let mut skill_dirs = Vec::new();
 
@@ -93,15 +97,37 @@ fn skill_dirs(
         }
     }
 
-    // Extra skill paths from settings: the user's own, so host paths. A
-    // folder that is not there is left out.
+    // Extra skill paths from settings. The folder check is the loader's:
+    // a folder that is not there loads nothing.
     for entry in &settings.skills {
-        let path = expand_path(entry, agent_dir);
-        if path.is_dir() {
-            skill_dirs.push((path, Scope::Global));
-        }
+        skill_dirs.push((expand_path(entry, agent_dir), listed_in));
     }
     skill_dirs
+}
+
+/// Which settings file the `skills` and the `prompts` list of the merged
+/// `settings` came from. A trusted project `settings.json` replaces a list
+/// when it names one (`project_overlay`), so a list that differs from the
+/// global file's own list came from the project: its entries are project
+/// paths and are read through the Workspace. The merged settings do not keep
+/// the layer, so this loads the global file again and compares. A list equal
+/// to the global one names the user's own folders and stays a host read.
+fn settings_layers(agent_dir: &Path, project_trusted: bool, settings: &Settings) -> (Scope, Scope) {
+    if !project_trusted {
+        return (Scope::Global, Scope::Global);
+    }
+    let global = Settings::load_file(&settings_path(agent_dir)).unwrap_or_default();
+    let layer = |merged: &[String], own: &[String]| {
+        if merged == own {
+            Scope::Global
+        } else {
+            Scope::Project
+        }
+    };
+    (
+        layer(&settings.skills, &global.skills),
+        layer(&settings.prompts, &global.prompts),
+    )
 }
 
 /// The prompt template folders in precedence order.
@@ -110,13 +136,14 @@ fn prompt_dirs(
     cwd: &Path,
     project_trusted: bool,
     settings: &Settings,
+    listed_in: Scope,
 ) -> Vec<(PathBuf, Scope)> {
     let mut prompt_dirs = vec![(agent_dir.join("prompts"), Scope::Global)];
     if project_trusted {
         prompt_dirs.push((get_project_dir(cwd).join("prompts"), Scope::Project));
     }
     for entry in &settings.prompts {
-        prompt_dirs.push((expand_path(entry, agent_dir), Scope::Global));
+        prompt_dirs.push((expand_path(entry, agent_dir), listed_in));
     }
     prompt_dirs
 }
@@ -135,7 +162,7 @@ pub fn load_resources(
     let mut out = LoadedResources::default();
     let mut seen_dirs = std::collections::HashSet::new();
     let mut seen_skills = std::collections::HashSet::new();
-    for (dir, _) in skill_dirs(agent_dir, cwd, project_trusted, settings) {
+    for (dir, _) in skill_dirs(agent_dir, cwd, project_trusted, settings, Scope::Global) {
         if !dir.is_dir() {
             continue;
         }
@@ -147,7 +174,7 @@ pub fn load_resources(
     }
 
     let mut seen_prompts = std::collections::HashSet::new();
-    for (dir, _) in prompt_dirs(agent_dir, cwd, project_trusted, settings) {
+    for (dir, _) in prompt_dirs(agent_dir, cwd, project_trusted, settings, Scope::Global) {
         if !dir.is_dir() {
             continue;
         }
@@ -175,16 +202,19 @@ pub async fn load_resources_in(
     settings: &Settings,
 ) -> LoadedResources {
     let mut out = LoadedResources::default();
+    // The user's global ignore file is a host read, made once.
+    let global_ignore = host_global_gitignore();
+    let (skills_from, prompts_from) = settings_layers(agent_dir, project_trusted, settings);
     let mut seen_dirs = std::collections::HashSet::new();
     let mut seen_skills = std::collections::HashSet::new();
-    for (dir, scope) in skill_dirs(agent_dir, cwd, project_trusted, settings) {
+    for (dir, scope) in skill_dirs(agent_dir, cwd, project_trusted, settings, skills_from) {
         let (key, skills) = match scope {
             Scope::Global => {
                 if !dir.is_dir() {
                     continue;
                 }
                 let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-                if seen_dirs.contains(&(scope, key.clone())) {
+                if seen_dirs.contains(&key) {
                     continue;
                 }
                 (key, load_skills(&dir).0)
@@ -197,18 +227,18 @@ pub async fn load_resources_in(
                     .canonical_path(&dir)
                     .await
                     .unwrap_or_else(|_| dir.clone());
-                if seen_dirs.contains(&(scope, key.clone())) {
+                if seen_dirs.contains(&key) {
                     continue;
                 }
-                (key, load_skills_in(workspace, &dir).await.0)
+                (key, load_skills_in(workspace, &dir, &global_ignore).await.0)
             }
         };
-        seen_dirs.insert((scope, key));
+        seen_dirs.insert(key);
         add_skills(&mut out, &mut seen_skills, settings, skills);
     }
 
     let mut seen_prompts = std::collections::HashSet::new();
-    for (dir, scope) in prompt_dirs(agent_dir, cwd, project_trusted, settings) {
+    for (dir, scope) in prompt_dirs(agent_dir, cwd, project_trusted, settings, prompts_from) {
         let templates = match scope {
             Scope::Global => {
                 if !dir.is_dir() {
