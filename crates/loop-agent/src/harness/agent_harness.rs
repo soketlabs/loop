@@ -108,6 +108,7 @@ pub struct AgentHarness {
     session: Arc<tokio::sync::Mutex<Session>>,
     host_env: Arc<dyn ExecutionEnv>,
     session_environment: parking_lot::RwLock<Option<std::collections::BTreeMap<String, String>>>,
+    tool_env_policy: parking_lot::RwLock<super::ToolEnvPolicy>,
     model: RwLock<Option<Model>>,
     thinking_level: RwLock<AgentThinkingLevel>,
     /// Synchronous lock: `tools_snapshot` runs inside the MCP server factory on a
@@ -163,6 +164,7 @@ impl AgentHarness {
             session: Arc::new(tokio::sync::Mutex::new(options.session)),
             host_env: options.host_env,
             session_environment: parking_lot::RwLock::new(None),
+            tool_env_policy: parking_lot::RwLock::new(super::ToolEnvPolicy::default()),
             model: RwLock::new(options.model),
             thinking_level: RwLock::new(AgentThinkingLevel::Off),
             tools: parking_lot::RwLock::new(options.tools),
@@ -1412,6 +1414,7 @@ impl AgentHarness {
             }
             *phase = AgentHarnessPhase::Turn;
         }
+        self.tool_env_policy.read().begin_turn();
         // Counted until this whole function ends, also if its future is
         // dropped: phase turns Idle before the `Settled` hooks run.
         let _in_flight = InFlight::enter(self);
@@ -1634,10 +1637,23 @@ impl AgentHarness {
             Some(sandbox) => sandbox.env(),
             None => Arc::clone(&self.host_env),
         };
-        Ok(match self.session_environment.read().as_ref() {
-            Some(values) => super::SessionExecutionEnv::wrap(env, values),
-            None => env,
-        })
+        let policy = self.tool_env_policy();
+        Ok(super::SessionExecutionEnv::for_tools(
+            env,
+            self.session_environment.read().as_ref(),
+            &policy,
+        ))
+    }
+
+    /// Which variables tools and `!shell` do not receive.
+    pub fn tool_env_policy(&self) -> super::ToolEnvPolicy {
+        self.tool_env_policy.read().clone()
+    }
+
+    /// Replace the tool environment policy. Tools built earlier keep the policy
+    /// they were built with, so build them from the same policy.
+    pub fn set_tool_env_policy(&self, policy: super::ToolEnvPolicy) {
+        *self.tool_env_policy.write() = policy;
     }
 
     #[cfg(feature = "orchestration")]

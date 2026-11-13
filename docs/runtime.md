@@ -35,7 +35,20 @@ clients"). WebSocket clients have no host-only credential or telemetry access.
 Each new Session receives the caller's cwd and environment for tools and
 `!shell`. Provider credentials resolve in the Runtime. A notice warns when an
 exported provider API key differs; it never shows the key. Runtime bearer tokens
-and built-in provider key variables are removed from tool environments.
+and built-in provider key variables are removed from tool environments. This
+holds for Runtime Sessions and for standalone `loop`, and it also removes the
+`apiKeyEnv` names of custom providers. `tools.passEnv` in the global settings
+keeps named variables. See [Tool environment](configuration.md#tool-environment).
+A Session opened without a caller environment (`loop session new`) uses the
+Runtime's own environment, with the same names removed.
+
+### Tool environment and the sandbox
+
+With the sandbox off, removing variables reduces accidental leaks of keys into
+tool output and logs. It is not a security boundary. A command can still read
+`.env` files, shell rc files and, on Linux, `/proc/<pid>/environ` of processes of
+the same user. The sandbox is the real protection: with it on, commands get a
+minimal environment and cannot read credential files.
 
 Resuming keeps the Session's original cwd and tool environment, so attaching a
 second Surface cannot change tools that are already running. The TUI says so on

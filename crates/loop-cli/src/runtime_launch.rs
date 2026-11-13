@@ -173,6 +173,19 @@ pub fn caller_environment(
         .collect()
 }
 
+/// Names a Surface forwards over WebSocket beyond the built-in allowlist:
+/// `runtime.forwardEnv`, and `tools.passEnv`, since a name there is an explicit
+/// choice to keep that variable in tool environments.
+fn forward_names(settings: &crate::config::Settings) -> Vec<String> {
+    settings
+        .runtime
+        .forward_env
+        .iter()
+        .chain(&settings.tools.pass_env)
+        .cloned()
+        .collect()
+}
+
 /// Capture this Surface's environment under its local forwarding policy.
 pub fn session_environment(
     remote: &RemoteBackend,
@@ -182,7 +195,7 @@ pub fn session_environment(
         crate::config::Settings::load_file(&crate::config::paths::settings_path(agent_dir))?;
     Ok(caller_environment(
         remote.is_websocket(),
-        &settings.runtime.forward_env,
+        &forward_names(&settings),
         std::env::vars(),
     ))
 }
@@ -642,6 +655,24 @@ mod tests {
         assert!(!remote.contains_key("OPENAI_API_KEY"));
         assert!(!remote.contains_key("LOOP_RUNTIME_TOKEN"));
         assert_eq!(caller_environment(false, &[], vars()).len(), 14);
+    }
+    #[test]
+    fn pass_env_names_are_forwarded_with_the_forward_env_names() {
+        let settings: crate::config::Settings = serde_json::from_str(
+            r#"{"runtime":{"forwardEnv":["TASK_VALUE"]},"tools":{"passEnv":["OPENAI_API_KEY"]}}"#,
+        )
+        .unwrap();
+        let names = forward_names(&settings);
+        assert_eq!(names, ["TASK_VALUE", "OPENAI_API_KEY"]);
+        let vars = [
+            ("OPENAI_API_KEY", "k"),
+            ("OTHER_KEY", "x"),
+            ("TASK_VALUE", "v"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()));
+        let sent = caller_environment(true, &names, vars);
+        assert_eq!(sent.len(), 2);
+        assert!(sent.contains_key("OPENAI_API_KEY") && sent.contains_key("TASK_VALUE"));
     }
     #[test]
     fn missing_history_and_picker_input_have_friendly_results() {

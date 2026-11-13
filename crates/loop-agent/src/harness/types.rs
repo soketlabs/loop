@@ -294,6 +294,13 @@ pub trait Shell: Send + Sync {
         false
     }
 
+    /// A short note for a failed command whose `output` names a variable that
+    /// Loop removed from the command environment. At most once per variable
+    /// per turn. `None` when nothing was removed or the command succeeded.
+    fn removed_env_note(&self, _output: &str, _exit_code: i32) -> Option<String> {
+        None
+    }
+
     /// Execute a command string via the system shell.
     async fn exec(
         &self,
