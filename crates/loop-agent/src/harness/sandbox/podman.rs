@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::harness::sandbox::protect::ProtectedBind;
-use crate::harness::sandbox::traits::SandboxError;
+use crate::harness::sandbox::SandboxError;
 use crate::harness::types::{ExecutionError, ExecutionErrorCode, ShellOutput};
 
 /// Options for `podman run`.

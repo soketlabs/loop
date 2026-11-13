@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::harness::sandbox::traits::{Sandbox, SandboxConfig, SandboxError, SandboxFactory};
+use crate::sandbox::{Sandbox, SandboxConfig, SandboxError, SandboxFactory};
 
 /// Register and create sandboxes by kind id.
 #[derive(Default)]
