@@ -304,3 +304,159 @@ async fn close_during_a_slow_compaction_cancels_it() {
     assert!(store.lease(&session.native_id).await.unwrap().is_none());
     rt.shutdown().await;
 }
+
+/// `session/fork` and `session/clone` of a Session holding a summary
+/// compaction and a shorten-only compaction: the copy builds the same
+/// context as the source at that point.
+#[tokio::test]
+async fn fork_and_clone_after_compactions_build_the_source_context() {
+    use loop_agent::harness::session::types::{
+        default_context_from_entries, PendingSessionWrite, Session,
+    };
+    use loop_agent::AgentMessage;
+    use loop_protocol::rpc::CloneParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let models = Arc::new(loop_ai::Models::create(Default::default()));
+    models.set_provider(faux_provider(FauxScript::new()));
+    let globals = GlobalResources::with_models(dir.path().join("agent"), models).unwrap();
+    let rt = Runtime::new(
+        globals,
+        opts(dir.path()),
+        Arc::new(MemoryEventLog::new()),
+        RuntimeLimits::default(),
+    )
+    .await
+    .unwrap();
+    let session = rt.new_session(SessionSpec::default()).await.unwrap();
+    rt.close(&session.key, false).await.unwrap();
+
+    // Write the source tree while no one holds it.
+    let store: Arc<dyn SessionStore> =
+        Arc::new(SqliteSessionStore::open(dir.path().join("agent/sessions.db")).unwrap());
+    let sid = session.native_id.clone();
+    let append = |w: PendingSessionWrite| {
+        let store = Arc::clone(&store);
+        let sid = sid.clone();
+        async move { store.append_entry(&sid, w).await.unwrap() }
+    };
+    let message = |m: AgentMessage| PendingSessionWrite::Message { message: m };
+    let result = |text: &str| {
+        AgentMessage::tool_result(loop_ai::ToolResultMessage {
+            tool_call_id: "call-1".into(),
+            tool_name: "big".into(),
+            content: vec![loop_ai::ToolResultContent::Text(loop_ai::TextContent {
+                text: text.into(),
+                text_signature: None,
+            })],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+            usage: None,
+            added_tool_names: Default::default(),
+        })
+    };
+    append(message(AgentMessage::user_text("first request"))).await;
+    append(message(AgentMessage::user_text("first follow-up"))).await;
+    let second = append(message(AgentMessage::user_text("second request"))).await;
+    let output = append(message(result(&"r".repeat(3_000)))).await;
+    append(PendingSessionWrite::Compaction {
+        summary: "summary of the first turn".into(),
+        first_kept_entry_id: Some(second.id().into()),
+        details: None,
+    })
+    .await;
+    let shortened = append(PendingSessionWrite::Compaction {
+        summary: "outputs shortened".into(),
+        first_kept_entry_id: Some(second.id().into()),
+        details: Some(serde_json::json!({"shortened": [output.id()]})),
+    })
+    .await;
+    let third = append(message(AgentMessage::user_text("third request"))).await;
+    append(message(AgentMessage::user_text("third follow-up"))).await;
+
+    let context_of = |sid: String, leaf: Option<String>| {
+        let store = Arc::clone(&store);
+        async move {
+            let reader = store.load(&sid).await.unwrap();
+            let messages = match leaf {
+                Some(leaf) => {
+                    let path = reader
+                        .read_path_to_root_or_compaction(Some(&leaf))
+                        .await
+                        .unwrap();
+                    default_context_from_entries(&path).messages
+                }
+                None => {
+                    Session::new(Arc::clone(&store), reader)
+                        .build_context()
+                        .await
+                        .unwrap()
+                        .messages
+                }
+            };
+            format!("{messages:?}")
+                .split("timestamp: ")
+                .map(|part| part.trim_start_matches(char::is_numeric))
+                .collect::<Vec<_>>()
+                .join("timestamp: ")
+        }
+    };
+
+    rt.load_session(&session, SessionSpec::default())
+        .await
+        .unwrap();
+    let source_now = context_of(sid.clone(), None).await;
+    assert!(source_now.contains("output shortened by automatic compaction"));
+    assert!(!source_now.contains("first follow-up"));
+
+    let clone = rt
+        .clone_session(CloneParams {
+            session: session.clone(),
+            name: None,
+            request_id: "clone-after-compaction".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        context_of(clone.session.native_id.clone(), None).await,
+        source_now,
+        "clone"
+    );
+
+    for (before, label) in [
+        (third.id(), "fork after the compactions"),
+        (second.id(), "fork at the kept point"),
+    ] {
+        let leaf = entries_before(&store, &sid, before).await;
+        let fork = rt
+            .fork(ForkParams {
+                session: session.clone(),
+                before_entry_id: before.into(),
+                name: None,
+                request_id: format!("fork-{label}"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            context_of(fork.session.native_id.clone(), None).await,
+            context_of(sid.clone(), Some(leaf)).await,
+            "{label}"
+        );
+    }
+    let _ = shortened;
+    rt.shutdown().await;
+}
+
+/// The id of the entry just before `entry` in Session `sid`.
+async fn entries_before(store: &Arc<dyn SessionStore>, sid: &str, entry: &str) -> String {
+    let entries = store
+        .load(sid)
+        .await
+        .unwrap()
+        .read_entries(None)
+        .await
+        .unwrap();
+    let at = entries.iter().position(|e| e.id() == entry).unwrap();
+    entries[at - 1].id().to_string()
+}
