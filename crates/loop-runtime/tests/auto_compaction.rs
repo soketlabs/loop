@@ -180,3 +180,126 @@ async fn an_overflow_compacts_and_the_session_keeps_working() {
     assert!(report.summary.starts_with("SUMMARY"));
     rt.shutdown().await;
 }
+
+/// A faux provider whose summary requests wait for `release`.
+struct SlowSummary {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+async fn runtime_with_slow_summary(dir: &std::path::Path) -> (Arc<Runtime>, SlowSummary) {
+    use loop_agent::harness::compaction::SUMMARY_SYSTEM_PROMPT;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (s, r) = (Arc::clone(&started), Arc::clone(&release));
+    let provider = loop_ai::providers::faux_provider_fn(Arc::new(move |ctx: &loop_ai::Context| {
+        let summary = ctx.system_prompt.as_deref() == Some(SUMMARY_SYSTEM_PROMPT);
+        let (s, r) = (Arc::clone(&s), Arc::clone(&r));
+        Box::pin(async move {
+            if summary {
+                s.notify_one();
+                r.notified().await;
+                FauxResponse::Text("SUMMARY: slow.".into())
+            } else {
+                FauxResponse::Text("answer".into())
+            }
+        })
+    }));
+    let models = Arc::new(loop_ai::Models::create(Default::default()));
+    models.set_provider(provider);
+    let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
+    let rt = Runtime::new(
+        globals,
+        opts(dir),
+        Arc::new(MemoryEventLog::new()),
+        RuntimeLimits::default(),
+    )
+    .await
+    .unwrap();
+    (Arc::new(rt), SlowSummary { started, release })
+}
+
+async fn compactable_session(rt: &Runtime) -> loop_protocol::SessionRef {
+    let session = rt.new_session(SessionSpec::default()).await.unwrap();
+    for text in [format!("first {}", "w".repeat(8_000)), "second".into()] {
+        let turn = rt
+            .prompt(&session, vec![ContentBlock::text(text)])
+            .await
+            .unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+    }
+    session
+}
+
+/// M1: while `/compact` waits for its summary, attach and prompt answer at
+/// once (the prompt is refused as busy), and the compaction then commits.
+#[tokio::test]
+async fn attach_does_not_wait_for_a_slow_compaction() {
+    use loop_wire::RuntimeControl;
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, slow) = runtime_with_slow_summary(dir.path()).await;
+    let session = compactable_session(&rt).await;
+    let (rt2, s2) = (Arc::clone(&rt), session.clone());
+    let compact = tokio::spawn(async move { rt2.compact(&s2, None).await });
+    tokio::time::timeout(Duration::from_secs(5), slow.started.notified())
+        .await
+        .expect("the summary request started");
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        rt.attach_snapshot_watching(1, &session, 0),
+    )
+    .await
+    .expect("attach did not wait for the summary")
+    .unwrap();
+    let prompt = tokio::time::timeout(
+        Duration::from_secs(2),
+        rt.prompt(&session, vec![ContentBlock::text("during")]),
+    )
+    .await
+    .expect("prompt did not wait for the summary");
+    match prompt {
+        Err(error) => assert!(
+            matches!(error, loop_protocol::BackendError::Busy) || error.to_string().contains("busy"),
+            "{error}"
+        ),
+        Ok(turn) => assert!(!matches!(turn.outcome().await, TurnOutcome::Completed(_))),
+    }
+    slow.release.notify_one();
+    let report = compact.await.unwrap().unwrap();
+    assert!(report.summary.starts_with("SUMMARY"));
+    rt.shutdown().await;
+}
+
+/// M1: closing the Session during a slow `/compact` does not wait for the
+/// summary, and the compaction writes nothing after the close.
+#[tokio::test]
+async fn close_during_a_slow_compaction_cancels_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, slow) = runtime_with_slow_summary(dir.path()).await;
+    let session = compactable_session(&rt).await;
+    let (rt2, s2) = (Arc::clone(&rt), session.clone());
+    let compact = tokio::spawn(async move { rt2.compact(&s2, None).await });
+    tokio::time::timeout(Duration::from_secs(5), slow.started.notified())
+        .await
+        .expect("the summary request started");
+    tokio::time::timeout(Duration::from_secs(5), rt.close(&session.key, false))
+        .await
+        .expect("close did not wait for the summary")
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), compact)
+        .await
+        .expect("the compaction ended")
+        .unwrap();
+    assert!(result.is_err());
+    let store = SqliteSessionStore::open(dir.path().join("agent/sessions.db")).unwrap();
+    let entries = store
+        .load(&session.native_id)
+        .await
+        .unwrap()
+        .read_entries(None)
+        .await
+        .unwrap();
+    assert!(!entries.iter().any(is_compaction));
+    assert!(store.lease(&session.native_id).await.unwrap().is_none());
+    rt.shutdown().await;
+}

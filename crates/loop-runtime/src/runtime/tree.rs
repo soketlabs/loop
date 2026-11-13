@@ -534,18 +534,35 @@ impl Runtime {
         instructions: Option<&str>,
     ) -> BackendResult<loop_protocol::CompactionReport> {
         let live = self.loaded(session).await?;
+        let head = {
+            let _guard = live.lifecycle.lock().await;
+            self.check_tree_live(&live)?;
+            if live.busy.load(Ordering::Acquire) {
+                return Err(BackendError::Busy);
+            }
+            barrier(&live).await?;
+            live.opened.harness.session_head().await.map_err(failed)?
+        };
+        // The summary is a model call: it runs without the lifecycle lock,
+        // so attach, close and other Session work do not wait for it. The
+        // harness refuses turns meanwhile, and closing cancels it.
+        let (mut report, write) = live
+            .opened
+            .native
+            .prepare_compaction(session, instructions)
+            .await?;
         let _guard = live.lifecycle.lock().await;
         self.check_tree_live(&live)?;
         if live.busy.load(Ordering::Acquire) {
             return Err(BackendError::Busy);
         }
         barrier(&live).await?;
+        if live.opened.harness.session_head().await.map_err(failed)? != head {
+            return Err(failed(
+                "the Session changed while compacting; nothing was written",
+            ));
+        }
         let slot = self.reserve_view(session, true)?;
-        let (mut report, write) = live
-            .opened
-            .native
-            .prepare_compaction(session, instructions)
-            .await?;
         // No `summary` key: that would add a branch summary entry.
         let marker = json!({"id":loop_ai::new_id(),"kind":"compact"}).to_string();
         let state = self
