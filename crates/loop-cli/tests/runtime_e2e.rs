@@ -142,6 +142,9 @@ async fn websocket_clients_list_attach_and_cannot_call_host_methods() {
     }).await;
 }
 
+/// At least 32 bytes, as the Runtime requires of an edge token.
+const EDGE_SECRET: &str = "edge-secret-token-edge-secret-token-0123";
+
 #[tokio::test]
 async fn an_edge_gateway_names_the_user_and_each_token_opens_only_its_listener() {
     bounded(async {
@@ -159,17 +162,24 @@ async fn an_edge_gateway_names_the_user_and_each_token_opens_only_its_listener()
             .mode(0o600)
             .open(&token_file)
             .unwrap();
-        std::fs::write(&token_file, "edge-secret-token\n").unwrap();
-        let serve = fx
-            .serve_with(&[
-                "--listen",
-                "127.0.0.1:0",
-                "--edge-listen",
-                "127.0.0.1:0",
-                "--edge-token-file",
-                token_file.to_str().unwrap(),
-            ])
-            .await;
+        std::fs::write(&token_file, format!("{EDGE_SECRET}\n")).unwrap();
+        let edge_flags = [
+            "--unstable-edge-listen",
+            "127.0.0.1:0",
+            "--unstable-edge-token-file",
+            token_file.to_str().unwrap(),
+        ];
+        // Without a tool lock the edge listener is refused at start.
+        let mut args = vec!["runtime", "start", "--listen", "127.0.0.1:0"];
+        args.extend_from_slice(&edge_flags);
+        let refused = fx.command(&args).output().await.unwrap();
+        assert!(!refused.status.success());
+        let error = String::from_utf8_lossy(&refused.stderr);
+        assert!(error.contains("needs --tool-lock chat"), "{error}");
+        let root = fx.work.to_str().unwrap().to_owned();
+        let mut args = vec!["--listen", "127.0.0.1:0", "--tool-lock", "chat", "--tool-lock-root", &root];
+        args.extend_from_slice(&edge_flags);
+        let serve = fx.serve_with(&args).await;
         serve.wait_text("Edge Gateway listener on ws://").await;
         let output = serve.output();
         let edge_url = output
@@ -187,7 +197,7 @@ async fn an_edge_gateway_names_the_user_and_each_token_opens_only_its_listener()
         // Each token opens only its own listener.
         let refused = loop_wire::socket::websocket_connect(&edge_url, runtime_token.trim()).await;
         assert_eq!(refused.err().map(|e| e.kind()), Some(std::io::ErrorKind::PermissionDenied));
-        let refused = loop_wire::socket::websocket_connect(&user_url, "edge-secret-token").await;
+        let refused = loop_wire::socket::websocket_connect(&user_url, EDGE_SECRET).await;
         assert_eq!(refused.err().map(|e| e.kind()), Some(std::io::ErrorKind::PermissionDenied));
 
         // The gateway names a user; initialize reports that user.
@@ -195,7 +205,7 @@ async fn an_edge_gateway_names_the_user_and_each_token_opens_only_its_listener()
             Principal::new(PrincipalKind::Person, "https://idp.example", "user-1").unwrap();
         let caller = Caller::asserted(principal, Tenant::new("acme").unwrap()).unwrap();
         let transport =
-            loop_wire::socket::websocket_connect_edge(&edge_url, "edge-secret-token", &caller)
+            loop_wire::socket::websocket_connect_edge(&edge_url, EDGE_SECRET, &caller)
                 .await
                 .unwrap();
         let (conn, mut incoming) = Connection::new(transport);
@@ -220,6 +230,21 @@ async fn an_edge_gateway_names_the_user_and_each_token_opens_only_its_listener()
         assert_eq!(result.principal.as_ref(), Some(caller.principal()));
         assert_eq!(result.tenant.as_ref(), Some(caller.tenant()));
         assert_eq!(result.via.unwrap().as_str(), "edge");
+        assert!(result.capabilities.tool_lock.is_some());
+        // An edge user never runs shell commands on the Runtime host.
+        let made = conn
+            .request(methods::SESSION_NEW, json!({}))
+            .await
+            .unwrap();
+        let shell = conn
+            .request(methods::SESSION_SHELL, json!({"session": made, "command": "id"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(shell, loop_wire::RpcError::Remote { code, .. }
+                if code == loop_protocol::rpc::error_codes::FORBIDDEN),
+            "{shell:?}"
+        );
         conn.close();
 
         // The ordinary WebSocket is the local user via the token.

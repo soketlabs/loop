@@ -111,8 +111,8 @@ running after you close the terminal, use your usual tool, such as `nohup`,
 | `--cwd DIR` | current folder | Folder for Sessions that name none |
 | `--tool-lock LOCK` | `LOOP_TOOL_LOCK`, else off | `chat`: lock the tools of every Session for the life of the Runtime. See [Tool lock](#tool-lock) |
 | `--tool-lock-root DIR` | `LOOP_TOOL_LOCK_ROOT` | Required with a lock: every Session folder must be in it |
-| `--edge-listen IP:PORT` | off | Serve a trusted Edge Gateway that names each connection's user. Loopback only. Needs `--edge-token-file`. See [Identity](#identity-who-acts-and-for-which-tenant) |
-| `--edge-token-file FILE` | off | With `--edge-listen`: a private (0600) file with the gateway's bearer token. It must differ from the Runtime token |
+| `--unstable-edge-listen IP:PORT` | off | **Unstable, not for real users yet.** Serve a trusted Edge Gateway that names each connection's user. Loopback only. Needs `--unstable-edge-token-file` and `--tool-lock chat`. See [Identity](#identity-who-acts-and-for-which-tenant) |
+| `--unstable-edge-token-file FILE` | off | **Unstable.** With `--unstable-edge-listen`: a private (0600) file with the gateway's bearer token, at least 32 bytes, outside the agent directory. It must differ from the Runtime token |
 
 The two limits can also be set in the global `~/.loop/agent/settings.json`
 (a project's settings cannot change them, since one Runtime serves many
@@ -362,52 +362,85 @@ For local use, nothing changes. You do not configure anything:
 
 | Connection | `principal` | `tenant` | `via` |
 |---|---|---|---|
-| The Unix socket (host authority) | `{person, local, uid:<your uid>}` | `local` | none |
+| The Unix socket (host authority) | `{person, local, uid:<your uid>}` (`os-user` in place of `uid:<n>` on a system without user ids) | `local` | none |
 | A loopback WebSocket with the Runtime token | the same local person | `local` | `token` |
-| An Edge Gateway connection (`--edge-listen`) | the person or service that the gateway names | the tenant that the gateway names | `edge` |
+| An Edge Gateway connection (`--unstable-edge-listen`) | the person or service that the gateway names | the tenant that the gateway names | `edge` |
 
 The `initialize` result shows the connection's `principal`, `tenant` and
 `via`. Clients that do not know these fields ignore them. Identity fields in a
-request (for example in `initialize`) are ignored. In this release the
-identity changes no permission: a WebSocket client still has remote authority,
-and an Edge Gateway connection has remote authority too.
+request (for example in `initialize`) are ignored. The identity of the host's
+user changes no permission: a WebSocket client still has remote authority. An
+Edge Gateway user has remote authority and the limits below.
 
-**Edge Gateway connections.** This option is for a gateway that signs users in
-(for example with OIDC) and then connects to the Runtime for each user. It is
-off by default. To turn it on, give both flags at start:
+A principal id comes from an outside identity provider. Text such as
+`../x` or `a,b` is a valid id. Code must never use an id as a file or folder
+name; use a hash of it. A tenant is safe as a file or folder name.
+
+**Edge Gateway connections (unstable).** This option is not for real users
+yet. It is for a gateway that signs users in (for example with OIDC) and then
+connects to the Runtime for each user. It is off by default. To turn it on,
+give both edge flags and a tool lock at start:
 
 ```sh
-loop runtime start --edge-listen 127.0.0.1:8790 --edge-token-file /private/edge.token
+loop runtime start --tool-lock chat --tool-lock-root /srv/loop-users \
+  --unstable-edge-listen 127.0.0.1:8790 \
+  --unstable-edge-token-file /private/edge.token
 ```
 
+- **A tool lock is necessary.** Without a tool lock, a Session can run shell
+  commands as your OS user. Those commands can open the Runtime's Unix socket
+  (host authority) and read your credentials and token files. Thus:
+  - `loop runtime start` refuses the edge flags without `--tool-lock`.
+  - The Runtime refuses every request of an edge connection (except
+    `initialize`) when it has no tool lock. The error is `Forbidden`.
+  - The Runtime always refuses `session/shell` from an edge connection with
+    `Forbidden`, also under a tool lock.
+  - `loop runtime start` refuses a `--tool-lock-root` that contains the agent
+    directory, the Session database or the edge token file.
 - The edge listener is separate from `--listen`. The Runtime token does not
   open an edge connection, and the edge token does not open an ordinary one.
-- The token file must be a 0600 file that you own, in a 0700 directory. The
-  Runtime refuses to start if the edge token is the same as the Runtime token.
+- The token file must be a 0600 file that you own, in a 0700 directory, with a
+  token of at least 32 bytes. It must not be in the Runtime's `run/` folder or
+  be the Runtime token file under another name. The Runtime refuses to start if
+  the edge token is the same as the Runtime token (also the one a previous
+  start left, when you do not give `--listen`).
 - The gateway names the user once, in the WebSocket handshake, with these
-  headers. Each header must be present exactly once:
+  headers. Each header must be present exactly once (in any letter case):
 
   | Header | Value |
   |---|---|
-  | `Authorization` | `Bearer <edge token>` |
+  | `Authorization` | `Bearer <edge token>`. The scheme name `Bearer` is not case-sensitive (RFC 7235). Use one space before the token |
   | `Loop-Principal-Kind` | `person` or `service` |
   | `Loop-Principal-Issuer` | the identity provider, such as `https://accounts.google.com`. Not `local` |
   | `Loop-Principal-Id` | the stable id from that provider, such as the OIDC `sub` |
-  | `Loop-Tenant` | 1 to 64 characters of `a-z`, `0-9`, `.`, `_` and `-`, starting with a letter or digit. Not `local` or `system` |
+  | `Loop-Tenant` | 1 to 64 characters of `a-z`, `0-9`, `.`, `_` and `-`. It starts with a letter or digit and does not end with `.`. Not `local` or `system`, and not a Windows device name (`con`, `prn`, `aux`, `nul`, `com0` to `com9`, `lpt0` to `lpt9`, also before a `.`) |
 
-  The issuer and id are 1 to 255 visible ASCII characters. A wrong token gets
-  HTTP 401. A missing, repeated, malformed, too long or reserved value gets
-  HTTP 400. The Runtime never falls back to the local identity.
+  The issuer and id are 1 to 255 visible ASCII characters. Spaces around a
+  value are removed. A wrong token gets HTTP 401. A missing, repeated,
+  malformed, too long or reserved value gets HTTP 400. The Runtime never falls
+  back to the local identity.
 - An ordinary WebSocket client that sends any `Loop-Principal-*` or
   `Loop-Tenant` header is refused with HTTP 400.
 - Anyone who has the edge token can act as any user in any tenant. Keep the
   token as private as a root password, and run the gateway on the same host.
   The Runtime does not check the gateway's claims; it trusts the gateway.
-- **There is no tenant isolation yet.** In this release the Runtime records
-  the identity but does not check ownership. Every edge user can list, attach
-  to, prompt and run `session/shell` in every Session, including the Sessions
-  of the local user and of other tenants. Do not turn this option on for
-  users who must not see each other's work.
+
+**What an edge user can reach.** In this release, an edge user can:
+
+- list, create, load, attach to, prompt, cancel, fork, clone, export, import,
+  rename and close **every** Session of this Runtime. This includes the
+  Sessions of the local user and of other tenants. **There is no tenant
+  isolation and no Session owner yet.**
+- through the agent of a Session: read the files in that Session's folder
+  (any folder in the tool-lock root) and use the web tools. The tool lock
+  turns off the shell, file changes, Subagents, workflows, MCP servers and
+  hooks.
+- read the workspace settings that the tool lock lets a chat client read. The
+  Runtime refuses changes under the lock.
+
+An edge user cannot run `session/shell`, call a host-only method, or change
+the tool lock. Do not turn this option on for users who must not see each
+other's work.
 
 ### Permissions and trust
 

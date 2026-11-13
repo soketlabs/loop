@@ -30,39 +30,130 @@ pub struct StartArgs {
     pub tool_lock: Option<String>,
     /// `--tool-lock-root`; without it, `LOOP_TOOL_LOCK_ROOT`.
     pub tool_lock_root: Option<PathBuf>,
-    /// `--edge-listen`: a loopback listener for a trusted Edge Gateway that
-    /// names each connection's end user at the handshake. Off by default.
+    /// `--unstable-edge-listen`: a loopback listener for a trusted Edge
+    /// Gateway that names each connection's end user at the handshake. Off
+    /// by default; unstable, not for real users yet.
     pub edge_listen: Option<std::net::SocketAddr>,
-    /// `--edge-token-file`: the gateway's bearer token, in a private file.
+    /// `--unstable-edge-token-file`: the gateway's bearer token, in a
+    /// private file.
     pub edge_token_file: Option<PathBuf>,
 }
 
-/// The checked edge options: both or neither, loopback only, and a token
-/// read from a private file. Refused before anything starts.
+/// Shortest edge token, in bytes: as long as the Runtime's own (256 bits in
+/// hex is 64; a 32-byte minimum refuses a short, guessable secret).
+const MIN_EDGE_TOKEN_BYTES: usize = 32;
+
+/// The checked edge flags: both or neither, a loopback address, and a tool
+/// lock. Refused before anything starts. The token file is read later
+/// ([`edge_token`]), once the Runtime token exists to compare it with.
+///
+/// An Edge Gateway user is outside the host, so the Runtime serves one only
+/// under a tool lock: without it a Session runs shell commands as the host's
+/// OS user. The server refuses such a connection too; this names the
+/// mistake at start.
 fn edge_options(
     listen: Option<std::net::SocketAddr>,
     token_file: Option<&std::path::Path>,
-) -> anyhow::Result<Option<(std::net::SocketAddr, String)>> {
-    use anyhow::Context;
+    locked: bool,
+) -> anyhow::Result<Option<(std::net::SocketAddr, PathBuf)>> {
     match (listen, token_file) {
         (None, None) => Ok(None),
-        (Some(_), None) | (None, Some(_)) => {
-            anyhow::bail!("--edge-listen and --edge-token-file are used together")
-        }
+        (Some(_), None) | (None, Some(_)) => anyhow::bail!(
+            "--unstable-edge-listen and --unstable-edge-token-file are used together"
+        ),
         (Some(address), Some(_)) if !address.ip().is_loopback() => {
-            anyhow::bail!("refusing a non-loopback --edge-listen bind: TLS is not yet supported; run the Edge Gateway on this host")
+            anyhow::bail!("refusing a non-loopback --unstable-edge-listen bind: TLS is not yet supported; run the Edge Gateway on this host")
         }
-        (Some(address), Some(path)) => {
-            let token = loop_wire::token::read(path).with_context(|| {
-                format!(
-                    "could not read the edge token file {}; it must be a 0600 file you own in a 0700 directory",
-                    path.display()
-                )
-            })?;
-            Ok(Some((address, token)))
-        }
+        (Some(_), Some(_)) if !locked => anyhow::bail!(
+            "--unstable-edge-listen needs --tool-lock chat: without a tool lock an Edge Gateway user could run commands as this host's user"
+        ),
+        (Some(address), Some(path)) => Ok(Some((address, path.to_path_buf()))),
     }
 }
+
+/// Refuse a tool-lock root from which a locked Session could read the
+/// Runtime's own secrets: the agent directory (credentials, the Runtime
+/// token, the Unix socket's folder), the Session database, or the edge token
+/// file. Paths that do not exist yet are compared as given.
+fn edge_reach(
+    lock_root: &std::path::Path,
+    secrets: &[(&str, &std::path::Path)],
+) -> anyhow::Result<()> {
+    let resolve = |path: &std::path::Path| {
+        path.canonicalize()
+            .or_else(|_| std::path::absolute(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let root = resolve(lock_root);
+    for (what, path) in secrets {
+        if resolve(path).starts_with(&root) {
+            anyhow::bail!(
+                "--unstable-edge-listen: the --tool-lock-root {} holds the {what}; an Edge Gateway user could read it. Use a root outside it",
+                root.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Read the edge token from `path`, after the Runtime token was made. It
+/// must be a private file (as [`loop_wire::token::read`] checks), at least
+/// [`MIN_EDGE_TOKEN_BYTES`] long, outside `run_dir` (the Runtime's token
+/// folder), not the Runtime token file itself (same device and inode, so a
+/// hard link or a second name is refused too), and not equal to the Runtime
+/// token. `runtime_token` is the token this start made, or else the one a
+/// previous start left in `run_dir`, so the check runs with or without
+/// `--listen`.
+fn edge_token(
+    path: &std::path::Path,
+    run_dir: &std::path::Path,
+    runtime_token: Option<&str>,
+) -> anyhow::Result<String> {
+    use anyhow::Context;
+    use std::os::unix::fs::MetadataExt;
+    let named = || {
+        format!(
+            "could not read the edge token file {}; it must be a 0600 file you own in a 0700 directory",
+            path.display()
+        )
+    };
+    let file = path.canonicalize().with_context(named)?;
+    if let Ok(run) = run_dir.canonicalize() {
+        if file.starts_with(&run) {
+            anyhow::bail!(
+                "the edge token file {} is in the Runtime's token folder {}; keep it outside the agent directory",
+                path.display(),
+                run.display()
+            );
+        }
+    }
+    let runtime_file = run_dir.join(RUNTIME_TOKEN_FILE);
+    if let (Ok(edge), Ok(runtime)) = (std::fs::metadata(&file), std::fs::metadata(&runtime_file)) {
+        if (edge.dev(), edge.ino()) == (runtime.dev(), runtime.ino()) {
+            anyhow::bail!("the edge token file is the Runtime token file; use a separate file");
+        }
+    }
+    let token = loop_wire::token::read(path).with_context(named)?;
+    if token.len() < MIN_EDGE_TOKEN_BYTES {
+        anyhow::bail!(
+            "the edge token in {} is shorter than {MIN_EDGE_TOKEN_BYTES} bytes",
+            path.display()
+        );
+    }
+    let stored = match runtime_token {
+        Some(token) => Some(token.to_owned()),
+        None => loop_wire::token::read(&runtime_file).ok(),
+    };
+    if stored.is_some_and(|runtime| {
+        loop_wire::socket::constant_time_eq(runtime.as_bytes(), token.as_bytes())
+    }) {
+        anyhow::bail!("the edge token must differ from the Runtime token");
+    }
+    Ok(token)
+}
+
+/// The Runtime token's file name in `run/`.
+const RUNTIME_TOKEN_FILE: &str = "runtime.token";
 
 /// Run the Runtime until SIGINT, SIGTERM or `loop runtime stop`.
 pub async fn start(args: StartArgs) -> anyhow::Result<()> {
@@ -97,7 +188,11 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         args.tool_lock_root.as_deref(),
         std::env::var(tool_lock::ROOT_ENV).ok().as_deref(),
     )?;
-    let edge = edge_options(args.edge_listen, args.edge_token_file.as_deref())?;
+    let edge = edge_options(
+        args.edge_listen,
+        args.edge_token_file.as_deref(),
+        tool_lock.is_some(),
+    )?;
     let lock_name = tool_lock.as_ref().map(|lock| lock.lock());
     let lock_root = tool_lock.as_ref().map(|lock| lock.root().to_path_buf());
     let agent_dir = paths::get_agent_dir();
@@ -134,6 +229,16 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     // The Session database may live outside this agent directory and be shared
     // with another Runtime; its ownership domain needs its own Lock.
     let sessions_db = paths::sessions_db_path(&agent_dir);
+    if let (Some((_, token_file)), Some(root)) = (&edge, &lock_root) {
+        edge_reach(
+            root,
+            &[
+                ("agent directory", agent_dir.as_path()),
+                ("Session database", sessions_db.as_path()),
+                ("edge token file", token_file.as_path()),
+            ],
+        )?;
+    }
     let sessions_lock = loop_app_core::runtime_instance::SessionDatabaseLock::acquire(&sessions_db)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -206,11 +311,14 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         }
         None => None,
     };
-    if let (Some((_, user, _)), Some((_, edge))) = (&websocket, &edge) {
-        if loop_wire::socket::constant_time_eq(user.as_bytes(), edge.as_bytes()) {
-            anyhow::bail!("the edge token must differ from the Runtime token");
-        }
-    }
+    // After the Runtime token exists, so the two are always compared.
+    let edge = match edge {
+        Some((address, path)) => Some((address, {
+            let user = websocket.as_ref().map(|(_, token, _)| token.as_str());
+            edge_token(&path, &agent_dir.join("run"), user)?
+        })),
+        None => None,
+    };
     let edge = match edge {
         Some((address, token)) => Some((
             tokio::net::TcpListener::bind(address)
@@ -247,7 +355,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     if let Some(url) = &listen_url {
         eprintln!(
             "loop runtime: listening on {url}; token file: {}",
-            agent_dir.join("run/runtime.token").display()
+            agent_dir.join("run").join(RUNTIME_TOKEN_FILE).display()
         );
     }
     if let Some((listener, _)) = &edge {
@@ -937,39 +1045,174 @@ where
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn edge_options_are_off_unless_both_are_given_and_safe() {
+    /// A private file: 0600 in a 0700 folder, as `token::read` wants.
+    fn private_file(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         use std::io::Write;
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-        let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-        assert!(super::edge_options(None, None).unwrap().is_none());
-        let dir = tempfile::tempdir().unwrap();
-        let private = dir.path().join("private");
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&private)
-            .unwrap();
-        let file = private.join("edge.token");
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => panic!("{e}"),
+        }
+        let file = dir.join(name);
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&file)
             .unwrap();
-        writeln!(f, "edge-secret").unwrap();
-        let (address, token) = super::edge_options(Some(loopback), Some(&file))
-            .unwrap()
+        writeln!(f, "{body}").unwrap();
+        file
+    }
+
+    const EDGE: &str = "edge-secret-edge-secret-edge-secret-0123";
+
+    #[test]
+    fn edge_options_are_off_unless_both_are_given_safe_and_locked() {
+        let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let file = std::path::Path::new("/somewhere/edge.token");
+        assert!(super::edge_options(None, None, false).unwrap().is_none());
+        assert_eq!(
+            super::edge_options(Some(loopback), Some(file), true)
+                .unwrap()
+                .unwrap(),
+            (loopback, file.to_path_buf())
+        );
+        assert!(super::edge_options(Some(loopback), None, true).is_err());
+        assert!(super::edge_options(None, Some(file), true).is_err());
+        // Without a tool lock an edge user could run commands as this host's
+        // user, so the listener is refused.
+        let unlocked = super::edge_options(Some(loopback), Some(file), false).unwrap_err();
+        assert!(unlocked.to_string().contains("--tool-lock"), "{unlocked}");
+        // Only a loopback address: not every address, and not an
+        // IPv4-mapped IPv6 address either.
+        for public in [
+            "0.0.0.0:7801",
+            "[::]:7801",
+            "[::ffff:127.0.0.1]:7801",
+            "10.0.0.1:7801",
+        ] {
+            let public: std::net::SocketAddr = public.parse().unwrap();
+            let refused = super::edge_options(Some(public), Some(file), true).unwrap_err();
+            assert!(
+                refused.to_string().contains("non-loopback"),
+                "{public}: {refused}"
+            );
+        }
+        let v6: std::net::SocketAddr = "[::1]:7801".parse().unwrap();
+        assert!(super::edge_options(Some(v6), Some(file), true).is_ok());
+    }
+
+    #[test]
+    fn a_lock_root_that_holds_a_runtime_secret_is_refused_for_edge_users() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("home/.loop");
+        let users = dir.path().join("srv/users");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&users).unwrap();
+        let db = agent.join("sessions.db");
+        let token = dir.path().join("gateway/edge.token");
+        let secrets = [
+            ("agent directory", agent.as_path()),
+            ("Session database", db.as_path()),
+            ("edge token file", token.as_path()),
+        ];
+        assert!(super::edge_reach(&users, &secrets).is_ok());
+        for (root, what) in [
+            (dir.path().join("home"), "agent directory"),
+            (agent.clone(), "agent directory"),
+            (dir.path().join("gateway"), "edge token file"),
+            (dir.path().to_path_buf(), "agent directory"),
+        ] {
+            let refused = super::edge_reach(&root, &secrets).unwrap_err();
+            assert!(refused.to_string().contains(what), "{refused}");
+        }
+    }
+
+    #[test]
+    fn the_edge_token_is_long_private_separate_and_not_the_runtime_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        let runtime = private_file(
+            &run,
+            super::RUNTIME_TOKEN_FILE,
+            "runtime-token-runtime-token-0123456789",
+        );
+        let gateway = dir.path().join("gateway");
+        let edge = private_file(&gateway, "edge.token", EDGE);
+        assert_eq!(super::edge_token(&edge, &run, Some("other")).unwrap(), EDGE);
+        // Equal to the token this start made (with --listen) ...
+        let same = super::edge_token(&edge, &run, Some(EDGE)).unwrap_err();
+        assert!(same.to_string().contains("must differ"), "{same}");
+        // ... and to the one in the token folder (without --listen).
+        let twin = private_file(
+            &gateway,
+            "twin.token",
+            "runtime-token-runtime-token-0123456789",
+        );
+        let stored = super::edge_token(&twin, &run, None).unwrap_err();
+        assert!(stored.to_string().contains("must differ"), "{stored}");
+        // The Runtime token file itself, by path or by a second name.
+        let itself = super::edge_token(&runtime, &run, None).unwrap_err();
+        assert!(itself.to_string().contains("token folder"), "{itself}");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::set_permissions(
+            &elsewhere,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let symlink = elsewhere.join("edge.token");
+        std::os::unix::fs::symlink(&runtime, &symlink).unwrap();
+        let linked = super::edge_token(&symlink, &run, Some("other")).unwrap_err();
+        assert!(linked.to_string().contains("token folder"), "{linked}");
+        // Inside the token folder at all.
+        let inside = private_file(&run, "edge.token", EDGE);
+        assert!(super::edge_token(&inside, &run, Some("other")).is_err());
+        // Short.
+        let short = private_file(&gateway, "short.token", "edge-secret");
+        let refused = super::edge_token(&short, &run, Some("other")).unwrap_err();
+        assert!(refused.to_string().contains("32 bytes"), "{refused}");
+        // Readable by others, or missing; the text names the edge file, not
+        // the Runtime token.
+        std::fs::set_permissions(&edge, std::os::unix::fs::PermissionsExt::from_mode(0o644))
             .unwrap();
-        assert_eq!((address, token.as_str()), (loopback, "edge-secret"));
-        assert!(super::edge_options(Some(loopback), None).is_err());
-        assert!(super::edge_options(None, Some(&file)).is_err());
-        let public: std::net::SocketAddr = "0.0.0.0:7801".parse().unwrap();
-        assert!(super::edge_options(Some(public), Some(&file)).is_err());
-        // A token file others can read is refused.
-        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o644))
-            .unwrap();
-        assert!(super::edge_options(Some(loopback), Some(&file)).is_err());
-        assert!(super::edge_options(Some(loopback), Some(&private.join("missing"))).is_err());
+        let open = format!(
+            "{:#}",
+            super::edge_token(&edge, &run, Some("other")).unwrap_err()
+        );
+        assert!(
+            open.contains("edge token file") && !open.contains("Runtime token"),
+            "{open}"
+        );
+        assert!(super::edge_token(&gateway.join("missing"), &run, None).is_err());
+    }
+
+    #[test]
+    fn a_hard_link_to_the_runtime_token_is_refused() {
+        // A second name of the Runtime token file in another folder: same
+        // device and inode. (`token::read` also refuses nlink != 1.)
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        let runtime = private_file(
+            &run,
+            super::RUNTIME_TOKEN_FILE,
+            "runtime-token-runtime-token-0123456789",
+        );
+        let gateway = dir.path().join("gateway");
+        std::fs::create_dir(&gateway).unwrap();
+        std::fs::set_permissions(
+            &gateway,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let linked = gateway.join("edge.token");
+        std::fs::hard_link(&runtime, &linked).unwrap();
+        let refused = super::edge_token(&linked, &run, None).unwrap_err();
+        assert!(
+            refused.to_string().contains("is the Runtime token file"),
+            "{refused}"
+        );
     }
 
     use super::*;

@@ -184,14 +184,25 @@ enum RuntimeCommand {
         /// [default: the `LOOP_TOOL_LOCK_ROOT` environment variable].
         #[arg(long, value_name = "DIR")]
         tool_lock_root: Option<PathBuf>,
-        /// Serve a trusted Edge Gateway on this loopback IP address and
-        /// port. The gateway names the end user of each connection at its
-        /// handshake. Needs `--edge-token-file` [default: off].
-        #[arg(long, value_name = "ADDR", requires = "edge_token_file")]
+        /// UNSTABLE, not for real users yet: serve a trusted Edge Gateway
+        /// on this loopback IP address and port. The gateway names the end
+        /// user of each connection at its handshake. Needs
+        /// `--unstable-edge-token-file` and `--tool-lock` [default: off].
+        #[arg(
+            long = "unstable-edge-listen",
+            value_name = "ADDR",
+            requires = "edge_token_file"
+        )]
         edge_listen: Option<std::net::SocketAddr>,
-        /// With `--edge-listen`: a private (0600) file that holds the
-        /// gateway's bearer token. It must differ from the Runtime token.
-        #[arg(long, value_name = "FILE", requires = "edge_listen")]
+        /// UNSTABLE, with `--unstable-edge-listen`: a private (0600) file
+        /// of at least 32 bytes that holds the gateway's bearer token,
+        /// outside the agent directory. It must differ from the Runtime
+        /// token.
+        #[arg(
+            long = "unstable-edge-token-file",
+            value_name = "FILE",
+            requires = "edge_listen"
+        )]
         edge_token_file: Option<PathBuf>,
     },
     /// Ask the running Runtime to stop, through its socket, and wait up to
@@ -865,9 +876,9 @@ mod tests {
             "loop",
             "runtime",
             "start",
-            "--edge-listen",
+            "--unstable-edge-listen",
             "127.0.0.1:7801",
-            "--edge-token-file",
+            "--unstable-edge-token-file",
             "/run/edge.token",
         ]);
         let Some(Commands::Runtime(RuntimeCommand::Start {
@@ -882,6 +893,21 @@ mod tests {
         assert_eq!(edge_token_file, Some(PathBuf::from("/run/edge.token")));
         // Each needs the other.
         for args in [
+            &[
+                "loop",
+                "runtime",
+                "start",
+                "--unstable-edge-listen",
+                "127.0.0.1:7801",
+            ][..],
+            &[
+                "loop",
+                "runtime",
+                "start",
+                "--unstable-edge-token-file",
+                "/run/edge.token",
+            ][..],
+            // The old, stable-sounding names are gone.
             &[
                 "loop",
                 "runtime",
