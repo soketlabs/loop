@@ -557,7 +557,7 @@ fn writer(
                     .collect();
                 append_group(&mut conn, all, replies, acknowledged);
                 commits += 1;
-                if commits % WAL_CHECK_COMMITS == 0 {
+                if commits.is_multiple_of(WAL_CHECK_COMMITS) {
                     bound_wal(&conn, wal);
                 }
             }
