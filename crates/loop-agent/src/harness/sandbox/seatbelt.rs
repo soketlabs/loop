@@ -330,6 +330,63 @@ pub struct SeatbeltPolicy {
     home_reads: Option<(Vec<PathBuf>, Vec<PathBuf>)>,
 }
 
+/// The secrets below the home directory (and the system keychains) that
+/// the Seatbelt profile denies to sandboxed commands, whatever the Policy:
+/// credential stores, shell histories and other agents' configuration. The
+/// edge listener's tool-lock root check reads the same list.
+pub fn sensitive_home_paths(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".git-credentials"),
+        home.join(".config/git/credentials"),
+        home.join(".cargo/credentials"),
+        home.join(".cargo/credentials.toml"),
+        home.join(".gem/credentials"),
+        home.join(".terraform.d/credentials.tfrc.json"),
+        home.join(".azure"),
+        home.join(".config/hub"),
+        home.join(".bash_history"),
+        home.join(".zsh_history"),
+        home.join(".zhistory"),
+        home.join(".sh_history"),
+        home.join(".history"),
+        home.join(".local/share/fish/fish_history"),
+        home.join(".python_history"),
+        home.join(".node_repl_history"),
+        home.join(".psql_history"),
+        home.join(".mysql_history"),
+        home.join(".sqlite_history"),
+        home.join(".lesshst"),
+        home.join(".netrc"),
+        home.join(".docker/config.json"),
+        home.join(".kube/config"),
+        home.join(".npmrc"),
+        home.join(".pypirc"),
+        home.join(".config/gcloud"),
+        home.join("Library/Cookies"),
+        home.join(".codex"),
+        home.join(".claude"),
+        home.join(".claude.json"),
+        home.join(".gemini"),
+        home.join(".qwen"),
+        home.join(".copilot"),
+        home.join(".config/github-copilot"),
+        home.join(".cursor"),
+        home.join(".continue"),
+        home.join(".aider.conf.yml"),
+        home.join(".config/opencode"),
+        home.join(".local/share/opencode"),
+        home.join(".config/goose"),
+        home.join(".config/amp"),
+        home.join(".local/share/amp"),
+        home.join(".ssh"),
+        home.join(".aws"),
+        home.join(".gnupg"),
+        home.join(".config/gh"),
+        home.join("Library/Keychains"),
+        PathBuf::from("/Library/Keychains"),
+    ]
+}
+
 impl SeatbeltPolicy {
     /// Build a policy with explicit home, agent directory and Runtime endpoints.
     pub fn new(
@@ -349,66 +406,19 @@ impl SeatbeltPolicy {
         // write its git directory outside the project.
         writes.extend(project_git_writes(&project)?);
         let mut denied_paths = vec![];
-        for path in [
-            home.join(".git-credentials"),
-            home.join(".config/git/credentials"),
-            home.join(".cargo/credentials"),
-            home.join(".cargo/credentials.toml"),
-            home.join(".gem/credentials"),
-            home.join(".terraform.d/credentials.tfrc.json"),
-            home.join(".azure"),
-            home.join(".config/hub"),
-            home.join(".bash_history"),
-            home.join(".zsh_history"),
-            home.join(".zhistory"),
-            home.join(".sh_history"),
-            home.join(".history"),
-            home.join(".local/share/fish/fish_history"),
-            home.join(".python_history"),
-            home.join(".node_repl_history"),
-            home.join(".psql_history"),
-            home.join(".mysql_history"),
-            home.join(".sqlite_history"),
-            home.join(".lesshst"),
-            home.join(".netrc"),
-            home.join(".docker/config.json"),
-            home.join(".kube/config"),
-            home.join(".npmrc"),
-            home.join(".pypirc"),
-            home.join(".config/gcloud"),
-            home.join("Library/Cookies"),
-            home.join(".codex"),
-            home.join(".claude"),
-            home.join(".claude.json"),
-            home.join(".gemini"),
-            home.join(".qwen"),
-            home.join(".copilot"),
-            home.join(".config/github-copilot"),
-            home.join(".cursor"),
-            home.join(".continue"),
-            home.join(".aider.conf.yml"),
-            home.join(".config/opencode"),
-            home.join(".local/share/opencode"),
-            home.join(".config/goose"),
-            home.join(".config/amp"),
-            home.join(".local/share/amp"),
-            home.join(".ssh"),
-            home.join(".aws"),
-            home.join(".gnupg"),
-            home.join(".config/gh"),
-            home.join("Library/Keychains"),
-            PathBuf::from("/Library/Keychains"),
-            agent.join("auth.json"),
-            agent.join("run"),
-            agent.join("mcp-auth"),
-            agent.join("agents"),
-            agent.join("history.json"),
-            agent.join("history"),
-            agent.join("logs"),
-            agent.join("usage"),
-        ]
-        .into_iter()
-        .chain(runtime_paths.iter().cloned())
+        for path in sensitive_home_paths(home)
+            .into_iter()
+            .chain([
+                agent.join("auth.json"),
+                agent.join("run"),
+                agent.join("mcp-auth"),
+                agent.join("agents"),
+                agent.join("history.json"),
+                agent.join("history"),
+                agent.join("logs"),
+                agent.join("usage"),
+            ])
+            .chain(runtime_paths.iter().cloned())
         {
             // Protect both the configured name and its resolved target.
             denied_paths.push(std::path::absolute(&path).map_err(io_error)?);
