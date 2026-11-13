@@ -378,8 +378,11 @@ automatic compaction through the existing update kinds:
 - A failed compaction after a context-length error ends the turn with
   `turn_ended` (`stop: error`) and an error that names the cause.
 
-`session/compact` replaces the transcript with a `branch_reset` (reason
-`compact`). An automatic compaction does not: the live transcript keeps the
+`session/compact` asks the model for the summary without holding the
+Session: attach, close and settings answer meanwhile, a prompt is refused as
+busy, and closing the Session cancels the compaction. If the Session's branch
+changed meanwhile, nothing is written. `session/compact` then replaces the
+transcript with a `branch_reset` (reason `compact`). An automatic compaction does not: the live transcript keeps the
 whole turn, and the compaction appears when the transcript is read again
 (`session/transcript`, attach, reload), as a `compaction summary` notice
 before the kept messages.

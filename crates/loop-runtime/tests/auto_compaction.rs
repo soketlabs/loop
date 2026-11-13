@@ -259,7 +259,8 @@ async fn attach_does_not_wait_for_a_slow_compaction() {
     .expect("prompt did not wait for the summary");
     match prompt {
         Err(error) => assert!(
-            matches!(error, loop_protocol::BackendError::Busy) || error.to_string().contains("busy"),
+            matches!(error, loop_protocol::BackendError::Busy)
+                || error.to_string().contains("busy"),
             "{error}"
         ),
         Ok(turn) => assert!(!matches!(turn.outcome().await, TurnOutcome::Completed(_))),

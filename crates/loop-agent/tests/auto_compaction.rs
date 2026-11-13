@@ -36,6 +36,8 @@ enum Reply {
     Tool,
     /// A context-length error, whatever the size.
     Overflow,
+    /// A context-length error after the stream started.
+    OverflowAfterStart,
     /// `n` tool calls to `big` in one response (run in parallel).
     Tools(usize),
     /// Text of about this many tokens cut at the output limit (the loop
@@ -196,6 +198,20 @@ async fn fixture_with(
                 };
             }
             let reply = p.replies.lock().pop_front().unwrap_or(Reply::Text("done"));
+            if matches!(reply, Reply::OverflowAfterStart) {
+                let mut error = AssistantMessage::pending(&model);
+                error.stop_reason = StopReason::Error;
+                error.error_message = Some("400 context_length_exceeded".into());
+                return FauxResponse::Events(vec![
+                    AssistantMessageEvent::Start {
+                        partial: AssistantMessage::pending(&model),
+                    },
+                    AssistantMessageEvent::Error {
+                        reason: StopReason::Error,
+                        error,
+                    },
+                ]);
+            }
             if tokens > *p.limit.lock() || matches!(reply, Reply::Overflow) {
                 return FauxResponse::Error(format!(
                     "400 context_length_exceeded: prompt is too long ({tokens} tokens)"
@@ -259,7 +275,7 @@ async fn fixture_with(
                         usage,
                     )
                 }
-                Reply::Overflow => unreachable!(),
+                Reply::Overflow | Reply::OverflowAfterStart => unreachable!(),
             }
         })
     }));
@@ -1019,7 +1035,11 @@ async fn overflow_quotes_the_turn_request_not_a_steering_message() {
     f.harness.steer(AgentMessage::user_text("STEERING NOTE"));
     f.provider.push(std::iter::repeat_n(Reply::Tool, 4));
     f.provider.push([Reply::Overflow, Reply::Text("done")]);
-    let answer = f.harness.prompt(long("THE REAL REQUEST", 400)).await.unwrap();
+    let answer = f
+        .harness
+        .prompt(long("THE REAL REQUEST", 400))
+        .await
+        .unwrap();
     assert_eq!(
         answer.as_assistant().unwrap().stop_reason,
         StopReason::Stop,
@@ -1038,7 +1058,8 @@ async fn overflow_quotes_the_turn_request_not_a_steering_message() {
 #[tokio::test]
 async fn overflow_quotes_the_turn_request_not_the_continue_prompt() {
     let f = fixture(settings()).await;
-    f.provider.push([Reply::Length(3_000), Reply::Overflow, Reply::Text("done")]);
+    f.provider
+        .push([Reply::Length(3_000), Reply::Overflow, Reply::Text("done")]);
     let answer = f.harness.prompt("THE REAL REQUEST").await.unwrap();
     assert_eq!(
         answer.as_assistant().unwrap().stop_reason,
@@ -1096,8 +1117,14 @@ async fn images_and_thinking_signatures_are_kept() {
     let last = f.provider.main_requests().last().unwrap().clone();
     let text = format!("{:?}", last.messages);
     assert!(text.contains("aW1hZ2U="), "the image is gone");
-    assert!(text.contains("SIGNATURE-123"), "the thinking signature is gone");
-    assert!(text.contains("TOOL-SIGNATURE"), "the tool call signature is gone");
+    assert!(
+        text.contains("SIGNATURE-123"),
+        "the thinking signature is gone"
+    );
+    assert!(
+        text.contains("TOOL-SIGNATURE"),
+        "the tool call signature is gone"
+    );
 }
 
 /// A nested compaction on the SQLite store builds the same context as the
@@ -1105,8 +1132,7 @@ async fn images_and_thinking_signatures_are_kept() {
 #[tokio::test]
 async fn nested_compaction_on_sqlite() {
     let dir = tempfile::tempdir().unwrap();
-    let store =
-        loop_agent::harness::create_sqlite_session_store(dir.path().join("s.db")).unwrap();
+    let store = loop_agent::harness::create_sqlite_session_store(dir.path().join("s.db")).unwrap();
     let f = fixture_on(Arc::clone(&store), settings()).await;
     with_history(&f, 8, 1_500).await;
     f.provider.push(std::iter::repeat_n(Reply::Tool, 20));
@@ -1153,8 +1179,13 @@ async fn an_unknown_window_still_recovers_from_an_overflow() {
     .await;
     *f.provider.limit.lock() = u64::MAX;
     with_history(&f, 3, 2_000).await;
-    assert_eq!(f.provider.summary_requests(), 0, "no threshold without a window");
-    f.provider.push([Reply::Overflow, Reply::Text("after retry")]);
+    assert_eq!(
+        f.provider.summary_requests(),
+        0,
+        "no threshold without a window"
+    );
+    f.provider
+        .push([Reply::Overflow, Reply::Text("after retry")]);
     let answer = f.harness.prompt("next").await.unwrap();
     assert_eq!(answer.as_assistant().unwrap().stop_reason, StopReason::Stop);
     assert_eq!(f.provider.summary_requests(), 1);
@@ -1185,4 +1216,33 @@ async fn dropping_a_manual_compaction_leaves_the_harness_idle() {
         .expect("not stuck")
         .unwrap();
     assert_eq!(answer.as_assistant().unwrap().stop_reason, StopReason::Stop);
+}
+
+/// A request refused after its stream started shows clients no message:
+/// the turn has exactly one agent message, the answer of the retry.
+#[tokio::test]
+async fn a_refused_request_leaves_no_ghost_message() {
+    let f = fixture(settings()).await;
+    with_history(&f, 3, 600).await;
+    let backend = NativeBackend::new(Arc::clone(&f.harness)).await;
+    let session = backend.current_session().await;
+    let mut rx = backend.subscribe();
+    f.provider
+        .push([Reply::OverflowAfterStart, Reply::Text("after retry")]);
+    let turn = backend
+        .prompt(&session, vec![ContentBlock::text("next")])
+        .await
+        .unwrap();
+    assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+    let mut agent_messages = 0;
+    while let Ok(Ok(envelope)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+        if let SessionUpdate::MessageStarted {
+            role: loop_protocol::Role::Agent,
+            ..
+        } = envelope.update
+        {
+            agent_messages += 1;
+        }
+    }
+    assert_eq!(agent_messages, 1);
 }

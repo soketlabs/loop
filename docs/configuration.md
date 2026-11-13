@@ -94,17 +94,40 @@ during a turn:
   once more. If that compaction fails, or the request is still too long, the
   turn ends with an error that says so. Loop does not try again.
 
-Compaction keeps about `keepRecentTokens` of the newest messages, the system
-prompt and the user's current request. It cuts at the start of a user turn,
-or at the start of a tool round inside one long turn, never between a tool
-call and its result. When the cut removes the current request, the summary
-quotes it. The Session tree records an automatic compaction as the same entry
-`/compact` writes, so resume, fork and the transcript work the same way. A
-cancelled turn records nothing. A `session_before_compact` hook (see
-[hooks](hooks.md)) can block a compaction or give the summary.
+At the threshold, compaction summarizes earlier turns and keeps about
+`keepRecentTokens` of the newest messages (at most half the room the window
+leaves after `reserveTokens`, the system prompt and the tool definitions).
+It never cuts into the current turn: the user's request stays as it was
+written, images included. When the current turn alone is too large, the
+outputs of its older tool rounds are shortened instead, each marked
+`[output shortened by automatic compaction …]`; the newest round stays
+whole. Before it asks the model for a summary, Loop checks that the result
+will fit; when it cannot, it says so in a notice and does not compact again
+in that turn. A turn compacts at most 8 times. When the window is not larger
+than `reserveTokens` and the system prompt and tools, Loop does not compact
+automatically and says so once per turn.
+
+Only the recovery after a context-length error may cut into the current
+turn, at the start of a tool round. The summary then quotes the request as
+the user wrote it when the turn started.
+
+A cut never falls between a tool call and its result. The Session tree
+records an automatic compaction as the same entry `/compact` writes, with
+the shortened outputs, so resume, fork and the transcript show the same
+context. A cancelled turn records nothing. A `session_before_compact` hook
+(see [hooks](hooks.md)) can block a compaction or give the summary. The
+summary request uses the Session's model with no reasoning and an answer of
+at most 2048 tokens.
+
+Every Session compacts this way, also a subagent's (a subagent is a
+Session). Workflow tasks of `/workflow` do not compact.
+
+When a model's context window is unknown (0), Loop has no threshold: it
+compacts only after a context-length error, once per request.
 
 Set `"compaction": {"enabled": false}` to turn automatic compaction off; a
-request that is too long then fails with the provider's error.
+request that is too long then fails with the provider's error. A change in
+the settings file reaches open Sessions with `workspace/reload`.
 
 ## Tool environment
 

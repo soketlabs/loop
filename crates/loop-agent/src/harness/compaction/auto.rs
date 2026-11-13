@@ -334,10 +334,9 @@ impl TurnCompactor {
             keep = keep.min(tokens_before / 2);
         }
         // A cut past the turn's request quotes it in the summary.
-        let quote = self
-            .request
-            .as_deref()
-            .map_or(0, |r| estimate_agent_message_tokens(&AgentMessage::user_text(r)));
+        let quote = self.request.as_deref().map_or(0, |r| {
+            estimate_agent_message_tokens(&AgentMessage::user_text(r))
+        });
         let quoted = |cut: usize| turn_start.is_some_and(|start| cut > start);
         let mut cut = if threshold {
             find_auto_cut_point(llm, keep, budget / 2)
@@ -395,7 +394,9 @@ impl TurnCompactor {
         // A summary at the front can only be replaced by one carrying it.
         let first_is_summary = matches!(
             messages.first(),
-            Some(AgentMessage::Custom(CustomAgentMessage::CompactionSummary { .. }))
+            Some(AgentMessage::Custom(
+                CustomAgentMessage::CompactionSummary { .. }
+            ))
         );
         if cut == 0 && !shorten.is_empty() && first_is_summary {
             cut = 1;

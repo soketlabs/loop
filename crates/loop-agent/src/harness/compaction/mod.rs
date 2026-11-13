@@ -224,7 +224,9 @@ pub enum AutoCompactionError {
     Summary(String),
     /// The compacted context would still be above the threshold, so the
     /// compaction is not worth its summary request.
-    #[error("compaction cannot bring the context under the threshold (~{after} tokens, limit ~{limit})")]
+    #[error(
+        "compaction cannot bring the context under the threshold (~{after} tokens, limit ~{limit})"
+    )]
     StillTooLarge {
         /// Estimated tokens after.
         after: u64,
