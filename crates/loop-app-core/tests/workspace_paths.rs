@@ -225,3 +225,143 @@ async fn project_system_prompt_files_load_through_the_env() {
     assert!(env.calls().is_empty(), "{:?}", env.calls());
     assert!(!std::path::Path::new(VIRTUAL_ROOT).exists());
 }
+
+/// The skill and prompt lists of a trusted project `settings.json` name
+/// project paths: they load through the env. The same lists in the global
+/// file are the user's own folders: host reads.
+#[tokio::test]
+async fn folders_named_by_project_settings_load_through_the_env() {
+    let agent = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    skill(ws.path().join("shared/s1"), "wp-shared");
+    write(ws.path().join("shared-prompts/sp.md"), "shared prompt");
+    let env = VirtualEnv::new(ws.path());
+    let shared = env.root().join("shared");
+    let shared_prompts = env.root().join("shared-prompts");
+
+    // The merged lists differ from the global file's (it names none): they
+    // came from the project settings.
+    let settings = Settings {
+        skills: vec![shared.to_string_lossy().into_owned()],
+        prompts: vec![shared_prompts.to_string_lossy().into_owned()],
+        ..Settings::default()
+    };
+    let res = load_resources_in(&env, agent.path(), env.root(), true, &settings).await;
+    assert!(res.skills.iter().any(|s| s.name == "wp-shared"));
+    assert!(res.prompts.iter().any(|p| p.name == "sp"));
+    assert!(env
+        .calls()
+        .iter()
+        .any(|c| c.starts_with("list_dir") && c.ends_with("shared")));
+    env.assert_no_leaks();
+
+    // Untrusted: the settings are the global ones, and a folder in them is
+    // a host path, never given to the env.
+    let host_dir = tempfile::tempdir().unwrap();
+    skill(host_dir.path().join("h1"), "wp-host");
+    let global_settings = Settings {
+        skills: vec![host_dir.path().to_string_lossy().into_owned()],
+        ..Settings::default()
+    };
+    global_settings
+        .save_file(&loop_app_core::config::paths::settings_path(agent.path()))
+        .unwrap();
+    let env = VirtualEnv::new(ws.path());
+    let res = load_resources_in(&env, agent.path(), env.root(), true, &global_settings).await;
+    assert!(res.skills.iter().any(|s| s.name == "wp-host"));
+    assert!(
+        !env.calls()
+            .iter()
+            .any(|c| c.contains(&*host_dir.path().to_string_lossy())),
+        "{:?}",
+        env.calls()
+    );
+    env.assert_no_leaks();
+}
+
+/// A reload (the admin `reload` and `trust` calls load with the host env of
+/// the workspace) gives the skill list of a fresh open, on a folder with
+/// ignore rules.
+#[tokio::test]
+async fn a_reload_gives_the_skill_list_of_a_fresh_open() {
+    use loop_app_core::runtime::{BootstrapOpts, GlobalResources, SessionFactory};
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let agent = base.join("agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    let project = base.join("project");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    write(project.join(".gitignore"), "skipme/\n");
+    write(project.join(".claude/skills/.ignore"), "!wp-wip/\n");
+    skill(project.join(".claude/skills/skipme/a"), "wp-skipped");
+    skill(project.join(".claude/skills/kept"), "wp-kept");
+    skill(project.join(".claude/skills/sub/wp-wip"), "wp-wip");
+    write(project.join(".claude/skills/sub/.gitignore"), "wp-wip/\n");
+    skill(project.join(".loop/skills/own"), "wp-own");
+    loop_app_core::config::trust::TrustStore::load(agent.join("trust.json"))
+        .unwrap()
+        .set(&project, true)
+        .unwrap();
+
+    let models = std::sync::Arc::new(loop_ai::Models::create(Default::default()));
+    let factory = SessionFactory::new(std::sync::Arc::new(
+        GlobalResources::with_models(agent.clone(), models).unwrap(),
+    ));
+    let opts = BootstrapOpts {
+        cwd: project.clone(),
+        provider: Some("faux".into()),
+        model: Some("faux-model".into()),
+        theme: None,
+        system_prompt: Some("p".into()),
+        append_system_prompt: None,
+        no_context_files: true,
+        interactive: false,
+        session_id: None,
+        no_web: true,
+        permission_mode: Some("ask".into()),
+        agent: None,
+    };
+    let fresh = factory.workspace(&opts).await.unwrap();
+    assert!(fresh.project_trusted);
+
+    let env = HostExecutionEnv::new(&fresh.cwd);
+    let reloaded = load_resources_in(
+        &env,
+        &agent,
+        &fresh.cwd,
+        fresh.project_trusted,
+        &fresh.settings,
+    )
+    .await;
+    let list = |r: &loop_app_core::resources::LoadedResources| {
+        r.skills
+            .iter()
+            .chain(&r.disabled_skills)
+            .filter(|s| s.name.starts_with("wp-"))
+            .map(|s| (s.name.clone(), s.path.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(list(&reloaded), list(&fresh.resources));
+    // And the old host loader (the walker of the `ignore` crate) agrees.
+    let host = load_resources(&agent, &fresh.cwd, true, &fresh.settings);
+    assert_eq!(list(&host), list(&fresh.resources));
+    // A global folder that is also a project folder (the agent dir is
+    // `<project>/.agents`) loads once and gives the same list as on the host.
+    let alias_agent = project.join(".agents");
+    skill(alias_agent.join("skills/aliased"), "wp-aliased");
+    let host = load_resources(&alias_agent, &fresh.cwd, true, &fresh.settings);
+    let through = load_resources_in(&env, &alias_agent, &fresh.cwd, true, &fresh.settings).await;
+    assert_eq!(list(&through), list(&host));
+    assert_eq!(
+        through
+            .skills
+            .iter()
+            .filter(|s| s.name == "wp-aliased")
+            .count(),
+        1
+    );
+    let mut names: Vec<_> = list(&fresh.resources).into_iter().map(|(n, _)| n).collect();
+    names.sort();
+    // `wp-wip`: the `.ignore` whitelist beats the deeper `.gitignore` rule.
+    assert_eq!(names, ["wp-kept", "wp-own", "wp-wip"]);
+}

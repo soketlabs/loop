@@ -10,10 +10,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use loop_agent::harness::prompt_templates::{load_prompt_templates, load_prompt_templates_in};
-use loop_agent::harness::skills::{load_skills, load_skills_in};
+use loop_agent::harness::skills::{host_global_gitignore, load_skills, load_skills_in};
 use loop_agent::harness::{
     create_edit_tool, create_glob_tool, create_grep_tool, create_ls_tool, create_read_tool,
-    create_write_tool, set_document_reader, DocumentReader, ExecutionEnv,
+    create_write_tool, set_document_reader, DocumentReader, ExecutionEnv, HostExecutionEnv,
 };
 use loop_agent::AgentTool;
 use serde_json::{json, Value};
@@ -203,7 +203,8 @@ async fn skills_and_templates_load_through_the_env() {
     std::fs::write(root.join("prompts/skip.txt"), "no").unwrap();
     let env = VirtualEnv::new(root);
 
-    let (skills, diags) = load_skills_in(&env, &env.root().join("skills")).await;
+    let (skills, diags) =
+        load_skills_in(&env, &env.root().join("skills"), &host_global_gitignore()).await;
     assert!(diags.is_empty(), "{diags:?}");
     let mut names: Vec<_> = skills.iter().map(|s| s.name.as_str()).collect();
     names.sort();
@@ -225,6 +226,56 @@ async fn skills_and_templates_load_through_the_env() {
     assert!(none.is_empty());
     assert_eq!(diags.len(), 1);
     env.assert_no_leaks();
+}
+
+fn write_file(path: &Path, text: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// Compare the host walk of `base/rel` with the walk through the virtual env
+/// (same skills, same paths, same order) and with the names expected; a
+/// difference is added to `diffs`, so one run shows every case that differs.
+async fn same_walk(diffs: &mut Vec<String>, base: &Path, rel: &str, expected: &[&str]) {
+    let host = load_skills(&base.join(rel)).0;
+    let host: Vec<_> = host
+        .iter()
+        .map(|s| (s.name.clone(), s.path.clone()))
+        .collect();
+    let env = VirtualEnv::new(base);
+    let through = load_skills_in(&env, &env.root().join(rel), &host_global_gitignore())
+        .await
+        .0;
+    let through: Vec<_> = through
+        .iter()
+        .map(|s| {
+            let rest = s.path.strip_prefix(env.root()).unwrap();
+            (s.name.clone(), base.join(rest))
+        })
+        .collect();
+    let names = |v: &[(String, std::path::PathBuf)]| {
+        let mut n: Vec<String> = v.iter().map(|(n, _)| n.clone()).collect();
+        n.sort();
+        n
+    };
+    let mut expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    if names(&host) != expected {
+        diffs.push(format!(
+            "{rel}: the host walk found {:?}, the case expects {expected:?}",
+            names(&host)
+        ));
+    }
+    if through != host {
+        diffs.push(format!(
+            "{rel}: env walk {:?} differs from host walk {:?}",
+            names(&through),
+            names(&host)
+        ));
+    }
+    if !env.leaks().is_empty() {
+        diffs.push(format!("{rel}: leaks {:?}", env.leaks()));
+    }
 }
 
 /// The loader through the env finds what the host walker finds, in the same
@@ -279,7 +330,9 @@ async fn the_env_skill_walk_matches_the_host_walk() {
 
         let env = VirtualEnv::new(&base);
         let virt_root = env.root().join(repo).join(".claude/skills");
-        let through: Vec<_> = load_skills_in(&env, &virt_root).await.0;
+        let through: Vec<_> = load_skills_in(&env, &virt_root, &host_global_gitignore())
+            .await
+            .0;
         let through: Vec<_> = through
             .iter()
             .map(|s| {
@@ -320,6 +373,94 @@ async fn the_env_skill_walk_matches_the_host_walk() {
         assert_eq!(names, expected, "{repo}");
         env.assert_no_leaks();
     }
+
+    // Rule precedence, repositories and links: cases the two walkers must
+    // decide alike (each came from a review of the first env walker).
+    let mut diffs: Vec<String> = Vec::new();
+    let w = |rel: &str, text: &str| write_file(&base.join(rel), text);
+    // P1: a match in any `.ignore` wins over any `.gitignore`, whatever the
+    // folder depth. (a) a whitelist in the root `.ignore` beats a deeper
+    // `.gitignore` rule; (b) an ignore rule in the root `.ignore` beats a
+    // whitelist in a deeper `.gitignore`.
+    std::fs::create_dir_all(base.join("p1a/.git")).unwrap();
+    w("p1a/skills/.ignore", "!wip/\n");
+    w("p1a/skills/sub/.gitignore", "wip/\n");
+    skill(&base.join("p1a/skills/sub"), "wip/w", "p1a-wip");
+    skill(&base.join("p1a/skills/sub"), "ok", "p1a-ok");
+    same_walk(&mut diffs, &base, "p1a/skills", &["p1a-ok", "p1a-wip"]).await;
+    std::fs::create_dir_all(base.join("p1b/.git")).unwrap();
+    w("p1b/skills/.ignore", "wip/\n");
+    w("p1b/skills/sub/.gitignore", "!wip/\n");
+    skill(&base.join("p1b/skills/sub"), "wip/w", "p1b-wip");
+    same_walk(&mut diffs, &base, "p1b/skills", &[]).await;
+    // P2: the rules of a repository above the nearest repository do not apply.
+    std::fs::create_dir_all(base.join("p2/.git")).unwrap();
+    std::fs::create_dir_all(base.join("p2/inner/.git")).unwrap();
+    w("p2/.gitignore", "skipme/\n");
+    skill(&base.join("p2/inner/skills"), "skipme/a", "p2-skipme");
+    skill(&base.join("p2/inner/skills"), "kept", "p2-kept");
+    same_walk(
+        &mut diffs,
+        &base,
+        "p2/inner/skills",
+        &["p2-kept", "p2-skipme"],
+    )
+    .await;
+    // P4: a `.jj` folder also makes a folder a repository.
+    std::fs::create_dir_all(base.join("p4/.jj")).unwrap();
+    w("p4/.gitignore", "skipme/\n");
+    skill(&base.join("p4/skills"), "skipme/a", "p4-skipme");
+    skill(&base.join("p4/skills"), "kept", "p4-kept");
+    same_walk(&mut diffs, &base, "p4/skills", &["p4-kept"]).await;
+    // P6: a root that is a link takes its parent folders from the resolved
+    // path, so the repository's `.gitignore` applies.
+    std::fs::create_dir_all(base.join("p6/repo/.git")).unwrap();
+    std::fs::create_dir_all(base.join("p6/elsewhere")).unwrap();
+    w("p6/repo/.gitignore", "skipme/\n");
+    skill(&base.join("p6/repo/skills"), "skipme/a", "p6-skipme");
+    skill(&base.join("p6/repo/skills"), "kept", "p6-kept");
+    std::os::unix::fs::symlink("../repo/skills", base.join("p6/elsewhere/link")).unwrap();
+    same_walk(&mut diffs, &base, "p6/elsewhere/link", &["p6-kept"]).await;
+    // P3: in a git worktree `.git` is a file; the exclude file is the one of
+    // the common git dir. (Its `gitdir:` line holds a host path, so this
+    // case runs on the host env itself.)
+    let main = base.join("p3/main");
+    std::fs::create_dir_all(main.join(".git/info")).unwrap();
+    std::fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+    std::fs::write(main.join(".git/info/exclude"), "excl/\n").unwrap();
+    std::fs::write(main.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
+    std::fs::create_dir_all(base.join("p3/wt")).unwrap();
+    std::fs::write(
+        base.join("p3/wt/.git"),
+        format!("gitdir: {}\n", main.join(".git/worktrees/wt").display()),
+    )
+    .unwrap();
+    skill(&base.join("p3/wt/skills"), "excl/a", "p3-excl");
+    skill(&base.join("p3/wt/skills"), "kept", "p3-kept");
+    let host: Vec<_> = load_skills(&base.join("p3/wt/skills")).0;
+    assert_eq!(
+        host.len(),
+        1,
+        "the worktree exclude applies on the host walk"
+    );
+    let env = HostExecutionEnv::new(&base);
+    let through = load_skills_in(&env, &base.join("p3/wt/skills"), &host_global_gitignore())
+        .await
+        .0;
+    let names =
+        |v: &[loop_agent::harness::Skill]| v.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+    if names(&through) != names(&host) {
+        diffs.push(format!(
+            "p3: env walk {:?} differs from host walk {:?}",
+            names(&through),
+            names(&host)
+        ));
+    }
+    assert!(
+        diffs.is_empty(),
+        "the env walk differs from the host walk:\n{}",
+        diffs.join("\n")
+    );
 
     // Templates: the same files in the same order.
     let prompts = base.join("repo/prompts");
