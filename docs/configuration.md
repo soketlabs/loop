@@ -92,6 +92,59 @@ directory; environment overrides cannot replace it. Network
 settings apply to shell subprocesses; host web/MCP services remain separate
 capabilities. See [the macOS sandbox decision](design/macos-sandbox.md).
 
+On Linux, `/sandbox local` runs shell commands in a Podman container that
+mounts the project at the same path. These paths are read-only in the
+container:
+
+- project `.loop`;
+- in the project's git directory, in each submodule git directory below
+  `.git/modules` and in each worktree directory below `.git/worktrees`:
+  `hooks`, `config`, `config.worktree`, `commondir`, `gitdir` and
+  `info/attributes`, and the `modules` and `worktrees` directories
+  themselves (so `git submodule add` and `git worktree add` fail in the
+  sandbox);
+- the directory that `core.hooksPath` names, when it is in the project
+  (Loop reads it from the repository config, `~/.gitconfig` and
+  `$XDG_CONFIG_HOME/git/config`; it does not follow `include` and does not
+  read the system config).
+
+Each git directory, and each directory between the project root and a
+protected path, is a mount point, so a command cannot rename it away and
+build a new one. When a protected path does not exist yet, Loop first
+creates a placeholder on the host: an empty directory (`.git`, `.loop`,
+`hooks`, `info`, `modules`, `worktrees`), an empty file (`config`,
+`config.worktree`, `info/attributes`) or a `commondir` that contains `.`
+(the git directory itself; an empty one would make Git fail). With that
+`commondir`, `git rev-parse --git-common-dir` prints an absolute path while
+a sandbox runs. An empty read-only `.git` means `git init` fails: run
+`git init` and `git clone` outside the sandbox. The last sandbox of a
+project to stop removes the placeholders that are still unchanged; after a
+crash, the next start removes them. A `.git` file that points into the
+project must point to a git directory on a `.git` path, which is then
+protected the same way; one that points outside the project is not mounted,
+so Git does not work in the container there. A symlinked protected path, and
+Loop's agent directory inside the project but outside `.loop`, refuse the
+start. File tools refuse the same paths, and also Git metadata and `.git`
+entries in any other repository in the project, as on macOS.
+
+Limits on Linux:
+
+- A shell command can still make a new repository in the project
+  (`git init sub`). Host Git runs that repository's hooks and config when
+  you work in it, and `git status` in the project also runs them when the
+  project's index records it as a gitlink (`git add sub`). After each shell
+  command Loop scans the project for new `.git` entries (up to 50,000
+  directory entries) and adds a warning to the command's output.
+- Hook managers read files in the working tree: husky (`.husky/`),
+  `pre-commit` (`.pre-commit-config.yaml`) and lefthook (`lefthook.yml`).
+  A command can change those files; the hooks then run them on the host.
+- `.git/rebase-merge`, `.git/rebase-apply` and `.git/sequencer` stay
+  writable, so a command can change the steps that `git rebase --continue`
+  or `git cherry-pick --continue` runs on the host.
+- With partial isolation, file tools run on the host and refuse symlinks
+  that lead out of the project, but a command in the container can still
+  make a symlink that a later host program follows.
+
 Loop supports Linux and macOS only. If sandbox preflight fails, standalone Loop leaves
 the sandbox off with a warning, while a Runtime started with `loop runtime start`
 refuses to admit the Session with `required workspace sandbox failed`. Runtime

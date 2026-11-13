@@ -12,6 +12,7 @@ use crate::harness::env::HostExecutionEnv;
 use crate::harness::sandbox::podman::{
     PodmanClient, PodmanExecOpts, PodmanRunOpts, RealPodmanClient,
 };
+use crate::harness::sandbox::protect::{self, ProtectedMounts};
 use crate::harness::sandbox::traits::{
     Sandbox, SandboxConfig, SandboxError, SandboxFactory, SandboxInfo, SandboxStatus,
 };
@@ -115,6 +116,10 @@ pub struct KrunSandbox {
     cpus: String,
     ram_mib: String,
     client: Arc<dyn PodmanClient>,
+    /// Loop's agent directory, write-protected when it lies in the project.
+    agent_dir: Option<PathBuf>,
+    /// The write-protected paths of the running container, and their stubs.
+    protected: parking_lot::Mutex<Option<ProtectedMounts>>,
     status: RwLock<SandboxStatus>,
     container_id: RwLock<Option<String>>,
     env: RwLock<Option<Arc<dyn ExecutionEnv>>>,
@@ -175,6 +180,12 @@ impl KrunSandbox {
             config.workdir
         };
         let workdir = std::fs::canonicalize(&workdir).unwrap_or(workdir);
+        let agent_dir = config
+            .options
+            .get("agentDir")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
         Self {
             id: loop_ai::new_id(),
             workdir,
@@ -184,6 +195,8 @@ impl KrunSandbox {
             cpus,
             ram_mib,
             client,
+            agent_dir,
+            protected: parking_lot::Mutex::new(None),
             status: RwLock::new(SandboxStatus::Created),
             container_id: RwLock::new(None),
             env: RwLock::new(None),
@@ -193,6 +206,41 @@ impl KrunSandbox {
 
     fn is_destroyed(&self) -> bool {
         self.destroyed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Release the protected paths of container `id` (`None`: no container
+    /// was made). Only when the container is gone: its mounts hold the
+    /// placeholders. A container that is still there keeps them, and a
+    /// later start of the project removes them.
+    async fn release_protected(&self, id: Option<&str>) {
+        let Some(protected) = self.protected.lock().take() else {
+            return;
+        };
+        let gone = match id {
+            None => true,
+            Some(id) => self.container_gone(id).await,
+        };
+        if !gone {
+            tracing::warn!(
+                container = id,
+                "sandbox: container still exists; keeping its placeholders"
+            );
+            protected.abandon();
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(move || protected.release()).await;
+    }
+
+    /// Whether container `id` no longer exists, waiting a few seconds for a
+    /// removal that `--rm` finishes after the stop returns.
+    async fn container_gone(&self, id: &str) -> bool {
+        for _ in 0..20 {
+            if let Ok(false) = self.client.exists(id).await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        false
     }
 
     /// Host workdir bind-mounted into the guest.
@@ -287,7 +335,26 @@ impl Sandbox for KrunSandbox {
         // Mount at the same absolute path inside the guest so host and container
         // paths match (e.g. `/home/u/proj/README.md` → `/home/u/proj/README.md`).
         let guest_workdir = self.workdir.to_string_lossy().into_owned();
-        let container_id = self
+        let (workdir, agent) = (self.workdir.clone(), self.agent_dir.clone());
+        let planned =
+            tokio::task::spawn_blocking(move || protect::plan(&workdir, agent.as_deref()))
+                .await
+                .map_err(|e| SandboxError::StartFailed(format!("sandbox: {e}")))
+                .and_then(|r| r);
+        let protected = planned.inspect_err(|_| {
+            *self.status.write() = SandboxStatus::Failed;
+        })?;
+        let binds = protected.binds.clone();
+        let git_entries = Arc::new(protected.git_entries().clone());
+        let read_only: Vec<PathBuf> = binds
+            .iter()
+            .filter(|b| b.read_only)
+            .map(|b| b.path.clone())
+            .collect();
+        if let Some(old) = self.protected.lock().replace(protected) {
+            old.abandon();
+        }
+        let run = self
             .client
             .run(PodmanRunOpts {
                 name,
@@ -297,27 +364,38 @@ impl Sandbox for KrunSandbox {
                 runtime: self.runtime.clone(),
                 cpus: self.cpus.clone(),
                 ram_mib: self.ram_mib.clone(),
+                binds,
             })
-            .await
-            .inspect_err(|_e| {
+            .await;
+        let container_id = match run {
+            Ok(id) => id,
+            Err(e) => {
                 *self.status.write() = SandboxStatus::Failed;
-            })?;
+                self.release_protected(None).await;
+                return Err(e);
+            }
+        };
         // Destroyed while `podman run` ran (an exit during an image pull):
         // nothing else will remove this container.
         if self.is_destroyed() {
             let _ = self.client.rm(&container_id).await;
+            self.release_protected(Some(&container_id)).await;
             *self.status.write() = SandboxStatus::Stopped;
             return Err(SandboxError::NotReady(
                 "sandbox was removed while it started".into(),
             ));
         }
 
-        let env: Arc<dyn ExecutionEnv> = Arc::new(KrunExecutionEnv::new(
-            Arc::clone(&self.client),
-            container_id.clone(),
-            self.workdir.clone(),
-            self.isolation,
-        ));
+        let env: Arc<dyn ExecutionEnv> = Arc::new(
+            KrunExecutionEnv::new(
+                Arc::clone(&self.client),
+                container_id.clone(),
+                self.workdir.clone(),
+                self.isolation,
+            )
+            .with_protected(self.agent_dir.clone(), read_only)
+            .with_git_entries(git_entries),
+        );
 
         *self.container_id.write() = Some(container_id);
         *self.env.write() = Some(env);
@@ -333,9 +411,10 @@ impl Sandbox for KrunSandbox {
         *self.status.write() = SandboxStatus::Stopping;
         *self.env.write() = None;
         let id = self.container_id.write().take();
-        if let Some(id) = id {
-            let _ = self.client.stop(&id).await;
+        if let Some(id) = &id {
+            let _ = self.client.stop(id).await;
         }
+        self.release_protected(id.as_deref()).await;
         *self.status.write() = SandboxStatus::Stopped;
         Ok(())
     }
@@ -345,11 +424,12 @@ impl Sandbox for KrunSandbox {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         *self.env.write() = None;
         let id = self.container_id.write().take();
-        if let Some(id) = id {
+        if let Some(id) = &id {
             // A forced remove stops the container at once; a graceful stop
             // first only waits for its timeout, which slows every exit.
-            let _ = self.client.rm(&id).await;
+            let _ = self.client.rm(id).await;
         }
+        self.release_protected(id.as_deref()).await;
         *self.status.write() = SandboxStatus::Stopped;
         Ok(())
     }
@@ -364,6 +444,16 @@ pub struct KrunExecutionEnv {
     isolation: KrunIsolation,
     /// Present when isolation is Partial.
     host_fs: Option<JailedHostFs>,
+    /// Loop's agent directory, write-protected for file tools.
+    agent_dir: Option<PathBuf>,
+    /// Paths mounted read-only in the container; file tools may not write
+    /// below them either.
+    read_only: Vec<PathBuf>,
+    /// `.git` entries in the project at the start; a shell command that
+    /// adds one gets a warning.
+    git_entries: Option<Arc<std::collections::BTreeSet<PathBuf>>>,
+    /// New `.git` entries already warned about (once each).
+    warned: parking_lot::Mutex<std::collections::BTreeSet<PathBuf>>,
 }
 
 impl KrunExecutionEnv {
@@ -387,7 +477,34 @@ impl KrunExecutionEnv {
             host_workdir,
             isolation,
             host_fs,
+            agent_dir: None,
+            read_only: Vec::new(),
+            git_entries: None,
+            warned: Default::default(),
         }
+    }
+
+    /// Warn after a shell command that adds a `.git` entry to the project
+    /// (one not in `entries`).
+    pub fn with_git_entries(mut self, entries: Arc<std::collections::BTreeSet<PathBuf>>) -> Self {
+        self.git_entries = Some(entries);
+        self
+    }
+
+    /// Also refuse file-tool writes to `agent_dir` and below the paths the
+    /// container mounts read-only.
+    pub fn with_protected(mut self, agent_dir: Option<PathBuf>, read_only: Vec<PathBuf>) -> Self {
+        self.agent_dir = agent_dir;
+        self.read_only = read_only;
+        self
+    }
+
+    /// Refuse a file-tool write, creation or removal of a write-protected
+    /// path ([`protect::write_denied`]) on the host, before either isolation
+    /// touches it.
+    fn check_write(&self, path: &Path) -> Result<(), FileError> {
+        protect::write_denied(&self.host_workdir, self.agent_dir.as_deref(), path)?;
+        protect::under_read_only(&self.host_workdir, &self.read_only, path)
     }
 
     /// Resolve a tool path to the absolute path used inside the guest.
@@ -549,6 +666,7 @@ impl FileSystem for KrunExecutionEnv {
     }
 
     async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
+        self.check_write(path)?;
         if let Some(fs) = &self.host_fs {
             return fs.write_file(path, data).await;
         }
@@ -577,6 +695,7 @@ impl FileSystem for KrunExecutionEnv {
     }
 
     async fn append_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
+        self.check_write(path)?;
         if let Some(fs) = &self.host_fs {
             return fs.append_file(path, data).await;
         }
@@ -697,6 +816,7 @@ impl FileSystem for KrunExecutionEnv {
     }
 
     async fn create_dir(&self, path: &Path) -> Result<(), FileError> {
+        self.check_write(path)?;
         if let Some(fs) = &self.host_fs {
             return fs.create_dir(path).await;
         }
@@ -719,6 +839,8 @@ impl FileSystem for KrunExecutionEnv {
     }
 
     async fn remove(&self, path: &Path) -> Result<(), FileError> {
+        protect::remove_denied(&self.host_workdir, self.agent_dir.as_deref(), path)?;
+        protect::under_read_only(&self.host_workdir, &self.read_only, path)?;
         if let Some(fs) = &self.host_fs {
             return fs.remove(path).await;
         }
@@ -814,14 +936,43 @@ impl Shell for KrunExecutionEnv {
         options: ShellExecOptions,
     ) -> Result<ShellOutput, ExecutionError> {
         let workdir = self.guest_cwd(&options)?;
-        self.exec_argv(
-            vec!["sh".into(), "-c".into(), command.to_string()],
-            Some(workdir),
-            None,
-            options.timeout_ms,
-            options.cancel,
-        )
-        .await
+        let mut out = self
+            .exec_argv(
+                vec!["sh".into(), "-c".into(), command.to_string()],
+                Some(workdir),
+                None,
+                options.timeout_ms,
+                options.cancel,
+            )
+            .await?;
+        if let Some(before) = &self.git_entries {
+            let project = self.host_workdir.clone();
+            let scan = tokio::task::spawn_blocking(move || protect::scan_git_entries(&project));
+            if let Ok((now, complete)) = scan.await {
+                let added: Vec<_> = {
+                    let mut warned = self.warned.lock();
+                    now.into_iter()
+                        .filter(|p| !before.contains(p))
+                        .filter(|p| warned.insert(p.clone()))
+                        .collect()
+                };
+                if !complete {
+                    tracing::debug!("sandbox: the .git scan of the project stopped early");
+                }
+                if !added.is_empty() {
+                    let list: Vec<String> = added.iter().map(|p| p.display().to_string()).collect();
+                    tracing::warn!(entries = ?list, "sandbox: a command made a git repository in the project");
+                    out.stderr.push_str(&format!(
+                        "\nwarning: this sandbox has created {} in the project: {}. Its hooks and \
+                         config are not write-protected, and git on the host runs them when it works \
+                         in that repository (also through a gitlink in the parent repository).\n",
+                        if added.len() == 1 { "a git repository" } else { "git repositories" },
+                        list.join(", ")
+                    ));
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -840,15 +991,114 @@ impl JailedHostFs {
                 "path escape (..) rejected",
             ));
         }
-        let root = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
-        let canon = std::fs::canonicalize(&abs).unwrap_or(abs.clone());
-        if !canon.starts_with(&root) && !abs.starts_with(&self.root) {
+        self.resolved(&abs)?;
+        Ok(abs)
+    }
+
+    /// `abs` with every symlink resolved (missing children kept), which
+    /// must stay in the root. A symlink that leads out is refused.
+    fn resolved(&self, abs: &Path) -> Result<PathBuf, FileError> {
+        let root = super::seatbelt::resolve_path(&self.root)?;
+        let resolved = super::seatbelt::resolve_path(abs)?;
+        if !resolved.starts_with(&root) {
             return Err(FileError::new(
                 FileErrorCode::InvalidPath,
                 format!("path escapes sandbox root: {}", abs.display()),
             ));
         }
-        Ok(abs)
+        Ok(resolved)
+    }
+
+    /// Open the resolved form of `path` with no symlink followed in any
+    /// component, so a link swapped in after the check fails the call
+    /// instead of leading out of the root.
+    #[cfg(unix)]
+    fn open(
+        &self,
+        path: &Path,
+        flags: rustix::fs::OFlags,
+        create_parents: bool,
+    ) -> Result<std::fs::File, FileError> {
+        use rustix::fs::{mkdirat, open, openat, Mode, OFlags};
+        let abs = self.assert_in_root(path)?;
+        let resolved = self.resolved(&abs)?;
+        let err = |e: rustix::io::Errno| {
+            let code = match e {
+                rustix::io::Errno::NOENT => FileErrorCode::NotFound,
+                rustix::io::Errno::LOOP | rustix::io::Errno::ACCESS | rustix::io::Errno::PERM => {
+                    FileErrorCode::PermissionDenied
+                }
+                _ => FileErrorCode::Io,
+            };
+            FileError::new(code, format!("{}: {e}", abs.display()))
+        };
+        let mut fd = open(
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(err)?;
+        let parts: Vec<_> = resolved
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(p) => Some(p.to_owned()),
+                _ => None,
+            })
+            .collect();
+        for (i, part) in parts.iter().enumerate() {
+            let last = i + 1 == parts.len();
+            if create_parents && !last {
+                match mkdirat(&fd, part.as_os_str(), Mode::from_raw_mode(0o755)) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(e) => return Err(err(e)),
+                }
+            }
+            let opts = if last {
+                flags
+            } else {
+                OFlags::RDONLY | OFlags::DIRECTORY
+            } | OFlags::NOFOLLOW
+                | OFlags::CLOEXEC
+                // A FIFO must not block the open; it is refused below.
+                | OFlags::NONBLOCK;
+            fd = openat(&fd, part.as_os_str(), opts, Mode::from_raw_mode(0o644)).map_err(err)?;
+        }
+        let file = std::fs::File::from(fd);
+        if !file
+            .metadata()
+            .map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))?
+            .is_file()
+        {
+            return Err(FileError::new(
+                FileErrorCode::InvalidPath,
+                format!("not a regular file: {}", abs.display()),
+            ));
+        }
+        Ok(file)
+    }
+
+    #[cfg(unix)]
+    fn read_all(&self, path: &Path) -> Result<Vec<u8>, FileError> {
+        use std::io::Read;
+        let mut file = self.open(path, rustix::fs::OFlags::RDONLY, false)?;
+        let mut out = Vec::new();
+        file.read_to_end(&mut out)
+            .map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))?;
+        Ok(out)
+    }
+
+    #[cfg(unix)]
+    fn write_all(&self, path: &Path, data: &[u8], append: bool) -> Result<(), FileError> {
+        use rustix::fs::OFlags;
+        use std::io::Write;
+        let mode = if append {
+            OFlags::APPEND
+        } else {
+            OFlags::TRUNC
+        };
+        let mut file = self.open(path, OFlags::WRONLY | OFlags::CREATE | mode, true)?;
+        file.write_all(data)
+            .map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))
     }
 }
 
@@ -866,21 +1116,46 @@ impl FileSystem for JailedHostFs {
         self.inner.join_path(base, child)
     }
 
+    #[cfg(unix)]
+    async fn read_text_file(&self, path: &Path) -> Result<String, FileError> {
+        let bytes = self.read_all(path)?;
+        String::from_utf8(bytes).map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))
+    }
+
+    #[cfg(unix)]
+    async fn read_binary_file(&self, path: &Path) -> Result<Vec<u8>, FileError> {
+        self.read_all(path)
+    }
+
+    #[cfg(unix)]
+    async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
+        self.write_all(path, data, false)
+    }
+
+    #[cfg(unix)]
+    async fn append_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
+        self.write_all(path, data, true)
+    }
+
+    #[cfg(not(unix))]
     async fn read_text_file(&self, path: &Path) -> Result<String, FileError> {
         let path = self.assert_in_root(path)?;
         self.inner.read_text_file(&path).await
     }
 
+    #[cfg(not(unix))]
     async fn read_binary_file(&self, path: &Path) -> Result<Vec<u8>, FileError> {
         let path = self.assert_in_root(path)?;
         self.inner.read_binary_file(&path).await
     }
 
+    #[cfg(not(unix))]
     async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
         let path = self.assert_in_root(path)?;
         self.inner.write_file(&path, data).await
     }
 
+    #[cfg(not(unix))]
     async fn append_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
         let path = self.assert_in_root(path)?;
         self.inner.append_file(&path, data).await

@@ -35,7 +35,7 @@ fn denied(path: &Path) -> FileError {
 
 // Resolve existing ancestors too: canonicalize(path).unwrap_or(path) would let
 // a symlink followed by a not-yet-created child escape the write jail.
-fn resolve_path(path: &Path) -> Result<PathBuf, FileError> {
+pub(super) fn resolve_path(path: &Path) -> Result<PathBuf, FileError> {
     let absolute = std::path::absolute(path).map_err(io_error)?;
     let mut out = PathBuf::new();
     for part in absolute.components() {
@@ -69,7 +69,7 @@ const GIT_METADATA: &str = r"/\.git/((modules|worktrees)/.+/)?(config|config\.wo
 /// existing pointer file elsewhere.
 const GIT_ENTRY: &str = r"/\.git$";
 
-fn git_metadata(path: &Path) -> bool {
+pub(super) fn git_metadata(path: &Path) -> bool {
     static RE: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(GIT_METADATA).expect("valid pattern"));
     path.to_str().is_none_or(|p| RE.is_match(p))
@@ -77,7 +77,7 @@ fn git_metadata(path: &Path) -> bool {
 
 /// Whether writing `path` would create, replace or remove a `.git` entry, or
 /// write below a `.git` that does not exist yet as a real directory.
-fn git_entry_write(path: &Path) -> bool {
+pub(super) fn git_entry_write(path: &Path) -> bool {
     if path.file_name().is_some_and(|n| n == ".git") {
         return true;
     }

@@ -39,6 +39,14 @@ impl<'a> Package<'a> {
         Ok(Self { zip, budget })
     }
 
+    /// The names of all parts.
+    pub(super) fn names(&self) -> Vec<String> {
+        self.zip
+            .file_names()
+            .filter_map(|n| n.ok().map(|n| n.into_owned()))
+            .collect()
+    }
+
     /// The UTF-8 text of part `name`, or `None` when the package has no such part.
     pub(super) fn text(&mut self, name: &str) -> Result<Option<String>, String> {
         let file = match self.zip.by_name(name) {

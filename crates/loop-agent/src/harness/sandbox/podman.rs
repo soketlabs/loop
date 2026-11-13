@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::harness::sandbox::protect::ProtectedBind;
 use crate::harness::sandbox::traits::SandboxError;
 use crate::harness::types::{ExecutionError, ExecutionErrorCode, ShellOutput};
 
@@ -28,6 +29,9 @@ pub struct PodmanRunOpts {
     pub cpus: String,
     /// `krun.ram_mib` annotation value (krun only).
     pub ram_mib: String,
+    /// Extra same-path bind mounts below the workdir, parents first: the
+    /// write-protected paths ([`super::protect::plan`]).
+    pub binds: Vec<ProtectedBind>,
 }
 
 /// Options for `podman exec`.
@@ -60,6 +64,10 @@ pub trait PodmanClient: Send + Sync {
     async fn stop(&self, container: &str) -> Result<(), SandboxError>;
     /// Force-remove a container.
     async fn rm(&self, container: &str) -> Result<(), SandboxError>;
+    /// Whether a container exists. The default says it does not (fakes).
+    async fn exists(&self, _container: &str) -> Result<bool, SandboxError> {
+        Ok(false)
+    }
 }
 
 /// Real `podman` binary client.
@@ -508,6 +516,54 @@ pub async fn check_krun_deps() -> Result<(), SandboxError> {
     check_local_sandbox_deps("krun").await
 }
 
+/// Arguments of `podman run` for `opts`.
+fn run_args(opts: &PodmanRunOpts) -> Result<Vec<String>, SandboxError> {
+    let volume = format!("{}:{}:U,z", opts.host_workdir.display(), opts.guest_workdir);
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--replace".into(),
+        "--rm".into(),
+        "--runtime".into(),
+        opts.runtime.clone(),
+        "--name".into(),
+        opts.name.clone(),
+        "-v".into(),
+        volume,
+    ];
+    // Same path in the guest. `U` (chown) stays on the workdir mount only.
+    for bind in &opts.binds {
+        let path = bind
+            .path
+            .to_str()
+            .filter(|p| !p.contains(':'))
+            .ok_or_else(|| {
+                SandboxError::StartFailed(format!(
+                    "cannot start the sandbox: cannot mount {} (the path must be UTF-8 without ':')",
+                    bind.path.display()
+                ))
+            })?;
+        args.push("-v".into());
+        args.push(if bind.read_only {
+            format!("{path}:{path}:ro")
+        } else {
+            format!("{path}:{path}")
+        });
+    }
+    args.push("-w".into());
+    args.push(opts.guest_workdir.clone());
+    if opts.runtime == "krun" {
+        args.push("--annotation".into());
+        args.push(format!("krun.cpus={}", opts.cpus));
+        args.push("--annotation".into());
+        args.push(format!("krun.ram_mib={}", opts.ram_mib));
+    }
+    args.push(opts.image.clone());
+    args.push("sleep".into());
+    args.push("infinity".into());
+    Ok(args)
+}
+
 #[async_trait]
 impl PodmanClient for RealPodmanClient {
     async fn preflight(&self, runtime: &str) -> Result<(), SandboxError> {
@@ -515,31 +571,7 @@ impl PodmanClient for RealPodmanClient {
     }
 
     async fn run(&self, opts: PodmanRunOpts) -> Result<String, SandboxError> {
-        let volume = format!("{}:{}:U,z", opts.host_workdir.display(), opts.guest_workdir);
-        let mut args: Vec<String> = vec![
-            "run".into(),
-            "-d".into(),
-            "--replace".into(),
-            "--rm".into(),
-            "--runtime".into(),
-            opts.runtime.clone(),
-            "--name".into(),
-            opts.name.clone(),
-            "-v".into(),
-            volume,
-            "-w".into(),
-            opts.guest_workdir.clone(),
-        ];
-        if opts.runtime == "krun" {
-            args.push("--annotation".into());
-            args.push(format!("krun.cpus={}", opts.cpus));
-            args.push("--annotation".into());
-            args.push(format!("krun.ram_mib={}", opts.ram_mib));
-        }
-        args.push(opts.image.clone());
-        args.push("sleep".into());
-        args.push("infinity".into());
-
+        let args = run_args(&opts)?;
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let (code, stdout, stderr) = self.run_capture(&arg_refs).await?;
         if code != 0 {
@@ -628,6 +660,19 @@ impl PodmanClient for RealPodmanClient {
             return Err(SandboxError::Other(format!("podman stop: {stderr}")));
         }
         Ok(())
+    }
+
+    async fn exists(&self, container: &str) -> Result<bool, SandboxError> {
+        match self
+            .run_capture(&["container", "exists", container])
+            .await?
+        {
+            (0, _, _) => Ok(true),
+            (1, _, _) => Ok(false),
+            (code, _, stderr) => Err(SandboxError::Other(format!(
+                "podman container exists ({code}): {stderr}"
+            ))),
+        }
     }
 
     async fn rm(&self, container: &str) -> Result<(), SandboxError> {
@@ -948,6 +993,52 @@ exec "$@"
                 "cancel={cancel}: env -i child left: {unmarked:?}"
             );
         }
+    }
+
+    fn run_opts(binds: Vec<ProtectedBind>) -> PodmanRunOpts {
+        PodmanRunOpts {
+            name: "loop-sandbox-x".into(),
+            image: "img".into(),
+            host_workdir: PathBuf::from("/p"),
+            guest_workdir: "/p".into(),
+            runtime: "runc".into(),
+            cpus: "2".into(),
+            ram_mib: "2048".into(),
+            binds,
+        }
+    }
+
+    #[test]
+    fn run_mounts_protected_paths_at_the_same_path_after_the_workdir() {
+        let args = run_args(&run_opts(vec![
+            ProtectedBind {
+                path: PathBuf::from("/p/.git"),
+                read_only: false,
+            },
+            ProtectedBind {
+                path: PathBuf::from("/p/.git/hooks"),
+                read_only: true,
+            },
+        ]))
+        .unwrap();
+        let line = args.join(" ");
+        assert!(
+            line.contains(
+                "-v /p:/p:U,z -v /p/.git:/p/.git -v /p/.git/hooks:/p/.git/hooks:ro -w /p"
+            ),
+            "{line}"
+        );
+        assert!(line.ends_with("img sleep infinity"), "{line}");
+    }
+
+    #[test]
+    fn run_refuses_a_protected_path_podman_cannot_parse() {
+        let err = run_args(&run_opts(vec![ProtectedBind {
+            path: PathBuf::from("/p/.git/modules/a:b"),
+            read_only: false,
+        }]))
+        .unwrap_err();
+        assert!(err.to_string().contains("without ':'"), "{err}");
     }
 
     #[tokio::test]

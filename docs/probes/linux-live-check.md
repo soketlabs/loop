@@ -37,7 +37,7 @@ Loop works on Linux from start to end. All checks pass. Six defects were found; 
 
 ## Observations for a decision
 
-- Project `.git/hooks` and `.loop` are writable from the Linux sandbox (docs promise protection on macOS only).
+- Project `.git/hooks` and `.loop` are writable from the Linux sandbox (docs promise protection on macOS only). Later fixed: the Linux sandbox now mounts them read-only (see the sandbox section of `docs/configuration.md`).
 - With the sandbox off, the shell tool sees provider key variables. `docs/runtime.md` says they are removed from tool environments.
 - The container starts from unpinned `fedora:latest` without `--network`, `--cap-drop` or `--read-only`.
 - Loop CI never runs real Podman; the only real-Podman test is ignored and gated by `LOOP_TEST_KRUN=1`, and its ignore text is stale.

@@ -18,8 +18,9 @@ pub(super) fn read(bytes: &[u8]) -> Result<String, String> {
         Some(rels) => xml::relationships(&rels, "ppt/_rels/presentation.xml.rels")?,
         None => HashMap::new(),
     };
-    // Each slide part is read once, however often the list names it.
-    let mut parts = Vec::new();
+    // Each slide part is read once, however often the list names it. A
+    // listed slide whose relationship is missing is kept as `None`.
+    let mut parts: Vec<Option<String>> = Vec::new();
     let mut seen = HashSet::new();
     for node in xml::nodes(&presentation).in_part("ppt/presentation.xml") {
         let Node::Open { name, attrs } = node? else {
@@ -28,12 +29,14 @@ pub(super) fn read(bytes: &[u8]) -> Result<String, String> {
         if name != "sldId" {
             continue;
         }
-        let Some(target) = attr(&attrs, "r:id").and_then(|id| rels.get(id)) else {
-            continue;
-        };
-        let part = xml::resolve("ppt/", target);
-        if seen.insert(part.clone()) {
-            parts.push(part);
+        match attr(&attrs, "r:id").and_then(|id| rels.get(id)) {
+            Some(target) => {
+                let part = xml::resolve("ppt/", target);
+                if seen.insert(part.clone()) {
+                    parts.push(Some(part));
+                }
+            }
+            None => parts.push(None),
         }
         if parts.len() > MAX_SLIDES {
             return Err(format!(
@@ -41,19 +44,63 @@ pub(super) fn read(bytes: &[u8]) -> Result<String, String> {
             ));
         }
     }
+    // A listed slide without a relationship may still be in the file as a
+    // part that nothing names. Its text cannot be shown, and a `write` from
+    // this text would drop it, so the read fails (`write` then treats the
+    // deck as unreadable). With no such part, the slide has no content.
+    if parts.iter().any(Option::is_none) {
+        let unread: Vec<String> = package
+            .names()
+            .into_iter()
+            .filter(|n| n.starts_with("ppt/slides/") && n.ends_with(".xml"))
+            .filter(|n| !seen.contains(n))
+            .collect();
+        if let Some(part) = unread.first() {
+            return Err(format!(
+                "the deck lists a slide without saying which part holds it, and {part} is \
+                 not listed: the file is damaged"
+            ));
+        }
+    }
     let mut md = Markdown::default();
-    let mut number = 0;
-    for part in parts {
-        let Some(slide) = package.text(&part)? else {
-            continue;
+    // Slides are numbered by their place in the deck's list, so a missing
+    // slide does not renumber the ones after it.
+    for (i, part) in parts.iter().enumerate() {
+        let number = i + 1;
+        let slide = match part {
+            Some(part) => package.text(part)?,
+            None => None,
         };
-        number += 1;
-        read_slide(&mut md, number, &part, &slide)?;
+        match (part, slide) {
+            (Some(part), Some(slide)) => read_slide(&mut md, number, part, &slide)?,
+            // Said in the text, so the read is not silently partial. The
+            // file holds no part for the slide (checked above), so `write`
+            // may still rebuild the deck from this text.
+            _ => md.block(&missing_slide(number)),
+        }
         if md.full() {
             break;
         }
     }
     Ok(md.finish())
+}
+
+/// The note `read` gives for slide `number`, listed by the deck but not in
+/// the file.
+fn missing_slide(number: usize) -> String {
+    format!("[slide {number} is missing from the file]")
+}
+
+/// Whether `block` is a paragraph that is exactly a [`missing_slide`] note.
+fn is_missing_note(block: &Block) -> bool {
+    let Block::Paragraph(spans) = block else {
+        return false;
+    };
+    let text = markdown::plain(spans);
+    text.trim()
+        .strip_prefix("[slide ")
+        .and_then(|t| t.strip_suffix(" is missing from the file]"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[derive(Default)]
@@ -223,7 +270,14 @@ struct Slide<'a> {
 }
 
 pub(super) fn write(blocks: &[Block]) -> Result<Vec<u8>, String> {
-    let slides = split(blocks);
+    // The note `read` gives for a missing slide is not slide text: a deck
+    // written back from what `read` gave must not show it.
+    let blocks: Vec<Block> = blocks
+        .iter()
+        .filter(|b| !is_missing_note(b))
+        .cloned()
+        .collect();
+    let slides = split(&blocks);
     let mut parts: Vec<(String, String)> = Vec::new();
     let mut ids = String::new();
     let mut rels = String::from(
@@ -628,6 +682,108 @@ mod tests {
         let bytes = write(&markdown::parse(source)).unwrap();
         let text = read(&bytes).unwrap();
         assert_eq!(text, "# Plan\n\n- Ship it\n    - Soon\n\nNotes here.\n\n# Numbers\n\n| Q | Revenue |\n| --- | --- |\n| Q1 | 10 |");
+    }
+
+    /// The parts of zip package `bytes`, as text.
+    fn unpack(bytes: &[u8]) -> Vec<(String, String)> {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut parts = Vec::new();
+        for i in 0..zip.len() {
+            let mut file = zip.by_index(i).unwrap();
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut file, &mut text).unwrap();
+            parts.push((file.name().unwrap().into_owned(), text));
+        }
+        parts
+    }
+
+    fn repack(parts: &[(String, String)]) -> Vec<u8> {
+        let refs: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(n, t)| (n.as_str(), t.as_str()))
+            .collect();
+        xml::package(&refs).unwrap()
+    }
+
+    /// `bytes` without part `drop`.
+    fn without_part(bytes: &[u8], drop: &str) -> Vec<u8> {
+        let mut parts = unpack(bytes);
+        parts.retain(|(name, _)| name != drop);
+        repack(&parts)
+    }
+
+    #[test]
+    fn a_slide_missing_from_the_file_is_noted_in_place_and_keeps_numbering() {
+        let deck = write(&markdown::parse(
+            "one\n\n---\n\ntwo\n\n---\n\nthree\n\n---\n\nfour",
+        ))
+        .unwrap();
+        let text = read(&without_part(&deck, "ppt/slides/slide2.xml")).unwrap();
+        assert_eq!(
+            text,
+            "# Slide 1\n\none\n\n[slide 2 is missing from the file]\n\n# Slide 3\n\nthree\n\n# Slide 4\n\nfour"
+        );
+    }
+
+    #[test]
+    fn a_slide_without_a_relationship_is_noted() {
+        let deck = write(&markdown::parse("# A\n\nx\n\n# B\n\ny")).unwrap();
+        let mut parts = unpack(&deck);
+        let rels = &mut parts
+            .iter_mut()
+            .find(|(n, _)| n == "ppt/_rels/presentation.xml.rels")
+            .unwrap()
+            .1;
+        // Drop the relationship of the first slide (rId10).
+        let start = rels.find("<Relationship Id=\"rId10\"").unwrap();
+        let end = start + rels[start..].find("/>").unwrap() + 2;
+        rels.replace_range(start..end, "");
+        // The slide part is still in the file, but nothing names it: its
+        // text is unseen, so the read fails.
+        let err = read(&repack(&parts)).unwrap_err();
+        assert!(err.contains("ppt/slides/slide1.xml"), "{err}");
+        parts.retain(|(n, _)| n != "ppt/slides/slide1.xml");
+        let bytes = repack(&parts);
+        assert_eq!(
+            read(&bytes).unwrap(),
+            "[slide 1 is missing from the file]\n\n# B\n\ny"
+        );
+    }
+
+    #[test]
+    fn a_deck_with_a_missing_slide_can_be_written_back_from_its_text() {
+        let deck = write(&markdown::parse("# A\n\nx\n\n# B\n\ny\n\n# C\n\nz")).unwrap();
+        let text = read(&without_part(&deck, "ppt/slides/slide2.xml")).unwrap();
+        assert_eq!(
+            text,
+            "# A\n\nx\n\n[slide 2 is missing from the file]\n\n# C\n\nz"
+        );
+        let rebuilt = write(&markdown::parse(&text)).unwrap();
+        // The note is not written as slide text.
+        assert_eq!(read(&rebuilt).unwrap(), "# A\n\nx\n\n# C\n\nz");
+        // Text that only mentions it stays.
+        let kept = write(&markdown::parse(
+            "# A\n\nsee [slide 2 is missing from the file] here",
+        ))
+        .unwrap();
+        assert!(read(&kept).unwrap().contains("missing from the file"));
+    }
+
+    /// `write` diffs against this text: a missing slide makes the deck
+    /// readable text with the note, not an unreadable file.
+    #[tokio::test]
+    async fn write_sees_the_note_as_the_previous_text() {
+        let deck = write(&markdown::parse("# A\n\nx\n\n# B\n\ny")).unwrap();
+        let bytes = without_part(&deck, "ppt/slides/slide1.xml");
+        let dir = tempfile::tempdir().unwrap();
+        let previous =
+            super::super::text_of(&dir.path().join("deck.pptx"), &bytes, None, dir.path())
+                .await
+                .unwrap();
+        assert_eq!(
+            previous,
+            super::super::Previous::Text("[slide 1 is missing from the file]\n\n# B\n\ny".into())
+        );
     }
 
     #[test]
