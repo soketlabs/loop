@@ -409,3 +409,157 @@ fn gate_with_approver_and_sink(
     gate.set_approver(Some(Arc::new(bridge)));
     (gate, prompts)
 }
+
+/// Commands the splitter cannot model are unreadable (S4 §7, first slice):
+/// they are not read-only, a bash deny pattern refuses them (fail closed),
+/// and an allow pattern does not match them. These are the review's bypass
+/// strings; each ran before this check.
+mod readable_commands {
+    use super::*;
+    use crate::permissions::rules::{read_only_command, unreadable};
+
+    /// ANSI-C quoting hides the newline that starts `touch PWNED`.
+    const SMUGGLED: &str = "echo $'\\''\ntouch PWNED\necho '";
+    /// A function named `ls` that runs `touch`.
+    const FUNCTION: &str = "ls () ( touch PWNED ); ls";
+
+    fn bypasses() -> Vec<&'static str> {
+        vec![
+            SMUGGLED,
+            FUNCTION,
+            "ls () { touch PWNED; }; ls",
+            "{ touch PWNED; }",
+            "echo {touch,PWNED}",
+            "cat <(touch PWNED)",
+            "cat <<EOF\nx\nEOF",
+            "tou\\\nch PWNED",
+            "echo `touch PWNED`",
+            "$(printf tou)ch PWNED",
+            "env touch PWNED",
+            "command touch PWNED",
+            "X=1 touch PWNED",
+            "bash -c 'touch PWNED'",
+            "printf 'touch PWNED' | sh",
+            "python3 -c 'open(\"PWNED\",\"w\")'",
+            "$CMD PWNED",
+            "eval 'touch PWNED'",
+            "xargs touch < list",
+        ]
+    }
+
+    #[test]
+    fn each_bypass_is_unreadable_and_not_read_only() {
+        for command in bypasses() {
+            assert!(unreadable(command).is_some(), "readable: {command:?}");
+            assert!(!read_only_command(command), "read-only: {command:?}");
+        }
+        assert!(!read_only_command("tree -ao out.txt"));
+        assert!(!read_only_command("tree --output=out.txt"));
+        assert!(!read_only_command("git diff --ext-diff"));
+    }
+
+    /// Normal use does not regress.
+    #[test]
+    fn ordinary_commands_stay_readable_and_read_only() {
+        for command in [
+            "ls -la",
+            "cat a b",
+            "grep -rn x .",
+            "git status",
+            "git log --oneline -5",
+            "git log --format='%H (%an)'",
+            "rg 'fn main(' src",
+            "cat Cargo.toml | grep version | sort | uniq",
+            "find . -name '*.rs'",
+            "echo \"${HOME}\"",
+            "tree -a src",
+            "echo 'a (b) {c}'",
+        ] {
+            assert!(unreadable(command).is_none(), "unreadable: {command:?}");
+            assert!(read_only_command(command), "not read-only: {command:?}");
+        }
+        for command in [
+            "cargo test 2>&1 | tail -5",
+            "cargo build &> log",
+            "make >| out",
+        ] {
+            assert!(unreadable(command).is_none(), "unreadable: {command:?}");
+        }
+        assert_eq!(
+            crate::permissions::split_command("cargo test 2>&1 | tail -5").unwrap(),
+            ["cargo test 2>&1", "tail -5"]
+        );
+    }
+
+    /// On the user command path: read-only and plan modes refuse each one,
+    /// a deny pattern refuses each one in full access (`by: unreadable`),
+    /// and with no pattern the mode decides.
+    #[tokio::test]
+    async fn the_gate_refuses_each_bypass_on_the_user_command_path() {
+        for command in bypasses() {
+            for mode in [ReadOnly, Plan] {
+                let (g, _c) = gate(mode, &[], vec![]);
+                assert!(
+                    g.check_user_command(command, None, None).await.is_err(),
+                    "{mode:?} ran {command:?}"
+                );
+            }
+            let (g, c) = gate(FullAccess, &[("bash(touch*)", "deny")], vec![]);
+            let refused = g.check_user_command(command, None, None).await.unwrap_err();
+            assert!(
+                refused.0.contains("cannot check it"),
+                "{command:?}: {refused}"
+            );
+            assert_eq!(c.take()[0].by, DecidedBy::Unreadable, "{command:?}");
+            let (g, _c) = gate(FullAccess, &[], vec![]);
+            assert!(g.check_user_command(command, None, None).await.is_ok());
+        }
+        let (g, _c) = gate(FullAccess, &[("bash(touch*)", "deny")], vec![]);
+        for command in ["/usr/bin/touch x", "TOUCH x", "touch x"] {
+            assert!(
+                g.check_user_command(command, None, None).await.is_err(),
+                "{command}"
+            );
+        }
+        assert!(g.check_user_command("ls -la", None, None).await.is_ok());
+        let (g, _c) = gate(FullAccess, &[], locked_off());
+        assert!(g.check_user_command(SMUGGLED, None, None).await.is_err());
+    }
+
+    /// The same on the model's tool path, and an allow pattern never
+    /// matches an unreadable command.
+    #[tokio::test]
+    async fn the_gate_refuses_each_bypass_on_the_model_path() {
+        let (g, c) = gate(ReadOnly, &[], vec![]);
+        for command in bypasses() {
+            let blocked = g.before_hook()(context("m", "bash", json!({"command": command})), None)
+                .await
+                .expect("refused");
+            assert!(blocked.block, "{command:?}");
+        }
+        assert_eq!(c.take().len(), bypasses().len());
+        let (g, _c) = gate(FullAccess, &[("bash(touch*)", "deny")], vec![]);
+        for command in bypasses() {
+            let blocked =
+                g.before_hook()(context("m", "bash", json!({"command": command})), None).await;
+            assert!(blocked.is_some_and(|b| b.block), "{command:?}");
+        }
+        let (g, _c) = gate(Ask, &[("bash", "ask"), ("bash(ls*)", "allow")], vec![]);
+        assert_eq!(
+            g.decide("bash", &json!({"command": "ls -la"})).await,
+            Decision::Allow
+        );
+        assert_eq!(
+            g.decide("bash", &json!({"command": FUNCTION})).await,
+            Decision::Ask
+        );
+    }
+
+    /// The bash block list sees the command the shell runs.
+    #[test]
+    fn the_block_list_sees_through_ansi_c_quoting_and_functions() {
+        let check = loop_agent::harness::tools::check_command_policy;
+        assert!(check("echo $'\\''\nrm -rf /\necho '", &[]).is_err());
+        assert!(check("ls () ( rm -rf / ); ls", &[]).is_err());
+    }
+}

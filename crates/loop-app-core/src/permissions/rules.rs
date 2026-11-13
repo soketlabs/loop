@@ -12,6 +12,7 @@ use super::Call;
 use crate::hooks_load::glob_match;
 pub use loop_agent::harness::tools::shell::split_command;
 use loop_agent::harness::tools::shell::split_words;
+pub use loop_agent::harness::tools::shell::unreadable;
 
 /// Per-tool default from `~/.loop/agent/settings.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +168,11 @@ const READ_ONLY_GIT: &[&str] = &[
 /// [`READ_ONLY_COMMANDS`] or a read-only `git` subcommand, with no output
 /// redirect, command substitution or variable assignment.
 pub fn read_only_command(command: &str) -> bool {
+    // An unreadable command can run anything after the part the splitter
+    // sees ([`unreadable`]).
+    if unreadable(command).is_some() {
+        return false;
+    }
     split_command(command).is_some_and(|parts| {
         parts
             .iter()
@@ -187,6 +193,18 @@ fn normalise(part: &str) -> String {
     split_words(part, true).unwrap_or_default().join(" ")
 }
 
+/// [`normalise`] with the program reduced to its last path part and
+/// lower-cased: `/usr/bin/touch` and `TOUCH` read as `touch` (S4 §7). A
+/// disk that ignores case runs `TOUCH` as `touch`.
+fn normalise_program(part: &str) -> String {
+    let mut words = split_words(part, true).unwrap_or_default();
+    if let Some(program) = words.first_mut() {
+        let base = program.rsplit('/').next().unwrap_or(program);
+        *program = base.to_lowercase();
+    }
+    words.join(" ")
+}
+
 fn read_only_part(words: &[String]) -> bool {
     let Some((program, args)) = words.split_first() else {
         return false;
@@ -204,7 +222,9 @@ fn read_only_part(words: &[String]) -> bool {
             let Some((sub, rest)) = args.split_first() else {
                 return false;
             };
-            if !READ_ONLY_GIT.contains(&sub.as_str()) || has(&["--output"]) {
+            // `--output` writes a file; `--ext-diff` runs a configured
+            // program.
+            if !READ_ONLY_GIT.contains(&sub.as_str()) || has(&["--output", "--ext-diff"]) {
                 return false;
             }
             // `git branch NAME` creates a branch; only listing is a read.
@@ -244,7 +264,10 @@ fn read_only_part(words: &[String]) -> bool {
         // `file -C` compiles a magic file.
         "file" => !has(&["-C", "--compile"]),
         "rg" => !has(&["--pre", "--hostname-bin"]),
-        "tree" => !has(&["-o"]),
+        // `-o FILE` writes FILE, also inside a cluster such as `-ao`.
+        "tree" => !args.iter().any(|a| {
+            a.starts_with("--o") || (a.starts_with('-') && !a.starts_with("--") && a.contains('o'))
+        }),
         // `uniq IN OUT` writes OUT.
         "uniq" => positional() <= 1,
         program => READ_ONLY_COMMANDS.contains(&program),
@@ -624,16 +647,22 @@ fn rule_with_key(
             } else {
                 // Deny and ask also match the part with quotes and escapes
                 // removed; allow (above) matches only the part as written.
-                let matches =
-                    |part: &str| glob_match(pattern, part) || glob_match(pattern, &normalise(part));
-                match split_command(subject) {
-                    Some(parts) => parts.iter().any(|part| matches(part)),
-                    None => {
-                        matches(subject)
-                            || subject.contains(pattern.trim_matches('*'))
-                            || normalise(subject).contains(pattern.trim_matches('*'))
+                let matches = |part: &str| {
+                    glob_match(pattern, part)
+                        || glob_match(pattern, &normalise(part))
+                        || glob_match(pattern, &normalise_program(part))
+                };
+                // An unreadable command cannot be shown not to match a deny
+                // pattern, so the pattern applies (fail closed, S4 §7).
+                *permission == ToolPermission::Deny && unreadable(subject).is_some()
+                    || match split_command(subject) {
+                        Some(parts) => parts.iter().any(|part| matches(part)),
+                        None => {
+                            matches(subject)
+                                || subject.contains(pattern.trim_matches('*'))
+                                || normalise(subject).contains(pattern.trim_matches('*'))
+                        }
                     }
-                }
             }
         } else if matches!(tool, "read" | "write" | "edit") || is_search(tool) {
             let home = call.home.as_deref();
@@ -652,8 +681,10 @@ fn rule_with_key(
         }
     }
     if specific.is_none() && !bash_allows.is_empty() {
+        // An allow pattern never matches an unreadable command.
         let all_allowed = subject
             .as_deref()
+            .filter(|command| unreadable(command).is_none())
             .and_then(split_command)
             .is_some_and(|parts| {
                 parts

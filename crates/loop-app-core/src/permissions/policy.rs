@@ -160,6 +160,22 @@ pub fn decide_why(
     let (rule, key) = rule_and_key(rules, call);
     let tool = call.tool.as_str();
     if rule.permission == ToolPermission::Deny {
+        let unreadable = (tool == "bash" && rule.specific)
+            .then(|| call.args.get("command").and_then(Value::as_str))
+            .flatten()
+            .and_then(super::rules::unreadable);
+        if let Some(why) = unreadable {
+            let pattern = key.as_deref().unwrap_or("bash(…)");
+            return Verdict::new(
+                Decision::Deny(format!(
+                    "`bash` is refused: the command has {why}, so Loop cannot check it \
+                     against the deny rule `{pattern}` in settings.toolPermissions. Run the \
+                     plain command, without it."
+                )),
+                DecidedBy::Unreadable,
+            )
+            .rule(key);
+        }
         return Verdict::new(
             Decision::Deny(format!(
                 "Tool `{tool}` is denied by settings.toolPermissions"
