@@ -616,8 +616,9 @@ command you type. The fields are in [permissions](permissions.md#decision-record
   `session_seq` never include it, and recovery does not read it. An older
   Loop reads such a row as an unknown record and keeps it.
 - **Who.** The record names the caller that sent the prompt or the command.
-  An answered approval also names who answered (`answered_by`); the
-  `escalation_answered` row holds the same value.
+  An answered approval also names who answered (`answered_by`, a
+  principal); the `escalation_answered` row names the same caller, with its
+  tenant and `via`.
 - **Read them** with SQLite:
 
   ```sh

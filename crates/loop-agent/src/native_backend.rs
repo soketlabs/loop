@@ -95,10 +95,17 @@ pub struct UserCommand {
     pub caller: Option<loop_protocol::Caller>,
 }
 
+/// Why the Policy gate refused a [`UserCommand`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct CommandRefused(pub String);
+
 /// The Policy gate's check for a [`UserCommand`]: `Ok` runs it, `Err` gives
 /// the refusal. It records its decision before it returns.
 pub type CommandGate = Arc<
-    dyn Fn(UserCommand) -> futures::future::BoxFuture<'static, Result<(), String>> + Send + Sync,
+    dyn Fn(UserCommand) -> futures::future::BoxFuture<'static, Result<(), CommandRefused>>
+        + Send
+        + Sync,
 >;
 
 /// Work that waits for the running turn to end. It is called with `true`
@@ -1469,7 +1476,7 @@ impl NativeBackend {
             caller,
         })
         .await
-        .map_err(refused)?;
+        .map_err(|refusal| refused(refusal.0))?;
         crate::harness::tools::check_command_policy(command, &[]).map_err(refused)?;
         let env = self.harness.tool_env().await.map_err(harness_error)?;
         let out = env

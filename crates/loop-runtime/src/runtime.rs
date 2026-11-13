@@ -1505,7 +1505,12 @@ impl AgentBackend for Runtime {
         // parent's turn (ADR-0009).
         let caller = caller.or_else(|| {
             let parent = live.parent.as_ref()?;
-            let parent = self.sessions.lock().unwrap().get(parent).cloned()?;
+            let parent = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(parent)
+                .cloned()?;
             parent.escalations.turn_caller()
         });
         live.escalations.set_turn_caller(caller);

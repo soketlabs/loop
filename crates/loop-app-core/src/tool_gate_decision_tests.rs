@@ -146,7 +146,7 @@ async fn a_user_command_is_judged_as_a_bash_call_in_every_mode() {
                 assert!(got.is_err(), "{row}: refused, got {got:?}");
                 assert_eq!(record.outcome, DecisionOutcome::Deny, "{row}");
                 assert_eq!(record.by, *by, "{row}");
-                assert_eq!(record.reason.as_deref(), got.err().as_deref(), "{row}");
+                assert_eq!(record.reason, got.err().map(|e| e.0), "{row}");
             }
             None => {
                 assert!(got.is_ok(), "{row}: runs, got {got:?}");
@@ -178,7 +178,7 @@ async fn only_the_host_user_approves_a_typed_command_that_would_ask() {
         .check_user_command("touch x", None, Some(edge("alice")))
         .await
         .unwrap_err();
-    assert!(refused.contains("outside this host"), "{refused}");
+    assert!(refused.0.contains("outside this host"), "{refused}");
     let record = capture.take().remove(0);
     assert_eq!(record.outcome, DecisionOutcome::Deny);
     assert_eq!(record.by, DecidedBy::NoApprover);
@@ -232,7 +232,7 @@ async fn a_record_that_cannot_be_written_refuses_the_call() {
     assert!(blocked.block);
     assert!(blocked.reason.unwrap().contains("the disk is full"));
     let refused = gate.check_user_command("ls", None, None).await.unwrap_err();
-    assert!(refused.contains("the disk is full"), "{refused}");
+    assert!(refused.0.contains("the disk is full"), "{refused}");
 }
 
 fn context(id: &str, name: &str, args: serde_json::Value) -> BeforeToolCallContext {

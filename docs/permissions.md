@@ -147,7 +147,7 @@ Every decision of the check is one **decision record**: allow, ask and deny, on 
 | `tool`, `kind`, `capability` | The tool, its kind, and the Capability it needs (`shell`, `write_files`, `mcp:github`, …) |
 | `subject` | A short summary that holds no secrets: the program of each part of a command (not its arguments), the path a file tool names, the host of a URL (not its path or query) |
 | `args_sha256` | A hash of the arguments. The record never holds the arguments or file contents |
-| `outcome`, `answer` | `allow`, `deny` or `ask`. For `ask`, `answer` is `allow` or `deny` when you answered before the call ran. A file edit is reviewed after the write, so its answer is in the Escalation's answer record |
+| `outcome`, `answer` | `allow`, `deny` or `ask`. For `ask`, `answer` is `allow` or `deny` when you answered before the call ran. A file edit is reviewed after the write, so its record has no `answer`: in the Runtime the answer is in the `escalation_answered` row; without the Runtime it is not recorded |
 | `by`, `layer`, `rule` | The step that decided: `off`, `rule`, `layer_ask`, `hook`, `grant`, `preset`, `approver`, `no_approver` or `user` (you typed the command); and the Policy layer or the `toolPermissions` key, when one decided |
 | `mode` | The permission mode |
 | `escalation`, `answered_by` | For an answered ask: the Escalation id and who answered it, which can be a different person than `principal` |

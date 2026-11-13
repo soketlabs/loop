@@ -14,7 +14,8 @@ use loop_app_core::permissions::decision::{
 use loop_app_core::permissions::{
     Capability, Layer, LayerSource, PermissionMode, Policy, Setting, State,
 };
-use loop_protocol::{Caller, Principal, PrincipalKind, Tenant};
+use loop_protocol::{Caller, InteractionOutcome, Principal, PrincipalKind, Tenant};
+use tokio::sync::oneshot;
 
 const LIMIT: Duration = Duration::from_secs(60);
 
@@ -24,6 +25,36 @@ async fn runtime(
     mode: &str,
     command: &'static str,
 ) -> (Arc<Runtime>, Arc<MemoryEventLog>) {
+    runtime_web(dir, mode, command, false).await
+}
+
+/// [`runtime`], with the web tools on when `web` is set.
+async fn runtime_web(
+    dir: &std::path::Path,
+    mode: &str,
+    command: &'static str,
+    web: bool,
+) -> (Arc<Runtime>, Arc<MemoryEventLog>) {
+    let (globals, opts) = setup(dir, mode, command, web);
+    let log = Arc::new(MemoryEventLog::new());
+    let rt = {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(globals, opts, log.clone(), store, RuntimeLimits::default())
+    }
+    .await
+    .unwrap()
+    .with_close_grace(Duration::from_millis(500))
+    .into_shared();
+    (rt, log)
+}
+
+/// The globals and options of [`runtime_web`].
+fn setup(
+    dir: &std::path::Path,
+    mode: &str,
+    command: &'static str,
+    web: bool,
+) -> (GlobalResources, BootstrapOpts) {
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(faux_provider_fn(Arc::new(move |context: &Context| {
         let asked = matches!(context.messages.last(), Some(Message::User(_)));
@@ -50,20 +81,11 @@ async fn runtime(
         no_context_files: true,
         interactive: false,
         session_id: None,
-        no_web: true,
+        no_web: !web,
         permission_mode: Some(mode.into()),
         agent: None,
     };
-    let log = Arc::new(MemoryEventLog::new());
-    let rt = {
-        let store = globals.open_runtime_session_store().unwrap();
-        Runtime::new(globals, opts, log.clone(), store, RuntimeLimits::default())
-    }
-    .await
-    .unwrap()
-    .with_close_grace(Duration::from_millis(500))
-    .into_shared();
-    (rt, log)
+    (globals, opts)
 }
 
 /// Every decision record in `log`, with its committed record.
@@ -285,7 +307,7 @@ async fn workspace_reads_return_no_secrets() {
             .to_string(),
         )
         .unwrap();
-        let (rt, _) = runtime(dir.path(), "ask", "true").await;
+        let (rt, _) = runtime_web(dir.path(), "ask", "true", true).await;
         let id = tree::workspace_id(&dir.path().canonicalize().unwrap());
         let admin: &dyn RuntimeAdmin = rt.as_ref();
         let caller = edge("alice");
@@ -348,6 +370,17 @@ async fn workspace_reads_return_no_secrets() {
                             .unwrap(),
                     )
                     .unwrap(),
+                    serde_json::to_value(
+                        admin
+                            .templates(TemplatesParams {
+                                workspace_id: id.clone(),
+                                name: Some("hello".into()),
+                                args: vec!["Bob".into()],
+                            })
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap(),
                 ]
             })
             .await;
@@ -368,8 +401,164 @@ async fn workspace_reads_return_no_secrets() {
             text.contains("\"local\"") && text.contains("\"remote\""),
             "{text}"
         );
-        assert!(text.contains("hello"), "{text}");
+        assert!(text.contains("Say hello to Bob"), "{text}");
+        // The web tools are on, so the status line went through the path
+        // that names an unavailable search backend's error.
+        let status = answers[2]["status"].as_str().unwrap();
+        assert!(status.starts_with("web tools on"), "{status}");
         rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A connection with a fixed caller that records what it is asked.
+struct Watcher {
+    caller: Caller,
+    asked: tokio::sync::mpsc::UnboundedSender<oneshot::Sender<InteractionOutcome>>,
+}
+#[async_trait]
+impl EscalationRecipient for Watcher {
+    fn caller(&self) -> Option<Caller> {
+        Some(self.caller.clone())
+    }
+    fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
+    async fn interact(
+        &self,
+        _: loop_protocol::rpc::InteractParams,
+        _: oneshot::Receiver<()>,
+    ) -> Result<InteractionOutcome, ()> {
+        let (tx, rx) = oneshot::channel();
+        self.asked.send(tx).map_err(|_| ())?;
+        rx.await.map_err(|_| ())
+    }
+}
+
+/// Through the Runtime: the caller that sends a prompt is carried into its
+/// turn. The host user's approval goes to the host user's connection only;
+/// an edge user's own turn reaches the edge user too.
+#[tokio::test]
+async fn the_prompt_s_caller_decides_who_is_asked_to_approve() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, log) = runtime(dir.path(), "ask", "echo asked").await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let host = Caller::host(Principal::local_uid(501));
+        let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (edge_tx, mut edge_rx) = tokio::sync::mpsc::unbounded_channel();
+        let control: &dyn loop_wire::RuntimeControl = rt.as_ref();
+        control
+            .register(
+                &session,
+                1,
+                true,
+                Some(Arc::new(Watcher {
+                    caller: host.clone(),
+                    asked: host_tx,
+                })),
+            )
+            .await
+            .unwrap();
+        control
+            .register(
+                &session,
+                2,
+                true,
+                Some(Arc::new(Watcher {
+                    caller: edge("alice"),
+                    asked: edge_tx,
+                })),
+            )
+            .await
+            .unwrap();
+
+        let turn = host
+            .clone()
+            .scope(rt.prompt(&session, vec![ContentBlock::text("one")]))
+            .await
+            .unwrap();
+        let answer = host_rx.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(edge_rx.try_recv().is_err(), "the edge user was asked");
+        answer
+            .send(InteractionOutcome::Selected {
+                native_id: loop_app_core::interaction::native_options::ACCEPT.into(),
+                note: None,
+            })
+            .unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        let (_, record) = decisions(&log)
+            .await
+            .into_iter()
+            .find(|(_, d)| d.call_id.as_deref() == Some("gate-call"))
+            .unwrap();
+        assert_eq!(record.principal, *host.principal());
+        assert_eq!(record.by, DecidedBy::Approver);
+        assert_eq!(record.answered_by.as_ref(), Some(host.principal()));
+
+        let turn = edge("alice")
+            .scope(rt.prompt(&session, vec![ContentBlock::text("two")]))
+            .await
+            .unwrap();
+        let from_edge = edge_rx.recv().await.unwrap();
+        let _from_host = host_rx.recv().await.unwrap();
+        from_edge
+            .send(InteractionOutcome::Selected {
+                native_id: loop_app_core::interaction::native_options::ACCEPT.into(),
+                note: None,
+            })
+            .unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        let last = decisions(&log).await.pop().unwrap().1;
+        assert_eq!(last.principal, *edge("alice").principal());
+        assert_eq!(last.answered_by.as_ref(), Some(edge("alice").principal()));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Without the Runtime, the factory's Session writes its decisions to
+/// `audit/decisions.jsonl` in the agent directory: the agent's calls and
+/// the commands the user types.
+#[tokio::test]
+async fn an_embedded_session_records_its_decisions_in_the_agent_directory() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (globals, opts) = setup(dir.path(), "full-access", "true", false);
+        let factory = loop_app_core::runtime::SessionFactory::new(Arc::new(globals));
+        let workspace = factory.workspace(&opts).await.unwrap();
+        let opened = factory.open(workspace, &opts).await.unwrap();
+        let call = loop_agent::BeforeToolCallContext::standalone(
+            ToolCall {
+                id: "e1".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "true"}),
+                thought_signature: None,
+            },
+            json!({"command": "true"}),
+        );
+        assert!(opened.tool_gate.before_hook()(call, None).await.is_none());
+        let session = opened.native.current_session().await;
+        opened
+            .native
+            .run_as(&session, "echo typed", None, None)
+            .await
+            .unwrap();
+        let file = dir.path().join("agent/audit/decisions.jsonl");
+        let records: Vec<PolicyDecisionRecord> = std::fs::read_to_string(&file)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let sources: Vec<_> = records.iter().map(|r| r.source.clone()).collect();
+        assert_eq!(sources, [DecisionSource::Native, DecisionSource::UserShell]);
+        let me = loop_app_core::permissions::decision::local_user();
+        assert!(records.iter().all(|r| r.principal == me));
+        assert_eq!(
+            records[0].session.as_deref(),
+            Some(session.native_id.as_str())
+        );
     })
     .await
     .unwrap();

@@ -492,7 +492,9 @@ async fn a_user_command_passes_the_policy_gate_first() {
         gate_seen.lock().unwrap().push(command);
         Box::pin(async move {
             if refuse {
-                Err("Tool `bash` is denied by settings.toolPermissions".into())
+                Err(loop_agent::native_backend::CommandRefused(
+                    "Tool `bash` is denied by settings.toolPermissions".into(),
+                ))
             } else {
                 Ok(())
             }

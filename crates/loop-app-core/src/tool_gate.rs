@@ -797,12 +797,16 @@ impl ToolGate {
         command: &str,
         session: Option<String>,
         caller: Option<Caller>,
-    ) -> Result<(), String> {
+    ) -> Result<(), loop_agent::native_backend::CommandRefused> {
+        use loop_agent::native_backend::CommandRefused;
         let args = serde_json::json!({ "command": command });
         let verdict = self.verdict("bash", &args).await;
         let host = caller.as_ref().is_none_or(Caller::is_host_user);
         let (result, decided) = match &verdict.decision {
-            Decision::Deny(reason) => (Err(reason.clone()), Decided::from_verdict(&verdict)),
+            Decision::Deny(reason) => (
+                Err(CommandRefused(reason.clone())),
+                Decided::from_verdict(&verdict),
+            ),
             Decision::Allow => (Ok(()), Decided::from_verdict(&verdict)),
             Decision::Ask if host => (Ok(()), Decided::allow(DecidedBy::User).after(&verdict)),
             Decision::Ask => {
@@ -812,7 +816,7 @@ impl ToolGate {
                     self.mode().as_str()
                 );
                 let decided = Decided::deny(DecidedBy::NoApprover, reason.clone()).after(&verdict);
-                (Err(reason), decided)
+                (Err(CommandRefused(reason)), decided)
             }
         };
         let facts = Facts {
@@ -824,7 +828,7 @@ impl ToolGate {
             caller,
             session,
         };
-        self.record(facts, &decided).await?;
+        self.record(facts, &decided).await.map_err(CommandRefused)?;
         result
     }
 
@@ -836,7 +840,9 @@ impl ToolGate {
             let gate = gate.upgrade();
             Box::pin(async move {
                 let Some(gate) = gate else {
-                    return Err("the Session's permission gate is gone".to_owned());
+                    return Err(loop_agent::native_backend::CommandRefused(
+                        "the Session's permission gate is gone".to_owned(),
+                    ));
                 };
                 gate.check_user_command(
                     &command.command,
