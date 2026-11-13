@@ -1139,3 +1139,23 @@ async fn nothing_to_compact_does_not_stop_later_compaction() {
     assert_eq!(answer.as_assistant().unwrap().stop_reason, StopReason::Stop);
     assert!(!compactions(&f.harness.read_session_entries().await.unwrap()).is_empty());
 }
+
+/// M4: an unknown window (0) has no threshold compaction, but an overflow
+/// is still recovered once.
+#[tokio::test]
+async fn an_unknown_window_still_recovers_from_an_overflow() {
+    let f = fixture_with(
+        create_in_memory_session_store(),
+        settings(),
+        0,
+        "sys".into(),
+    )
+    .await;
+    *f.provider.limit.lock() = u64::MAX;
+    with_history(&f, 3, 2_000).await;
+    assert_eq!(f.provider.summary_requests(), 0, "no threshold without a window");
+    f.provider.push([Reply::Overflow, Reply::Text("after retry")]);
+    let answer = f.harness.prompt("next").await.unwrap();
+    assert_eq!(answer.as_assistant().unwrap().stop_reason, StopReason::Stop);
+    assert_eq!(f.provider.summary_requests(), 1);
+}
