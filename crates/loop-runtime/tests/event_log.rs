@@ -242,3 +242,54 @@ async fn a_policy_decision_row_is_log_only_and_survives_a_reopen() {
         .iter()
         .all(|r| !matches!(r.event.kind, EventKind::PolicyDecision(_))));
 }
+
+/// Decision rows and the Session projection: a decision counts as Session
+/// activity, and its turn is the turn already running, so it adds no turn,
+/// no Session sequence, no prompt and no revision. A decision with no turn
+/// (a typed command between turns) adds no turn either.
+#[tokio::test]
+async fn policy_decision_rows_add_no_phantom_turns_to_the_projection() {
+    async fn check(log: &dyn EventLog) {
+        let s = SessionKey::from("s");
+        log.append_batch(vec![update("s")]).await.unwrap();
+        let before = log.session_summary(&s).await.unwrap().unwrap();
+        let decision = |turn: Option<&str>, ts_ms| Event {
+            generation: 1,
+            session_key: Some(s.clone()),
+            turn: turn.map(Into::into),
+            ts_ms,
+            kind: EventKind::PolicyDecision(json!({"id": "pd", "outcome": "allow"})),
+        };
+        log.append_batch(vec![decision(Some("turn-1"), 5_000)])
+            .await
+            .unwrap();
+        log.append_batch(vec![decision(None, 6_000)]).await.unwrap();
+        let after = log.session_summary(&s).await.unwrap().unwrap();
+        assert_eq!(after.last_seq, before.last_seq);
+        assert_eq!(after.last_revision, before.last_revision);
+        assert_eq!(after.prompts_sent, before.prompts_sent);
+        assert_eq!(after.turn_count, before.turn_count);
+        assert_eq!(after.parent, before.parent);
+        assert_eq!(after.last_activity_ms, 6_000);
+        let turns: Vec<String> = log
+            .turn_ids(&s)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.0)
+            .collect();
+        assert_eq!(turns, ["turn-1"]);
+    }
+    check(&MemoryEventLog::new()).await;
+    let dir = tempfile::tempdir().unwrap();
+    check(&SqliteEventLog::open(dir.path()).await.unwrap()).await;
+    // The same after a reopen, from the stored projection.
+    let log = SqliteEventLog::open(dir.path()).await.unwrap();
+    let summary = log
+        .session_summary(&SessionKey::from("s"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.turn_count, 1);
+    assert_eq!(summary.last_activity_ms, 6_000);
+}
