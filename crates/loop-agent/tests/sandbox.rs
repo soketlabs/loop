@@ -467,12 +467,21 @@ async fn linux_sandbox_mounts_and_file_tools_protect_git_metadata_and_loop() {
             .collect();
         assert_eq!(
             binds,
-            vec![
-                (project.join(".git"), false),
-                (project.join(".git/config"), true),
-                (project.join(".git/hooks"), true),
-                (project.join(".loop"), true),
-            ],
+            [
+                (".git", false),
+                (".git/commondir", true),
+                (".git/config", true),
+                (".git/config.worktree", true),
+                (".git/hooks", true),
+                (".git/info", false),
+                (".git/info/attributes", true),
+                (".git/modules", true),
+                (".git/worktrees", true),
+                (".loop", true),
+            ]
+            .iter()
+            .map(|(p, ro)| (project.join(p), *ro))
+            .collect::<Vec<_>>(),
             "{isolation}"
         );
         let env = sb.env();
@@ -507,7 +516,47 @@ async fn linux_sandbox_mounts_and_file_tools_protect_git_metadata_and_loop() {
             .await
             .unwrap();
         sb.destroy().await.unwrap();
+        // The placeholders are gone after the sandbox.
+        for p in [
+            ".git/commondir",
+            ".git/config.worktree",
+            ".git/info",
+            ".git/modules",
+        ] {
+            assert!(!project.join(p).exists(), "{isolation}: {p} left");
+        }
     }
+}
+
+#[tokio::test]
+async fn linux_sandbox_warns_when_a_command_makes_a_repository() {
+    let (_dir, project) = repo_project();
+    let client = Arc::new(FakePodman::new());
+    let sb = KrunSandbox::with_client(
+        SandboxConfig {
+            workdir: project.clone(),
+            options: json!({"isolation": "partial"}),
+            labels: Default::default(),
+        },
+        client.clone(),
+    );
+    sb.start().await.unwrap();
+    let env = sb.env();
+    let out = env.exec("true", ShellExecOptions::default()).await.unwrap();
+    assert!(!out.stderr.contains("warning"), "{}", out.stderr);
+    // The fake runs nothing; make the repository as the command would.
+    std::fs::create_dir_all(project.join("sub/.git")).unwrap();
+    let out = env
+        .exec("git init sub", ShellExecOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        out.stderr.contains("created a git repository"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("sub/.git"), "{}", out.stderr);
+    sb.destroy().await.unwrap();
 }
 
 #[tokio::test]

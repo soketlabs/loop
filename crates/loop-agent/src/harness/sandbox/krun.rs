@@ -208,12 +208,39 @@ impl KrunSandbox {
         self.destroyed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Remove the stubs of the protected paths. Call only after the
-    /// container is gone: its mounts hold the stubs.
-    fn remove_stubs(&self) {
-        if let Some(protected) = self.protected.lock().take() {
-            protected.remove_stubs();
+    /// Release the protected paths of container `id` (`None`: no container
+    /// was made). Only when the container is gone: its mounts hold the
+    /// placeholders. A container that is still there keeps them, and a
+    /// later start of the project removes them.
+    async fn release_protected(&self, id: Option<&str>) {
+        let Some(protected) = self.protected.lock().take() else {
+            return;
+        };
+        let gone = match id {
+            None => true,
+            Some(id) => self.container_gone(id).await,
+        };
+        if !gone {
+            tracing::warn!(
+                container = id,
+                "sandbox: container still exists; keeping its placeholders"
+            );
+            protected.abandon();
+            return;
         }
+        let _ = tokio::task::spawn_blocking(move || protected.release()).await;
+    }
+
+    /// Whether container `id` no longer exists, waiting a few seconds for a
+    /// removal that `--rm` finishes after the stop returns.
+    async fn container_gone(&self, id: &str) -> bool {
+        for _ in 0..20 {
+            if let Ok(false) = self.client.exists(id).await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        false
     }
 
     /// Host workdir bind-mounted into the guest.
@@ -308,20 +335,26 @@ impl Sandbox for KrunSandbox {
         // Mount at the same absolute path inside the guest so host and container
         // paths match (e.g. `/home/u/proj/README.md` → `/home/u/proj/README.md`).
         let guest_workdir = self.workdir.to_string_lossy().into_owned();
-        let protected =
-            protect::plan(&self.workdir, self.agent_dir.as_deref()).inspect_err(|_| {
-                *self.status.write() = SandboxStatus::Failed;
-            })?;
+        let (workdir, agent) = (self.workdir.clone(), self.agent_dir.clone());
+        let planned =
+            tokio::task::spawn_blocking(move || protect::plan(&workdir, agent.as_deref()))
+                .await
+                .map_err(|e| SandboxError::StartFailed(format!("sandbox: {e}")))
+                .and_then(|r| r);
+        let protected = planned.inspect_err(|_| {
+            *self.status.write() = SandboxStatus::Failed;
+        })?;
         let binds = protected.binds.clone();
+        let git_entries = Arc::new(protected.git_entries().clone());
         let read_only: Vec<PathBuf> = binds
             .iter()
             .filter(|b| b.read_only)
             .map(|b| b.path.clone())
             .collect();
         if let Some(old) = self.protected.lock().replace(protected) {
-            old.remove_stubs();
+            old.abandon();
         }
-        let container_id = self
+        let run = self
             .client
             .run(PodmanRunOpts {
                 name,
@@ -333,16 +366,20 @@ impl Sandbox for KrunSandbox {
                 ram_mib: self.ram_mib.clone(),
                 binds,
             })
-            .await
-            .inspect_err(|_e| {
+            .await;
+        let container_id = match run {
+            Ok(id) => id,
+            Err(e) => {
                 *self.status.write() = SandboxStatus::Failed;
-                self.remove_stubs();
-            })?;
+                self.release_protected(None).await;
+                return Err(e);
+            }
+        };
         // Destroyed while `podman run` ran (an exit during an image pull):
         // nothing else will remove this container.
         if self.is_destroyed() {
             let _ = self.client.rm(&container_id).await;
-            self.remove_stubs();
+            self.release_protected(Some(&container_id)).await;
             *self.status.write() = SandboxStatus::Stopped;
             return Err(SandboxError::NotReady(
                 "sandbox was removed while it started".into(),
@@ -356,7 +393,8 @@ impl Sandbox for KrunSandbox {
                 self.workdir.clone(),
                 self.isolation,
             )
-            .with_protected(self.agent_dir.clone(), read_only),
+            .with_protected(self.agent_dir.clone(), read_only)
+            .with_git_entries(git_entries),
         );
 
         *self.container_id.write() = Some(container_id);
@@ -373,10 +411,10 @@ impl Sandbox for KrunSandbox {
         *self.status.write() = SandboxStatus::Stopping;
         *self.env.write() = None;
         let id = self.container_id.write().take();
-        if let Some(id) = id {
-            let _ = self.client.stop(&id).await;
+        if let Some(id) = &id {
+            let _ = self.client.stop(id).await;
         }
-        self.remove_stubs();
+        self.release_protected(id.as_deref()).await;
         *self.status.write() = SandboxStatus::Stopped;
         Ok(())
     }
@@ -386,12 +424,12 @@ impl Sandbox for KrunSandbox {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         *self.env.write() = None;
         let id = self.container_id.write().take();
-        if let Some(id) = id {
+        if let Some(id) = &id {
             // A forced remove stops the container at once; a graceful stop
             // first only waits for its timeout, which slows every exit.
-            let _ = self.client.rm(&id).await;
+            let _ = self.client.rm(id).await;
         }
-        self.remove_stubs();
+        self.release_protected(id.as_deref()).await;
         *self.status.write() = SandboxStatus::Stopped;
         Ok(())
     }
@@ -411,6 +449,9 @@ pub struct KrunExecutionEnv {
     /// Paths mounted read-only in the container; file tools may not write
     /// below them either.
     read_only: Vec<PathBuf>,
+    /// `.git` entries in the project at the start; a shell command that
+    /// adds one gets a warning.
+    git_entries: Option<Arc<std::collections::BTreeSet<PathBuf>>>,
 }
 
 impl KrunExecutionEnv {
@@ -436,7 +477,15 @@ impl KrunExecutionEnv {
             host_fs,
             agent_dir: None,
             read_only: Vec::new(),
+            git_entries: None,
         }
+    }
+
+    /// Warn after a shell command that adds a `.git` entry to the project
+    /// (one not in `entries`).
+    pub fn with_git_entries(mut self, entries: Arc<std::collections::BTreeSet<PathBuf>>) -> Self {
+        self.git_entries = Some(entries);
+        self
     }
 
     /// Also refuse file-tool writes to `agent_dir` and below the paths the
@@ -884,14 +933,37 @@ impl Shell for KrunExecutionEnv {
         options: ShellExecOptions,
     ) -> Result<ShellOutput, ExecutionError> {
         let workdir = self.guest_cwd(&options)?;
-        self.exec_argv(
-            vec!["sh".into(), "-c".into(), command.to_string()],
-            Some(workdir),
-            None,
-            options.timeout_ms,
-            options.cancel,
-        )
-        .await
+        let mut out = self
+            .exec_argv(
+                vec!["sh".into(), "-c".into(), command.to_string()],
+                Some(workdir),
+                None,
+                options.timeout_ms,
+                options.cancel,
+            )
+            .await?;
+        if let Some(before) = &self.git_entries {
+            let project = self.host_workdir.clone();
+            let scan = tokio::task::spawn_blocking(move || protect::scan_git_entries(&project));
+            if let Ok((now, complete)) = scan.await {
+                let added: Vec<_> = now.iter().filter(|p| !before.contains(*p)).collect();
+                if !complete {
+                    tracing::debug!("sandbox: the .git scan of the project stopped early");
+                }
+                if !added.is_empty() {
+                    let list: Vec<String> = added.iter().map(|p| p.display().to_string()).collect();
+                    tracing::warn!(entries = ?list, "sandbox: a command made a git repository in the project");
+                    out.stderr.push_str(&format!(
+                        "\nwarning: this sandbox has created {} in the project: {}. Its hooks and \
+                         config are not write-protected, and git on the host runs them when it works \
+                         in that repository (also through a gitlink in the parent repository).\n",
+                        if added.len() == 1 { "a git repository" } else { "git repositories" },
+                        list.join(", ")
+                    ));
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

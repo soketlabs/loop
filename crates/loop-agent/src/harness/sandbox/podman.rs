@@ -64,6 +64,10 @@ pub trait PodmanClient: Send + Sync {
     async fn stop(&self, container: &str) -> Result<(), SandboxError>;
     /// Force-remove a container.
     async fn rm(&self, container: &str) -> Result<(), SandboxError>;
+    /// Whether a container exists. The default says it does not (fakes).
+    async fn exists(&self, _container: &str) -> Result<bool, SandboxError> {
+        Ok(false)
+    }
 }
 
 /// Real `podman` binary client.
@@ -656,6 +660,19 @@ impl PodmanClient for RealPodmanClient {
             return Err(SandboxError::Other(format!("podman stop: {stderr}")));
         }
         Ok(())
+    }
+
+    async fn exists(&self, container: &str) -> Result<bool, SandboxError> {
+        match self
+            .run_capture(&["container", "exists", container])
+            .await?
+        {
+            (0, _, _) => Ok(true),
+            (1, _, _) => Ok(false),
+            (code, _, stderr) => Err(SandboxError::Other(format!(
+                "podman container exists ({code}): {stderr}"
+            ))),
+        }
     }
 
     async fn rm(&self, container: &str) -> Result<(), SandboxError> {
