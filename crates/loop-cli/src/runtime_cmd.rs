@@ -81,8 +81,8 @@ fn edge_options(
 ///
 /// The user's own secrets count too: a root that contains `home` (the
 /// home directory itself or a folder above it) is refused, and so is a root
-/// that overlaps any path the Seatbelt profile denies to sandboxed commands
-/// (`~/.ssh`, `~/.aws`, `~/.config/gh`, shell histories and the like;
+/// that overlaps any path the Seatbelt profile denies to sandboxed commands,
+/// or a credential store or browser profile folder (`~/.ssh`, `~/.aws`, `~/.config/gh`, shell histories and the like;
 /// [`loop_agent::harness::sandbox::seatbelt::sensitive_home_paths`]). A
 /// root below the home directory, such as `~/projects`, is allowed.
 fn edge_reach(
@@ -138,7 +138,7 @@ fn edge_reach(
                 );
             }
         }
-        for path in loop_agent::harness::sandbox::seatbelt::sensitive_home_paths(home) {
+        for path in loop_agent::harness::sandbox::seatbelt::sensitive_home_paths_extended(home) {
             let secret = resolve(&path);
             if secret.starts_with(&root) || root.starts_with(&secret) {
                 anyhow::bail!(
@@ -1280,7 +1280,7 @@ mod tests {
             );
         }
         // The shared list, not a copy: every entry is refused, both ways.
-        for path in loop_agent::harness::sandbox::seatbelt::sensitive_home_paths(&home)
+        for path in loop_agent::harness::sandbox::seatbelt::sensitive_home_paths_extended(&home)
             .into_iter()
             .filter(|p| p.starts_with(&home))
         {
@@ -1302,6 +1302,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(refused.to_string().contains(".config/gh"), "{refused}");
+        // The wider list: whole credential and browser folders.
+        for wider in [".docker", ".kube", ".password-store"] {
+            let refused =
+                super::edge_reach(&home.join(wider), &secrets, std::slice::from_ref(&home))
+                    .unwrap_err();
+            assert!(refused.to_string().contains(wider), "{refused}");
+        }
         // A symbolic link to the home directory cannot hide it.
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&home, &link).unwrap();

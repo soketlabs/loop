@@ -384,7 +384,17 @@ pub fn sensitive_home_paths(home: &Path) -> Vec<PathBuf> {
         home.join(".config/gh"),
         home.join("Library/Keychains"),
         PathBuf::from("/Library/Keychains"),
-        // Whole folders of credential stores and browser profiles.
+    ]
+}
+
+/// [`sensitive_home_paths`] and more folders that hold credentials or
+/// personal data: whole credential stores and browser profiles. The Edge
+/// listener's tool-lock root check uses this wider list; the Seatbelt
+/// profile does not deny these, so tools such as `docker` and `kubectl`
+/// keep working inside the sandbox.
+pub fn sensitive_home_paths_extended(home: &Path) -> Vec<PathBuf> {
+    let mut paths = sensitive_home_paths(home);
+    paths.extend([
         home.join(".password-store"),
         home.join(".local/share/keyrings"),
         home.join(".kube"),
@@ -398,7 +408,8 @@ pub fn sensitive_home_paths(home: &Path) -> Vec<PathBuf> {
         home.join("Library/Application Support/BraveSoftware"),
         home.join("Library/Application Support/Microsoft Edge"),
         home.join("Library/Safari"),
-    ]
+    ]);
+    paths
 }
 
 impl SeatbeltPolicy {
@@ -1488,6 +1499,75 @@ fn shell_quote(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The paths the Seatbelt profile denies below the home directory. A
+    /// change here changes what sandboxed commands can read, so it must be
+    /// deliberate: the Edge listener's wider list is
+    /// [`sensitive_home_paths_extended`].
+    #[test]
+    fn the_seatbelt_sensitive_list_is_pinned() {
+        let home = Path::new("/h");
+        let expected: Vec<PathBuf> = [
+            ".git-credentials",
+            ".config/git/credentials",
+            ".cargo/credentials",
+            ".cargo/credentials.toml",
+            ".gem/credentials",
+            ".terraform.d/credentials.tfrc.json",
+            ".azure",
+            ".config/hub",
+            ".bash_history",
+            ".zsh_history",
+            ".zhistory",
+            ".sh_history",
+            ".history",
+            ".local/share/fish/fish_history",
+            ".python_history",
+            ".node_repl_history",
+            ".psql_history",
+            ".mysql_history",
+            ".sqlite_history",
+            ".lesshst",
+            ".netrc",
+            ".docker/config.json",
+            ".kube/config",
+            ".npmrc",
+            ".pypirc",
+            ".config/gcloud",
+            "Library/Cookies",
+            ".codex",
+            ".claude",
+            ".claude.json",
+            ".gemini",
+            ".qwen",
+            ".copilot",
+            ".config/github-copilot",
+            ".cursor",
+            ".continue",
+            ".aider.conf.yml",
+            ".config/opencode",
+            ".local/share/opencode",
+            ".config/goose",
+            ".config/amp",
+            ".local/share/amp",
+            ".ssh",
+            ".aws",
+            ".gnupg",
+            ".config/gh",
+            "Library/Keychains",
+        ]
+        .iter()
+        .map(|p| home.join(p))
+        .chain([PathBuf::from("/Library/Keychains")])
+        .collect();
+        assert_eq!(sensitive_home_paths(home), expected);
+        let extended = sensitive_home_paths_extended(home);
+        assert!(extended.starts_with(&expected));
+        for wider in [".docker", ".kube", ".password-store", ".mozilla"] {
+            assert!(!expected.contains(&home.join(wider)), "{wider}");
+            assert!(extended.contains(&home.join(wider)), "{wider}");
+        }
+    }
 
     #[test]
     fn paths_are_parameters_not_profile_source() {
