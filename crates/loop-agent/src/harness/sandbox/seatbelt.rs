@@ -384,6 +384,20 @@ pub fn sensitive_home_paths(home: &Path) -> Vec<PathBuf> {
         home.join(".config/gh"),
         home.join("Library/Keychains"),
         PathBuf::from("/Library/Keychains"),
+        // Whole folders of credential stores and browser profiles.
+        home.join(".password-store"),
+        home.join(".local/share/keyrings"),
+        home.join(".kube"),
+        home.join(".docker"),
+        home.join(".mozilla"),
+        home.join(".config/google-chrome"),
+        home.join(".config/chromium"),
+        home.join(".config/BraveSoftware"),
+        home.join("Library/Application Support/Google/Chrome"),
+        home.join("Library/Application Support/Firefox"),
+        home.join("Library/Application Support/BraveSoftware"),
+        home.join("Library/Application Support/Microsoft Edge"),
+        home.join("Library/Safari"),
     ]
 }
 
@@ -410,6 +424,7 @@ impl SeatbeltPolicy {
             .into_iter()
             .chain([
                 agent.join("auth.json"),
+                agent.join("audit"),
                 agent.join("run"),
                 agent.join("mcp-auth"),
                 agent.join("agents"),
