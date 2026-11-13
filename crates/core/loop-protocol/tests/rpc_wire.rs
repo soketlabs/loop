@@ -61,6 +61,47 @@ fn initialize() {
     );
 }
 
+/// A client reads the identity of a newer server leniently: a value that
+/// today's rules refuse reads as absent, and `initialize` still succeeds.
+#[test]
+fn a_client_reads_a_newer_server_s_identity_leniently() {
+    let base = json!({
+        "protocol_version": 1,
+        "server_info": {"name": "loop", "version": "9.0.0"},
+        "instance": "native",
+        "capabilities": {}
+    });
+    let with = |fields: Value| {
+        let mut value = base.clone();
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        serde_json::from_value::<InitializeResult>(value).unwrap()
+    };
+    let good = with(json!({
+        "principal": {"kind": "person", "issuer": "https://idp", "id": "alice"},
+        "tenant": "acme",
+        "via": "edge"
+    }));
+    assert_eq!(good.principal.unwrap().id(), "alice");
+    assert_eq!(good.tenant.unwrap().as_str(), "acme");
+    assert_eq!(good.via.unwrap().as_str(), "edge");
+    let newer = with(json!({
+        "principal": {"kind": "person", "issuer": "https://idp", "id": "has space"},
+        "tenant": "Upper/Case",
+        "via": "a via with spaces"
+    }));
+    assert_eq!(
+        (newer.principal, newer.tenant, newer.via),
+        (None, None, None)
+    );
+    // A kind this client does not know is kept, not dropped.
+    let robot = with(json!({"principal": {"kind": "robot", "issuer": "https://idp", "id": "r"}}));
+    assert_eq!(robot.principal.unwrap().kind().as_str(), "robot");
+    assert!(with(json!({"principal": null})).principal.is_none());
+}
+
 #[test]
 fn sessions_and_prompts() {
     roundtrip(

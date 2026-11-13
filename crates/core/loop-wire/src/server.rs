@@ -86,16 +86,18 @@ pub enum Authority {
 }
 
 /// The OS user that runs this process, as a principal in the `local`
-/// issuer: `{ person, local, uid:<euid> }` (ADR-0009).
+/// issuer: `{ person, local, uid:<euid> }` (ADR-0009), or
+/// [`Principal::local_os_user`] where there is no uid.
 pub fn local_principal() -> Principal {
     #[cfg(unix)]
     {
         // SAFETY: geteuid has no arguments or preconditions.
         Principal::local_uid(unsafe { libc::geteuid() })
     }
+    // No numeric user id: a distinct id, never `uid:0` (root).
     #[cfg(not(unix))]
     {
-        Principal::local_uid(0)
+        Principal::local_os_user()
     }
 }
 
@@ -108,6 +110,44 @@ fn default_caller(authority: Authority) -> Option<Caller> {
         Authority::HostLocal => Some(Caller::host(local_principal())),
         Authority::Remote => None,
     }
+}
+
+/// Why `method` is refused for this connection's caller when the caller is
+/// a user from outside the host ([`Caller::is_host_user`] is false), such as
+/// an Edge Gateway's end user. `None` serves it.
+///
+/// The rule (H1): an outside user is served only by a Runtime with a tool
+/// lock, and never gets `session/shell`. Without the lock a Session can run
+/// shell commands as the host's OS user, which reach the Runtime's 0600
+/// Unix socket (host-local authority), its credentials and its token files.
+/// The lock turns the shell, file writes and every non-chat tool off and
+/// confines reads to the Session's folder. The check fails closed: no
+/// Runtime, no admin service, or no lock offered all refuse.
+fn outside_user_refusal(
+    host: &ClientHost,
+    runtime: Option<&dyn RuntimeControl>,
+    method: &str,
+) -> Option<RpcErrorBody> {
+    if host.caller.as_ref().is_none_or(Caller::is_host_user) {
+        return None;
+    }
+    let forbidden = |message: &str| {
+        let mut body =
+            RpcErrorBody::from(&loop_protocol::BackendError::Forbidden(method.to_owned()));
+        body.message = format!("{method} is refused: {message}");
+        body
+    };
+    if admin_offered(runtime).tool_lock.is_none() {
+        return Some(forbidden(
+            "an Edge Gateway user is served only by a Runtime with a tool lock",
+        ));
+    }
+    if method == methods::SESSION_SHELL {
+        return Some(forbidden(
+            "an Edge Gateway user cannot run shell commands on the Runtime host",
+        ));
+    }
+    None
 }
 
 /// Whether `method` with `params` needs host-local authority: the host-only
@@ -255,23 +295,24 @@ async fn run(
     // missed; forwarding starts once the client is initialized.
     let updates = backend.subscribe();
     let (control, control_rx) = mpsc::unbounded_channel();
-    let forwarder = tokio::spawn(in_scope(
-        host.caller.clone(),
-        forward(
-            Arc::clone(&conn),
-            backend.instance().clone(),
-            updates,
-            control_rx,
-            runtime.clone(),
-            host.clone(),
-        ),
+    // Not in the caller's scope: it only forwards updates and registers
+    // this connection for Escalations, and reads no identity.
+    let forwarder = tokio::spawn(forward(
+        Arc::clone(&conn),
+        backend.instance().clone(),
+        updates,
+        control_rx,
+        runtime.clone(),
+        host.clone(),
     ));
     let mut initialized = false;
     while let Some(message) = incoming.recv().await {
         match message {
             Incoming::Response { id, result } => conn.resolve(id, result).await,
             Incoming::Notification { method, params } => {
-                if method == methods::SESSION_CANCEL {
+                if method == methods::SESSION_CANCEL
+                    && outside_user_refusal(&host, runtime.as_deref(), &method).is_none()
+                {
                     if let Ok(SessionParams { session }) = parse::<SessionParams>(params) {
                         backend.cancel(&session);
                     }
@@ -355,6 +396,12 @@ async fn run(
                         id,
                         Err((codes::INVALID_REQUEST, "call initialize first".into())),
                     );
+                    continue;
+                }
+                // An outside user (an Edge Gateway assertion) is served only
+                // by a tool-locked Runtime, and never gets `session/shell`.
+                if let Some(refused) = outside_user_refusal(&host, runtime.as_deref(), &method) {
+                    respond(&conn, id, Err(refused));
                     continue;
                 }
                 // Refused before parsing or dispatch, whatever the params.
@@ -1422,10 +1469,6 @@ async fn register_recipient(
 
 #[async_trait]
 impl crate::control::EscalationRecipient for ClientHost {
-    fn caller(&self) -> Option<Caller> {
-        self.caller.clone()
-    }
-
     fn withdraw(&self, params: loop_protocol::rpc::InteractWithdrawnParams) {
         let _ = self
             .conn

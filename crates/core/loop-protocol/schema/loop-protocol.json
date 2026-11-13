@@ -82,7 +82,7 @@
       "type": "string"
     },
     "Caller": {
-      "description": "Who a connection acts for: a principal in a tenant, and how it came.\nFixed when the connection is accepted; never changed after.",
+      "description": "Who a connection acts for: a principal in a tenant, and how it came.\nFixed when the connection is accepted; never changed after.\n\n`==` compares every field, `via` included. For authorization use\n[`Caller::same_identity`].\n\nReading one (serde) applies the rules of the constructor its `via` names,\nso text from a peer can never make a caller the constructors refuse: no\n`via` or `token` is the host's user ([`Caller::host`],\n[`Caller::local_token`]: `local` issuer and tenant); `edge` is an\nassertion ([`Caller::asserted`]: never `local`, never a reserved tenant,\na known kind); any other `via` is refused.",
       "properties": {
         "principal": {
           "$ref": "#/$defs/Principal"
@@ -1039,7 +1039,7 @@
               "type": "null"
             }
           ],
-          "description": "Who this connection acts for (ADR-0009), fixed when the connection\nwas accepted. Absent from an older server, or from a connection that\nhas no identity. A request field never changes it."
+          "description": "Who this connection acts for (ADR-0009), fixed when the connection\nwas accepted. Absent from an older server, or from a connection that\nhas no identity. A request field never changes it.\n\nThe server builds these three from validated values. A client reads\nthem leniently: a value from a newer server that today's rules\nrefuse reads as absent, so `initialize` still succeeds."
         },
         "protocol_version": {
           "description": "The version to use: the client's, when the server speaks it, or else\nthe server's highest. A client that can't use it closes.",
@@ -2096,24 +2096,15 @@
       "type": "object"
     },
     "PrincipalKind": {
-      "description": "What kind of principal acts.",
-      "oneOf": [
-        {
-          "const": "person",
-          "description": "A person.",
-          "type": "string"
-        },
-        {
-          "const": "service",
-          "description": "A Service Identity: unattended work, or the Runtime itself.",
-          "type": "string"
-        },
-        {
-          "const": "unknown",
-          "description": "A kind this reader does not know. Read from a newer peer; never\naccepted from an Edge Gateway assertion.",
-          "type": "string"
-        }
-      ]
+      "description": "What kind of principal acts: `person` or `service`. A reader keeps a kind it does not know as it came.",
+      "examples": [
+        "person",
+        "service"
+      ],
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[!-~]+$",
+      "type": "string"
     },
     "PromptParams": {
       "description": "`session/prompt` params.",
@@ -3963,10 +3954,10 @@
       "type": "object"
     },
     "Tenant": {
-      "description": "The isolation boundary data belongs to. Opaque; `local` and `system` are reserved.",
+      "description": "The isolation boundary data belongs to. Opaque; `local` and `system` are reserved. Windows device names (`con`, `prn`, `aux`, `nul`, `com0`-`com9`, `lpt0`-`lpt9`, also before a `.`) are refused.",
       "maxLength": 64,
       "minLength": 1,
-      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "pattern": "^[a-z0-9]([a-z0-9._-]*[a-z0-9_-])?$",
       "type": "string"
     },
     "ToolCall": {

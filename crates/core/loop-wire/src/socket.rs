@@ -98,38 +98,37 @@ pub mod edge_headers {
     pub const ALL: [&str; 4] = [PRINCIPAL_KIND, PRINCIPAL_ISSUER, PRINCIPAL_ID, TENANT];
 }
 
-/// Most bytes of all identity headers together. The principal and tenant
-/// limits are smaller; this bounds the work before they are checked.
-const MAX_ASSERTION_BYTES: usize = 1024;
-
 fn refusal(status: StatusCode, reason: &str) -> ErrorResponse {
     let mut refused = ErrorResponse::new(Some(reason.into()));
     *refused.status_mut() = status;
     refused
 }
 
+/// `Authorization: Bearer <token>`. The scheme name is case-insensitive
+/// (RFC 7235 §2.1, so `bearer` and `BEARER` match too), followed by one
+/// space and the token, compared in constant time.
 fn bearer_matches(request: &Request, token: &str) -> bool {
-    let expected = format!("Bearer {token}");
+    const SCHEME: &[u8] = b"bearer ";
     let given = request
         .headers()
         .get("authorization")
         .map(HeaderValue::as_bytes)
         .unwrap_or_default();
-    !token.is_empty() && constant_time_eq(given, expected.as_bytes())
+    let scheme_ok =
+        given.len() >= SCHEME.len() && given[..SCHEME.len()].eq_ignore_ascii_case(SCHEME);
+    let presented = given.get(SCHEME.len()..).unwrap_or_default();
+    // Both compared always, so a wrong scheme takes as long as a wrong token.
+    let token_ok = constant_time_eq(presented, token.as_bytes());
+    !token.is_empty() && scheme_ok & token_ok
 }
 
 /// The caller an edge handshake asserts. Each header must be present once.
 fn asserted_caller(request: &Request) -> Result<loop_protocol::Caller, String> {
     use loop_protocol::{Caller, Principal, PrincipalKind, Tenant};
+    // No cap of its own: each value is checked against its own limit (all
+    // four together are at most 581 valid bytes), a repeated header is
+    // refused, and the WebSocket library bounds the header block.
     let headers = request.headers();
-    let total: usize = edge_headers::ALL
-        .iter()
-        .flat_map(|name| headers.get_all(*name))
-        .map(HeaderValue::len)
-        .sum();
-    if total > MAX_ASSERTION_BYTES {
-        return Err("the identity assertion is too large".into());
-    }
     let one = |name: &'static str| -> Result<&str, String> {
         let mut values = headers.get_all(name).iter();
         match (values.next(), values.next()) {
@@ -140,11 +139,9 @@ fn asserted_caller(request: &Request) -> Result<loop_protocol::Caller, String> {
             (Some(_), Some(_)) => Err(format!("{name} is given more than once")),
         }
     };
-    let kind = match one(edge_headers::PRINCIPAL_KIND)? {
-        "person" => PrincipalKind::Person,
-        "service" => PrincipalKind::Service,
-        _ => return Err(loop_protocol::IdentityError::UnknownKind.to_string()),
-    };
+    // An unknown kind is refused by `Caller::asserted`.
+    let kind =
+        PrincipalKind::parse(one(edge_headers::PRINCIPAL_KIND)?).map_err(|e| e.to_string())?;
     let principal = Principal::new(
         kind,
         one(edge_headers::PRINCIPAL_ISSUER)?,
@@ -255,18 +252,12 @@ pub async fn websocket_connect_edge(
     edge_token: &str,
     caller: &loop_protocol::Caller,
 ) -> io::Result<Transport> {
-    use loop_protocol::PrincipalKind;
     let invalid = |e: loop_protocol::IdentityError| io::Error::new(io::ErrorKind::InvalidInput, e);
     // Checks the same rules the Runtime applies.
     let principal = caller.principal();
     loop_protocol::Caller::asserted(principal.clone(), caller.tenant().clone()).map_err(invalid)?;
-    let kind = match principal.kind() {
-        PrincipalKind::Person => "person",
-        PrincipalKind::Service => "service",
-        PrincipalKind::Unknown => return Err(invalid(loop_protocol::IdentityError::UnknownKind)),
-    };
     let headers = [
-        (edge_headers::PRINCIPAL_KIND, kind),
+        (edge_headers::PRINCIPAL_KIND, principal.kind().as_str()),
         (edge_headers::PRINCIPAL_ISSUER, principal.issuer()),
         (edge_headers::PRINCIPAL_ID, principal.id()),
         (edge_headers::TENANT, caller.tenant().as_str()),
@@ -387,9 +378,16 @@ where
     }
 }
 
-/// Compare without leaking how many leading bytes matched.
+/// Compare without leaking how many leading bytes matched, and without an
+/// early exit when the lengths differ: every byte of the longer input is
+/// read either way.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    let longest = a.len().max(b.len());
+    let mut diff = u8::from(a.len() != b.len());
+    for i in 0..longest {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    }
+    diff == 0
 }
 
 #[cfg(test)]
@@ -402,6 +400,9 @@ mod tests {
         assert!(!constant_time_eq(b"Bearer abd", b"Bearer abc"));
         assert!(!constant_time_eq(b"Bearer ab", b"Bearer abc"));
         assert!(!constant_time_eq(b"", b"Bearer abc"));
+        assert!(!constant_time_eq(b"Bearer abc\0", b"Bearer abc"));
+        assert!(!constant_time_eq(b"Bearer abc", b"Bearer abc\0"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     #[cfg(unix)]

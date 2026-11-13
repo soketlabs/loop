@@ -289,11 +289,6 @@ fn unsupported(method: &str) -> BackendError {
 /// An interactive connection that can receive a Session's Escalations.
 #[async_trait]
 pub trait EscalationRecipient: Send + Sync {
-    /// Who this connection acts for, so an answer can name `answered_by`
-    /// (S4 §12). `None` when the connection has no identity.
-    fn caller(&self) -> Option<loop_protocol::Caller> {
-        None
-    }
     /// Queue withdrawal synchronously in the connection's ordered output.
     /// The Runtime calls this before removing the recipient or redispatching.
     fn withdraw(&self, params: loop_protocol::rpc::InteractWithdrawnParams);

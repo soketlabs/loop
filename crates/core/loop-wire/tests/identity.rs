@@ -11,15 +11,17 @@ use async_trait::async_trait;
 use loop_protocol::rpc::{methods, InitializeResult, PeerInfo, SessionInfo};
 use loop_protocol::{
     AgentBackend, BackendError, BackendInstanceId, BackendResult, Caller, Capabilities,
-    ContentBlock, Principal, PrincipalKind, SessionRef, SessionSpec, Tenant, TurnHandle,
-    UpdateEnvelope,
+    ContentBlock, LocalShell, Principal, PrincipalKind, SessionRef, SessionSpec, ShellResult,
+    Tenant, ToolLock, TurnHandle, UpdateEnvelope,
 };
 use loop_wire::server::{serve_with_caller, serve_with_control, ServeOptions};
 use loop_wire::socket::{
     edge_headers, websocket_accept, websocket_accept_edge, websocket_connect_edge,
 };
 use loop_wire::transport::memory;
-use loop_wire::{Attachment, Authority, Connection, Incoming, RuntimeControl, Transport};
+use loop_wire::{
+    Attachment, Authority, Connection, Incoming, RpcError, RuntimeAdmin, RuntimeControl, Transport,
+};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -39,6 +41,11 @@ struct Echo {
     instance: BackendInstanceId,
     updates: broadcast::Sender<UpdateEnvelope>,
     cancels: std::sync::Mutex<Vec<String>>,
+    /// The tool lock its admin service offers; `None` is an unlocked
+    /// Runtime.
+    lock: Option<ToolLock>,
+    /// Shell commands that reached the backend.
+    shells: std::sync::Mutex<Vec<String>>,
 }
 
 fn seen() -> String {
@@ -54,7 +61,13 @@ impl AgentBackend for Echo {
         &self.instance
     }
     fn capabilities(&self) -> Capabilities {
-        Capabilities::default()
+        Capabilities {
+            local_shell: true,
+            ..Capabilities::default()
+        }
+    }
+    fn local_shell(&self) -> Option<&dyn LocalShell> {
+        Some(self)
     }
     fn subscribe(&self) -> broadcast::Receiver<UpdateEnvelope> {
         self.updates.subscribe()
@@ -86,6 +99,29 @@ impl AgentBackend for Echo {
 }
 
 #[async_trait]
+impl LocalShell for Echo {
+    async fn run(
+        &self,
+        _: &SessionRef,
+        command: &str,
+        _: Option<u64>,
+    ) -> BackendResult<ShellResult> {
+        self.shells.lock().unwrap().push(command.to_owned());
+        Err(BackendError::Unsupported(seen()))
+    }
+}
+
+#[async_trait]
+impl RuntimeAdmin for Echo {
+    fn offered(&self) -> Capabilities {
+        Capabilities {
+            tool_lock: self.lock,
+            ..Capabilities::default()
+        }
+    }
+}
+
+#[async_trait]
 impl RuntimeControl for Echo {
     async fn list(&self) -> BackendResult<Vec<SessionInfo>> {
         Err(BackendError::Unsupported(seen()))
@@ -96,13 +132,23 @@ impl RuntimeControl for Echo {
     async fn attach(&self, _: &SessionRef, _: u64) -> BackendResult<Attachment> {
         Err(BackendError::Unsupported(seen()))
     }
+    fn admin(&self) -> Option<&dyn RuntimeAdmin> {
+        Some(self)
+    }
 }
 
+/// A tool-locked Runtime, which serves Edge Gateway users.
 fn echo() -> Arc<Echo> {
+    echo_with(Some(ToolLock::Chat))
+}
+
+fn echo_with(lock: Option<ToolLock>) -> Arc<Echo> {
     Arc::new(Echo {
         instance: "echo".into(),
         updates: broadcast::channel(4).0,
         cancels: std::sync::Mutex::new(Vec::new()),
+        lock,
+        shells: std::sync::Mutex::new(Vec::new()),
     })
 }
 
@@ -175,7 +221,7 @@ async fn a_host_local_connection_is_the_local_user_in_the_local_tenant() {
         let conn = client(client_end);
         let (value, result) = initialize(&conn, forged()).await;
         let local = loop_wire::local_principal();
-        assert_eq!(local.kind(), PrincipalKind::Person);
+        assert_eq!(local.kind(), &PrincipalKind::Person);
         assert_eq!(local.issuer(), "local");
         assert!(local.id().starts_with("uid:"));
         assert_eq!(result.principal.as_ref(), Some(&local));
@@ -314,6 +360,129 @@ async fn a_token_connection_is_the_local_user_via_token() {
         // A token connection is still remote: host-only methods are refused.
         let refused = conn.request(methods::RUNTIME_STOP, json!({})).await;
         assert!(refused.is_err());
+    })
+    .await
+    .unwrap();
+}
+
+fn forbidden(answer: Result<Value, RpcError>) -> String {
+    match answer {
+        Err(RpcError::Remote { code, message, .. })
+            if code == loop_protocol::rpc::error_codes::FORBIDDEN =>
+        {
+            message
+        }
+        other => panic!("expected Forbidden, got {other:?}"),
+    }
+}
+
+fn a_session() -> Value {
+    json!({"instance": "echo", "key": "s", "native_id": "n"})
+}
+
+#[tokio::test]
+async fn an_edge_user_is_refused_everything_by_a_runtime_without_a_tool_lock() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let backend = echo_with(None);
+        let (server, client_end) = memory();
+        let _ = serve_with_caller(
+            backend.clone(),
+            Some(backend.clone()),
+            server,
+            info(),
+            options(Authority::Remote),
+            edge_caller("alice", "acme"),
+        );
+        let conn = client(client_end);
+        // initialize answers, so the gateway sees who it is and that no lock
+        // is offered ...
+        let (_, result) = initialize(&conn, json!({})).await;
+        assert_eq!(result.capabilities.tool_lock, None);
+        // ... and every other request is refused before the backend sees it.
+        for (method, params) in [
+            (methods::SESSION_NEW, json!({})),
+            (methods::SESSION_LIST, json!({})),
+            (
+                methods::SESSION_LOAD,
+                json!({"session": a_session(), "spec": {}}),
+            ),
+            (
+                methods::SESSION_ATTACH,
+                json!({"session": a_session(), "after_seq": 0}),
+            ),
+            (
+                methods::SESSION_PROMPT,
+                json!({"session": a_session(), "content": []}),
+            ),
+            (
+                methods::SESSION_SHELL,
+                json!({"session": a_session(), "command": "id"}),
+            ),
+            ("a/future_method", json!({})),
+        ] {
+            let message = forbidden(conn.request(method, params).await);
+            assert!(message.contains("tool lock"), "{method}: {message}");
+        }
+        conn.notify(methods::SESSION_CANCEL, json!({"session": a_session()}))
+            .unwrap();
+        // The same backend with no admin service also refuses (fail closed).
+        let (server, client_end) = memory();
+        let _ = serve_with_caller(
+            backend.clone() as Arc<dyn AgentBackend>,
+            None,
+            server,
+            info(),
+            options(Authority::Remote),
+            edge_caller("alice", "acme"),
+        );
+        let conn = client(client_end);
+        initialize(&conn, json!({})).await;
+        forbidden(conn.request(methods::SESSION_NEW, json!({})).await);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(backend.cancels.lock().unwrap().is_empty());
+        assert!(backend.shells.lock().unwrap().is_empty());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn an_edge_user_never_runs_a_shell_command_but_the_host_user_does() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let backend = echo();
+        let shell = json!({"session": a_session(), "command": "id"});
+        let (server, client_end) = memory();
+        let _ = serve_with_caller(
+            backend.clone(),
+            Some(backend.clone()),
+            server,
+            info(),
+            options(Authority::Remote),
+            edge_caller("alice", "acme"),
+        );
+        let edge = client(client_end);
+        initialize(&edge, json!({})).await;
+        // Under a lock an edge user is served ...
+        assert_eq!(new_session_sees(&edge).await, "alice|acme");
+        // ... except the shell, refused before the backend.
+        let message = forbidden(edge.request(methods::SESSION_SHELL, shell.clone()).await);
+        assert!(message.contains("shell"), "{message}");
+        assert!(backend.shells.lock().unwrap().is_empty());
+        // The host's user is not an outside user: the shell reaches the
+        // backend (which answers for itself).
+        let host = echo_with(None);
+        let (server, client_end) = memory();
+        let _ = serve_with_control(
+            host.clone(),
+            host.clone(),
+            server,
+            info(),
+            options(Authority::HostLocal),
+        );
+        let local = client(client_end);
+        initialize(&local, json!({})).await;
+        let _ = local.request(methods::SESSION_SHELL, shell).await;
+        assert_eq!(host.shells.lock().unwrap().as_slice(), ["id"]);
     })
     .await
     .unwrap();
@@ -509,7 +678,8 @@ async fn a_malformed_oversized_or_reserved_assertion_is_refused() {
             with(edge_headers::TENANT, "a/b"),
             with(edge_headers::TENANT, &"t".repeat(65)),
             with(edge_headers::TENANT, "a\tb"),
-            // All of them together over the assertion cap.
+            // Far over a part's limit. There is no separate cap on all four
+            // together: valid values are at most 581 bytes in all.
             with(edge_headers::PRINCIPAL_ISSUER, &"i".repeat(900)),
         ];
         for name in edge_headers::ALL {
