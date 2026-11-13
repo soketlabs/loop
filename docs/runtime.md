@@ -403,6 +403,11 @@ loop runtime start --edge-listen 127.0.0.1:8790 --edge-token-file /private/edge.
 - Anyone who has the edge token can act as any user in any tenant. Keep the
   token as private as a root password, and run the gateway on the same host.
   The Runtime does not check the gateway's claims; it trusts the gateway.
+- **There is no tenant isolation yet.** In this release the Runtime records
+  the identity but does not check ownership. Every edge user can list, attach
+  to, prompt and run `session/shell` in every Session, including the Sessions
+  of the local user and of other tenants. Do not turn this option on for
+  users who must not see each other's work.
 
 ### Permissions and trust
 
