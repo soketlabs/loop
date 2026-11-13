@@ -9,15 +9,15 @@ publish = false
 
 [features]
 default = ["event-log", "session-store"]
-# Event Log suite. Needs the `EventLog` trait from loop-runtime.
-event-log = ["dep:loop-runtime", "dep:loop-protocol", "dep:serde_json"]
+# Event Log suite. Needs the `EventLog` contract from loop-store.
+event-log = ["dep:loop-store", "dep:loop-protocol", "dep:serde_json"]
 # Session store suite. Needs the `SessionStore` trait from loop-agent.
 session-store = ["dep:loop-agent", "dep:serde_json"]
 
 [dependencies]
 loop-agent = { workspace = true, optional = true }
 loop-protocol = { workspace = true, optional = true }
-loop-runtime = { workspace = true, optional = true }
+loop-store = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true }
 
