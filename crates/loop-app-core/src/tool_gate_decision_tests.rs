@@ -507,7 +507,7 @@ mod readable_commands {
             let (g, c) = gate(FullAccess, &[("bash(touch*)", "deny")], vec![]);
             let refused = g.check_user_command(command, None, None).await.unwrap_err();
             assert!(
-                refused.0.contains("cannot check it"),
+                refused.0.contains("cannot check this command") && refused.0.contains("to run it"),
                 "{command:?}: {refused}"
             );
             assert_eq!(c.take()[0].by, DecidedBy::Unreadable, "{command:?}");
@@ -823,4 +823,125 @@ async fn the_answer_to_a_file_review_is_recorded() {
             ),
         ]
     );
+}
+
+/// What local users see after the unreadable-command rule.
+mod unreadable_for_local_users {
+    use super::*;
+    use crate::permissions::rules::read_only_command;
+
+    /// Forms that use a wrapper or shell syntax, common in real use.
+    const FORMS: &[&str] = &[
+        "env FOO=1 cargo test",
+        "FOO=1 cargo test",
+        "sh -c 'cargo test && cargo clippy'",
+        "xargs echo < list.txt",
+        "time cargo build",
+        "echo $(pwd)",
+        "cat <<EOF\nhello\nEOF",
+        "(cd src && ls)",
+        "for f in *.rs; do wc -l $f; done",
+    ];
+
+    /// With no bash deny pattern (the default), these run as before: they
+    /// are not read-only, so `ask` and `accept-edits` ask as for any
+    /// command that is not read-only, `full-access` allows them, and a
+    /// typed command runs.
+    #[tokio::test]
+    async fn with_no_deny_pattern_they_behave_as_before() {
+        for command in FORMS {
+            assert!(!read_only_command(command), "{command:?}");
+            for (mode, want) in [
+                (Ask, Decision::Ask),
+                (AcceptEdits, Decision::Ask),
+                (FullAccess, Decision::Allow),
+            ] {
+                let (g, _c) = gate(mode, &[], vec![]);
+                let got = g.decide("bash", &json!({ "command": command })).await;
+                assert_eq!(got, want, "{mode:?} {command:?}");
+                assert!(
+                    g.check_user_command(command, None, None).await.is_ok(),
+                    "{mode:?} typed {command:?}"
+                );
+            }
+        }
+    }
+
+    /// With a bash deny pattern, the refusal names the construct and says
+    /// how to run the command.
+    #[tokio::test]
+    async fn with_a_deny_pattern_the_refusal_says_how_to_proceed() {
+        let (g, _c) = gate(FullAccess, &[("bash(rm *)", "deny")], vec![]);
+        for (command, advice) in [
+            (
+                "env FOO=1 cargo test",
+                "remove `env` and run the inner command directly",
+            ),
+            ("FOO=1 cargo test", "set the variable in its own part first"),
+            (
+                "sh -c 'cargo test'",
+                "remove `sh` and run the inner command directly",
+            ),
+            ("echo $(pwd)", "run the inner command on its own first"),
+            ("cat <<EOF\nx\nEOF", "put the text in a file"),
+            ("(cd src && ls)", "without the parentheses"),
+            ("cat {a,b}.txt", "without `{` and `}`"),
+        ] {
+            let refused = g.check_user_command(command, None, None).await.unwrap_err();
+            assert!(refused.0.contains("`bash(rm *)`"), "{refused}");
+            assert!(refused.0.contains(advice), "{command:?}: {refused}");
+        }
+        // The advice works: the plain forms run.
+        for command in [
+            "cargo test",
+            "export FOO=1; cargo test",
+            "cd src && ls",
+            "cat a.txt b.txt",
+        ] {
+            assert!(
+                g.check_user_command(command, None, None).await.is_ok(),
+                "{command}"
+            );
+        }
+    }
+
+    /// Which common read-only forms stay read-only, and which lost it.
+    #[test]
+    fn common_read_only_forms() {
+        for command in [
+            "git diff",
+            "git show HEAD",
+            "git log -p",
+            "git log --oneline -5",
+            "echo $HOME",
+            "echo ${HOME}",
+            "ls -la | grep x",
+            "grep -E 'a|(b)' src",
+            "find . \\( -name a -o -name b \\)",
+            "wc -l < file",
+        ] {
+            assert!(read_only_command(command), "lost: {command:?}");
+        }
+        // Were read-only before, are not now.
+        for command in [
+            "cat {a,b}.txt",
+            "ls ~/{a,b}",
+            "git log HEAD@{1}",
+            "git diff @{upstream}",
+            "cat <<<x",
+            "echo $'a\\tb'",
+            "tree -ao out.txt",
+            "git diff --ext-diff",
+        ] {
+            assert!(!read_only_command(command), "still read-only: {command:?}");
+        }
+        // Were not read-only before either.
+        for command in [
+            "ls $(pwd)",
+            "for f in *; do cat $f; done",
+            "while true; do ls; done",
+        ] {
+            assert!(!read_only_command(command), "{command:?}");
+        }
+    }
 }

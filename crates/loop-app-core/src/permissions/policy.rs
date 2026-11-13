@@ -163,14 +163,13 @@ pub fn decide_why(
         let unreadable = (tool == "bash" && rule.specific)
             .then(|| call.args.get("command").and_then(Value::as_str))
             .flatten()
-            .and_then(super::rules::unreadable);
-        if let Some(why) = unreadable {
+            .and_then(loop_agent::harness::tools::shell::unreadable_advice);
+        if let Some(advice) = unreadable {
             let pattern = key.as_deref().unwrap_or("bash(…)");
             return Verdict::new(
                 Decision::Deny(format!(
-                    "`bash` is refused: the command has {why}, so Loop cannot check it \
-                     against the deny rule `{pattern}` in settings.toolPermissions. Run the \
-                     plain command, without it."
+                    "`bash` is refused: Loop cannot check this command against the deny rule \
+                     `{pattern}` in settings.toolPermissions, because {advice}."
                 )),
                 DecidedBy::Unreadable,
             )

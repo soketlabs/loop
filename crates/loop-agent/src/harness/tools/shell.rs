@@ -37,6 +37,51 @@ pub fn unreadable(command: &str) -> Option<&'static str> {
     parts.iter().find_map(|part| runs_another_program(part))
 }
 
+/// How to run `command` so that Loop can read it, when it is unreadable:
+/// what to remove or change.
+pub fn unreadable_advice(command: &str) -> Option<String> {
+    let why = unreadable(command)?;
+    let advice = match why {
+        "a command substitution `$(…)`" | "a command substitution (backticks)" => {
+            "run the inner command on its own first, then use its output as plain text".into()
+        }
+        "a subshell, function or other `(…)`" => {
+            "run the commands without the parentheses, one part at a time".into()
+        }
+        "a group, function body or brace expansion" => {
+            "write each word out in full, without `{` and `}`".into()
+        }
+        "ANSI-C quoting `$'…'`" | "locale quoting `$\"…\"`" => {
+            "use plain single or double quotes".into()
+        }
+        "a here-document or here-string" => "put the text in a file and pass the file".into(),
+        "a line continuation" => "write the command on one line".into(),
+        "unbalanced quotes" => "close every quote".into(),
+        "a variable assignment before the program" => {
+            "set the variable in its own part first (`export NAME=value; …`), or leave it out"
+                .into()
+        }
+        "a variable as the program" | "a glob as the program" => {
+            "write the program name out in full".into()
+        }
+        "an interpreter with inline code" => {
+            "put the code in a script file and run the file, or run the command directly".into()
+        }
+        _ => {
+            // A program that runs another program: name it.
+            let program = split_command(command)
+                .into_iter()
+                .flatten()
+                .find(|part| runs_another_program(part).is_some())
+                .and_then(|part| split_words(&part, true))
+                .and_then(|words| words.into_iter().next())
+                .unwrap_or_default();
+            format!("remove `{program}` and run the inner command directly")
+        }
+    };
+    Some(format!("the command has {why}; to run it, {advice}"))
+}
+
 /// The first construct of `command` that the splitter cannot model.
 fn unmodelled_syntax(command: &str) -> Option<&'static str> {
     let (mut single, mut double) = (false, false);
