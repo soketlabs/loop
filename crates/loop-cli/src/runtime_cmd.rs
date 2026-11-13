@@ -74,21 +74,37 @@ fn edge_options(
 /// Refuse a tool-lock root from which a locked Session could read the
 /// Runtime's own secrets: the agent directory (credentials, the Runtime
 /// token, the Unix socket's folder), the Session database, or the edge token
-/// file. Paths that do not exist yet are compared as given.
+/// file. The root and a secret must not overlap in either direction: a root
+/// inside the agent directory (such as its `run/` folder) is refused too.
+/// A path that does not exist yet is resolved through its nearest existing
+/// parent, so a symbolic link cannot hide it.
 fn edge_reach(
     lock_root: &std::path::Path,
     secrets: &[(&str, &std::path::Path)],
 ) -> anyhow::Result<()> {
-    let resolve = |path: &std::path::Path| {
-        path.canonicalize()
-            .or_else(|_| std::path::absolute(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    };
+    fn resolve(path: &std::path::Path) -> PathBuf {
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut missing = Vec::new();
+        let mut existing = path.as_path();
+        loop {
+            if let Ok(real) = existing.canonicalize() {
+                return missing.iter().rev().fold(real, |acc, part| acc.join(part));
+            }
+            match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    missing.push(name.to_owned());
+                    existing = parent;
+                }
+                _ => return path,
+            }
+        }
+    }
     let root = resolve(lock_root);
     for (what, path) in secrets {
-        if resolve(path).starts_with(&root) {
+        let secret = resolve(path);
+        if secret.starts_with(&root) || root.starts_with(&secret) {
             anyhow::bail!(
-                "--unstable-edge-listen: the --tool-lock-root {} holds the {what}; an Edge Gateway user could read it. Use a root outside it",
+                "--unstable-edge-listen: the --tool-lock-root {} overlaps the {what}; an Edge Gateway user could read it. Use a root outside it",
                 root.display()
             );
         }
@@ -1123,11 +1139,25 @@ mod tests {
             ("edge token file", token.as_path()),
         ];
         assert!(super::edge_reach(&users, &secrets).is_ok());
+        // A secret that does not exist yet, behind a symbolic link into the
+        // root, is found through its nearest existing parent.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&users, &link).unwrap();
+        let hidden = link.join("later/sessions.db");
+        let refused =
+            super::edge_reach(&users, &[("Session database", hidden.as_path())]).unwrap_err();
+        assert!(
+            refused.to_string().contains("Session database"),
+            "{refused}"
+        );
         for (root, what) in [
             (dir.path().join("home"), "agent directory"),
             (agent.clone(), "agent directory"),
             (dir.path().join("gateway"), "edge token file"),
             (dir.path().to_path_buf(), "agent directory"),
+            // A root inside the agent directory reaches its secrets too.
+            (agent.join("run"), "agent directory"),
+            (agent.join("sessions"), "agent directory"),
         ] {
             let refused = super::edge_reach(&root, &secrets).unwrap_err();
             assert!(refused.to_string().contains(what), "{refused}");
