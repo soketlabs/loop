@@ -7,19 +7,20 @@ workflow has a Windows job or step.
 
 | Workflow | File | Runs on | Does |
 |----------|------|---------|------|
-| CI | `.github/workflows/ci.yml` | push to `main`; PR into `main` or `staging`; merge queue; manual | Format, lint, tests, desktop check |
+| CI | `.github/workflows/ci.yml` | push to `main`; PR into `main` or `staging`; merge queue; manual | Format, lint, tests |
 | Release | `.github/workflows/release.yml` | tag `v*.*.*`; manual | Builds, signs, publishes. See [Releasing](releasing.md) |
+
+The desktop app is developed in a separate repository and has its own CI.
 
 ## CI jobs
 
 | Job | Runner | What it runs |
 |-----|--------|--------------|
-| `Changes` | Linux | Reads the changed files of a PR and sets `rust` and `desktop` |
+| `Changes` | Linux | Reads the changed files of a PR and sets `rust` |
 | `Lint (fmt + clippy)` | Linux | `cargo fmt`, ShellCheck, clippy for: the workspace, loop-cli without telemetry, loop-cli without the usage view, and **with `orchestration`** |
 | `Test (ubuntu-latest)` | Linux | `cargo test --locked` (default members), `bash -n install.sh` |
 | `Test (macos-latest)` | macOS | `cargo test` for the crates that have OS-specific code (see below), `bash -n install.sh` |
 | `Test (ubuntu-latest, feature sets)` | Linux | Tests without telemetry, and tests with `orchestration` |
-| `Check desktop (nightly)` | Linux | `cargo check -p loop-desktop` on nightly |
 | `CI gate` | Linux | Passes when all jobs passed or were skipped. **Require this one check.** |
 
 All jobs run in parallel. There is no separate `cargo build` step: `cargo test`
@@ -34,12 +35,6 @@ builds the same binaries.
   - Only docs (`docs/`, root and `.github/` Markdown files, `resources/`,
     `LICENSE`, issue templates): the Rust jobs are skipped. The gate still
     passes, because skipped jobs count as passed.
-  - The desktop job runs only when a crate in the desktop dependency tree
-    changes (`loop-desktop`, `loop-app-core`, `loop-agent`, `loop-ai`,
-    `loop-mcp`, `loop-orchestration`, `loop-telemetry`, `loop-test-support`,
-    `core/*`, `extend/loop-acp`), or `Cargo.toml`, `Cargo.lock` or `ci.yml`
-    change. If the desktop app starts to depend on another crate, add it to the
-    `desk` pattern in `ci.yml`.
   - Anything else: all jobs.
 - A new push to a PR cancels the older run of that PR. Runs on `main` are
   never cancelled.
@@ -108,5 +103,4 @@ ref, plus the default branch), so the release builds save a cache only on
   `taiki-e/install-action`, run `cargo nextest run --locked` plus
   `cargo test --doc --locked`, and compare the times.
 - **Shared cache for lint and test.** See Caches.
-- **Clippy on loop-desktop.** `CONTRIBUTING.md` asks for it by hand. Nightly clippy changes every night and could turn unrelated PRs red, so CI only compiles the app.
 - **Clippy on macOS.** About one extra macOS minute per run (10 Linux minutes).

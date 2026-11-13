@@ -7,6 +7,8 @@ This page is for maintainers.
 - **CI** (`.github/workflows/ci.yml`) runs on every PR and push to `main` and `staging`, plus manual **Run workflow**. It lints and tests; it does **not** publish a release. See [CI](ci.md).
 - **Release** (`.github/workflows/release.yml`) publishes multi-platform binaries only when you cut a version tag (or manually with `create_release`).
 
+This repository releases the CLI only. The desktop app is developed and released from a separate repository.
+
 Supported release targets:
 
 | Asset | Platform |
