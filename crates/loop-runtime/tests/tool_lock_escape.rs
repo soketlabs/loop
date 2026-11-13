@@ -203,12 +203,16 @@ async fn locked(w: &World, seen: Arc<Mutex<Seen>>) -> Arc<Runtime> {
     let globals = GlobalResources::with_models(w.agent.clone(), models)
         .unwrap()
         .with_tool_lock(Some(lock));
-    Runtime::new(
-        globals,
-        opts(&w.alice),
-        Arc::new(MemoryEventLog::new()),
-        RuntimeLimits::default(),
-    )
+    {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(
+            globals,
+            opts(&w.alice),
+            Arc::new(MemoryEventLog::new()),
+            store,
+            RuntimeLimits::default(),
+        )
+    }
     .await
     .unwrap()
     .into_shared()
@@ -328,12 +332,16 @@ async fn no_session_opens_outside_the_root() {
         let models = Arc::new(loop_ai::Models::create(Default::default()));
         models.set_provider(faux_provider_fn(attacker(Arc::default())));
         let globals = GlobalResources::with_models(w.agent.clone(), models).unwrap();
-        let rt = Runtime::new(
-            globals,
-            opts(&w.alice),
-            Arc::new(MemoryEventLog::new()),
-            RuntimeLimits::default(),
-        )
+        let rt = {
+            let store = globals.open_runtime_session_store().unwrap();
+            Runtime::new(
+                globals,
+                opts(&w.alice),
+                Arc::new(MemoryEventLog::new()),
+                store,
+                RuntimeLimits::default(),
+            )
+        }
         .await
         .unwrap()
         .into_shared();

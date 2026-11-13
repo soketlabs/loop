@@ -46,9 +46,12 @@ async fn runtime(dir: &Path, log: Arc<dyn EventLog>) -> Runtime {
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(loop_ai::providers::faux_provider(Default::default()));
     let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
-    Runtime::new(globals, opts(dir), log, RuntimeLimits::default())
-        .await
-        .unwrap()
+    {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(globals, opts(dir), log, store, RuntimeLimits::default())
+    }
+    .await
+    .unwrap()
 }
 
 fn update(generation: u64, session: &SessionKey, turn: &str, update: SessionUpdate) -> Event {
@@ -578,12 +581,16 @@ async fn clean_shutdown_mid_turn_leaves_no_turn_for_recovery() {
         let models = Arc::new(loop_ai::Models::create(Default::default()));
         models.set_provider(loop_ai::providers::faux_provider(script));
         let globals = GlobalResources::with_models(dir.path().join("agent"), models).unwrap();
-        let rt = Runtime::new(
-            globals,
-            opts(dir.path()),
-            log.clone(),
-            RuntimeLimits::default(),
-        )
+        let rt = {
+            let store = globals.open_runtime_session_store().unwrap();
+            Runtime::new(
+                globals,
+                opts(dir.path()),
+                log.clone(),
+                store,
+                RuntimeLimits::default(),
+            )
+        }
         .await
         .unwrap();
         let session = rt.new_session(SessionSpec::default()).await.unwrap();

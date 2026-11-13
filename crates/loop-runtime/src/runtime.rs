@@ -4,10 +4,7 @@ use async_trait::async_trait;
 use loop_agent::{
     harness::{
         create_session_repository,
-        session::{
-            sqlite::{LeaseIdentity, SqliteSessionStore},
-            SessionStore,
-        },
+        session::{LeaseIdentity, RuntimeSessionStore, SessionStore},
         types::SessionError,
         Sandbox,
     },
@@ -101,7 +98,7 @@ pub struct Runtime {
     generation: u64,
     limits: RuntimeLimits,
     turns: Arc<Semaphore>,
-    store: Arc<SqliteSessionStore>,
+    store: Arc<dyn RuntimeSessionStore>,
     identity: LeaseIdentity,
     updates: broadcast::Sender<UpdateEnvelope>,
     activity: Activity,
@@ -279,12 +276,15 @@ fn reference(id: &str) -> SessionRef {
     }
 }
 impl Runtime {
-    /// Construct a Runtime over injected resources and an Event Log. The caller owns
-    /// the process lock; crash recovery/reclamation belongs to the startup layer.
+    /// Construct a Runtime over injected resources, an Event Log and a Session
+    /// store. The Runtime opens no database itself: the caller builds both
+    /// stores. The caller owns the process lock; crash recovery/reclamation
+    /// belongs to the startup layer.
     pub async fn new(
         mut globals: GlobalResources,
         defaults: BootstrapOpts,
         log: Arc<dyn EventLog>,
+        store: Arc<dyn RuntimeSessionStore>,
         limits: RuntimeLimits,
     ) -> BackendResult<Self> {
         if limits.max_sessions == 0 || limits.max_active_turns == 0 {
@@ -302,9 +302,7 @@ impl Runtime {
             pid: std::process::id(),
             generation: i64::try_from(generation).map_err(failed)?,
         };
-        let store = Arc::new(SqliteSessionStore::open(&globals.sessions_db).map_err(failed)?);
-        globals.repository =
-            create_session_repository(Arc::new(store.for_lease(identity.clone())), None);
+        globals.repository = create_session_repository(store.for_lease(identity.clone()), None);
         log.append_batch(vec![Event {
             generation,
             session_key: None,
@@ -373,7 +371,9 @@ impl Runtime {
     /// since the newest generation whose recovery committed.
     ///
     /// With `lock` (the lock of this Runtime's own Session database), leases of
-    /// an earlier Runtime are reclaimed and released.
+    /// an earlier Runtime are reclaimed and released. The lock must name the
+    /// store's `database_path`; with a store that has no database path,
+    /// `recover(Some(lock))` fails.
     ///
     /// Precondition: call before serving any Session; turns of this generation
     /// are never ended here.
@@ -383,7 +383,13 @@ impl Runtime {
     ) -> BackendResult<crate::Recovery> {
         use crate::recovery::{unfinished, REASON};
         if let Some(lock) = lock {
-            let ours = std::path::absolute(&self.factory.globals.sessions_db).map_err(failed)?;
+            let ours = std::path::absolute(self.store.database_path().ok_or_else(|| {
+                failed(format!(
+                    "the held lock is for {}, but this Runtime's Session store has no database file",
+                    lock.sessions_db().display()
+                ))
+            })?)
+            .map_err(failed)?;
             if lock.sessions_db() != ours {
                 return Err(failed(format!(
                     "the held lock is for {}, not this Runtime's Session database {}",
@@ -1675,7 +1681,8 @@ mod tests {
             agent: None,
         };
         let log = Arc::new(MemoryEventLog::new());
-        let rt = Runtime::new(globals, opts, log.clone(), RuntimeLimits::default())
+        let store = globals.open_runtime_session_store().unwrap();
+        let rt = Runtime::new(globals, opts, log.clone(), store, RuntimeLimits::default())
             .await
             .unwrap();
         let session = rt.new_session(SessionSpec::default()).await.unwrap();

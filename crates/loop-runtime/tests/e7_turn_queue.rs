@@ -862,10 +862,19 @@ async fn build(dir: &Path, limits: RuntimeLimits, log_delay_ms: u64, seed: u64) 
         open: AtomicI64::new(0),
         window_peak: AtomicI64::new(0),
     });
-    let rt = Runtime::new(globals, make_opts(&dir.join("work")), log.clone(), limits)
-        .await
-        .unwrap()
-        .into_shared();
+    let rt = {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(
+            globals,
+            make_opts(&dir.join("work")),
+            log.clone(),
+            store,
+            limits,
+        )
+    }
+    .await
+    .unwrap()
+    .into_shared();
     Built { rt, shared, log }
 }
 

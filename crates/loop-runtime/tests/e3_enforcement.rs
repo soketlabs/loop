@@ -1574,7 +1574,18 @@ async fn run_case(base: &Path, case: &Case) -> Outcome {
             });
             let g = globals(&dirs, model(script.clone(), seen.clone(), hook));
             let log = Arc::new(MemoryEventLog::new());
-            match Runtime::new(g, dirs.opts(case.mode), log, RuntimeLimits::default()).await {
+            match {
+                let store = g.open_runtime_session_store().unwrap();
+                Runtime::new(
+                    g,
+                    dirs.opts(case.mode),
+                    log,
+                    store,
+                    RuntimeLimits::default(),
+                )
+            }
+            .await
+            {
                 Ok(rt) => {
                     let rt = rt.into_shared();
                     let spec = SessionSpec {

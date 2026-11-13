@@ -118,6 +118,50 @@ impl GlobalResources {
     }
 }
 
+/// Store construction at the edge: the Runtime opens no database itself.
+impl GlobalResources {
+    /// Inject a model catalog and the Session store of the shared repository,
+    /// with no SQLite store opened.
+    ///
+    /// The injected store and `sessions_db` can differ: `sessions_db` still
+    /// names the default path, and nothing is created there. The Runtime
+    /// never reads `sessions_db` (it uses its injected store). Code that
+    /// still reads it: the standalone Surface path of
+    /// [`SessionFactory::open`] (`create_sqlite_session_store_for_resume`),
+    /// [`Self::open_runtime_session_store`], and `loop_app_core::Runtime`,
+    /// which copies it for the Surfaces to show. So do not use these
+    /// resources for a standalone Surface.
+    pub fn with_models_and_store(
+        agent_dir: PathBuf,
+        models: Arc<Models>,
+        store: Arc<dyn loop_agent::harness::session::SessionStore>,
+    ) -> anyhow::Result<Self> {
+        ensure_agent_dirs(&agent_dir)?;
+        let credentials = Arc::new(FileCredentialStore::open(auth_path(&agent_dir))?);
+        Ok(Self {
+            sessions_db: sessions_db_path(&agent_dir),
+            agent_dir,
+            credentials,
+            models,
+            repository: create_session_repository(store, None),
+            tool_lock: None,
+        })
+    }
+
+    /// Open the SQLite Session store at `sessions_db`, with the leases,
+    /// control markers and destinations that a Runtime needs.
+    pub fn open_runtime_session_store(
+        &self,
+    ) -> Result<
+        Arc<dyn loop_agent::harness::session::RuntimeSessionStore>,
+        loop_agent::harness::types::SessionError,
+    > {
+        Ok(Arc::new(
+            loop_agent::harness::session::sqlite::SqliteSessionStore::open(&self.sessions_db)?,
+        ))
+    }
+}
+
 /// A workspace's sandbox, its tool env and whether the sandbox is off.
 type Execution = (SandboxMode, Arc<dyn ExecutionEnv>, bool);
 

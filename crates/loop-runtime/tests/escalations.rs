@@ -110,13 +110,13 @@ async fn runtime_with_approval(
         agent: None,
     };
     Arc::new(
-        loop_runtime::Runtime::new(
-            loop_app_core::runtime::GlobalResources::with_models(dir.join("agent"), models)
-                .unwrap(),
-            opts,
-            log,
-            Default::default(),
-        )
+        {
+            let globals =
+                loop_app_core::runtime::GlobalResources::with_models(dir.join("agent"), models)
+                    .unwrap();
+            let store = globals.open_runtime_session_store().unwrap();
+            loop_runtime::Runtime::new(globals, opts, log, store, Default::default())
+        }
         .await
         .unwrap(),
     )
