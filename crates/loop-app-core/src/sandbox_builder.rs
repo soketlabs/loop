@@ -1,10 +1,14 @@
 //! One place that turns sandbox settings or `/sandbox local` flags into a running sandbox.
 //!
 //! Both `/sandbox local` and the Session factory go through [`SandboxBuilder`]. The
-//! builder picks the platform's sandbox from a [`SandboxRegistry`]: on Linux that is
-//! the Podman sandbox ([`KrunSandboxFactory`]); macOS uses Seatbelt. A new platform
-//! sandbox only needs a factory registered in [`platform_registry`] under
-//! [`LOCAL_SANDBOX_KIND`].
+//! builder selects a Workspace driver by data, not by `#[cfg]`: the sandbox kind
+//! (`sandbox.mode`, [`LOCAL_SANDBOX_KIND`]) and the platform go to
+//! [`SandboxRegistry::select`], which returns the first registered driver that
+//! serves the kind and supports the platform. The built-in drivers are `podman`
+//! (Linux, [`KrunSandboxFactory`](loop_agent::harness::KrunSandboxFactory)) and
+//! `seatbelt` (macOS). A driver from another crate registers itself with
+//! [`register_workspace_driver`](loop_agent::harness::sandbox::register_workspace_driver);
+//! [`platform_registry`] adds it after the built-in drivers.
 //!
 //! Isolation and runtime are optional. A value the user set (a flag, or a key in
 //! `settings.json`) is explicit; a missing value inherits the platform default. An
@@ -14,6 +18,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use loop_agent::harness::sandbox::{builtin_workspace_drivers, HostOs};
 use loop_agent::harness::{
     KrunIsolation, LocalSandboxRuntime, Sandbox, SandboxConfig, SandboxRegistry,
 };
@@ -38,12 +43,19 @@ pub enum SandboxPlatform {
 impl SandboxPlatform {
     /// The platform this binary was built for.
     pub fn current() -> Self {
-        if cfg!(target_os = "linux") {
-            Self::Linux
-        } else if cfg!(target_os = "macos") {
-            Self::MacOs
-        } else {
-            Self::Other
+        match HostOs::current() {
+            HostOs::Linux => Self::Linux,
+            HostOs::MacOs => Self::MacOs,
+            HostOs::Other => Self::Other,
+        }
+    }
+
+    /// The platform as driver selection data.
+    pub fn os(self) -> HostOs {
+        match self {
+            Self::Linux => HostOs::Linux,
+            Self::MacOs => HostOs::MacOs,
+            Self::Other => HostOs::Other,
         }
     }
 
@@ -65,11 +77,7 @@ impl SandboxPlatform {
     }
 
     fn name(self) -> &'static str {
-        match self {
-            Self::Linux => "Linux",
-            Self::MacOs => "macOS",
-            Self::Other => "this platform",
-        }
+        self.os().name()
     }
 }
 
@@ -120,6 +128,8 @@ pub fn parse_local_sandbox_flags(args: &[&str]) -> Result<LocalSandboxFlags, Str
 /// What the user asked for, before platform defaults are applied.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxRequest {
+    /// Sandbox kind (`sandbox.mode`); `None` means [`LOCAL_SANDBOX_KIND`].
+    pub kind: Option<String>,
     /// Explicit isolation, if any.
     pub isolation: Option<KrunIsolation>,
     /// Explicit container runtime, if any.
@@ -170,6 +180,7 @@ impl SandboxRequest {
             (isolation, runtime)
         };
         Ok(Self {
+            kind: (settings.mode != "off").then(|| settings.mode.clone()),
             isolation,
             runtime,
             network: settings.network(),
@@ -190,6 +201,7 @@ impl SandboxRequest {
     /// command that replaces it.
     pub fn for_flags(settings: &SandboxSettings, flags: LocalSandboxFlags) -> Self {
         Self {
+            kind: None,
             isolation: flags.isolation,
             runtime: flags.runtime,
             network: settings.network(),
@@ -359,16 +371,15 @@ impl fmt::Display for SandboxBuildError {
 
 impl std::error::Error for SandboxBuildError {}
 
-/// Registry with the sandbox factories this platform supports.
+/// Registry with every built-in Workspace driver, then the drivers other
+/// crates registered with `register_workspace_driver`. Each driver states
+/// the platforms it supports; [`SandboxBuilder::start`] checks that at run time.
 pub fn platform_registry() -> SandboxRegistry {
     let registry = SandboxRegistry::new();
-    #[cfg(target_os = "linux")]
-    registry.register(Arc::new(loop_agent::harness::KrunSandboxFactory));
-    #[cfg(target_os = "macos")]
-    registry.register(Arc::new(
-        loop_agent::harness::sandbox::seatbelt::SeatbeltSandboxFactory,
-    ));
-    registry
+    for driver in builtin_workspace_drivers() {
+        registry.register_driver(driver);
+    }
+    registry.with_registered_drivers()
 }
 
 /// Builds the platform's local sandbox from a [`SandboxRequest`].
@@ -434,24 +445,20 @@ impl SandboxBuilder {
         request: &SandboxRequest,
     ) -> Result<(Arc<dyn Sandbox>, SandboxPlan), SandboxBuildError> {
         let plan = self.resolve(request)?;
-        if !self
+        // Settings -> registry lookup -> platform check. A kind with no driver
+        // for this platform is "not available", as before.
+        let kind = request.kind.as_deref().unwrap_or(LOCAL_SANDBOX_KIND);
+        let driver = self
             .registry
-            .kinds()
-            .iter()
-            .any(|kind| kind == LOCAL_SANDBOX_KIND)
-        {
-            return Err(SandboxBuildError::Unavailable {
+            .select(kind, self.platform.os())
+            .map_err(|_| SandboxBuildError::Unavailable {
                 platform: self.platform,
-            });
-        }
-        let sandbox = self
-            .registry
-            .create(
-                LOCAL_SANDBOX_KIND,
-                plan.config_for_agent(workdir, &self.agent_dir),
-            )
+            })?;
+        let workspace = driver
+            .create(plan.config_for_agent(workdir, &self.agent_dir))
             .await
             .map_err(|e| SandboxBuildError::Start(e.to_string()))?;
+        let sandbox: Arc<dyn Sandbox> = workspace;
         if let Err(e) = sandbox.start().await {
             let _ = sandbox.destroy().await;
             return Err(SandboxBuildError::Start(e.to_string()));
@@ -864,12 +871,56 @@ mod tests {
 
     #[test]
     fn platform_registry_matches_the_build_target() {
-        let kinds = platform_registry().kinds();
-        let has_local = kinds.iter().any(|k| k == LOCAL_SANDBOX_KIND);
+        let registry = platform_registry();
+        let local = registry.select(LOCAL_SANDBOX_KIND, HostOs::current());
         assert_eq!(
-            has_local,
+            local.is_ok(),
             cfg!(any(target_os = "linux", target_os = "macos")),
-            "{kinds:?}"
+            "{:?}",
+            registry.driver_ids()
+        );
+        let expected = if cfg!(target_os = "linux") {
+            Some("podman")
+        } else if cfg!(target_os = "macos") {
+            Some("seatbelt")
+        } else {
+            None
+        };
+        assert_eq!(local.ok().map(|d| d.id().to_owned()).as_deref(), expected);
+    }
+
+    #[test]
+    fn platform_registry_selects_by_data_on_every_platform() {
+        let registry = platform_registry();
+        let pick = |os| {
+            registry
+                .select(LOCAL_SANDBOX_KIND, os)
+                .ok()
+                .map(|d| d.id().to_owned())
+        };
+        assert_eq!(pick(HostOs::Linux).as_deref(), Some("podman"));
+        #[cfg(unix)]
+        assert_eq!(pick(HostOs::MacOs).as_deref(), Some("seatbelt"));
+        assert_eq!(pick(HostOs::Other), None);
+    }
+
+    #[tokio::test]
+    async fn other_platform_with_the_full_registry_says_not_available() {
+        let builder = SandboxBuilder::new(SandboxPlatform::Other, platform_registry());
+        let dir = tempfile::tempdir().unwrap();
+        let err = match builder.start(dir.path(), &SandboxRequest::default()).await {
+            Err(e) => e,
+            Ok(_) => panic!("started a sandbox on an unsupported platform"),
+        };
+        assert_eq!(
+            err,
+            SandboxBuildError::Unavailable {
+                platform: SandboxPlatform::Other
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "the local sandbox is not available on this platform yet; tools run on the host (/sandbox off)."
         );
     }
 }
