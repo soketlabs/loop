@@ -136,26 +136,30 @@ A command you type in a client (`!command` in the TUI, or the `session/shell` me
 
 ## Unreadable commands
 
-Loop reads a `bash` command as text: it splits it at `;`, `&&`, `||`, `|`, `&` and newlines, and removes quotes and escapes. Some shell constructs make the shell read the text differently. A command with one of them is **unreadable**:
+Loop reads a `bash` command with a small grammar that it models exactly. A command it can read is **readable**; everything else is **unreadable**.
 
-- command or process substitution: `$(…)`, backticks, `<(…)`, `>(…)`;
-- any other unquoted `(` or `)`: a subshell, a function definition, a `case` pattern, `$((…))`;
-- an unquoted `{` or `}`: a group, a function body, brace expansion (a `${NAME}` parameter is fine);
-- `$'…'` and `$"…"` quoting;
-- a here-document or here-string (`<<`, `<<<`);
-- a line continuation (a backslash at the end of a line);
-- unbalanced quotes;
-- a program that runs another program: `env`, `command`, `builtin`, `exec`, `eval`, `source`, `.`, `alias`, `time`, `nohup`, `nice`, `timeout`, `stdbuf`, `xargs`, `sudo`, `su`, `doas`, `!`, a shell (`sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`, also after a pipe), and `python* -c`, `node -e`, `perl -e`, `ruby -e`;
-- a `NAME=value` assignment before the program, a variable or a glob as the program.
+A readable command is one or more simple commands separated by `|`, `||`, `&&`, `;` or newlines. A simple command is:
+
+- a **program** in plain text: letters, digits and `_ . / + -` only (no quotes, no `$`, no globs);
+- **arguments** made of: plain text from letters, digits and `_ . / + - = : , @ %`; the glob characters `* ? [ ]`; `~` inside a word (`HEAD~1`); a backslash before one printable character; `'single quotes'` and `"double quotes"` on one line (in double quotes no backtick or `!`); and `$NAME` or `${NAME}`;
+- **redirects**: `<`, `>`, `>>`, `>|`, `&>`, `&>>` with a file name, and `2>&1`, `>&2`, `>&-`.
+
+Anything else is unreadable, for example: a comment (`#`), `(`, `)`, `{`, `}`, backticks, `$(…)`, `$[…]`, `${x:…}` and every other `$` form, `~` at the start of a word, `!`, a lone `&`, here-documents, a quoted newline, unbalanced quotes, control characters, non-ASCII text outside quotes; shell keywords (`if`, `for`, `while`, …); an assignment before the program (`X=1 cmd`); programs that run another program (`env`, `command`, `exec`, `eval`, `source`, `.`, `time`, `nohup`, `nice`, `timeout`, `xargs`, `sudo`, shells such as `sh` and `bash`, …); built-ins that change how later commands run (`alias`, `hash`, `trap`, `set`, `read`, `export PATH=…`, `printf -v`, …); and `python* -c`, `node -e`, `perl -e`, `ruby -e`.
 
 For an unreadable command:
 
 - it is not a read-only command, so `read-only` and `plan` refuse it;
-- if any `bash` deny pattern is set, the command is refused, with a reason that names the construct and the rule (`by: unreadable` in the record). Use the plain command;
+- if any `bash` deny pattern is set, the command is refused. The reason names what Loop could not read and how to run the command (`by: unreadable` in the record);
 - an `allow` pattern never matches it;
-- otherwise the mode decides, as for any command.
+- otherwise the mode decides, as for any command that is not read-only. **With no `bash` deny pattern, nothing changes except read-only status.**
 
-Deny and ask patterns also match the program by its last path part, lower-cased: `/usr/bin/touch` and `TOUCH` match `bash(touch*)`. The `bash` block list reads an unreadable command by cutting it at every separator and bracket, so `rm -rf /` after a `$'…'` is still refused. Redirects such as `2>&1`, `&>` and `>|` stay part of their command.
+Deny and ask patterns match each simple command as written, with quotes and escapes removed, and with the program reduced to its last path part and lower-cased (`/usr/bin/touch` and `TOUCH` match `bash(touch*)`).
+
+A read-only command must also be readable. An argument the shell can change (a variable or an unquoted glob) makes `find`, `sort`, `file`, `rg`, `tree`, `uniq` and `git` not read-only, because it could become an option that writes or runs a program.
+
+A test runs a seeded corpus of command strings under `sh`, `bash` and `dash`: no command that Loop calls read-only writes a file, and a readable command starts only the programs Loop reports (`crates/loop-app-core/tests/shell_differential.rs`).
+
+The `bash` block list reads a readable command the same way. It cuts an unreadable command at every separator and bracket and checks each piece, so `rm -rf /` after a comment or a `$'…'` is still refused.
 
 ## Decision records
 

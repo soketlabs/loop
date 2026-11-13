@@ -422,6 +422,12 @@ mod readable_commands {
     const SMUGGLED: &str = "echo $'\\''\ntouch PWNED\necho '";
     /// A function named `ls` that runs `touch`.
     const FUNCTION: &str = "ls () ( touch PWNED ); ls";
+    /// A comment hides the quote that seems to open after it.
+    const COMMENT: &str = "echo #'\ntouch PWNED\n'";
+    /// Arithmetic inside a parameter runs a command (bash, macOS sh).
+    const ARITHMETIC: &str = "echo ${x:=a[\\$(touch PWNED)]}; echo $[x]";
+    /// A variable inside the program word.
+    const VARIABLE_PROGRAM: &str = "export y=ouch; t${y} PWNED";
 
     fn bypasses() -> Vec<&'static str> {
         vec![
@@ -444,6 +450,14 @@ mod readable_commands {
             "$CMD PWNED",
             "eval 'touch PWNED'",
             "xargs touch < list",
+            // Round 2 of the review.
+            COMMENT,
+            ARITHMETIC,
+            "echo ${s:1}",
+            VARIABLE_PROGRAM,
+            "echo 'a\nb'; touch PWNED #'",
+            "hash -p /usr/bin/touch ls; ls PWNED",
+            "read PATH < list; ls",
         ]
     }
 
@@ -561,6 +575,7 @@ mod readable_commands {
         let check = loop_agent::harness::tools::check_command_policy;
         assert!(check("echo $'\\''\nrm -rf /\necho '", &[]).is_err());
         assert!(check("ls () ( rm -rf / ); ls", &[]).is_err());
+        assert!(check("echo #'\nrm -rf /\n'", &[]).is_err());
     }
 }
 
@@ -919,6 +934,13 @@ mod unreadable_for_local_users {
             "grep -E 'a|(b)' src",
             "find . \\( -name a -o -name b \\)",
             "wc -l < file",
+            "git diff HEAD~1 -- src",
+            "echo \"${HOME}/x\"",
+            "rg -n 'fn main' src",
+            "find . -name '*.rs'",
+            "grep -rn \"x y\" .",
+            "cat src/*.rs | wc -l",
+            "ls -la; ls\n",
         ] {
             assert!(read_only_command(command), "lost: {command:?}");
         }
@@ -932,6 +954,17 @@ mod unreadable_for_local_users {
             "echo $'a\\tb'",
             "tree -ao out.txt",
             "git diff --ext-diff",
+            "ls ~",
+            "cat ~/notes.txt",
+            "ls # list",
+            "ls &",
+            "echo $1",
+            "echo \"$@\"",
+            "[ -f x ]",
+            "echo 'a\nb'",
+            "find . -name *.rs",
+            "find $DIR",
+            "git log $REV",
         ] {
             assert!(!read_only_command(command), "still read-only: {command:?}");
         }

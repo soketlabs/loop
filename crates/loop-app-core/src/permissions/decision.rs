@@ -23,8 +23,6 @@ pub use loop_store::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::rules::split_command;
-
 /// The folder below the agent directory that holds embedded decision
 /// records.
 pub const AUDIT_DIR: &str = "audit";
@@ -140,25 +138,29 @@ pub fn subject_of(kind: ToolKind, args: &Value) -> DecisionSubject {
 /// `NAME=value` assignment, with the path left off. An unreadable command
 /// gives its first word only.
 fn programs(command: &str) -> Vec<String> {
-    let parts = split_command(command).unwrap_or_else(|| vec![command.to_owned()]);
-    parts
-        .iter()
-        .filter_map(|part| {
-            part.split_whitespace()
-                .find(|word| !is_assignment(word))
-                .map(|word| {
-                    let word = word.trim_matches(|c| c == '\'' || c == '"');
-                    word.rsplit('/').next().unwrap_or(word).to_owned()
-                })
-        })
-        .filter(|word| !word.is_empty())
-        .collect()
-}
-
-fn is_assignment(word: &str) -> bool {
-    word.split_once('=').is_some_and(|(name, _)| {
-        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
+    match loop_agent::harness::tools::shell::parse(command) {
+        Ok(commands) => commands
+            .iter()
+            .map(|simple| {
+                let program = simple.program();
+                program.rsplit('/').next().unwrap_or(program).to_owned()
+            })
+            .collect(),
+        // Unreadable: the first plain word that is not an assignment, by
+        // its last path part; nothing when there is none, so no argument
+        // or value is kept.
+        Err(_) => command
+            .split_whitespace()
+            .find(|word| !word.contains('='))
+            .filter(|word| {
+                word.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '+' | '-'))
+            })
+            .map(|word| word.rsplit('/').next().unwrap_or(word).to_owned())
+            .into_iter()
+            .filter(|word| !word.is_empty())
+            .collect(),
+    }
 }
 
 /// `scheme://host[:port]` of `url`, without user info, path or query.
@@ -427,7 +429,9 @@ mod tests {
             ToolKind::Execute,
             &json!({"command": "TOKEN=abc /usr/bin/curl -H 'Authorization: x' https://a && jq .k"}),
         );
-        assert_eq!(s.programs, ["curl", "jq"]);
+        // An assignment before the program makes it unreadable: only the
+        // first plain word is kept.
+        assert_eq!(s.programs, ["curl"]);
         let text = serde_json::to_string(&s).unwrap();
         assert!(
             !text.contains("abc") && !text.contains("Authorization"),
