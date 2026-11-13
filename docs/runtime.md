@@ -608,10 +608,18 @@ Event Log: each tool call of the agent and its Subagents, each `/workflow`
 shell task, each permission request of a subscription agent, and each
 command you type. The fields are in [permissions](permissions.md#decision-records).
 
-- **Order.** For a tool call, the Runtime first commits the call's
-  `tool_call` update, then the decision, and only then runs the tool. A crash
-  after the decision leaves the record. If the record cannot be written, the
-  call is refused.
+- **Order.** For a tool call with an effect, the Runtime first commits the
+  call's `tool_call` update, then the decision, and only then runs the tool.
+  An allowed read of files has no effect to protect: its decision commits
+  before the read runs, but it does not wait for the `tool_call` update. If
+  the record cannot be written, the call is refused. An approver's answer
+  takes effect (a plan approval's mode change, an "allow for this Session"
+  grant) only after its record commits.
+- **Durability.** The Event Log commits with SQLite `synchronous=NORMAL`. A
+  crash of the Runtime process keeps every committed record. A power loss
+  can lose the last records while the effects of their calls stay on disk.
+- **Hooks run first.** `tool_call` hooks are part of the decision, so a
+  command hook runs before the record is written.
 - **Audit only.** The row has no Session sequence. Attach, replay and
   `session_seq` never include it, and recovery does not read it. An older
   Loop reads such a row as an unknown record and keeps it.

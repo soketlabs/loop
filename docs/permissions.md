@@ -25,7 +25,7 @@ Loop records every decision of this check before the call runs: see [Decision re
 - **A write or edit through a symlink** shows where it lands in the approval prompt. The title starts with the real target; the detail gives the target and the link on two lines. Names are quoted, control characters are escaped, and a long link name is shortened in the middle.
 - **`read-only` is a ceiling.** A hook can't allow a call that changes files or runs commands.
 - **What `read-only` turns off is taken away, not just refused.** The model isn't offered `write`, `edit`, or MCP tools that their server doesn't mark read-only, in the agent loop or through `loop --serve-mcp`. `bash` stays, for read-only commands. Switching mode changes the toolset from the next turn.
-- **Bash in `read-only`** runs a command only when every part of it reads: `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `tree`, `file`, `stat`, `du`, `which`, `echo`, `sort`, `uniq`, `diff`, and `git status`, `log`, `diff`, `show`, `blame`, `ls-files`, `rev-parse`, and `branch` when it only lists. Output redirects (`>`), `$(…)`, backticks, variable assignments, and options that write or run programs (`find -exec`/`-delete`, `sort -o`, `rg --pre`, `git --output`) are refused.
+- **Bash in `read-only`** runs a command only when every part of it reads: `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `tree`, `file`, `stat`, `du`, `which`, `echo`, `sort`, `uniq`, `diff`, and `git status`, `log`, `diff`, `show`, `blame`, `ls-files`, `rev-parse`, and `branch` when it only lists. Output redirects (`>`), variable assignments, options that write or run programs (`find -exec`/`-delete`/`-fprint`, `sort -o`, `tree -o`, `rg --pre`, `git --output`, `git --ext-diff`) and every [unreadable command](#unreadable-commands) are refused. Git can still run programs that the repository's own configuration names (for example a diff `textconv` driver).
 - **MCP tools in `read-only`** run when their server marks them read-only (`readOnlyHint`). The server sets that hint, so deny a tool in `toolPermissions` if you don't trust it.
 - **Session approvals:** "Accept all … for this session" in a prompt stops further prompts for that group (file edits, bash or web) in this session, including after `--resume`.
 - **Deny rules and hooks apply in every mode,** `full-access` included.
@@ -131,8 +131,31 @@ A command you type in a client (`!command` in the TUI, or the `session/shell` me
 - **Only the host's user approves by typing.** A caller from outside the host (an Edge Gateway user) cannot approve, so where `bash` would ask, the command is refused. Today the Runtime refuses `session/shell` from those callers anyway.
 - **Hooks do not run** for a command you type. `tool_call` hooks review the agent's tool calls; a typed command is your own action.
 - **The `bash` block list applies** (below).
-- **Command patterns are advisory**, for your commands as for the agent's: a `bash` deny pattern reads the command as text, and a wrapper (`env touch x`, `sh -c '…'`, a script) can get past it. To keep the shell out of reach, turn it off with a Policy layer or use the tool lock.
+- **Command patterns are advisory**, for your commands as for the agent's (see [Unreadable commands](#unreadable-commands)). A script, `make` or `find -exec` can still run a denied program. To keep the shell out of reach, turn it off with a Policy layer or use the tool lock.
 - **Protected files.** The shell can write any file your OS user can. The sandbox (`sandbox.mode: local`) protects the agent directory, project `.loop` and git metadata from commands, yours and the agent's alike.
+
+## Unreadable commands
+
+Loop reads a `bash` command as text: it splits it at `;`, `&&`, `||`, `|`, `&` and newlines, and removes quotes and escapes. Some shell constructs make the shell read the text differently. A command with one of them is **unreadable**:
+
+- command or process substitution: `$(…)`, backticks, `<(…)`, `>(…)`;
+- any other unquoted `(` or `)`: a subshell, a function definition, a `case` pattern, `$((…))`;
+- an unquoted `{` or `}`: a group, a function body, brace expansion (a `${NAME}` parameter is fine);
+- `$'…'` and `$"…"` quoting;
+- a here-document or here-string (`<<`, `<<<`);
+- a line continuation (a backslash at the end of a line);
+- unbalanced quotes;
+- a program that runs another program: `env`, `command`, `builtin`, `exec`, `eval`, `source`, `.`, `alias`, `time`, `nohup`, `nice`, `timeout`, `stdbuf`, `xargs`, `sudo`, `su`, `doas`, `!`, a shell (`sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`, also after a pipe), and `python* -c`, `node -e`, `perl -e`, `ruby -e`;
+- a `NAME=value` assignment before the program, a variable or a glob as the program.
+
+For an unreadable command:
+
+- it is not a read-only command, so `read-only` and `plan` refuse it;
+- if any `bash` deny pattern is set, the command is refused, with a reason that names the construct and the rule (`by: unreadable` in the record). Use the plain command;
+- an `allow` pattern never matches it;
+- otherwise the mode decides, as for any command.
+
+Deny and ask patterns also match the program by its last path part, lower-cased: `/usr/bin/touch` and `TOUCH` match `bash(touch*)`. The `bash` block list reads an unreadable command by cutting it at every separator and bracket, so `rm -rf /` after a `$'…'` is still refused. Redirects such as `2>&1`, `&>` and `>|` stay part of their command.
 
 ## Decision records
 
@@ -147,16 +170,20 @@ Every decision of the check is one **decision record**: allow, ask and deny, on 
 | `tool`, `kind`, `capability` | The tool, its kind, and the Capability it needs (`shell`, `write_files`, `mcp:github`, …) |
 | `subject` | A short summary that holds no secrets: the program of each part of a command (not its arguments), the path a file tool names, the host of a URL (not its path or query) |
 | `args_sha256` | A hash of the arguments. The record never holds the arguments or file contents |
-| `outcome`, `answer` | `allow`, `deny` or `ask`. For `ask`, `answer` is `allow` or `deny` when you answered before the call ran. A file edit is reviewed after the write, so its record has no `answer`: in the Runtime the answer is in the `escalation_answered` row; without the Runtime it is not recorded |
+| `outcome`, `answer` | `allow`, `deny` or `ask`. For `ask`, `answer` is `allow` or `deny` when you answered before the call ran. A file edit is reviewed after the write: its first record has no `answer`, and the answer gets a second record with the same `call_id` |
 | `by`, `layer`, `rule` | The step that decided: `off`, `rule`, `layer_ask`, `hook`, `grant`, `preset`, `approver`, `no_approver` or `user` (you typed the command); and the Policy layer or the `toolPermissions` key, when one decided |
 | `mode` | The permission mode |
 | `escalation`, `answered_by` | For an answered ask: the Escalation id and who answered it, which can be a different person than `principal` |
-| `reason` | The refusal reason |
+| `reason` | The refusal reason, at most 512 bytes. When the approver or a hook refused, the record says only that (`the approver rejected it`, `a tool_call hook blocked it`), because their text can quote the call. URLs anywhere in `reason`, `tool` and `rule` lose their user info, query and fragment |
 
 **Where records go:**
 
 - **In the Runtime**, each record is a `policy_decision` row in the Event Log (`events.db`). It is audit-only: it has no Session sequence, so attach and replay do not show it. See [the Runtime docs](runtime.md#decision-records).
 - **Without the Runtime** (`--print` without the Runtime, the TUI's fallback, `--serve-mcp`), there is no Event Log. Records are JSON lines in `audit/decisions.jsonl` in the agent directory (mode 0600, folder 0700). Surfaces and replay do not see this file.
+  - Loop never writes it through a link: a symlinked `audit/` folder or file refuses the call. Both must belong to you; Loop sets their modes at every open.
+  - At 8 MiB the file is renamed to `decisions.jsonl.1`; Loop keeps 4 older files.
+  - The macOS sandbox keeps `audit/` from commands and file tools, as it does `auth.json`. Without a sandbox, a command can read or change the file, as it can `auth.json`.
+- **Durability.** A record is written before the call runs, so a crash of Loop keeps it. A record of a call with an effect is synced to disk first; a record of an allowed read of files is synced with the next such record, so a power loss can lose the last reads. In the Runtime, see [the Runtime docs](runtime.md#decision-records).
 
 ## Upgrading from 0.4
 
