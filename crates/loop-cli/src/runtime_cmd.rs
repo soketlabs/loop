@@ -26,6 +26,10 @@ pub struct StartArgs {
     pub permission_mode: Option<String>,
     /// Folder for Sessions that name none.
     pub cwd: PathBuf,
+    /// `--tool-lock`; without it, the `LOOP_TOOL_LOCK` environment variable.
+    pub tool_lock: Option<String>,
+    /// `--tool-lock-root`; without it, `LOOP_TOOL_LOCK_ROOT`.
+    pub tool_lock_root: Option<PathBuf>,
 }
 
 /// Run the Runtime until SIGINT, SIGTERM or `loop runtime stop`.
@@ -52,6 +56,17 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
             );
         }
     }
+    // Refused before anything starts: a typo must never start a Runtime
+    // without the lock it asked for.
+    use loop_app_core::permissions::tool_lock;
+    let tool_lock = tool_lock::resolve(
+        args.tool_lock.as_deref(),
+        std::env::var(tool_lock::ENV).ok().as_deref(),
+        args.tool_lock_root.as_deref(),
+        std::env::var(tool_lock::ROOT_ENV).ok().as_deref(),
+    )?;
+    let lock_name = tool_lock.as_ref().map(|lock| lock.lock());
+    let lock_root = tool_lock.as_ref().map(|lock| lock.root().to_path_buf());
     let agent_dir = paths::get_agent_dir();
     let settings = Settings::load_file(&paths::settings_path(&agent_dir)).unwrap_or_default();
     // Refused before anything starts, naming the flag or settings key.
@@ -89,7 +104,11 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     let sessions_lock = loop_app_core::runtime_instance::SessionDatabaseLock::acquire(&sessions_db)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let globals = GlobalResources::load(agent_dir.clone(), &settings.providers, true).await?;
+    // Fixed here for the life of the process: no setting or request can
+    // change it later.
+    let globals = GlobalResources::load(agent_dir.clone(), &settings.providers, true)
+        .await?
+        .with_tool_lock(tool_lock);
     let log = Arc::new(
         SqliteEventLog::open(&agent_dir)
             .await
@@ -171,6 +190,13 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         "Runtime listening"
     );
     eprintln!("loop runtime: listening on {}", socket.display());
+    if let (Some(lock), Some(root)) = (lock_name, &lock_root) {
+        eprintln!(
+            "loop runtime: tool lock `{lock}`: every Session can only read files in its \
+             folder and use the web tools; Session folders must be in {}",
+            root.display()
+        );
+    }
     if let Some(url) = &listen_url {
         eprintln!(
             "loop runtime: listening on {url}; token file: {}",
@@ -187,6 +213,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         agent_dir: agent_dir.clone(),
         listen_url,
         auto_started: args.auto_started,
+        tool_lock: lock_name,
     });
 
     let info = PeerInfo {
@@ -366,6 +393,8 @@ struct Control {
     #[cfg(feature = "usage")]
     agent_dir: PathBuf,
     listen_url: Option<String>,
+    /// Advertised in `initialize` so a client can hide what it turns off.
+    tool_lock: Option<loop_protocol::ToolLock>,
 }
 
 /// Workspace admin is the Runtime's; the host-only usage history and
@@ -382,6 +411,7 @@ impl loop_wire::RuntimeAdmin for Control {
             host_usage: cfg!(feature = "usage"),
             host_defaults: true,
             runtime_stop_empty: true,
+            tool_lock: self.tool_lock,
             ..self.runtime.offered()
         }
     }
@@ -417,6 +447,13 @@ impl loop_wire::RuntimeAdmin for Control {
     }
     #[cfg(feature = "usage")]
     async fn usage(&self, p: admin::UsageParams) -> BackendResult<admin::UsageResult> {
+        // The host's usage log covers every Session; not under a tool lock.
+        if let Some(lock) = self.tool_lock {
+            return Err(loop_protocol::BackendError::ToolLocked {
+                what: "runtime/usage".into(),
+                lock,
+            });
+        }
         let dir = loop_app_core::config::paths::usage_dir(&self.agent_dir);
         tokio::task::spawn_blocking(move || usage_page(&dir, &p))
             .await
@@ -777,6 +814,9 @@ pub async fn status(socket: Option<PathBuf>, json: bool) -> anyhow::Result<bool>
             status.max_active_turns,
             from(&status.max_active_turns_from)
         );
+        if let Some(lock) = status.tool_lock {
+            println!("tool lock: {lock} (fixed until the Runtime stops)");
+        }
     }
     Ok(true)
 }

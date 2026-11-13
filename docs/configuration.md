@@ -205,6 +205,8 @@ Environment variables:
 | `LOOP_CODING_AGENT_DIR` | Use a different config directory |
 | `LOOP_CODING_AGENT_SESSION_DIR` | Use a different directory for `sessions.db` |
 | `LOOP_DEBUG=1` | Write debug logs (same as `--debug`) |
+| `LOOP_TOOL_LOCK=chat` | Start `loop runtime start` with the `chat` tool lock, as `--tool-lock chat` does: every Session can only read files in its folder and use the web tools. No setting can widen it. An empty value is an error. See [the Runtime](runtime.md#tool-lock) |
+| `LOOP_TOOL_LOCK_ROOT` | The folder every Session of a locked Runtime must be in, as `--tool-lock-root` does. Required with a lock |
 | `LOOP_PDF_OCR_API_KEY` | Turn on OCR for PDFs without a text layer, through a Mistral-compatible OCR API (needs the `web` feature). Unset, such a PDF reads as empty. **OCR uploads the whole PDF** to the endpoint, see below |
 | `LOOP_PDF_OCR_URL`, `LOOP_PDF_OCR_MODEL` | Use another OCR endpoint or model (defaults: `https://api.mistral.ai/v1/ocr`, `mistral-ocr-latest`). The URL must be `https://` |
 

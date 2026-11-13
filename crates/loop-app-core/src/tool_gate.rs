@@ -87,6 +87,13 @@ pub struct ToolGate {
     /// Told the new mode when approving a plan changes it, so the Session
     /// can record it for every attached Surface.
     mode_recorder: Mutex<Option<ModeRecorder>>,
+    /// The Runtime's tool lock: set once, never cleared. Its layer is added
+    /// over the Policy on every check ([`Self::effective_policy`]), so
+    /// [`Self::set_policy`] cannot drop it.
+    tool_lock: std::sync::OnceLock<crate::permissions::tool_lock::ToolLock>,
+    /// Under a tool lock: the Session's folder and root as they resolved
+    /// when it opened. Set once; every path check compares against it.
+    confinement: std::sync::OnceLock<Arc<crate::permissions::tool_lock::Confinement>>,
 }
 
 /// See [`ToolGate::set_mode_recorder`].
@@ -155,12 +162,51 @@ impl ToolGate {
             kind: self.kind_now(tool),
             ..Call::new(tool, serde_json::Value::Null, self.workspace())
         };
-        self.policy.lock().available(self.mode(), &call)
+        self.effective_policy().available(self.mode(), &call)
     }
 
-    /// The Policy layers over the mode.
+    /// Lock this gate's tools for good with the Runtime's tool lock
+    /// ([`crate::permissions::tool_lock`]). A second lock is ignored; the
+    /// first one stays.
+    pub fn lock_tools(&self, lock: crate::permissions::tool_lock::ToolLock) {
+        let _ = self.tool_lock.set(lock);
+        self.allowed.lock().clear();
+    }
+
+    /// The tool lock in force, if any.
+    pub fn tool_lock(&self) -> Option<crate::permissions::tool_lock::ToolLock> {
+        self.tool_lock.get().copied()
+    }
+
+    /// Bind a locked gate's reads to `confinement` for good. A second one
+    /// is ignored; the first one stays.
+    pub fn confine(&self, confinement: crate::permissions::tool_lock::Confinement) {
+        let _ = self.confinement.set(Arc::new(confinement));
+        self.allowed.lock().clear();
+    }
+
+    /// Whether a locked gate may let a read of `path` through: inside the
+    /// stored folder and root. A locked gate without a confinement refuses.
+    fn locked_read_ok(&self, path: &std::path::Path) -> bool {
+        match self.confinement.get() {
+            Some(confined) => confined.allows(path),
+            None => false,
+        }
+    }
+
+    /// The Policy every check uses: the one set, with the tool lock's layer
+    /// on top when there is a lock.
+    fn effective_policy(&self) -> Policy {
+        let policy = self.policy.lock().clone();
+        match self.tool_lock() {
+            Some(lock) => policy.with_only(crate::permissions::tool_lock::layer(lock)),
+            None => policy,
+        }
+    }
+
+    /// The Policy layers over the mode, the tool lock's included.
     pub fn policy(&self) -> Policy {
-        self.policy.lock().clone()
+        self.effective_policy()
     }
 
     /// Replace the Policy layers over the mode; applies to the next call.
@@ -259,8 +305,19 @@ impl ToolGate {
     /// What the mode and the Policy say about a call, before hooks and the
     /// approver.
     pub async fn decide(&self, tool: &str, args: &serde_json::Value) -> Decision {
+        if let Some(confined) = self.confinement.get() {
+            if confined.moved() {
+                return Decision::Deny(format!(
+                    "`{tool}` is refused: this Session's folder {} was moved or replaced \
+                     after the Session opened, so the tool lock refuses every call of this \
+                     Session. Open a new Session.",
+                    confined.folder().display()
+                ));
+            }
+        }
         let call = self.call(tool, args).await;
-        self.policy.lock().decide(self.mode(), &self.rules(), &call)
+        self.effective_policy()
+            .decide(self.mode(), &self.rules(), &call)
     }
 
     async fn call(&self, tool: &str, args: &serde_json::Value) -> Call {
@@ -269,6 +326,7 @@ impl ToolGate {
         let kind = self.kind(tool).await;
         Call {
             rule_bases: self.rule_bases.lock().clone(),
+            confinement: self.confinement.get().cloned(),
             ..Call::resolve_in(tool, kind, args, &workspace, &cwd)
         }
     }
@@ -373,6 +431,12 @@ impl ToolGate {
             };
             let workspace = gate.workspace();
             let cwd = gate.cwd(&workspace);
+            // Under a tool lock every walked entry must resolve inside the
+            // Session's folder: a symlink or hard link out is hidden, and a
+            // walk never enters a linked folder outside.
+            if gate.tool_lock().is_some() && !gate.locked_read_ok(path) {
+                return false;
+            }
             let bases = gate.rule_bases.lock().clone();
             // Not under the lock: matching reads the filesystem.
             let rules = gate.rules();
@@ -521,7 +585,7 @@ impl ToolGate {
                         Some(ToolDecision::Allow) => {
                             // A Policy layer's "ask" holds even against a hook.
                             let call = gate.call(&ctx.tool_call.name, &ctx.args).await;
-                            if !gate.policy.lock().requires_ask(&call) {
+                            if !gate.effective_policy().requires_ask(&call) {
                                 gate.mark_allowed(&ctx.tool_call, &ctx.args);
                                 return None;
                             }
@@ -548,7 +612,7 @@ impl ToolGate {
                     }
                     Some(approver) => {
                         let call = gate.call(&ctx.tool_call.name, &ctx.args).await;
-                        let ignore_grants = gate.policy.lock().requires_ask(&call);
+                        let ignore_grants = gate.effective_policy().requires_ask(&call);
                         approver
                             .review_before_tool(ctx, cancel, ignore_grants)
                             .await
@@ -569,7 +633,7 @@ impl ToolGate {
                 let patch = match gate.approver() {
                     Some(approver) if !allowed => {
                         let call = gate.call(&ctx.tool_call.name, &ctx.args).await;
-                        let ignore_grants = gate.policy.lock().requires_ask(&call);
+                        let ignore_grants = gate.effective_policy().requires_ask(&call);
                         approver
                             .review_after_file_tool(ctx.clone(), cancel, ignore_grants)
                             .await
@@ -730,6 +794,110 @@ mod tests {
         let (bridge, prompts) = ToolApprovalBridge::new(env, None, Default::default());
         gate.set_approver(Some(Arc::new(bridge)));
         (gate, prompts)
+    }
+
+    /// The second layer: a locked tool that reaches the gate anyway is
+    /// refused, whatever the mode, the rules, a hook, a grant or a new
+    /// Policy say.
+    #[tokio::test]
+    async fn a_tool_lock_refuses_calls_nothing_can_widen() {
+        use crate::permissions::tool_lock::{layer, ToolLock};
+        use crate::permissions::{Capability, Layer, LayerSource, Setting, State};
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        std::fs::write(ws.join("a.txt"), "a").unwrap();
+        let (gate, mut prompts) = gate_with_approver(&[
+            ("bash", "allow"),
+            ("write", "allow"),
+            ("edit", "allow"),
+            ("subagent", "allow"),
+            ("mcp__fs__write", "allow"),
+        ]);
+        gate.set_workspace(ws.clone());
+        *gate.cwd.lock() = Some(ws.clone());
+        let (_dir, registry) = hooks(&[serde_json::json!(
+            {"on": "tool_call", "action": {"allow": true}}
+        )]);
+        gate.set_hooks(registry);
+        gate.set_mode(PermissionMode::FullAccess);
+        let before = gate.before_hook();
+        // Control: unlocked, full access runs everything.
+        assert!(before(call("bash"), None).await.is_none());
+        assert!(gate.available("bash"));
+
+        gate.lock_tools(ToolLock::Chat);
+        let removed = [
+            "bash",
+            "write",
+            "edit",
+            "subagent",
+            "todo",
+            "exit_plan",
+            "spawn_task",
+            "mcp__fs__write",
+            "brand_new_tool",
+        ];
+        type Change = Box<dyn Fn(&ToolGate)>;
+        let widen: [(&str, Change); 5] = [
+            (
+                "full-access",
+                Box::new(|g| g.set_mode(PermissionMode::FullAccess)),
+            ),
+            ("plan", Box::new(|g| g.set_mode(PermissionMode::Plan))),
+            (
+                "allow rules",
+                Box::new(|g| {
+                    g.set_permissions(BTreeMap::from([
+                        ("bash".into(), ToolPermission::Allow),
+                        ("write".into(), ToolPermission::Allow),
+                    ]))
+                }),
+            ),
+            // What `subagent::confine` and a future settings loader do.
+            (
+                "a new Policy",
+                Box::new(|g| {
+                    let on = Setting::always(State::On);
+                    let (policy, _) =
+                        crate::permissions::Policy::new(vec![Layer::new(LayerSource::Session)
+                            .set(Capability::Shell, on.clone())
+                            .set(Capability::Other, on)]);
+                    g.set_policy(policy)
+                }),
+            ),
+            (
+                "a Policy without the lock",
+                Box::new(|g| g.set_policy(Default::default())),
+            ),
+        ];
+        for (what, change) in widen {
+            change(&gate);
+            for tool in removed {
+                assert!(!gate.available(tool), "{what}: {tool} offered");
+                let mut ctx = call(tool);
+                ctx.args = serde_json::json!({"command": "touch x", "path": "a.txt"});
+                let result = before(ctx, None).await.expect("refused");
+                assert!(result.block, "{what}: {tool}");
+                let reason = result.reason.unwrap_or_default();
+                assert!(
+                    reason.contains("the Runtime's tool lock"),
+                    "{what}: {reason}"
+                );
+            }
+            for tool in ["read", "grep", "glob", "ls", "web_fetch", "web_search"] {
+                assert!(gate.available(tool), "{what}: {tool} removed");
+            }
+        }
+        assert!(prompts.try_recv().is_err(), "nobody was asked");
+        // A second lock does not replace the first, and the Policy shows it.
+        gate.lock_tools(ToolLock::Unknown);
+        assert_eq!(gate.tool_lock(), Some(ToolLock::Chat));
+        let (with_lock, _) = gate.policy().with(Layer::new(LayerSource::Session));
+        assert_eq!(
+            gate.policy().with_only(layer(ToolLock::Chat)),
+            gate.policy()
+        );
+        assert_ne!(with_lock, crate::permissions::Policy::default());
     }
 
     #[tokio::test]

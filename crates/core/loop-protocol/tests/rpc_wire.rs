@@ -254,6 +254,7 @@ fn runtime_status_wire() {
             max_active_turns: 8,
             max_sessions_from: None,
             max_active_turns_from: None,
+            tool_lock: None,
         },
         json!({"pid":42,"socket":"/a/run/runtime.sock","generation":3,"loaded":2,"busy":1,
             "max_sessions":16,"max_active_turns":8}),
@@ -271,6 +272,7 @@ fn runtime_status_wire() {
             max_active_turns: 8,
             max_sessions_from: Some("settings".into()),
             max_active_turns_from: Some("default".into()),
+            tool_lock: None,
         },
         json!({"auto_started":true,"pid":42,"socket":"/s","listen_url":"ws://127.0.0.1:1234/","generation":3,"loaded":0,"busy":0,
             "max_sessions":3,"max_active_turns":8,
@@ -933,6 +935,25 @@ fn forbidden_error_and_admin_capabilities_wire() {
     .unwrap();
     assert_eq!(some["workspace_reload"], json!(true));
     assert_eq!(some["host_usage"], json!(true));
+}
+
+#[test]
+fn tool_locked_error_wire() {
+    use loop_protocol::rpc::{error_codes, RpcErrorBody};
+    use loop_protocol::{BackendError, ToolLock};
+    let error = BackendError::ToolLocked {
+        what: "session/shell".into(),
+        lock: ToolLock::Chat,
+    };
+    let body = RpcErrorBody::from(&error);
+    assert_eq!(error_codes::TOOL_LOCKED, -32007);
+    assert_eq!(
+        serde_json::to_value(&body).unwrap(),
+        json!({"code":-32007,
+            "message":"session/shell is off: this Runtime runs with the `chat` tool lock",
+            "data":{"what":"session/shell","lock":"chat"}})
+    );
+    assert_eq!(body.into_backend_error(), error);
 }
 
 #[test]

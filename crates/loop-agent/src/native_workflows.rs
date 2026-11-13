@@ -10,6 +10,7 @@ pub(super) struct WorkflowRun {
 impl NativeBackend {
     /// A prior admission for this request, without reserving execution again.
     pub fn known_workflow(&self, p: &WorkflowParams) -> BackendResult<Option<WorkflowResult>> {
+        self.refuse_if_locked("session/workflow")?;
         let key = format!("{}:{}", p.session.key, p.request_id);
         let fingerprint = serde_json::to_string(p).map_err(|e| invalid(e.to_string()))?;
         let runs = self.workflows.lock();
@@ -25,6 +26,7 @@ impl NativeBackend {
     }
     /// Start once, retaining ownership when the requesting Surface disconnects.
     pub async fn workflow(self: &Arc<Self>, p: WorkflowParams) -> BackendResult<WorkflowResult> {
+        self.refuse_if_locked("session/workflow")?;
         self.check_session(&p.session).await?;
         if p.goal.trim().is_empty()
             || p.goal.len() > 65536

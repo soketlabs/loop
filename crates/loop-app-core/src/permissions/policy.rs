@@ -48,6 +48,9 @@ pub struct Call {
     /// Whether the call's `path` resolves inside `workspace`, following
     /// symlinks. Only `write` and `edit` calls are resolved.
     pub inside_workspace: bool,
+    /// Under a tool lock: the Session's folder and root as they resolved
+    /// when it opened ([`super::tool_lock::Confinement`]).
+    pub confinement: Option<std::sync::Arc<super::tool_lock::Confinement>>,
 }
 
 impl Call {
@@ -63,6 +66,7 @@ impl Call {
             workspace,
             home: None,
             inside_workspace: false,
+            confinement: None,
         }
     }
 
