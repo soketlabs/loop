@@ -1469,7 +1469,10 @@ impl AgentHarness {
         let mut result = self.run_turn_inner(input, token.clone()).await;
 
         let PendingTurnWrites {
-            writes, first_kept, ..
+            writes,
+            first_kept,
+            shortened,
+            ..
         } = self.pending_writes.lock().take();
         // Aborted turns should leave no session footprint so a follow-up prompt
         // (or UI "stop") behaves as if the turn never ran.
@@ -1484,11 +1487,24 @@ impl AgentHarness {
             for (index, mut w) in writes.into_iter().enumerate() {
                 if let PendingSessionWrite::Compaction {
                     first_kept_entry_id,
+                    details,
                     ..
                 } = &mut w
                 {
                     if let Some(&kept) = first_kept.get(&index) {
                         *first_kept_entry_id = written.get(kept).cloned();
+                    }
+                    // Tool results of this turn it shortened, by entry id.
+                    if let (Some(writes), Some(details)) = (shortened.get(&index), details) {
+                        let mut ids: Vec<serde_json::Value> =
+                            details["shortened"].as_array().cloned().unwrap_or_default();
+                        ids.extend(
+                            writes
+                                .iter()
+                                .filter_map(|w| written.get(*w).cloned())
+                                .map(serde_json::Value::String),
+                        );
+                        details["shortened"] = serde_json::Value::Array(ids);
                     }
                 }
                 let compaction = matches!(w, PendingSessionWrite::Compaction { .. });

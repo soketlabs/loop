@@ -159,6 +159,9 @@ pub struct PendingTurnWrites {
     pub writes: Vec<PendingSessionWrite>,
     /// Compaction write index to the index of its first kept message write.
     pub first_kept: HashMap<usize, usize>,
+    /// Compaction write index to the message writes of the tool results it
+    /// shortened, recorded in its details by entry id once written.
+    pub shortened: HashMap<usize, Vec<usize>>,
     /// Indices of the message writes the agent loop made (its context
     /// messages, in order).
     pub loop_messages: Vec<usize>,
@@ -215,8 +218,9 @@ struct TurnTreeState {
 /// What a compaction will do, decided before any model call.
 struct Plan {
     cut: usize,
-    /// Tool call ids of current-turn results to shorten.
-    shorten: Vec<String>,
+    /// Context indices of current-turn results to shorten (by position:
+    /// providers may repeat a tool call id).
+    shorten: Vec<usize>,
     /// The summary text when no model call is needed (an earlier summary is
     /// all that is cut).
     reuse: Option<String>,
@@ -344,6 +348,7 @@ impl TurnCompactor {
             find_overflow_cut(llm, keep, |i| if quoted(i) { quote } else { 0 })
         };
         let mut shorten = Vec::new();
+        let mut freed = 0u64;
         if threshold {
             // Never cut into the current turn: its request stays verbatim.
             let start = turn_start.unwrap_or(messages.len());
@@ -358,6 +363,7 @@ impl TurnCompactor {
             }
             let summary_room = room(cut).max(if cut == 0 { 64 } else { 0 });
             let mut kept: u64 = estimate_agent_messages_tokens(&messages[cut..]);
+            let unshortened = kept;
             if kept + summary_room > budget / 2 {
                 // Shorten the outputs of all the turn's older rounds; the
                 // newest round stays whole. All at once, so later rounds
@@ -366,8 +372,9 @@ impl TurnCompactor {
                     .iter()
                     .rposition(|m| m.as_assistant().is_some())
                     .unwrap_or(messages.len());
-                for message in messages
+                for (index, message) in messages
                     .iter()
+                    .enumerate()
                     .take(last_round)
                     .skip(turn_start.unwrap_or(0).max(cut))
                 {
@@ -379,10 +386,12 @@ impl TurnCompactor {
                                 loop_ai::Message::ToolResult(short),
                             ));
                             kept = kept.saturating_sub(before.saturating_sub(after));
-                            shorten.push(result.tool_call_id.clone());
+                            // By position: providers may repeat a call id.
+                            shorten.push(index);
                         }
                     }
                 }
+                freed = unshortened.saturating_sub(kept);
                 if kept + summary_room > budget {
                     return Err(AutoCompactionError::StillTooLarge {
                         after: kept + summary_room + overhead,
@@ -413,6 +422,14 @@ impl TurnCompactor {
         };
         if reuse.is_some() && shorten.is_empty() {
             return Err(AutoCompactionError::NothingToCompact);
+        }
+        // A compaction with no summary costs nothing, so it is bounded by
+        // progress: one that frees under a tenth of the room is not done.
+        if reuse.is_some() && freed < budget / 10 {
+            return Err(AutoCompactionError::StillTooLarge {
+                after: tokens_before.saturating_sub(freed) + overhead,
+                limit: window.saturating_sub(reserve),
+            });
         }
         let after = if reuse.is_some() { 0 } else { room(cut) }
             + estimate_agent_messages_tokens(&messages[cut..])
@@ -494,7 +511,8 @@ impl TurnCompactor {
         // recovery), from the text captured when the turn started.
         let request_cut = state.turn_start.is_some_and(|start| cut > start)
             || (state.turn_start.is_none() && !has_user_message(&messages[cut..]));
-        let mut summary = if request_cut {
+        // A reused summary may already quote it.
+        let mut summary = if request_cut && !summary.contains("<request>") {
             summary_with_request(&summary, self.request.as_deref())
         } else {
             summary
@@ -508,11 +526,12 @@ impl TurnCompactor {
         let mut compacted = Vec::with_capacity(messages.len() - cut + 1);
         compacted.push(create_compaction_summary_message(summary.clone()));
         compacted.extend_from_slice(&messages[cut..]);
-        for message in &mut compacted {
-            if let AgentMessage::Llm(loop_ai::Message::ToolResult(result)) = message {
-                if plan.shorten.contains(&result.tool_call_id) {
-                    shorten_tool_result(result, SHORTENED_OUTPUT_CHARS);
-                }
+        // `compacted[0]` is the summary, then `messages[cut..]`.
+        for &index in &plan.shorten {
+            if let Some(AgentMessage::Llm(loop_ai::Message::ToolResult(result))) =
+                compacted.get_mut(index + 1 - cut)
+            {
+                shorten_tool_result(result, SHORTENED_OUTPUT_CHARS);
             }
         }
         let tokens_after = estimate_agent_messages_tokens(&compacted);
@@ -535,13 +554,26 @@ impl TurnCompactor {
 
         let mut details =
             compaction_details(request.trigger, tokens_before, tokens_after, usage.as_ref());
+        // Shortened outputs are recorded by entry id; an entry of this turn
+        // gets its id when the turn is written.
+        let mut written_shortened = Vec::new();
+        let mut pending_shortened = Vec::new();
+        for &index in &plan.shorten {
+            match &refs[index] {
+                EntryRef::Written(id) => written_shortened.push(id.clone()),
+                EntryRef::Pending(write) => pending_shortened.push(*write),
+            }
+        }
         if !plan.shorten.is_empty() {
-            details["shortened"] = serde_json::json!(plan.shorten);
+            details["shortened"] = serde_json::json!(written_shortened);
         }
         let first_kept = refs[cut].clone();
         {
             let mut pending = self.pending.lock();
             let index = pending.writes.len();
+            if !pending_shortened.is_empty() {
+                pending.shortened.insert(index, pending_shortened);
+            }
             let first_kept_entry_id = match first_kept {
                 EntryRef::Written(id) => Some(id),
                 EntryRef::Pending(write) => {
@@ -560,13 +592,16 @@ impl TurnCompactor {
             state.refs = Some(next);
             state.turn_start = match state.turn_start {
                 Some(start) if cut <= start => Some(start - cut + 1),
-                _ => None,
+                // The summary, which quotes the request, now starts the turn.
+                Some(_) => Some(0),
+                None => None,
             };
         }
         Ok(CompactionOutcome {
             messages: compacted,
             tokens_before,
             tokens_after,
+            summarized: usage.is_some() || plan.reuse.is_none(),
         })
     }
 

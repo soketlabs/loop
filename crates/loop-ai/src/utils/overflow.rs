@@ -35,12 +35,15 @@ pub fn is_overflow_text(error: &str) -> bool {
     if RATE_LIMIT_PATTERNS.iter().any(|p| lower.contains(p)) {
         return false;
     }
+    // "Timeout exceeded … context deadline" is a network error.
+    let timeout = TIMEOUT_PATTERNS.iter().any(|p| lower.contains(p));
     OVERFLOW_PATTERNS.iter().any(|p| lower.contains(p))
-        || ORDERED_OVERFLOW_PATTERNS.iter().any(|(first, then)| {
-            lower
-                .find(first)
-                .is_some_and(|at| lower[at + first.len()..].contains(then))
-        })
+        || !timeout
+            && ORDERED_OVERFLOW_PATTERNS.iter().any(|(first, then)| {
+                lower
+                    .find(first)
+                    .is_some_and(|at| lower[at + first.len()..].contains(then))
+            })
 }
 
 /// Texts of rate limits, which name tokens but are not overflows.
@@ -73,6 +76,9 @@ const OVERFLOW_PATTERNS: &[&str] = &[
     "request too large",
     "exceeds the maximum number of tokens",
 ];
+
+/// Texts of timeouts, which may say "exceeded" and "context".
+const TIMEOUT_PATTERNS: &[&str] = &["timeout", "timed out", "deadline"];
 
 /// Two words in this order, anything between: "exceeds … context".
 const ORDERED_OVERFLOW_PATTERNS: &[(&str, &str)] = &[("exceed", "context")];
@@ -177,6 +183,8 @@ mod tests {
             "Rate limit reached for model `llama-3.3-70b` in organization `org` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Used 5000, Requested 2000.",
             "429 rate_limit_error: This request would exceed the rate limit for your organization of 40,000 input tokens per minute.",
             "max_tokens: 9000 > 8192, which is the maximum allowed number of output tokens",
+            "Timeout exceeded while awaiting headers (context: request to https://api.example.com)",
+            "net/http: request canceled (Client.Timeout exceeded while awaiting headers): context deadline exceeded",
         ] {
             assert!(!is_overflow_text(text), "{text}");
         }

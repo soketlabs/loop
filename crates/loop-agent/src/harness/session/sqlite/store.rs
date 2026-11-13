@@ -1482,8 +1482,13 @@ impl SqliteSessionStore {
                         if label.starts_with(super::super::TOOL_APPROVAL_LABEL_NAMESPACE) => continue,
                     SessionTreeEntry::Label { label, .. } => PendingSessionWrite::Label { label },
                     SessionTreeEntry::SessionInfo { .. } => continue,
-                    SessionTreeEntry::Compaction { summary, first_kept_entry_id, .. } => PendingSessionWrite::Compaction {
-                        summary, first_kept_entry_id: first_kept_entry_id.and_then(|id| remap.get(&id).cloned()), details: None,
+                    SessionTreeEntry::Compaction { summary, first_kept_entry_id, details, .. } => PendingSessionWrite::Compaction {
+                        summary, first_kept_entry_id: first_kept_entry_id.and_then(|id| remap.get(&id).cloned()),
+                        // Only the shortened tool outputs (by new entry id), so the copy builds the same context.
+                        details: crate::harness::compaction::remap_details(
+                            details.map(|d| serde_json::json!({"shortened": d.get("shortened").cloned().unwrap_or_default()})),
+                            |old| remap.get(old).cloned(),
+                        ),
                     },
                     SessionTreeEntry::BranchSummary { summary, .. } => PendingSessionWrite::BranchSummary { summary },
                     // Imported paths, custom data and grants never confer authority.

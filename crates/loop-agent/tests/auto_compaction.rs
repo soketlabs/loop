@@ -38,6 +38,8 @@ enum Reply {
     Overflow,
     /// A context-length error after the stream started.
     OverflowAfterStart,
+    /// A context-length error after some text was streamed.
+    OverflowAfterContent,
     /// `n` tool calls to `big` in one response (run in parallel).
     Tools(usize),
     /// Text of about this many tokens cut at the output limit (the loop
@@ -75,6 +77,9 @@ struct Provider {
     /// The provider's real limit, which may be below the model's declared
     /// window.
     limit: Arc<Mutex<u64>>,
+    /// Give every tool call the same id, as Gemini does when its API sends
+    /// none (`gemini_call_1` in each response).
+    fixed_id: Arc<Mutex<bool>>,
 }
 
 impl Provider {
@@ -167,6 +172,7 @@ async fn fixture_with(
         usage: Arc::new(Mutex::new(true)),
         started: Default::default(),
         limit: Arc::new(Mutex::new(window)),
+        fixed_id: Arc::new(Mutex::new(false)),
     };
     let model_slot: Arc<Mutex<Option<Model>>> = Default::default();
     let (p, slot) = (provider.clone(), Arc::clone(&model_slot));
@@ -198,6 +204,26 @@ async fn fixture_with(
                 };
             }
             let reply = p.replies.lock().pop_front().unwrap_or(Reply::Text("done"));
+            if matches!(reply, Reply::OverflowAfterContent) {
+                let mut partial = AssistantMessage::pending(&model);
+                partial.content.push(text(""));
+                let mut error = partial.clone();
+                error.stop_reason = StopReason::Error;
+                error.error_message = Some("400 context_length_exceeded".into());
+                return FauxResponse::Events(vec![
+                    AssistantMessageEvent::Start {
+                        partial: AssistantMessage::pending(&model),
+                    },
+                    AssistantMessageEvent::TextStart {
+                        content_index: 0,
+                        partial,
+                    },
+                    AssistantMessageEvent::Error {
+                        reason: StopReason::Error,
+                        error,
+                    },
+                ]);
+            }
             if matches!(reply, Reply::OverflowAfterStart) {
                 let mut error = AssistantMessage::pending(&model);
                 error.stop_reason = StopReason::Error;
@@ -222,10 +248,15 @@ async fn fixture_with(
                 Reply::Text(t) => answer(&model, vec![text(t)], StopReason::Stop, usage),
                 Reply::Tool => {
                     let n = p.requests.lock().len();
+                    let id = if *p.fixed_id.lock() {
+                        "gemini_call_1".to_string()
+                    } else {
+                        format!("call-{n}")
+                    };
                     answer(
                         &model,
                         vec![AssistantContent::ToolCall(ToolCall {
-                            id: format!("call-{n}"),
+                            id,
                             name: "big".into(),
                             arguments: json!({}),
                             thought_signature: None,
@@ -275,7 +306,9 @@ async fn fixture_with(
                         usage,
                     )
                 }
-                Reply::Overflow | Reply::OverflowAfterStart => unreachable!(),
+                Reply::Overflow | Reply::OverflowAfterStart | Reply::OverflowAfterContent => {
+                    unreachable!()
+                }
             }
         })
     }));
@@ -1245,4 +1278,164 @@ async fn a_refused_request_leaves_no_ghost_message() {
         }
     }
     assert_eq!(agent_messages, 1);
+}
+
+/// Whether a tool result's text was shortened.
+fn is_shortened(message: &Message) -> bool {
+    matches!(message, Message::ToolResult(t) if format!("{:?}", t.content).contains("output shortened"))
+}
+
+/// N1: tool call ids repeat (Gemini sends `gemini_call_1` in every
+/// response). Shortening goes by position: the newest result, which the
+/// model is about to read, is never shortened, and the turn completes.
+#[tokio::test]
+async fn repeated_tool_call_ids_never_shorten_the_newest_result() {
+    let f = fixture(settings()).await;
+    *f.provider.fixed_id.lock() = true;
+    f.provider.push(std::iter::repeat_n(Reply::Tool, 12));
+    f.provider.push([Reply::Text("all done")]);
+    let answer = f.harness.prompt("please run big many times").await.unwrap();
+    assert_eq!(answer.as_assistant().unwrap().stop_reason, StopReason::Stop);
+    assert!(!compactions(&f.harness.read_session_entries().await.unwrap()).is_empty());
+    for r in f.provider.main_requests() {
+        if let Some(last) = r.messages.last() {
+            assert!(!is_shortened(last), "the newest tool result was shortened");
+        }
+    }
+}
+
+/// N1 across turns: results of an earlier turn with the same ids stay as
+/// they were while the current turn's older outputs are shortened.
+#[tokio::test]
+async fn repeated_ids_across_turns_shorten_only_the_current_turn() {
+    let mut s = settings();
+    s.keep_recent_tokens = 3_000;
+    let f = fixture(s).await;
+    *f.provider.fixed_id.lock() = true;
+    f.provider.push([Reply::Tool, Reply::Text("first done")]);
+    f.harness.prompt("first turn").await.unwrap();
+    f.provider.push(std::iter::repeat_n(Reply::Tool, 9));
+    f.provider.push([Reply::Text("second done")]);
+    f.harness.prompt("second turn").await.unwrap();
+    for r in f.provider.main_requests() {
+        let start = r.messages.iter().position(
+            |m| matches!(m, Message::User(u) if format!("{u:?}").contains("second turn")),
+        );
+        if let Some(start) = start {
+            assert!(
+                !r.messages[..start].iter().any(is_shortened),
+                "a result of the earlier turn was shortened"
+            );
+        }
+        if let Some(last) = r.messages.last() {
+            assert!(!is_shortened(last));
+        }
+    }
+}
+
+/// Run a long turn with repeated ids on `store` and check that the context
+/// rebuilt from the tree equals what the last request sent; then export and
+/// import the Session and check the copy builds the same context.
+async fn replay_equals_live(store: Arc<dyn SessionStore>) {
+    let f = fixture_on(Arc::clone(&store), settings()).await;
+    *f.provider.fixed_id.lock() = true;
+    with_history(&f, 2, 800).await;
+    f.provider.push(std::iter::repeat_n(Reply::Tool, 14));
+    f.provider.push([Reply::Text("done")]);
+    f.harness.prompt("many rounds").await.unwrap();
+    let entries = f.harness.read_session_entries().await.unwrap();
+    assert!(entries.iter().any(|e| matches!(e,
+        SessionTreeEntry::Compaction { details: Some(d), .. }
+            if d["shortened"].as_array().is_some_and(|a| !a.is_empty()))));
+    let ctx = f.harness.session_context().await.unwrap();
+    let llm = convert_to_llm(&ctx.messages);
+    let last = f.provider.main_requests().last().unwrap().clone();
+    assert_eq!(same_llm(&llm[..llm.len() - 1]), same_llm(&last.messages));
+
+    let file = f.harness.export_session().await.unwrap();
+    let copy = loop_agent::harness::session::import_session_file(store.as_ref(), &file, None)
+        .await
+        .unwrap();
+    f.harness.switch_session(&copy).await.unwrap();
+    let imported = f.harness.session_context().await.unwrap();
+    assert_eq!(same_agent(&imported.messages), same_agent(&ctx.messages));
+}
+
+#[tokio::test]
+async fn replay_equals_live_on_the_memory_store() {
+    replay_equals_live(create_in_memory_session_store()).await;
+}
+
+#[tokio::test]
+async fn replay_equals_live_on_the_sqlite_store() {
+    let dir = tempfile::tempdir().unwrap();
+    replay_equals_live(
+        loop_agent::harness::create_sqlite_session_store(dir.path().join("s.db")).unwrap(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn replay_equals_live_on_the_jsonl_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn loop_agent::harness::ExecutionEnv> =
+        Arc::new(HostExecutionEnv::new(dir.path().to_path_buf()));
+    replay_equals_live(loop_agent::harness::create_jsonl_session_store(
+        fs,
+        dir.path().join("sessions"),
+    ))
+    .await;
+}
+
+/// N2: compactions that only shorten outputs make no model call and do not
+/// count toward the summary limit: an 80-round turn completes.
+#[tokio::test]
+async fn an_eighty_round_turn_completes() {
+    let f = fixture(settings()).await;
+    f.provider.push(std::iter::repeat_n(Reply::Tool, 80));
+    f.provider.push([Reply::Text("all done")]);
+    let answer = f.harness.prompt("please run big many times").await.unwrap();
+    let message = answer.as_assistant().unwrap();
+    assert_eq!(
+        message.stop_reason,
+        StopReason::Stop,
+        "{:?}",
+        message.error_message
+    );
+    eprintln!(
+        "80 rounds: {} requests, {} summaries, {} compactions",
+        f.provider.main_requests().len(),
+        f.provider.summary_requests(),
+        compactions(&f.harness.read_session_entries().await.unwrap()).len()
+    );
+    assert!(f.provider.summary_requests() <= 8);
+}
+
+/// LOW (a): the retry streams some text and then overflows too. Clients
+/// see one agent message, ended by the error, not a second one.
+#[tokio::test]
+async fn a_retry_that_overflows_after_content_ends_its_own_message() {
+    let f = fixture(settings()).await;
+    with_history(&f, 3, 600).await;
+    let backend = NativeBackend::new(Arc::clone(&f.harness)).await;
+    let session = backend.current_session().await;
+    let mut rx = backend.subscribe();
+    f.provider
+        .push([Reply::Overflow, Reply::OverflowAfterContent]);
+    let turn = backend
+        .prompt(&session, vec![ContentBlock::text("next")])
+        .await
+        .unwrap();
+    let _ = turn.outcome().await;
+    let mut started = 0;
+    while let Ok(Ok(envelope)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+        if let SessionUpdate::MessageStarted {
+            role: loop_protocol::Role::Agent,
+            ..
+        } = envelope.update
+        {
+            started += 1;
+        }
+    }
+    assert_eq!(started, 1);
 }

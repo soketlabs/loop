@@ -336,7 +336,10 @@ pub async fn import_session_file(
             } => PendingSessionWrite::Compaction {
                 summary,
                 first_kept_entry_id: first_kept_entry_id.and_then(|old| new_ids.get(&old).cloned()),
-                details,
+                // Shortened outputs are named by entry id; map them too.
+                details: crate::harness::compaction::remap_details(details, |old| {
+                    new_ids.get(old).cloned()
+                }),
             },
             SessionTreeEntry::BranchSummary { summary, .. } => {
                 PendingSessionWrite::BranchSummary { summary }

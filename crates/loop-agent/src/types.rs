@@ -662,6 +662,9 @@ pub struct CompactionOutcome {
     pub tokens_before: u64,
     /// Estimated tokens after.
     pub tokens_after: u64,
+    /// The compaction asked the model for a summary (it did not only
+    /// shorten tool outputs or reuse an earlier summary).
+    pub summarized: bool,
 }
 
 /// Replace the context with a compacted one and record it.

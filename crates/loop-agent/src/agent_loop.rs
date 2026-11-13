@@ -522,14 +522,17 @@ struct CompactionState {
     /// the window is too small): later requests do not try again. An
     /// overflow still gets its one recovery.
     threshold_failed: bool,
-    /// Automatic compactions in this run.
+    /// Automatic compactions in this run that asked the model for a
+    /// summary. Compactions that only shorten tool outputs are free; their
+    /// own rule stops them when they free too little.
     compactions: u32,
     /// Estimated tokens of the system prompt and tool definitions.
     overhead_estimate: u64,
 }
 
-/// Most automatic compactions in one run, so a context that compaction
-/// cannot shrink never pays for summaries without end.
+/// Most automatic compactions with a summary request in one run, so a
+/// context that compaction cannot shrink never pays for summaries without
+/// end.
 pub const MAX_COMPACTIONS_PER_RUN: u32 = 8;
 
 /// One model request, with automatic compaction around it:
@@ -614,10 +617,13 @@ async fn request_with_compaction(
     if pushed {
         context.messages.pop();
     }
+    // Whether clients have an open message (a `MessageStart` of the newest
+    // attempt): the error then ends it rather than starting another.
+    let mut open = announced;
     let failure = if state.compactions >= MAX_COMPACTIONS_PER_RUN {
         let reason = message.error_message.clone().unwrap_or_default();
         format!(
-            "The context is too long for the model and this turn already compacted {MAX_COMPACTIONS_PER_RUN} times: {reason}"
+            "The context is too long for the model and this turn already asked for {MAX_COMPACTIONS_PER_RUN} summaries: {reason}"
         )
     } else {
         match compact_context(
@@ -641,6 +647,7 @@ async fn request_with_compaction(
                 if pushed {
                     context.messages.pop();
                 }
+                open = announced;
                 format!(
                     "The context is still too long for the model after automatic compaction: {reason}"
                 )
@@ -666,7 +673,7 @@ async fn request_with_compaction(
     let mut failed = message;
     failed.stop_reason = StopReason::Error;
     failed.error_message = Some(failure);
-    finish_response(context, failed, false, announced, emit).await
+    finish_response(context, failed, false, open, emit).await
 }
 
 /// Compact `context` through the run's [`CompactContextFn`] and report it.
@@ -705,7 +712,13 @@ async fn compact_context(
         emit: Some(Arc::clone(emit)),
     })
     .await?;
-    state.compactions += 1;
+    if outcome.summarized {
+        state.compactions += 1;
+    }
+    if trigger == CompactionTrigger::Overflow {
+        // The context changed: the threshold may help again.
+        state.threshold_failed = false;
+    }
     context.messages = outcome.messages;
     state.usage_valid_from = context.messages.len();
     emit_ev(

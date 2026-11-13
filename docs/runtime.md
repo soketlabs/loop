@@ -513,7 +513,9 @@ changed meanwhile, nothing is written. `session/compact` then replaces the
 transcript with a `branch_reset` (reason `compact`). An automatic compaction does not: the live transcript keeps the
 whole turn, and the compaction appears when the transcript is read again
 (`session/transcript`, attach, reload), as a `compaction summary` notice
-before the kept messages.
+before the kept messages. Tool outputs that an automatic compaction
+shortened appear shortened in that transcript, although live clients saw
+them in full.
 
 ## After a crash
 

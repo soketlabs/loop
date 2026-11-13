@@ -472,7 +472,8 @@ pub fn shorten_tool_result(result: &mut loop_ai::ToolResultMessage, keep_chars: 
     changed
 }
 
-/// The tool call ids a compaction entry shortened, from its `details`.
+/// The tool result entries a compaction shortened, from its `details`
+/// (entry ids, not tool call ids: providers may repeat a call id).
 pub fn shortened_from_details(details: Option<&serde_json::Value>) -> Vec<String> {
     details
         .and_then(|d| d.get("shortened"))
@@ -485,20 +486,43 @@ pub fn shortened_from_details(details: Option<&serde_json::Value>) -> Vec<String
         .unwrap_or_default()
 }
 
-/// Shorten the tool results named in a compaction entry's `details`, as the
-/// compaction did when it ran.
-pub fn apply_shortened(messages: &mut [AgentMessage], details: Option<&serde_json::Value>) {
-    let ids = shortened_from_details(details);
-    if ids.is_empty() {
+/// Shorten the tool results whose entries a compaction entry's `details`
+/// names, as the compaction did when it ran. `ids` are the entry ids behind
+/// `messages`, in order.
+pub fn apply_shortened(
+    messages: &mut [AgentMessage],
+    ids: &[&str],
+    details: Option<&serde_json::Value>,
+) {
+    let shortened = shortened_from_details(details);
+    if shortened.is_empty() {
         return;
     }
-    for message in messages {
+    for (message, id) in messages.iter_mut().zip(ids) {
         if let AgentMessage::Llm(Message::ToolResult(result)) = message {
-            if ids.contains(&result.tool_call_id) {
+            if shortened.iter().any(|s| s == id) {
                 shorten_tool_result(result, SHORTENED_OUTPUT_CHARS);
             }
         }
     }
+}
+
+/// `details` with its shortened entry ids mapped to new ids (a copy or an
+/// import gives entries new ids); ids without a new one are dropped.
+pub fn remap_details(
+    details: Option<serde_json::Value>,
+    new_id: impl Fn(&str) -> Option<String>,
+) -> Option<serde_json::Value> {
+    let mut details = details?;
+    if let Some(list) = details.get("shortened").and_then(|v| v.as_array()).cloned() {
+        let mapped: Vec<serde_json::Value> = list
+            .iter()
+            .filter_map(|id| id.as_str().and_then(&new_id))
+            .map(serde_json::Value::String)
+            .collect();
+        details["shortened"] = serde_json::Value::Array(mapped);
+    }
+    Some(details)
 }
 
 /// Fixed tokens of every request that compaction cannot remove: the system

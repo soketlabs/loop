@@ -103,7 +103,9 @@ outputs of its older tool rounds are shortened instead, each marked
 `[output shortened by automatic compaction …]`; the newest round stays
 whole. Before it asks the model for a summary, Loop checks that the result
 will fit; when it cannot, it says so in a notice and does not compact again
-in that turn. A turn compacts at most 8 times. When the window is not larger
+in that turn. A turn asks for at most 8 summaries; compactions that only
+shorten outputs cost no model call and stop when they free less than a
+tenth of the room. When the window is not larger
 than `reserveTokens` and the system prompt and tools, Loop does not compact
 automatically and says so once per turn.
 
