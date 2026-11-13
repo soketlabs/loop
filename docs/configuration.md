@@ -102,7 +102,8 @@ read-only, and `.git` itself cannot be renamed or removed. When `.git`,
 `.git/hooks` or `.loop` does not exist yet, Loop creates an empty directory
 there before the container starts and mounts it read-only, so `git init`
 fails (run `git init` and `git clone` outside the sandbox). Loop removes the
-directory when the sandbox stops, if it is still empty. A project whose
+directory when the sandbox stops, if it is still empty and no other sandbox
+of the same project still runs (otherwise the empty directory stays). A project whose
 `.git`, `.loop` or Git metadata entry is a symlink cannot start the sandbox.
 File tools refuse the same paths, and also Git metadata and `.git` entries
 in any other repository in the project, as on macOS. Limits: in the main

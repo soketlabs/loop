@@ -55,16 +55,65 @@ pub struct ProtectedMounts {
     /// Empty directories created on the host as mount points, parents
     /// before children.
     pub stubs: Vec<PathBuf>,
+    /// Shared lock on the project ([`project_lock`]) while this sandbox runs.
+    lock: Option<std::fs::File>,
 }
 
 impl ProtectedMounts {
     /// Remove the stubs that are still empty. Never removes content.
+    ///
+    /// Only when no other sandbox of this project runs: a host `rmdir` of a
+    /// directory that is a mount point in another container detaches that
+    /// mount there, and the other sandbox would lose its protection. A
+    /// stub then stays as an empty directory.
     pub fn remove_stubs(&self) {
+        if self.stubs.is_empty() || !self.alone() {
+            return;
+        }
         for stub in self.stubs.iter().rev() {
             // `remove_dir` fails on a directory that is not empty.
             let _ = std::fs::remove_dir(stub);
         }
     }
+}
+
+impl ProtectedMounts {
+    #[cfg(unix)]
+    fn alone(&self) -> bool {
+        // Upgrade the shared lock; it fails while another sandbox holds one.
+        self.lock.as_ref().is_some_and(|lock| {
+            rustix::fs::flock(lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok()
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn alone(&self) -> bool {
+        true
+    }
+}
+
+/// A lock file for `project`, shared by the sandboxes of that project of
+/// this user. The name holds a stable hash (FNV-1a) of the project path.
+#[cfg(unix)]
+fn project_lock(project: &Path) -> Result<std::fs::File, SandboxError> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in project.as_os_str().as_bytes() {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+    }
+    // SAFETY: geteuid has no arguments or preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let path = std::env::temp_dir().join(format!("loop-sandbox-{uid}-{hash:016x}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| io_refuse(&path, e))?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared)
+        .map_err(|e| io_refuse(&path, e.into()))?;
+    Ok(file)
 }
 
 fn refuse(path: &Path, why: &str) -> SandboxError {
@@ -206,6 +255,11 @@ pub fn plan(project: &Path, agent_dir: Option<&Path>) -> Result<ProtectedMounts,
         out: ProtectedMounts::default(),
         git_dirs: 0,
     };
+    // Before any stub is made: a sandbox that stops now keeps its stubs.
+    #[cfg(unix)]
+    {
+        p.out.lock = Some(project_lock(project)?);
+    }
     let result = plan_into(&mut p, project, agent_dir);
     if result.is_err() {
         p.out.remove_stubs();
@@ -400,6 +454,31 @@ mod tests {
         std::fs::write(project.join(".loop/settings.json"), "{}").unwrap();
         m.remove_stubs();
         assert!(project.join(".loop/settings.json").is_file());
+        assert!(!project.join(".git").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stubs_stay_while_another_sandbox_of_the_project_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(dir.path()).unwrap();
+        let first = plan(&project, None).unwrap();
+        // The second sandbox finds the first one's empty stubs.
+        let second = plan(&project, None).unwrap();
+        assert!(second.stubs.is_empty());
+        first.remove_stubs();
+        assert!(
+            project.join(".git").is_dir(),
+            "removed under a running sandbox"
+        );
+        drop(first);
+        second.remove_stubs();
+        drop(second);
+        // A later sandbox alone removes its own stubs.
+        std::fs::remove_dir(project.join(".git")).unwrap();
+        std::fs::remove_dir(project.join(".loop")).unwrap();
+        let third = plan(&project, None).unwrap();
+        third.remove_stubs();
         assert!(!project.join(".git").exists());
     }
 
