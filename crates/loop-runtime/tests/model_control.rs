@@ -589,6 +589,33 @@ impl EventLog for GatedLog {
     async fn finish_generation(&self, generation: u64, ms: i64) -> loop_runtime::log::Result<()> {
         self.inner.finish_generation(generation, ms).await
     }
+    async fn read_session_page(
+        &self,
+        session: &loop_protocol::SessionKey,
+        after_seq: u64,
+        through_seq: Option<u64>,
+        limit: loop_runtime::log::PageLimit,
+    ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
+        self.inner
+            .read_session_page(session, after_seq, through_seq, limit)
+            .await
+    }
+    async fn session_summary(
+        &self,
+        session: &loop_protocol::SessionKey,
+    ) -> loop_runtime::log::Result<Option<loop_runtime::log::SessionSummary>> {
+        self.inner.session_summary(session).await
+    }
+    async fn recovery_page(
+        &self,
+        from_generation: u64,
+        after_global: u64,
+        limit: loop_runtime::log::PageLimit,
+    ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
+        self.inner
+            .recovery_page(from_generation, after_global, limit)
+            .await
+    }
 }
 
 #[tokio::test]
@@ -770,6 +797,33 @@ impl EventLog for FailingLog {
     }
     async fn finish_generation(&self, generation: u64, ms: i64) -> loop_runtime::log::Result<()> {
         self.inner.finish_generation(generation, ms).await
+    }
+    async fn read_session_page(
+        &self,
+        session: &loop_protocol::SessionKey,
+        after_seq: u64,
+        through_seq: Option<u64>,
+        limit: loop_runtime::log::PageLimit,
+    ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
+        self.inner
+            .read_session_page(session, after_seq, through_seq, limit)
+            .await
+    }
+    async fn session_summary(
+        &self,
+        session: &loop_protocol::SessionKey,
+    ) -> loop_runtime::log::Result<Option<loop_runtime::log::SessionSummary>> {
+        self.inner.session_summary(session).await
+    }
+    async fn recovery_page(
+        &self,
+        from_generation: u64,
+        after_global: u64,
+        limit: loop_runtime::log::PageLimit,
+    ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
+        self.inner
+            .recovery_page(from_generation, after_global, limit)
+            .await
     }
 }
 

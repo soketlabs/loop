@@ -864,11 +864,42 @@ pub async fn read_your_writes_on(log: Arc<dyn EventLog>) {
     .unwrap();
 }
 
-/// The bound on one append while replays run. The ADR asks for 50 ms (C7);
-/// the check allows more for loaded test machines and debug builds. Before
-/// the reader/writer split, appends here waited about 500 ms (median).
-pub const APPEND_LATENCY_BOUND: Duration = Duration::from_millis(150);
+/// How many times slower than idle an append may be while replays run.
+pub const APPEND_LATENCY_FACTOR: u32 = 10;
+/// The bound never goes below this. The ADR asks for 50 ms (C7). Before the
+/// reader/writer split, appends here waited about 500 ms at the median.
+pub const APPEND_LATENCY_FLOOR: Duration = Duration::from_millis(50);
+/// Appends measured in each phase (idle, then during replays).
+const LATENCY_SAMPLES: usize = 300;
+/// A phase stops after this time even with fewer samples, so a store that
+/// fails does not run for minutes.
+const LATENCY_PHASE: Duration = Duration::from_secs(20);
 
+/// Sorted latencies of single appends to another Session, one every 1 ms.
+async fn append_latencies(log: &dyn EventLog) -> Vec<Duration> {
+    let mut latencies = Vec::with_capacity(LATENCY_SAMPLES);
+    let phase = Instant::now();
+    while latencies.len() < LATENCY_SAMPLES && phase.elapsed() < LATENCY_PHASE {
+        let start = Instant::now();
+        log.append_batch(vec![update("small")]).await.unwrap();
+        latencies.push(start.elapsed());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    latencies.sort();
+    latencies
+}
+
+/// The value at quantile `q` of sorted samples.
+fn quantile(sorted: &[Duration], q: f64) -> Duration {
+    let index = ((sorted.len() - 1) as f64 * q).round() as usize;
+    sorted[index]
+}
+
+/// The rule: while replays run, the median and the p95 append latency each
+/// stay under `max(APPEND_LATENCY_FACTOR x the same statistic when idle,
+/// APPEND_LATENCY_FLOOR)`. Both phases use the same store in the same test,
+/// so a slow machine raises both. The median and the p95 ignore a few
+/// scheduler pauses; a store that serves reads on its writer fails both.
 pub async fn long_read_does_not_delay_appends_on(log: Arc<dyn EventLog>) {
     tokio::time::timeout(Duration::from_secs(120), async {
         let big = SessionKey::from("big");
@@ -882,6 +913,7 @@ pub async fn long_read_does_not_delay_appends_on(log: Arc<dyn EventLog>) {
         let start = Instant::now();
         assert_eq!(log.read_after(&big, 0).await.unwrap().len(), events);
         let replay = start.elapsed();
+        let idle = append_latencies(log.as_ref()).await;
         let stop = Arc::new(AtomicBool::new(false));
         let mut readers = Vec::new();
         for _ in 0..2 {
@@ -898,26 +930,29 @@ pub async fn long_read_does_not_delay_appends_on(log: Arc<dyn EventLog>) {
             }));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let mut latencies = Vec::new();
-        for _ in 0..100 {
-            let start = Instant::now();
-            log.append_batch(vec![update("small")]).await.unwrap();
-            latencies.push(start.elapsed());
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        let busy = append_latencies(log.as_ref()).await;
         stop.store(true, Ordering::Release);
         let mut replays = 0;
         for reader in readers {
             replays += reader.await.unwrap();
         }
-        latencies.sort();
-        let p50 = latencies[latencies.len() / 2];
-        let p99 = latencies[latencies.len() * 99 / 100];
         assert!(replays > 0, "the replays ran during the appends");
-        assert!(
-            p99 <= APPEND_LATENCY_BOUND,
-            "append p99 {p99:?} (p50 {p50:?}) while {replays} replays ran; one replay takes {replay:?}"
+        let report = format!(
+            "idle p50 {:?} p95 {:?}; during {replays} replays p50 {:?} p95 {:?} ({} samples); one replay takes {replay:?}",
+            quantile(&idle, 0.5),
+            quantile(&idle, 0.95),
+            quantile(&busy, 0.5),
+            quantile(&busy, 0.95),
+            busy.len()
         );
+        println!("append latency: {report}");
+        for q in [0.5, 0.95] {
+            let bound = (quantile(&idle, q) * APPEND_LATENCY_FACTOR).max(APPEND_LATENCY_FLOOR);
+            assert!(
+                quantile(&busy, q) <= bound,
+                "append q{q} above {bound:?}: {report}"
+            );
+        }
     })
     .await
     .unwrap();
