@@ -2493,6 +2493,7 @@ dependencies = [
  "loop-app-core",
  "loop-orchestration",
  "loop-protocol",
+ "loop-store",
  "loop-store-testkit",
  "loop-wire",
  "rusqlite",
@@ -2506,12 +2507,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "loop-store"
+version = "0.6.0"
+dependencies = [
+ "async-trait",
+ "loop-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "loop-store-testkit"
 version = "0.6.0"
 dependencies = [
  "loop-agent",
  "loop-protocol",
- "loop-runtime",
+ "loop-store",
  "serde_json",
  "tempfile",
  "tokio",

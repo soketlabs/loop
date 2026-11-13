@@ -16,6 +16,7 @@ loop-agent = { workspace = true, features = ["sqlite"] }
 loop-ai.workspace = true
 loop-app-core.workspace = true
 loop-protocol.workspace = true
+loop-store.workspace = true
 loop-wire.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
