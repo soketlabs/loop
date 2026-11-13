@@ -181,6 +181,18 @@ impl ApprovalKind {
     }
 }
 
+/// How the prompt step before a call went, for the decision record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Review {
+    /// Not asked now: a file tool, whose review comes after the write.
+    Later,
+    /// Not asked: a Session grant ("accept all") covers it.
+    Granted,
+    /// The user was asked, through the Escalation `escalation` when the
+    /// approver is a Runtime host.
+    Asked { escalation: Option<String> },
+}
+
 /// The user's answer to a plan (`exit_plan`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanReview {
@@ -346,16 +358,25 @@ impl ToolApprovalBridge {
     }
 
     /// The prompt step of [`crate::tool_gate::ToolGate`] before a call
-    /// (bash, web).
+    /// (bash, web), and how it went, for the decision record.
     pub(crate) async fn review_before_tool(
         &self,
         ctx: BeforeToolCallContext,
         cancel: Option<CancellationToken>,
         ignore_grants: bool,
-    ) -> Option<BeforeToolCallResult> {
+    ) -> (Option<BeforeToolCallResult>, Review) {
         let name = ctx.tool_call.name.as_str();
+        // Not asked now: a Session grant covers it, or it is a file tool,
+        // whose review comes after the write.
+        let not_asked = |name: &str| {
+            if interactive_tools().contains(&name) && !matches!(name, "write" | "edit") {
+                Review::Granted
+            } else {
+                Review::Later
+            }
+        };
         if !self.asks(name, ignore_grants) {
-            return None;
+            return (None, not_asked(name));
         }
         // Build the (kind, summary, detail, reject subject) tuple for the
         // prompt; only tools with an interactive workflow get here
@@ -417,40 +438,43 @@ impl ToolApprovalBridge {
                     format!("search for '{query}'"),
                 )
             }
-            _ => return None,
+            _ => return (None, Review::Later),
         };
 
         let _lock = self.gate.lock().await;
         // Re-check after waiting for the gate (Accept-all may have landed).
         if !self.asks(name, ignore_grants) {
-            return None;
+            return (None, Review::Granted);
         }
         if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
-            return Some(BeforeToolCallResult {
+            let blocked = BeforeToolCallResult {
                 block: true,
                 reason: Some("Approval cancelled".into()),
-            });
+            };
+            return (Some(blocked), Review::Asked { escalation: None });
         }
 
-        let decision = self
+        let (decision, escalation) = self
             .ask_user(kind, name, summary, detail, cancel.as_ref())
             .await;
+        let asked = Review::Asked { escalation };
 
         match decision {
-            ApprovalDecision::Accept => None,
+            ApprovalDecision::Accept => (None, asked),
             ApprovalDecision::AcceptSession => {
                 self.grant_and_persist(kind.group()).await;
-                None
+                (None, asked)
             }
             ApprovalDecision::Reject { reason } => {
                 let msg = match reason.filter(|r| !r.trim().is_empty()) {
                     Some(r) => format!("User rejected {subject}. Reason: {r}"),
                     None => format!("User rejected {subject}."),
                 };
-                Some(BeforeToolCallResult {
+                let blocked = BeforeToolCallResult {
                     block: true,
                     reason: Some(msg),
-                })
+                };
+                (Some(blocked), asked)
             }
         }
     }
@@ -462,10 +486,10 @@ impl ToolApprovalBridge {
         plan: &str,
         then: &str,
         cancel: Option<CancellationToken>,
-    ) -> PlanReview {
+    ) -> (PlanReview, Option<String>) {
         let _lock = self.gate.lock().await;
         let summary = format!("approve to continue in {then} mode");
-        let decision = self
+        let (decision, escalation) = self
             .ask_user(
                 ApprovalKind::Plan,
                 loop_agent::harness::EXIT_PLAN_TOOL,
@@ -474,7 +498,7 @@ impl ToolApprovalBridge {
                 cancel.as_ref(),
             )
             .await;
-        match decision {
+        let review = match decision {
             ApprovalDecision::Accept => PlanReview::Approved {
                 accept_edits: false,
             },
@@ -482,7 +506,8 @@ impl ToolApprovalBridge {
             ApprovalDecision::Reject { reason } => {
                 PlanReview::KeepPlanning(reason.filter(|r| !r.trim().is_empty()))
             }
-        }
+        };
+        (review, escalation)
     }
 
     /// The review step of [`crate::tool_gate::ToolGate`] after a file edit.
@@ -558,7 +583,7 @@ impl ToolApprovalBridge {
 
         let target = review.target_path.as_deref().filter(|_| review.via_link);
         let (summary, detail) = file_edit_prompt(&path, target);
-        let decision = self
+        let (decision, _escalation) = self
             .ask_user(
                 ApprovalKind::FileEdit,
                 name,
@@ -602,7 +627,8 @@ impl ToolApprovalBridge {
         summary: String,
         detail: String,
         cancel: Option<&CancellationToken>,
-    ) -> ApprovalDecision {
+    ) -> (ApprovalDecision, Option<String>) {
+        let mut escalation = None;
         let response_rx = match &self.prompts {
             PromptSink::Prompts(tx) => {
                 let (response_tx, response_rx) = oneshot::channel();
@@ -616,14 +642,16 @@ impl ToolApprovalBridge {
                     })
                     .is_err()
                 {
-                    return ApprovalDecision::Reject {
+                    let refused = ApprovalDecision::Reject {
                         reason: Some("approval UI unavailable".into()),
                     };
+                    return (refused, None);
                 }
                 response_rx
             }
             PromptSink::Host(host) => {
                 let request = native_permission_request(kind, tool_name, summary, detail);
+                escalation = Some(request.id().to_string());
                 let host = Arc::clone(host);
                 let (response_tx, response_rx) = oneshot::channel();
                 tokio::spawn(async move {
@@ -633,7 +661,7 @@ impl ToolApprovalBridge {
             }
         };
 
-        tokio::select! {
+        let decision = tokio::select! {
             biased;
             _ = async {
                 if let Some(c) = cancel {
@@ -645,7 +673,8 @@ impl ToolApprovalBridge {
             res = response_rx => res.unwrap_or(ApprovalDecision::Reject {
                 reason: Some("approval UI closed".into()),
             }),
-        }
+        };
+        (decision, escalation)
     }
 
     async fn grant_and_persist(&self, group: &str) {

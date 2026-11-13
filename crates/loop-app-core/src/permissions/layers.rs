@@ -12,9 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::collections::BTreeMap as Rules;
 
 use super::capability::{Capability, Setting, State};
-use super::policy::{available, decide, Call, Decision};
+use super::policy::{available, decide_why, Call, Decision, Verdict};
 use super::rules::ToolPermission;
 use super::PermissionMode;
+use loop_store::DecidedBy;
 
 /// Where a Policy layer comes from, top first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -39,6 +40,21 @@ pub enum LayerSource {
 }
 
 impl LayerSource {
+    /// The id in decision records: `runtime`, `managed`, `org`, `group`,
+    /// `user`, `project`, `agent_definition` or `session`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime",
+            Self::Managed => "managed",
+            Self::Org => "org",
+            Self::Group => "group",
+            Self::User => "user",
+            Self::Project => "project",
+            Self::AgentDefinition => "agent_definition",
+            Self::Session => "session",
+        }
+    }
+
     /// The name in notices and refusals.
     pub fn label(self) -> &'static str {
         match self {
@@ -208,10 +224,27 @@ impl Policy {
         rules: &Rules<String, ToolPermission>,
         call: &Call,
     ) -> Decision {
-        let decision = decide(mode, rules, call);
+        self.decide_why(mode, rules, call).decision
+    }
+
+    /// [`Self::decide`], with the step and the layer that decided, for the
+    /// decision record.
+    pub fn decide_why(
+        &self,
+        mode: PermissionMode,
+        rules: &Rules<String, ToolPermission>,
+        call: &Call,
+    ) -> Verdict {
+        let verdict = decide_why(mode, rules, call);
+        let by_layer = |decision: Decision, by: DecidedBy, source: LayerSource| Verdict {
+            decision,
+            by,
+            rule: None,
+            layer: Some(source),
+        };
         if let Some(layer) = self.unlisted(call) {
             let offered: Vec<&str> = layer.tools.iter().flatten().map(String::as_str).collect();
-            return Decision::Deny(format!(
+            let decision = Decision::Deny(format!(
                 "`{}` is not allowed: {} offers only {}",
                 call.tool,
                 layer.source.label(),
@@ -221,28 +254,34 @@ impl Policy {
                     offered.join(", ")
                 }
             ));
+            return by_layer(decision, DecidedBy::Off, layer.source);
         }
-        match (self.ceiling(call), decision) {
-            (_, Decision::Deny(reason)) => Decision::Deny(reason),
+        match (self.ceiling(call), &verdict.decision) {
+            (_, Decision::Deny(_)) => verdict,
             (
                 Some(Ceiling {
                     state: State::Off,
                     source,
                 }),
                 _,
-            ) => Decision::Deny(format!(
-                "`{}` is not allowed: {} turns off {}",
-                call.tool,
-                source.label(),
-                Capability::of(call).label()
-            )),
+            ) => by_layer(
+                Decision::Deny(format!(
+                    "`{}` is not allowed: {} turns off {}",
+                    call.tool,
+                    source.label(),
+                    Capability::of(call).label()
+                )),
+                DecidedBy::Off,
+                source,
+            ),
             (
                 Some(Ceiling {
-                    state: State::Ask, ..
+                    state: State::Ask,
+                    source,
                 }),
                 Decision::Allow,
-            ) => Decision::Ask,
-            (_, decision) => decision,
+            ) => by_layer(Decision::Ask, DecidedBy::LayerAsk, source),
+            _ => verdict,
         }
     }
 

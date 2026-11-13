@@ -65,6 +65,9 @@ mod admin;
 #[cfg(test)]
 mod admin_tests;
 mod attach;
+mod decisions;
+#[cfg(test)]
+mod gate_tests;
 mod leases;
 mod pause;
 mod publish;
@@ -897,6 +900,8 @@ impl loop_wire::RuntimeControl for Runtime {
             let _lifecycle = live.lifecycle.lock().await;
             self.check_tree_live(&live)?;
             self.reserve(&live).await?;
+            live.escalations
+                .set_turn_caller(loop_protocol::Caller::current());
             match live.opened.native.workflow(p).await {
                 Ok(result) => result,
                 Err(error) => {
@@ -1456,6 +1461,8 @@ impl AgentBackend for Runtime {
         session: &SessionRef,
         input: Vec<ContentBlock>,
     ) -> BackendResult<TurnHandle> {
+        // Read before any spawn: the task-local caller does not cross one.
+        let caller = loop_protocol::Caller::current();
         let mut reloads = 0;
         let live = loop {
             let live = match self.route(session) {
@@ -1493,6 +1500,15 @@ impl AgentBackend for Runtime {
             drop(lifecycle);
             break live;
         };
+        // The turn acts for this caller, carried into it explicitly. A
+        // Subagent's turn has no connection: it acts for whoever started its
+        // parent's turn (ADR-0009).
+        let caller = caller.or_else(|| {
+            let parent = live.parent.as_ref()?;
+            let parent = self.sessions.lock().unwrap().get(parent).cloned()?;
+            parent.escalations.turn_caller()
+        });
+        live.escalations.set_turn_caller(caller);
         let (done, handle) = TurnHandle::channel();
         let log = self.log.clone();
         let generation = self.generation;

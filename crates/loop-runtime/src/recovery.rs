@@ -293,4 +293,42 @@ mod tests {
         settled.event.kind = EventKind::PromptSettled(serde_json::json!({}));
         assert!(unfinished(&[prompt(1, 1), settled], 2).0.is_empty());
     }
+
+    /// An `escalation_answered` row written before `answered_by` existed
+    /// still closes its Escalation, as one with it does; a `policy_decision`
+    /// row between them changes nothing.
+    #[test]
+    fn old_and_new_answer_rows_both_close_their_escalation() {
+        let record = |global_seq, kind| LoggedEvent {
+            global_seq,
+            session_seq: None,
+            event: Event {
+                generation: 1,
+                session_key: Some("s".into()),
+                turn: None,
+                ts_ms: 0,
+                kind,
+            },
+        };
+        let raised = || EventKind::EscalationRaised(serde_json::json!({"id": "i1", "request": {}}));
+        for answer in [
+            serde_json::json!({"id": "i1", "answer": {"outcome": "cancelled"}, "grant": null}),
+            serde_json::json!({"id": "i1", "answer": {"outcome": "cancelled"}, "grant": null,
+                "answered_by": {"principal": {"kind": "person", "issuer": "local",
+                    "id": "uid:501"}, "tenant": "local"}}),
+        ] {
+            let records = [
+                record(1, raised()),
+                record(
+                    2,
+                    EventKind::PolicyDecision(serde_json::json!({"id": "pd-1"})),
+                ),
+                record(3, EventKind::EscalationAnswered(answer)),
+            ];
+            let (_, open) = unfinished(&records, 2);
+            assert!(open.is_empty(), "the answered Escalation is still open");
+        }
+        let (_, open) = unfinished(&[record(1, raised())], 2);
+        assert_eq!(open.len(), 1, "control: an unanswered one stays open");
+    }
 }

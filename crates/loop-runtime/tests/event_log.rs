@@ -179,3 +179,44 @@ async fn sqlite_recovery_does_not_load_prompt_content() {
         .collect();
     assert_eq!(columns, ["generation", "kind"]);
 }
+
+/// A `policy_decision` row in a SQLite Event Log: it takes no Session
+/// sequence, so a Session read (attach, replay) skips it and the Session's
+/// sequence stays contiguous; it reads back unchanged after a reopen; and
+/// recovery's reads leave it out.
+#[tokio::test]
+async fn a_policy_decision_row_is_log_only_and_survives_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let decision = json!({"id": "pd-1", "outcome": "deny", "by": "rule"});
+    {
+        let log = SqliteEventLog::open(dir.path()).await.unwrap();
+        log.append_batch(vec![update("s")]).await.unwrap();
+        log.append_batch(vec![Event {
+            generation: 1,
+            session_key: Some(SessionKey::from("s")),
+            turn: None,
+            ts_ms: 1,
+            kind: EventKind::PolicyDecision(decision.clone()),
+        }])
+        .await
+        .unwrap();
+        log.append_batch(vec![update("s")]).await.unwrap();
+    }
+    let log = SqliteEventLog::open(dir.path()).await.unwrap();
+    let session = log.read_after(&SessionKey::from("s"), 0).await.unwrap();
+    let seqs: Vec<_> = session.iter().map(|r| r.session_seq).collect();
+    assert_eq!(seqs, [Some(1), Some(2)]);
+    let all = log.read_runtime_after(0).await.unwrap();
+    let stored = all
+        .iter()
+        .find(|r| matches!(r.event.kind, EventKind::PolicyDecision(_)))
+        .expect("the decision is stored");
+    assert_eq!(stored.event.kind, EventKind::PolicyDecision(decision));
+    assert_eq!(stored.session_seq, None);
+    assert!(log
+        .recovery_records(0)
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| !matches!(r.event.kind, EventKind::PolicyDecision(_))));
+}

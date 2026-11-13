@@ -1,8 +1,15 @@
 //! Session-scoped Escalation arbitration and durable decisions.
+//!
+//! Who may answer: a host user's connection (or an in-process recipient)
+//! gets every Escalation of the Session, as before. A user from outside the
+//! host ([`Caller::is_host_user`] is false) gets, and can answer, only the
+//! Escalations of a turn it started. The caller that started the turn is
+//! captured when the Runtime admits the prompt ([`EscalationHost::set_turn_caller`]).
+//! The `escalation_answered` record names the caller that answered.
 use crate::log::{Event, EventKind, EventLog};
 use async_trait::async_trait;
 use loop_protocol::{
-    rpc::InteractParams, HostServices, InteractionOutcome, InteractionRequest, SessionRef,
+    rpc::InteractParams, Caller, HostServices, InteractionOutcome, InteractionRequest, SessionRef,
 };
 use loop_wire::control::EscalationRecipient;
 use serde_json::json;
@@ -18,6 +25,27 @@ struct Inner {
     generation: u64,
     state: Mutex<State>,
     interrupted: watch::Sender<bool>,
+    /// The caller that started the current turn (or command), carried
+    /// here from prompt admission: the task-local caller does not cross
+    /// the turn's spawned task. `None` for an in-process prompt.
+    turn_caller: std::sync::Mutex<Option<Caller>>,
+    /// Who answered recent Escalations, by id, until the decision record
+    /// takes it. Holds at most [`ANSWERS_KEPT`].
+    answered: std::sync::Mutex<std::collections::VecDeque<(String, Option<Caller>)>>,
+}
+
+/// How many answers [`Inner::answered`] keeps for the decision records.
+const ANSWERS_KEPT: usize = 64;
+
+/// Whether `recipient` may see and answer an Escalation of a turn that
+/// `started_by` started: a host user or an in-process recipient always; a
+/// user from outside the host only for its own turn.
+fn may_answer(recipient: &dyn EscalationRecipient, started_by: Option<&Caller>) -> bool {
+    match recipient.caller() {
+        None => true,
+        Some(caller) if caller.is_host_user() => true,
+        Some(caller) => started_by.is_some_and(|started| started.same_identity(&caller)),
+    }
 }
 #[derive(Default)]
 struct State {
@@ -31,6 +59,8 @@ struct Pending {
     request: InteractionRequest,
     answer: oneshot::Sender<InteractionOutcome>,
     deliveries: HashMap<u64, Delivery>,
+    /// The caller that started the turn that raised it.
+    started_by: Option<Caller>,
 }
 struct Delivery {
     token: u64,
@@ -82,7 +112,47 @@ impl EscalationHost {
             generation,
             state: Mutex::new(State::default()),
             interrupted: watch::channel(false).0,
+            turn_caller: std::sync::Mutex::new(None),
+            answered: std::sync::Mutex::new(Default::default()),
         }))
+    }
+    /// Set the caller that started the turn about to run, at prompt
+    /// admission. Escalations raised from now on belong to its turn.
+    pub fn set_turn_caller(&self, caller: Option<Caller>) {
+        *self
+            .0
+            .turn_caller
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = caller;
+    }
+    /// The caller that started the current turn, if known.
+    pub fn turn_caller(&self) -> Option<Caller> {
+        self.0
+            .turn_caller
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    /// Who answered the Escalation `id`, once; `None` when it is not known.
+    pub fn take_answered_by(&self, id: &str) -> Option<Caller> {
+        let mut answered = self
+            .0
+            .answered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = answered.iter().position(|(answered, _)| answered == id)?;
+        answered.remove(at).and_then(|(_, caller)| caller)
+    }
+    fn remember_answer(&self, id: String, caller: Option<Caller>) {
+        let mut answered = self
+            .0
+            .answered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if answered.len() >= ANSWERS_KEPT {
+            answered.pop_front();
+        }
+        answered.push_back((id, caller));
     }
     /// Stop in-flight decision waits after close grace expires. The Event Log
     /// writer may already have committed; pending requests must still withdraw.
@@ -119,7 +189,9 @@ impl EscalationHost {
         state.recipients.insert(connection, recipient.clone());
         let mut next = state.delivery;
         for (&ticket, pending) in &mut state.pending {
-            if !pending.deliveries.contains_key(&connection) {
+            if !pending.deliveries.contains_key(&connection)
+                && may_answer(recipient.as_ref(), pending.started_by.as_ref())
+            {
                 next += 1;
                 self.dispatch(ticket, pending, connection, next, recipient.clone());
             }
@@ -204,11 +276,16 @@ impl EscalationHost {
         let Some(pending) = state.pending.get(&ticket) else {
             return;
         };
-        if !pending
+        let Some(delivery) = pending
             .deliveries
             .get(&connection)
-            .is_some_and(|d| d.token == token)
-            || !valid(&pending.request, &answer)
+            .filter(|d| d.token == token)
+        else {
+            return;
+        };
+        let answered_by = delivery.recipient.caller();
+        if !valid(&pending.request, &answer)
+            || !may_answer(delivery.recipient.as_ref(), pending.started_by.as_ref())
         {
             return;
         }
@@ -224,8 +301,12 @@ impl EscalationHost {
         let result = self
             .record(EventKind::EscalationAnswered(json!({
                 "id": pending.request.id(), "answer": answer, "grant": grant,
+                "answered_by": answered_by,
             })))
             .await;
+        if result.is_ok() {
+            self.remember_answer(pending.request.id().to_string(), answered_by);
+        }
         if result.is_err() && *self.0.interrupted.borrow() {
             // Close owns the terminal withdrawal, even if this write committed
             // before its acknowledgement stalled. Never resume the gate here.
@@ -312,6 +393,7 @@ impl HostServices for EscalationHost {
                     request: request.clone(),
                     answer: tx,
                     deliveries: HashMap::new(),
+                    started_by: self.turn_caller(),
                 },
             );
             let waiting = WaitingTool {
@@ -334,6 +416,9 @@ impl HostServices for EscalationHost {
             let mut pending = state.pending.remove(&ticket).unwrap();
             let recipients = state.recipients.clone();
             for (connection, recipient) in recipients {
+                if !may_answer(recipient.as_ref(), pending.started_by.as_ref()) {
+                    continue;
+                }
                 state.delivery += 1;
                 self.dispatch(ticket, &mut pending, connection, state.delivery, recipient);
             }

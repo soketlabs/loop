@@ -72,7 +72,10 @@ async fn native(responses: Vec<FauxResponse>, tools: Vec<AgentTool>) -> Arc<Nati
         sandbox: SandboxMode::Disabled,
         resources: Default::default(),
     }));
-    NativeBackend::new(harness).await
+    let backend = NativeBackend::new(harness).await;
+    // User commands pass a Policy gate; this one lets every one run.
+    backend.set_command_gate(Arc::new(|_| Box::pin(async { Ok(()) })));
+    backend
 }
 
 /// Answers every permission prompt with its first option.

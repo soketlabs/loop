@@ -11,8 +11,10 @@ use loop_protocol::ToolKind;
 use serde_json::Value;
 
 use super::capability::{Capability, State};
-use super::rules::{rule_for, ToolPermission};
+use super::layers::LayerSource;
+use super::rules::{rule_and_key, ToolPermission};
 use super::PermissionMode;
+use loop_store::DecidedBy;
 
 /// What the mode says about one call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,33 +119,86 @@ pub fn decide(
     rules: &BTreeMap<String, ToolPermission>,
     call: &Call,
 ) -> Decision {
-    let rule = rule_for(rules, call);
+    decide_why(mode, rules, call).decision
+}
+
+/// A [`Decision`] and the step that made it, for the decision record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    /// The decision.
+    pub decision: Decision,
+    /// The step of the check order that made it.
+    pub by: DecidedBy,
+    /// The `toolPermissions` key that decided, when a rule did.
+    pub rule: Option<String>,
+    /// The Policy layer that decided, when a layer did.
+    pub layer: Option<LayerSource>,
+}
+
+impl Verdict {
+    fn new(decision: Decision, by: DecidedBy) -> Self {
+        Self {
+            decision,
+            by,
+            rule: None,
+            layer: None,
+        }
+    }
+
+    fn rule(mut self, rule: Option<String>) -> Self {
+        self.rule = rule;
+        self
+    }
+}
+
+/// [`decide`], with the step that decided.
+pub fn decide_why(
+    mode: PermissionMode,
+    rules: &BTreeMap<String, ToolPermission>,
+    call: &Call,
+) -> Verdict {
+    let (rule, key) = rule_and_key(rules, call);
     let tool = call.tool.as_str();
     if rule.permission == ToolPermission::Deny {
-        return Decision::Deny(format!(
-            "Tool `{tool}` is denied by settings.toolPermissions"
-        ));
+        return Verdict::new(
+            Decision::Deny(format!(
+                "Tool `{tool}` is denied by settings.toolPermissions"
+            )),
+            DecidedBy::Rule,
+        )
+        .rule(key);
     }
     // Ending plan mode always asks the user, and only plan mode has it.
     if tool == EXIT_PLAN_TOOL {
         return match mode {
-            PermissionMode::Plan => Decision::Ask,
-            _ => Decision::Deny("plan mode is off; carry on with the work".into()),
+            PermissionMode::Plan => Verdict::new(Decision::Ask, DecidedBy::Preset),
+            _ => Verdict::new(
+                Decision::Deny("plan mode is off; carry on with the work".into()),
+                DecidedBy::Off,
+            ),
         };
     }
     let capability = Capability::of(call);
     match mode.setting(&capability).state_for(call) {
-        State::Off => Decision::Deny(off_reason(mode, &capability, tool)),
+        State::Off => Verdict::new(
+            Decision::Deny(off_reason(mode, &capability, tool)),
+            DecidedBy::Off,
+        ),
         State::On
             if mode.pattern_ask_applies()
                 && rule.specific
                 && rule.permission == ToolPermission::Ask =>
         {
-            Decision::Ask
+            Verdict::new(Decision::Ask, DecidedBy::Rule).rule(key)
         }
-        State::On => Decision::Allow,
-        State::Ask if rule.permission == ToolPermission::Allow => Decision::Allow,
-        State::Ask => Decision::Ask,
+        State::On => Verdict::new(Decision::Allow, DecidedBy::Preset),
+        State::Ask if rule.permission == ToolPermission::Allow && key.is_some() => {
+            Verdict::new(Decision::Allow, DecidedBy::Rule).rule(key)
+        }
+        State::Ask if rule.permission == ToolPermission::Allow => {
+            Verdict::new(Decision::Allow, DecidedBy::Preset)
+        }
+        State::Ask => Verdict::new(Decision::Ask, DecidedBy::Preset),
     }
 }
 

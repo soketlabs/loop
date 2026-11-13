@@ -25,8 +25,11 @@
 //! - [`policy`]: [`decide`], a function of the mode, the rules and a
 //!   [`Call`] the gate resolved first.
 //! - [`tool_lock`]: the Runtime's tool lock as the top Policy layer.
+//! - [`decision`]: the decision record of every gate decision, and the sink
+//!   it goes to.
 
 pub mod capability;
+pub mod decision;
 pub mod layers;
 pub mod mode;
 pub mod policy;
@@ -36,8 +39,10 @@ pub mod tool_lock;
 pub use capability::{Capability, Scope, Setting, State};
 pub use layers::{Ceiling, Layer, LayerSource, Policy};
 pub use mode::PermissionMode;
-pub use policy::{available, decide, inside_workspace, workspace_root, Call, Decision};
+pub use policy::{
+    available, decide, decide_why, inside_workspace, workspace_root, Call, Decision, Verdict,
+};
 pub use rules::{
-    read_only_command, rule_for, search_may_show, search_may_show_in, split_command, Rule,
-    ToolPermission,
+    read_only_command, rule_and_key, rule_for, search_may_show, search_may_show_in, split_command,
+    Rule, ToolPermission,
 };

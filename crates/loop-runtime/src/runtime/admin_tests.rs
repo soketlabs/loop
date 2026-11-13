@@ -1455,6 +1455,10 @@ mod gate_mode {
     struct Watcher(mpsc::UnboundedSender<Asked>);
     #[async_trait::async_trait]
     impl EscalationRecipient for Watcher {
+        fn caller(&self) -> Option<loop_protocol::Caller> {
+            None
+        }
+
         fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
         async fn interact(
             &self,

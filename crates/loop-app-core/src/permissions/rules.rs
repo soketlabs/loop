@@ -578,15 +578,34 @@ pub fn rule_for(rules: &BTreeMap<String, ToolPermission>, call: &Call) -> Rule {
     rule_with(rules, call, &OnceCell::new())
 }
 
+/// [`rule_for`], and the `toolPermissions` key that decided it (`bash`,
+/// `bash(touch*)`), when a key did; for decision records.
+pub fn rule_and_key(
+    rules: &BTreeMap<String, ToolPermission>,
+    call: &Call,
+) -> (Rule, Option<String>) {
+    rule_with_key(rules, call, &OnceCell::new())
+}
+
 /// [`rule_for`] with the call path's [`PathForms`] worked out at most once.
 fn rule_with(
     rules: &BTreeMap<String, ToolPermission>,
     call: &Call,
     forms: &OnceCell<PathForms>,
 ) -> Rule {
+    rule_with_key(rules, call, forms).0
+}
+
+/// [`rule_with`] and the deciding key.
+fn rule_with_key(
+    rules: &BTreeMap<String, ToolPermission>,
+    call: &Call,
+    forms: &OnceCell<PathForms>,
+) -> (Rule, Option<String>) {
     let tool = call.tool.as_str();
     let subject = subject(tool, &call.args);
     let mut specific: Option<ToolPermission> = None;
+    let mut specific_key: Option<&str> = None;
     let mut bash_allows = Vec::new();
     for (key, permission) in rules {
         let (tool_pattern, Some(pattern)) = split_key(key) else {
@@ -629,6 +648,7 @@ fn rule_with(
         };
         if hit && specific.is_none_or(|s| permission.strictness() > s.strictness()) {
             specific = Some(*permission);
+            specific_key = Some(key);
         }
     }
     if specific.is_none() && !bash_allows.is_empty() {
@@ -642,24 +662,29 @@ fn rule_with(
             });
         if all_allowed {
             specific = Some(ToolPermission::Allow);
+            // Several allow patterns can share the command; name the tool.
+            specific_key = Some("bash(…)");
         }
     }
     if let Some(permission) = specific {
-        return Rule {
+        let rule = Rule {
             permission,
             specific: true,
         };
+        return (rule, specific_key.map(str::to_owned));
     }
     if let Some(permission) = rules.get(tool) {
-        return Rule::plain(*permission);
+        return (Rule::plain(*permission), Some(tool.to_owned()));
     }
     // Plain glob keys such as `mcp__github__*`; the strictest match wins.
     let plain = rules
         .iter()
         .filter(|(key, _)| split_key(key).1.is_none() && key.contains('*') && glob_match(key, tool))
-        .map(|(_, p)| *p)
-        .max_by_key(|p| p.strictness());
-    Rule::plain(plain.unwrap_or(ToolPermission::Allow))
+        .max_by_key(|(_, p)| p.strictness());
+    match plain {
+        Some((key, permission)) => (Rule::plain(*permission), Some(key.clone())),
+        None => (Rule::plain(ToolPermission::Allow), None),
+    }
 }
 
 #[cfg(test)]

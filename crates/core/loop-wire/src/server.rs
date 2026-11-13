@@ -1469,6 +1469,10 @@ async fn register_recipient(
 
 #[async_trait]
 impl crate::control::EscalationRecipient for ClientHost {
+    fn caller(&self) -> Option<Caller> {
+        self.caller.clone()
+    }
+
     fn withdraw(&self, params: loop_protocol::rpc::InteractWithdrawnParams) {
         let _ = self
             .conn

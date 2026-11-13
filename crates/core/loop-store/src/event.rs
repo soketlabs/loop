@@ -16,9 +16,9 @@ pub const WRITER_QUEUE_CAPACITY: usize = 64;
 
 /// A typed activity. Audit payloads retain their callers' JSON without loss.
 ///
-/// The ADR-0007 kinds `policy_decision`, `tree` and `session_deleted` are not
-/// variants yet: a stored row of those kinds still reads as
-/// [`EventKind::Unknown`]. Their payload types are in [`crate::records`].
+/// The ADR-0007 kinds `tree` and `session_deleted` are not variants yet: a
+/// stored row of those kinds still reads as [`EventKind::Unknown`]. Their
+/// payload types are in [`crate::records`].
 // Updates dominate the stream; keep envelopes inline to avoid an allocation per chunk.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,6 +42,10 @@ pub enum EventKind {
     SubagentEnded(Value),
     RuntimeStarted(Value),
     RuntimeStopped(Value),
+    /// One Policy gate decision, a [`crate::records::PolicyDecisionRecord`]
+    /// as JSON. Log-only and audit-only: it takes no Session sequence, and
+    /// an older reader reads it as [`EventKind::Unknown`].
+    PolicyDecision(Value),
     /// Unrecognized activity, including its original kind and payload.
     #[serde(untagged)]
     Unknown(Value),
