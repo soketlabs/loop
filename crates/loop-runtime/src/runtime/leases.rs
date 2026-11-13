@@ -8,14 +8,14 @@ pub(super) const RENEW_GIVE_UP: Duration = Duration::from_secs(25);
 // Own admission's lease until the pump and Session map take responsibility.
 // A Surface can drop its request future at any await point during construction.
 pub(super) struct OpeningLease {
-    store: Arc<SqliteSessionStore>,
+    store: Arc<dyn RuntimeSessionStore>,
     identity: LeaseIdentity,
     id: String,
     pub(super) armed: bool,
 }
 impl OpeningLease {
     pub(super) async fn acquire(
-        store: Arc<SqliteSessionStore>,
+        store: Arc<dyn RuntimeSessionStore>,
         identity: LeaseIdentity,
         id: String,
     ) -> BackendResult<Self> {

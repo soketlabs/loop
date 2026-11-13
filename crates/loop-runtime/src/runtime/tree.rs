@@ -101,7 +101,7 @@ fn in_caller_scope<F: std::future::Future>(
 /// A destination created but not yet admitted. Dropped early, it rolls back
 /// before releasing the destination lock, so no retry reads its receipt first.
 struct Unadmitted {
-    created: Option<loop_agent::harness::session::sqlite::DestinationCreation>,
+    created: Option<loop_agent::harness::session::DestinationCreation>,
     lock: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 impl Drop for Unadmitted {

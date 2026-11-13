@@ -278,12 +278,16 @@ async fn runtime(dirs: &Dirs, seen: Arc<Mutex<Seen>>, lock: Option<ToolLock>) ->
         .with_tool_lock(lock.map(|lock| {
             loop_app_core::permissions::tool_lock::RuntimeToolLock::new(lock, &dirs.ws).unwrap()
         }));
-    Runtime::new(
-        globals,
-        dirs.opts(),
-        Arc::new(MemoryEventLog::new()),
-        RuntimeLimits::default(),
-    )
+    {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(
+            globals,
+            dirs.opts(),
+            Arc::new(MemoryEventLog::new()),
+            store,
+            RuntimeLimits::default(),
+        )
+    }
     .await
     .unwrap()
     .into_shared()

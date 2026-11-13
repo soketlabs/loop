@@ -125,10 +125,17 @@ async fn shared(
         }));
     let mut opts = opts(&ws);
     opts.permission_mode = Some("full-access".into());
-    let rt = Runtime::new(globals, opts, Arc::new(MemoryEventLog::new()), limits)
-        .await
-        .unwrap()
-        .into_shared();
+    let store = globals.open_runtime_session_store().unwrap();
+    let rt = Runtime::new(
+        globals,
+        opts,
+        Arc::new(MemoryEventLog::new()),
+        store,
+        limits,
+    )
+    .await
+    .unwrap()
+    .into_shared();
     let _ = probe.runtime.set(Arc::downgrade(&rt));
     (rt, probe)
 }

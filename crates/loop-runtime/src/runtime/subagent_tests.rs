@@ -174,11 +174,14 @@ async fn runtime(
 ) -> (Arc<Runtime>, Arc<MemoryEventLog>, Arc<Seen>) {
     let (globals, seen) = globals(dir, script);
     let log = Arc::new(MemoryEventLog::new());
-    let rt = Runtime::new(globals, opts(dir, mode), log.clone(), limits)
-        .await
-        .unwrap()
-        .with_close_grace(Duration::from_millis(500))
-        .into_shared();
+    let rt = {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(globals, opts(dir, mode), log.clone(), store, limits)
+    }
+    .await
+    .unwrap()
+    .with_close_grace(Duration::from_millis(500))
+    .into_shared();
     (rt, log, seen)
 }
 
@@ -400,12 +403,16 @@ async fn depth_limit_is_configurable() {
     tokio::time::timeout(LIMIT, async {
         let dir = tempfile::tempdir().unwrap();
         let (globals, seen) = globals(dir.path(), nest());
-        let rt = Runtime::new(
-            globals,
-            opts(dir.path(), "full-access"),
-            Arc::new(MemoryEventLog::new()),
-            RuntimeLimits::default(),
-        )
+        let rt = {
+            let store = globals.open_runtime_session_store().unwrap();
+            Runtime::new(
+                globals,
+                opts(dir.path(), "full-access"),
+                Arc::new(MemoryEventLog::new()),
+                store,
+                RuntimeLimits::default(),
+            )
+        }
         .await
         .unwrap()
         .with_subagent_depth(1)
@@ -590,12 +597,16 @@ async fn cancelling_the_parent_cancels_its_descendants() {
         let log = Arc::new(MemoryEventLog::new());
         // The default close grace: a cascade that relied on aborting stuck
         // turns would take seconds per level and record `aborted`.
-        let rt = Runtime::new(
-            globals,
-            opts(dir.path(), "full-access"),
-            log.clone(),
-            RuntimeLimits::default(),
-        )
+        let rt = {
+            let store = globals.open_runtime_session_store().unwrap();
+            Runtime::new(
+                globals,
+                opts(dir.path(), "full-access"),
+                log.clone(),
+                store,
+                RuntimeLimits::default(),
+            )
+        }
         .await
         .unwrap()
         .into_shared();
@@ -726,12 +737,16 @@ async fn the_tool_is_offered_only_inside_a_shared_runtime() {
 
         let other = tempfile::tempdir().unwrap();
         let (globals, _) = globals(other.path(), script);
-        let plain = Runtime::new(
-            globals,
-            opts(other.path(), "full-access"),
-            Arc::new(MemoryEventLog::new()),
-            RuntimeLimits::default(),
-        )
+        let plain = {
+            let store = globals.open_runtime_session_store().unwrap();
+            Runtime::new(
+                globals,
+                opts(other.path(), "full-access"),
+                Arc::new(MemoryEventLog::new()),
+                store,
+                RuntimeLimits::default(),
+            )
+        }
         .await
         .unwrap();
         let session = plain.new_session(SessionSpec::default()).await.unwrap();

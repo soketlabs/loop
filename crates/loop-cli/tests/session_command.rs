@@ -116,7 +116,14 @@ async fn runtime_with_limits(
         permission_mode: Some("ask".into()),
         agent: None,
     };
-    Arc::new(Runtime::new(globals, opts, log, limits).await.unwrap())
+    Arc::new(
+        {
+            let store = globals.open_runtime_session_store().unwrap();
+            Runtime::new(globals, opts, log, store, limits)
+        }
+        .await
+        .unwrap(),
+    )
 }
 fn serve(
     rt: Arc<Runtime>,

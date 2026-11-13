@@ -52,10 +52,12 @@ async fn an_overflow_compacts_and_the_session_keeps_working() {
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(faux_provider(script));
     let globals = GlobalResources::with_models(dir.path().join("agent"), models).unwrap();
+    let session_store = globals.open_runtime_session_store().unwrap();
     let rt = Runtime::new(
         globals,
         opts(dir.path()),
         Arc::new(MemoryEventLog::new()),
+        session_store,
         RuntimeLimits::default(),
     )
     .await
@@ -208,10 +210,12 @@ async fn runtime_with_slow_summary(dir: &std::path::Path) -> (Arc<Runtime>, Slow
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(provider);
     let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
+    let session_store = globals.open_runtime_session_store().unwrap();
     let rt = Runtime::new(
         globals,
         opts(dir),
         Arc::new(MemoryEventLog::new()),
+        session_store,
         RuntimeLimits::default(),
     )
     .await
@@ -320,10 +324,12 @@ async fn fork_and_clone_after_compactions_build_the_source_context() {
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(faux_provider(FauxScript::new()));
     let globals = GlobalResources::with_models(dir.path().join("agent"), models).unwrap();
+    let session_store = globals.open_runtime_session_store().unwrap();
     let rt = Runtime::new(
         globals,
         opts(dir.path()),
         Arc::new(MemoryEventLog::new()),
+        session_store,
         RuntimeLimits::default(),
     )
     .await
