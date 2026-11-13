@@ -168,3 +168,73 @@ async fn append_latency_during_large_replay() {
     );
     println!("PROBE|RESULT|{result}");
 }
+
+/// WAL size while large replays and appends overlap (review item L4).
+/// Ignored. `PROBE_WAL_SECS` [20] sets the run time.
+///
+/// ```text
+/// cargo test --locked -p loop-runtime --test replay_append_probe wal_size -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement; run by hand"]
+async fn wal_size_during_replay_and_appends() {
+    let secs = env_u64("PROBE_WAL_SECS", 20);
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(SqliteEventLog::open(dir.path()).await.unwrap());
+    let text = "x".repeat(1024);
+    for _ in 0..32 {
+        log.append_batch((0..256).map(|_| chunk("big", text.clone())).collect())
+            .await
+            .unwrap();
+    }
+    let wal = dir.path().join("events.db-wal");
+    let size = |path: &std::path::Path| std::fs::metadata(path).map_or(0, |m| m.len());
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let log = log.clone();
+        let stop = stop.clone();
+        tasks.push(tokio::spawn(async move {
+            while !stop.load(Ordering::Acquire) {
+                log.read_after(&"big".into(), 0).await.unwrap();
+            }
+        }));
+    }
+    {
+        let log = log.clone();
+        let stop = stop.clone();
+        let text = text.clone();
+        tasks.push(tokio::spawn(async move {
+            while !stop.load(Ordering::Acquire) {
+                log.append_batch((0..8).map(|_| chunk("small", text.clone())).collect())
+                    .await
+                    .unwrap();
+            }
+        }));
+    }
+    let start = Instant::now();
+    let mut max = 0;
+    let mut samples = Vec::new();
+    while start.elapsed() < Duration::from_secs(secs) {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let now = size(&wal);
+        max = max.max(now);
+        samples.push(now);
+    }
+    stop.store(true, Ordering::Release);
+    for task in tasks {
+        task.await.unwrap();
+    }
+    let appended = log.latest_seq(&"small".into()).await.unwrap();
+    let mib = |b: u64| b as f64 / 1048576.0;
+    println!(
+        "PROBE|WAL| {secs} s: max {:.1} MiB, last {:.1} MiB, median {:.1} MiB; {appended} small events appended",
+        mib(max),
+        mib(*samples.last().unwrap_or(&0)),
+        mib({
+            let mut s = samples.clone();
+            s.sort();
+            s[s.len() / 2]
+        })
+    );
+}

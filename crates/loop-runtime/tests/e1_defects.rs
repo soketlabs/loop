@@ -143,6 +143,9 @@ impl EventLog for AtTurnEnd {
     async fn last_activity_ms(&self) -> LogResult<HashMap<SessionKey, i64>> {
         self.inner.last_activity_ms().await
     }
+    async fn sync(&self) -> loop_runtime::log::Result<()> {
+        self.inner.sync().await
+    }
     async fn read_session_page(
         &self,
         session: &loop_protocol::SessionKey,

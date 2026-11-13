@@ -361,6 +361,9 @@ impl EventLog for FaultyLog {
     fn capabilities(&self) -> loop_store::StoreCapabilities {
         self.inner.capabilities()
     }
+    async fn sync(&self) -> loop_runtime::log::Result<()> {
+        self.inner.sync().await
+    }
     async fn read_session_page(
         &self,
         session: &loop_protocol::SessionKey,

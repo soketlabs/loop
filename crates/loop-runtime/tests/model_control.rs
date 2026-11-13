@@ -589,6 +589,9 @@ impl EventLog for GatedLog {
     async fn finish_generation(&self, generation: u64, ms: i64) -> loop_runtime::log::Result<()> {
         self.inner.finish_generation(generation, ms).await
     }
+    async fn sync(&self) -> loop_runtime::log::Result<()> {
+        self.inner.sync().await
+    }
     async fn read_session_page(
         &self,
         session: &loop_protocol::SessionKey,
@@ -797,6 +800,9 @@ impl EventLog for FailingLog {
     }
     async fn finish_generation(&self, generation: u64, ms: i64) -> loop_runtime::log::Result<()> {
         self.inner.finish_generation(generation, ms).await
+    }
+    async fn sync(&self) -> loop_runtime::log::Result<()> {
+        self.inner.sync().await
     }
     async fn read_session_page(
         &self,

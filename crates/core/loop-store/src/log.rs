@@ -30,11 +30,28 @@ pub trait EventLog: Send + Sync {
     /// Updates for this Session with session_seq strictly greater than after_seq.
     /// A store with paged reads may read it in pages; the result is one
     /// contiguous run of `session_seq`, through the latest seq at the start.
+    ///
+    /// Pages are separate read transactions. They join into one consistent
+    /// read only because the log is append-only: a committed record never
+    /// changes or goes away. A future purge (ADR-0007 B6) must pin the read
+    /// or check a tombstone on each page.
     async fn read_after(&self, session: &SessionKey, after_seq: u64) -> Result<Vec<LoggedEvent>>;
     /// All activity with global_seq strictly greater than the supplied cursor.
     async fn read_runtime_after(&self, global_seq: u64) -> Result<Vec<LoggedEvent>>;
     /// Last committed Update sequence for this Session, or zero.
     async fn latest_seq(&self, session: &SessionKey) -> Result<u64>;
+    /// Wait until every append that was queued before this call has
+    /// committed or failed, even an append whose caller stopped waiting.
+    ///
+    /// Reads see every append that returned. They need not see one that
+    /// was queued and then abandoned (its future was dropped while the
+    /// writer still held it). A caller that must see such appends, for
+    /// example before it reads the turn ids of a reloaded Session, calls
+    /// this first. The default does nothing: it is right for a store whose
+    /// reads already see queued appends, or whose appends are never queued.
+    async fn sync(&self) -> Result<()> {
+        Ok(())
+    }
     /// What this store supports. The default declares none of the ADR-0007
     /// behaviour, so its paged reads below return pages cut from whole reads.
     fn capabilities(&self) -> StoreCapabilities {
@@ -44,6 +61,8 @@ pub trait EventLog: Send + Sync {
     /// `session_seq` order (ADR-0007 §8 `read_session`). `through_seq: None`
     /// reads to the end. See [`Page`] for `next` and [`PageLimit`] for the
     /// size rule. A read that starts after an append returned sees it.
+    /// Pages read one after another rely on the log being append-only, as
+    /// [`EventLog::read_after`] says.
     ///
     /// The default cuts the page from [`EventLog::read_after`], so each page
     /// costs a whole read. Stores with `paged_reads` read only the page.

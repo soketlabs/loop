@@ -355,6 +355,9 @@ impl EventLog for SlowLog {
     async fn finish_generation(&self, generation: u64, stopped_ms: i64) -> LogResult<()> {
         self.inner.finish_generation(generation, stopped_ms).await
     }
+    async fn sync(&self) -> loop_runtime::log::Result<()> {
+        self.inner.sync().await
+    }
     async fn read_session_page(
         &self,
         session: &loop_protocol::SessionKey,

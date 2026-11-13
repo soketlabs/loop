@@ -18,6 +18,18 @@ pub const READER_POOL_SIZE: usize = 4;
 /// an older database, or caught up.
 const BACKFILL_CHUNK: usize = 2048;
 
+/// The backfill chunk of `open`. Tests may set `LOOP_B2_BACKFILL_CHUNK`.
+fn backfill_chunk() -> usize {
+    #[cfg(test)]
+    if let Some(chunk) = std::env::var("LOOP_B2_BACKFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return chunk;
+    }
+    BACKFILL_CHUNK
+}
+
 /// The driver error as a store error. `loop-store` has no `rusqlite`
 /// types, so this conversion lives with the SQLite implementation.
 fn db(error: rusqlite::Error) -> EventLogError {
@@ -84,6 +96,11 @@ enum Command {
     Allocate(String, u32, i64, Reply<u64>),
     Finish(u64, i64, Reply<()>),
     MarkRecovered(u64, i64, Reply<()>),
+    /// Resolves after every request queued before it has committed or failed.
+    Sync(Reply<()>),
+    /// Test hook: the writer waits until the sender is dropped or sends.
+    #[cfg(test)]
+    Pause(std::sync::mpsc::Receiver<()>),
 }
 
 /// SQLite Event Log at `<agent_dir>/events.db` (independent of Session storage).
@@ -231,10 +248,11 @@ impl SqliteEventLog {
             let mut conn = Connection::open(writer_path)?;
             // These pragmas apply to the actual long-lived writer connection.
             conn.execute_batch(
-                "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
+                "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; \
+                 PRAGMA journal_size_limit=67108864;",
             )?;
             migrate(&mut conn)?;
-            backfill(&mut conn, BACKFILL_CHUNK, None)?;
+            backfill(&mut conn, backfill_chunk(), None)?;
             let last = conn.query_row(MAX_GLOBAL_SQL, [], |row| row.get(0))?;
             Ok((conn, last))
         })
@@ -243,7 +261,8 @@ impl SqliteEventLog {
         let acknowledged = Arc::new(AtomicU64::new(last));
         let (sender, receiver) = mpsc::channel(WRITER_QUEUE_CAPACITY);
         let ack = Arc::clone(&acknowledged);
-        tokio::task::spawn_blocking(move || writer(conn, receiver, &ack));
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        tokio::task::spawn_blocking(move || writer(conn, receiver, &ack, &wal));
         Ok(Self {
             sender,
             readers: Arc::new(Readers {
@@ -283,7 +302,18 @@ impl SqliteEventLog {
         let readers = Arc::clone(&self.readers);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            readers.run(floor, &read).map_err(EventLogError::from)
+            readers.run(floor, &read).map_err(|error| {
+                if let SqlError::Stale { seen, floor } = error {
+                    // A new read transaction in WAL mode sees every commit, so
+                    // this is a broken invariant, not a condition to handle.
+                    debug_assert!(false, "stale reader snapshot {seen} < {floor}");
+                    return EventLogError::Storage(format!(
+                        "invariant violated: a new reader snapshot at global_seq {seen} \
+                         misses the acknowledged {floor}"
+                    ));
+                }
+                EventLogError::from(error)
+            })
         })
         .await
         .map_err(|e| EventLogError::Storage(e.to_string()))?
@@ -439,6 +469,9 @@ impl EventLog for SqliteEventLog {
         self.request(|reply| Command::MarkRecovered(generation, recovered_ms, reply))
             .await
     }
+    async fn sync(&self) -> Result<()> {
+        self.request(Command::Sync).await
+    }
 }
 
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -478,10 +511,23 @@ fn migrate(conn: &mut Connection) -> SqlResult<()> {
     Ok(())
 }
 
-fn writer(mut conn: Connection, mut receiver: mpsc::Receiver<Command>, acknowledged: &AtomicU64) {
+fn writer(
+    mut conn: Connection,
+    mut receiver: mpsc::Receiver<Command>,
+    acknowledged: &AtomicU64,
+    wal: &Path,
+) {
     let mut pending = None;
+    let mut commits = 0u32;
     while let Some(command) = pending.take().or_else(|| receiver.blocking_recv()) {
         match command {
+            Command::Sync(reply) => {
+                let _ = reply.send(Ok(()));
+            }
+            #[cfg(test)]
+            Command::Pause(release) => {
+                let _ = release.recv();
+            }
             Command::Append(events, reply) => {
                 let mut count = events.len();
                 let mut requests = vec![(events, reply)];
@@ -510,6 +556,10 @@ fn writer(mut conn: Connection, mut receiver: mpsc::Receiver<Command>, acknowled
                     })
                     .collect();
                 append_group(&mut conn, all, replies, acknowledged);
+                commits += 1;
+                if commits % WAL_CHECK_COMMITS == 0 {
+                    bound_wal(&conn, wal);
+                }
             }
             Command::Allocate(owner, pid, started, reply) => {
                 let _ = reply.send(allocate(&mut conn, &owner, pid, started).map_err(Into::into));
@@ -594,6 +644,7 @@ fn append(conn: &mut Connection, events: Vec<Event>) -> SqlResult<Vec<LoggedEven
         .prepare_cached(MAX_GLOBAL_SQL)?
         .query_row([], |r| r.get(0))?;
     let mut records = Vec::with_capacity(events.len());
+    let mut rows = Vec::with_capacity(events.len());
     {
         // Session sequences of this transaction: one index read per Session.
         let mut seqs: HashMap<SessionKey, u64> = HashMap::new();
@@ -639,10 +690,11 @@ fn append(conn: &mut Connection, events: Vec<Event>) -> SqlResult<Vec<LoggedEven
                 record.event.ts_ms,
                 payload
             ])?;
+            rows.push(ProjectionRow::of(&record, kind));
             records.push(record);
         }
     }
-    project(&tx, &records)?;
+    project(&tx, &rows)?;
     tx.commit()?;
     Ok(records)
 }
@@ -675,6 +727,152 @@ const UPSERT_SUMMARY_SQL: &str = "INSERT INTO session_summary \
     turn_count=turn_count+excluded.turn_count, \
     parent=COALESCE(parent,excluded.parent)";
 
+/// What the projection needs of stored rows, read from the columns and two
+/// JSON paths; the payload is never decoded. The text test `instr` keeps
+/// JSON parsing to the few rows that can hold a revision. A row whose
+/// needed JSON is not valid gives NULL for that field and 1 in `bad`.
+/// The rules equal the queries before step B2: prompts by the `kind`
+/// column, a parent by `json_extract` of `session_opened`, turns and
+/// activity by their columns.
+const PROJECTION_ROWS_SQL: &str = "SELECT global_seq, session_key, session_seq, kind, turn, ts_ms, \
+    CASE WHEN kind='update' AND (instr(payload,'\"type\":\"config_changed\"')>0 \
+        OR instr(payload,'\"type\":\"branch_reset\"')>0) AND json_valid(payload) \
+        AND json_extract(payload,'$.event.payload.update.type') IN ('config_changed','branch_reset') \
+        THEN json_extract(payload,'$.event.payload.update.revision') END, \
+    CASE WHEN kind='session_opened' AND json_valid(payload) \
+        THEN payload -> '$.event.payload.parent' END, \
+    CASE WHEN kind='session_opened' OR (kind='update' AND (instr(payload,'\"type\":\"config_changed\"')>0 \
+        OR instr(payload,'\"type\":\"branch_reset\"')>0)) \
+        THEN NOT COALESCE(json_valid(payload),0) ELSE 0 END \
+    FROM events WHERE global_seq>?1 AND global_seq<=?2 ORDER BY global_seq LIMIT ?3";
+
+/// One record as the projection sees it.
+#[derive(Debug, Clone, PartialEq)]
+struct ProjectionRow {
+    global_seq: u64,
+    session: Option<SessionKey>,
+    seq: Option<u64>,
+    kind: String,
+    turn: Option<TurnId>,
+    ts_ms: i64,
+    revision: Option<u64>,
+    parent: Option<SessionKey>,
+    /// A JSON field the projection needs could not be read.
+    malformed: bool,
+}
+
+impl ProjectionRow {
+    /// The live path: from the record in memory and its `kind` column. It
+    /// gives the same values as the column path for any row this binary
+    /// writes (a test compares both).
+    fn of(record: &LoggedEvent, kind: &str) -> Self {
+        let delta = SummaryDelta::of(record);
+        Self {
+            global_seq: record.global_seq,
+            session: record.event.session_key.clone(),
+            seq: record.session_seq,
+            kind: kind.to_owned(),
+            turn: record.event.turn.clone(),
+            ts_ms: record.event.ts_ms,
+            revision: delta.as_ref().and_then(|d| d.revision),
+            parent: delta.and_then(|d| d.parent),
+            malformed: false,
+        }
+    }
+
+    /// The column path. Never fails on the content of a payload.
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        use rusqlite::types::Value as Sql;
+        let mut malformed = row.get::<_, Option<bool>>(8)?.unwrap_or(true);
+        let revision = match row.get::<_, Sql>(6)? {
+            Sql::Null => None,
+            Sql::Integer(n) => match u64::try_from(n) {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    malformed = true;
+                    None
+                }
+            },
+            _ => {
+                malformed = true;
+                None
+            }
+        };
+        // `->` gives the JSON text of the parent; read it as `SummaryDelta`
+        // reads the payload: a string is a key, null is none, any other
+        // value is kept as its JSON text.
+        let parent = match row.get::<_, Option<String>>(7)? {
+            None => None,
+            Some(text) => match serde_json::from_str::<Value>(&text) {
+                Ok(Value::Null) => None,
+                Ok(Value::String(key)) => Some(SessionKey::from(key)),
+                Ok(other) => Some(SessionKey::from(other.to_string())),
+                Err(_) => {
+                    malformed = true;
+                    None
+                }
+            },
+        };
+        Ok(Self {
+            global_seq: row.get(0)?,
+            session: row.get::<_, Option<String>>(1)?.map(SessionKey::from),
+            seq: row.get(2)?,
+            kind: row.get(3)?,
+            turn: row.get::<_, Option<String>>(4)?.map(TurnId::from),
+            ts_ms: row.get(5)?,
+            revision,
+            parent,
+            malformed,
+        })
+    }
+}
+
+/// Rows `(after, through]` for the projection, at most `limit`.
+fn projection_rows(
+    conn: &Connection,
+    after: u64,
+    through: u64,
+    limit: usize,
+) -> SqlResult<Vec<ProjectionRow>> {
+    if after >= through {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare_cached(PROJECTION_ROWS_SQL)?;
+    let rows = stmt
+        .query_map(
+            params![bound(after), bound(through), bound(limit as u64)],
+            ProjectionRow::read,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Rows whose JSON the projection could not read: how many, and the first.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Malformed {
+    count: u64,
+    first: Option<u64>,
+}
+
+impl Malformed {
+    fn add(&mut self, rows: &[ProjectionRow]) {
+        for row in rows.iter().filter(|r| r.malformed) {
+            self.count += 1;
+            self.first.get_or_insert(row.global_seq);
+        }
+    }
+    /// One warning line for all the rows found by one pass.
+    fn warn(&self, pass: &str) {
+        if let Some(first) = self.first {
+            eprintln!(
+                "Event Log: {pass}: {} rows have a payload the Session summary cannot read \
+                 (first global_seq {first}); their revision or parent is not counted",
+                self.count
+            );
+        }
+    }
+}
+
 fn projection_mark(conn: &Connection) -> SqlResult<u64> {
     Ok(conn
         .prepare_cached(MARK_SQL)?
@@ -690,36 +888,34 @@ fn set_projection_mark(conn: &Connection, global_seq: u64) -> SqlResult<()> {
 /// Apply committed records to the projection, in the caller's transaction.
 /// Records at or below the mark are skipped (idempotent). If the mark is
 /// behind the first record (an older writer appended without the
-/// projection), the missing events are applied first.
-fn project(conn: &Connection, records: &[LoggedEvent]) -> SqlResult<()> {
-    let (Some(first), Some(last)) = (records.first(), records.last()) else {
+/// projection), the missing rows are applied first, from their columns.
+fn project(conn: &Connection, rows: &[ProjectionRow]) -> SqlResult<()> {
+    let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
         return Ok(());
     };
     let mut mark = projection_mark(conn)?;
     if mark + 1 < first.global_seq {
-        catch_up(conn, mark, first.global_seq - 1)?;
+        let malformed = catch_up(conn, mark, first.global_seq - 1)?;
+        malformed.warn("catch-up of rows written without the summary");
         mark = first.global_seq - 1;
     }
-    apply(conn, records.iter().filter(|r| r.global_seq > mark))?;
+    apply(conn, rows.iter().filter(|r| r.global_seq > mark))?;
     set_projection_mark(conn, last.global_seq.max(mark))
 }
 
-/// Apply stored events `(after, through]` in chunks.
-fn catch_up(conn: &Connection, mut after: u64, through: u64) -> SqlResult<()> {
+/// Apply stored rows `(after, through]` in chunks.
+fn catch_up(conn: &Connection, mut after: u64, through: u64) -> SqlResult<Malformed> {
+    let mut malformed = Malformed::default();
     while after < through {
-        let page = global_page(
-            conn,
-            after,
-            through,
-            PageLimit::events(BACKFILL_CHUNK as u32),
-        )?;
-        let Some(last) = page.items.last().map(|r| r.global_seq) else {
+        let rows = projection_rows(conn, after, through, BACKFILL_CHUNK)?;
+        let Some(last) = rows.last().map(|r| r.global_seq) else {
             break;
         };
-        apply(conn, page.items.iter())?;
+        malformed.add(&rows);
+        apply(conn, rows.iter())?;
         after = last;
     }
-    Ok(())
+    Ok(malformed)
 }
 
 /// One commit group's change to one Session.
@@ -729,24 +925,31 @@ struct GroupFold {
     turns: Vec<(TurnId, u64)>,
 }
 
-/// Fold the records per Session, then write one upsert per Session.
-fn apply<'a>(conn: &Connection, records: impl Iterator<Item = &'a LoggedEvent>) -> SqlResult<()> {
+/// Fold the rows per Session, then write one upsert per Session.
+fn apply<'a>(conn: &Connection, rows: impl Iterator<Item = &'a ProjectionRow>) -> SqlResult<()> {
     let mut groups: BTreeMap<SessionKey, GroupFold> = BTreeMap::new();
-    for record in records {
-        let Some(delta) = SummaryDelta::of(record) else {
+    for row in rows {
+        let Some(session) = &row.session else {
             continue;
         };
-        let group = groups
-            .entry(delta.session.clone())
-            .or_insert_with(|| GroupFold {
-                summary: SessionSummary::empty(delta.session.clone()),
-                revised: false,
-                turns: Vec::new(),
-            });
+        let delta = SummaryDelta {
+            session: session.clone(),
+            seq: row.seq,
+            ts_ms: row.ts_ms,
+            revision: row.revision,
+            prompt: row.kind == "prompt_sent",
+            turn: row.turn.clone(),
+            parent: row.parent.clone(),
+        };
+        let group = groups.entry(session.clone()).or_insert_with(|| GroupFold {
+            summary: SessionSummary::empty(session.clone()),
+            revised: false,
+            turns: Vec::new(),
+        });
         group.revised |= delta.revision.is_some();
         if let Some(turn) = &delta.turn {
             if !group.turns.iter().any(|(seen, _)| seen == turn) {
-                group.turns.push((turn.clone(), record.global_seq));
+                group.turns.push((turn.clone(), row.global_seq));
             }
         }
         // Turns are counted against the table below, not in the group.
@@ -776,30 +979,90 @@ fn apply<'a>(conn: &Connection, records: impl Iterator<Item = &'a LoggedEvent>) 
     Ok(())
 }
 
-/// Build or catch up the projection from the events, one transaction per
-/// chunk; each moves the mark with its rows, so an interrupted backfill
+/// Build or catch up the projection from the stored rows, one transaction
+/// per chunk; each moves the mark with its rows, so an interrupted backfill
 /// continues where it stopped. Returns whether it reached the end; with
 /// `max_chunks` it stops early (tests use it to interrupt).
+///
+/// It reads columns and two JSON paths only, so the content of a payload
+/// never makes it fail. A backfill that runs over a second prints a start
+/// line, a progress line every few seconds and a done line on stderr.
 fn backfill(conn: &mut Connection, chunk: usize, max_chunks: Option<usize>) -> SqlResult<bool> {
+    let start = std::time::Instant::now();
+    let mut announced: Option<std::time::Instant> = None;
     let mut chunks = 0;
-    loop {
+    let mut applied = 0u64;
+    let mut malformed = Malformed::default();
+    let result = loop {
         if max_chunks.is_some_and(|max| chunks >= max) {
-            return Ok(false);
+            break Ok(false);
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mark = projection_mark(&tx)?;
         let through: u64 = tx.query_row(MAX_GLOBAL_SQL, [], |row| row.get(0))?;
         if mark >= through {
             tx.commit()?;
-            return Ok(true);
+            break Ok(true);
         }
-        let limit = PageLimit::events(u32::try_from(chunk).unwrap_or(u32::MAX));
-        let page = global_page(&tx, mark, through, limit)?;
-        let last = page.items.last().map_or(through, |r| r.global_seq);
-        apply(&tx, page.items.iter())?;
+        let rows = projection_rows(&tx, mark, through, chunk)?;
+        let last = rows.last().map_or(through, |r| r.global_seq);
+        malformed.add(&rows);
+        apply(&tx, rows.iter())?;
         set_projection_mark(&tx, last)?;
         tx.commit()?;
         chunks += 1;
+        applied += rows.len() as u64;
+        let left = through - last;
+        match announced {
+            None if start.elapsed() >= std::time::Duration::from_secs(1) => {
+                eprintln!(
+                    "Event Log: building the Session summary: {applied} events done, \
+                     {left} to go (global_seq {last} of {through})"
+                );
+                announced = Some(std::time::Instant::now());
+            }
+            Some(at) if at.elapsed() >= std::time::Duration::from_secs(5) => {
+                eprintln!(
+                    "Event Log: building the Session summary: {applied} events done, {left} to go"
+                );
+                announced = Some(std::time::Instant::now());
+            }
+            _ => {}
+        }
+    };
+    if announced.is_some() {
+        eprintln!(
+            "Event Log: Session summary built from {applied} events in {:.1} s",
+            start.elapsed().as_secs_f64()
+        );
+    }
+    malformed.warn("Session summary backfill");
+    result
+}
+
+/// WAL size above which the writer runs a TRUNCATE checkpoint. Readers
+/// that overlap without a gap keep the automatic PASSIVE checkpoint from
+/// ever resetting the WAL, so without this it grows without bound.
+const WAL_RESET_BYTES: u64 = 64 * 1024 * 1024;
+/// The writer checks the WAL size after this many commits.
+const WAL_CHECK_COMMITS: u32 = 64;
+
+/// Keep the WAL bounded while readers overlap. Reading the file size costs
+/// one `stat`. Above the limit, a TRUNCATE checkpoint waits (busy timeout)
+/// for the read transactions open now, which are one page each, copies the
+/// WAL into the database and empties it. A busy or failed checkpoint is
+/// tried again at the next check.
+fn bound_wal(conn: &Connection, wal: &Path) {
+    if std::fs::metadata(wal).is_ok_and(|m| m.len() >= WAL_RESET_BYTES) {
+        // Retry every 1 ms (at most about 1 s): each reader holds its
+        // snapshot for one page, so the default busy sleeps, which grow to
+        // 100 ms, would stall appends far longer than needed.
+        let _ = conn.busy_handler(Some(|tries| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            tries < 1000
+        }));
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
     }
 }
 
@@ -947,10 +1210,16 @@ fn recovery_page(
     if from_generation > i64::MAX as u64 || after_global > i64::MAX as u64 {
         return Ok(Page::last(Vec::new()));
     }
-    let Some(floor) = recovery_floor(conn, from_generation as i64)? else {
-        return Ok(Page::last(Vec::new()));
+    // The floor matters only for the first page: later pages start after a
+    // record that is already past it.
+    let after = if after_global == 0 {
+        match recovery_floor(conn, from_generation as i64)? {
+            Some(floor) => floor - 1,
+            None => return Ok(Page::last(Vec::new())),
+        }
+    } else {
+        after_global as i64
     };
-    let after = (after_global as i64).max(floor - 1);
     page(
         conn,
         RECOVERY_PAGE_SQL,
@@ -1032,6 +1301,7 @@ mod tests {
     use super::*;
     use loop_store::summarize;
     use loop_store_testkit::event_log as kit;
+    use std::collections::BTreeSet;
 
     /// Rows of `EXPLAIN QUERY PLAN`, with every parameter left NULL.
     fn plan(conn: &Connection, sql: &str) -> Vec<String> {
@@ -1247,7 +1517,9 @@ mod tests {
     }
 
     /// The projection rows, in key order.
-    fn projection_rows(conn: &Connection) -> (Vec<SessionSummary>, Vec<(String, String, i64)>) {
+    fn projection_rows_table(
+        conn: &Connection,
+    ) -> (Vec<SessionSummary>, Vec<(String, String, i64)>) {
         let summaries = conn
             .prepare("SELECT session_key,last_seq,last_revision,last_activity_ms,prompts_sent,turn_count,parent FROM session_summary ORDER BY session_key")
             .expect("prepare")
@@ -1322,9 +1594,13 @@ mod tests {
         assert_matches_fold(&log).await;
         drop(log);
         let mut conn = Connection::open(&path).expect("open");
-        let live = projection_rows(&conn);
+        let live = projection_rows_table(&conn);
         rebuild(&mut conn);
-        assert_eq!(projection_rows(&conn), live, "projection equals a rebuild");
+        assert_eq!(
+            projection_rows_table(&conn),
+            live,
+            "projection equals a rebuild"
+        );
     }
 
     /// An older binary can append after the migration (a downgrade): the
@@ -1345,9 +1621,9 @@ mod tests {
             .expect("append");
         assert_matches_fold(&log).await;
         let mut conn = Connection::open(dir.path().join("events.db")).expect("open");
-        let live = projection_rows(&conn);
+        let live = projection_rows_table(&conn);
         rebuild(&mut conn);
-        assert_eq!(projection_rows(&conn), live);
+        assert_eq!(projection_rows_table(&conn), live);
     }
 
     /// Applying the same records twice changes nothing: the mark skips them.
@@ -1357,17 +1633,12 @@ mod tests {
         for batch in kit::workload() {
             append(&mut conn, batch).expect("append");
         }
-        let before = projection_rows(&conn);
-        let records = {
-            let tx = conn.transaction().expect("tx");
-            let page = global_page(&tx, 0, u64::MAX, PageLimit::events(10_000)).expect("read");
-            tx.commit().expect("commit");
-            page.items
-        };
+        let before = projection_rows_table(&conn);
+        let rows = projection_rows(&conn, 0, u64::MAX, 10_000).expect("rows");
         let tx = conn.transaction().expect("tx");
-        project(&tx, &records).expect("project again");
+        project(&tx, &rows).expect("project again");
         tx.commit().expect("commit");
-        assert_eq!(projection_rows(&conn), before);
+        assert_eq!(projection_rows_table(&conn), before);
     }
 
     /// A pooled connection left inside a read transaction would keep an old
@@ -1440,6 +1711,570 @@ mod tests {
         );
     }
 
+    /// The queries of the code before step B2, as the reference for the
+    /// projection. Rows whose JSON is not valid are left out of the parent
+    /// and revision queries (the old `json_extract` failed on them).
+    struct OldQueries {
+        prompts: BTreeMap<String, u64>,
+        activity: BTreeMap<String, i64>,
+        turns: BTreeMap<String, Vec<String>>,
+        subagents: BTreeSet<String>,
+        revision: BTreeMap<String, u64>,
+        last_seq: BTreeMap<String, u64>,
+    }
+
+    fn old_queries(conn: &Connection) -> OldQueries {
+        let pairs = |sql: &str| -> Vec<(String, i64)> {
+            conn.prepare(sql)
+                .expect("prepare")
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        let mut turns: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (session, turn) in conn
+            .prepare("SELECT session_key, turn FROM events WHERE session_key IS NOT NULL AND turn IS NOT NULL GROUP BY session_key, turn ORDER BY MIN(global_seq)")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("rows")
+        {
+            turns.entry(session).or_default().push(turn);
+        }
+        let subagents = conn
+            .prepare("SELECT DISTINCT session_key FROM events WHERE kind='session_opened' AND session_key IS NOT NULL AND json_valid(payload) AND json_extract(payload,'$.event.payload.parent') IS NOT NULL")
+            .expect("prepare")
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows");
+        let mut revision = BTreeMap::new();
+        for (session, rev) in pairs(
+            "SELECT session_key, json_extract(payload,'$.event.payload.update.revision') FROM events \
+             WHERE kind='update' AND json_valid(payload) \
+             AND json_extract(payload,'$.event.payload.update.type') IN ('config_changed','branch_reset') \
+             AND json_type(payload,'$.event.payload.update.revision')='integer' \
+             ORDER BY global_seq",
+        ) {
+            revision.insert(session, rev as u64);
+        }
+        OldQueries {
+            prompts: pairs("SELECT session_key, COUNT(*) FROM events WHERE session_key IS NOT NULL AND kind='prompt_sent' GROUP BY session_key")
+                .into_iter()
+                .map(|(k, n)| (k, n as u64))
+                .collect(),
+            activity: pairs("SELECT session_key, MAX(ts_ms) FROM events WHERE session_key IS NOT NULL GROUP BY session_key")
+                .into_iter()
+                .collect(),
+            turns,
+            subagents,
+            revision,
+            last_seq: pairs("SELECT session_key, MAX(session_seq) FROM events WHERE session_key IS NOT NULL AND session_seq IS NOT NULL GROUP BY session_key")
+                .into_iter()
+                .map(|(k, n)| (k, n as u64))
+                .collect(),
+        }
+    }
+
+    /// The projection equals the old queries for every Session.
+    fn assert_matches_old_queries(conn: &Connection) {
+        let old = old_queries(conn);
+        let (summaries, turn_rows) = projection_rows_table(conn);
+        assert_eq!(
+            summaries.len(),
+            old.activity.len(),
+            "one summary per Session"
+        );
+        for summary in &summaries {
+            let key = summary.session.as_str().to_owned();
+            assert_eq!(
+                summary.prompts_sent,
+                old.prompts.get(&key).copied().unwrap_or(0),
+                "{key} prompts"
+            );
+            assert_eq!(
+                summary.last_activity_ms, old.activity[&key],
+                "{key} activity"
+            );
+            assert_eq!(
+                summary.last_seq,
+                old.last_seq.get(&key).copied().unwrap_or(0),
+                "{key} seq"
+            );
+            assert_eq!(
+                summary.last_revision,
+                old.revision.get(&key).copied().unwrap_or(0),
+                "{key} revision"
+            );
+            assert_eq!(
+                summary.parent.is_some(),
+                old.subagents.contains(&key),
+                "{key} subagent"
+            );
+            let turns: Vec<String> = turn_rows
+                .iter()
+                .filter(|(s, _, _)| *s == key)
+                .map(|(_, t, g)| (g, t.clone()))
+                .collect::<BTreeMap<_, _>>()
+                .into_values()
+                .collect();
+            assert_eq!(
+                turns,
+                old.turns.get(&key).cloned().unwrap_or_default(),
+                "{key} turns"
+            );
+            assert_eq!(summary.turn_count, turns.len() as u64);
+        }
+    }
+
+    /// Rows that the current binary cannot decode, or whose JSON is broken,
+    /// as an older or newer writer could leave them.
+    fn insert_bad_rows(conn: &Connection) {
+        let mut global: i64 = conn
+            .query_row(MAX_GLOBAL_SQL, [], |row| row.get(0))
+            .expect("max");
+        let mut raw = |session: &str,
+                       seq: Option<i64>,
+                       kind: &str,
+                       turn: Option<&str>,
+                       ts: i64,
+                       payload: &str| {
+            global += 1;
+            conn.execute(
+                INSERT_SQL,
+                params![global, 1, session, seq, kind, turn, ts, payload],
+            )
+            .expect("insert");
+        };
+        let next = |session: &str| -> i64 {
+            latest(conn, &SessionKey::from(session)).expect("latest") as i64 + 1
+        };
+        // Broken JSON in each kind that the summary reads JSON from.
+        let s = next("bad");
+        raw(
+            "bad",
+            Some(s),
+            "update",
+            Some("turn-9"),
+            900,
+            "{not json \"type\":\"config_changed\"",
+        );
+        raw("bad", None, "session_opened", None, 901, "{not json");
+        // A prompt of a newer payload version: the kind column still counts.
+        raw(
+            "bad",
+            None,
+            "prompt_sent",
+            Some("turn-10"),
+            902,
+            "{\"v\":2,\"event\":{\"kind\":\"prompt_sent\",\"payload\":{}}}",
+        );
+        // No `event` key, and a kind this binary does not know.
+        raw("bad", None, "prompt_sent", None, 903, "{\"v\":1}");
+        raw(
+            "a",
+            None,
+            "future_kind",
+            Some("turn-11"),
+            904,
+            "{\"v\":1,\"event\":{\"kind\":\"future_kind\",\"payload\":{}}}",
+        );
+        // A valid revision record of a newer version, and a non-integer revision.
+        let s = next("a");
+        raw("a", Some(s), "update", None, 905, "{\"v\":2,\"event\":{\"kind\":\"update\",\"payload\":{\"update\":{\"type\":\"config_changed\",\"revision\":77}}}}");
+        let s = next("a");
+        raw("a", Some(s), "update", None, 906, "{\"v\":1,\"event\":{\"kind\":\"update\",\"payload\":{\"update\":{\"type\":\"branch_reset\",\"revision\":\"x\"}}}}");
+        // A parent that is not a string.
+        raw("odd", None, "session_opened", None, 907, "{\"v\":1,\"event\":{\"kind\":\"session_opened\",\"payload\":{\"parent\":{\"id\":\"a\"}}}}");
+    }
+
+    /// H1: a pre-B2 database with rows the binary cannot read still opens.
+    /// The summary equals the old queries, Unknown rows included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bad_rows_do_not_stop_open_and_the_summary_equals_the_old_queries() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("events.db");
+        old_database(&path);
+        {
+            let conn = Connection::open(&path).expect("open");
+            insert_bad_rows(&conn);
+            for batch in kit::workload() {
+                insert_old(&conn, batch);
+            }
+        }
+        let log = SqliteEventLog::open(dir.path())
+            .await
+            .expect("open with bad rows");
+        let summary = log
+            .session_summary(&"bad".into())
+            .await
+            .expect("summary")
+            .expect("bad");
+        assert_eq!(summary.prompts_sent, 2, "prompts by the kind column");
+        assert_eq!(summary.turn_count, 2);
+        // Appends still work.
+        log.append_batch(vec![kit::update("bad")])
+            .await
+            .expect("append");
+        drop(log);
+        let mut conn = Connection::open(&path).expect("open");
+        assert_matches_old_queries(&conn);
+        let live = projection_rows_table(&conn);
+        rebuild(&mut conn);
+        assert_eq!(projection_rows_table(&conn), live);
+    }
+
+    /// H1: bad rows written after open (by an older writer) do not stop the
+    /// next append, which catches them up from their columns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bad_rows_during_catch_up_do_not_stop_appends() {
+        let dir = tempfile::tempdir().expect("dir");
+        let log = SqliteEventLog::open(dir.path()).await.expect("open");
+        for batch in kit::workload() {
+            log.append_batch(batch).await.expect("append");
+        }
+        {
+            let conn = Connection::open(dir.path().join("events.db")).expect("open");
+            insert_bad_rows(&conn);
+        }
+        log.append_batch(vec![kit::update("a")])
+            .await
+            .expect("append after bad rows");
+        let summary = log
+            .session_summary(&"a".into())
+            .await
+            .expect("summary")
+            .expect("a");
+        assert_eq!(
+            summary.last_revision, 77,
+            "a newer version's revision counts"
+        );
+        drop(log);
+        let mut conn = Connection::open(dir.path().join("events.db")).expect("open");
+        assert_matches_old_queries(&conn);
+        let live = projection_rows_table(&conn);
+        rebuild(&mut conn);
+        assert_eq!(projection_rows_table(&conn), live);
+    }
+
+    /// The live path (records in memory) and the column path (stored rows)
+    /// give the same projection row for every record this binary writes,
+    /// Unknown kinds and non-string parents included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_and_column_paths_agree() {
+        let dir = tempfile::tempdir().expect("dir");
+        let log = SqliteEventLog::open(dir.path()).await.expect("open");
+        for batch in kit::workload() {
+            log.append_batch(batch).await.expect("append");
+        }
+        let opened = |parent: serde_json::Value| Event {
+            generation: 1,
+            session_key: Some("p".into()),
+            turn: Some("turn-1".into()),
+            ts_ms: 5,
+            kind: EventKind::SessionOpened(serde_json::json!({"parent": parent, "z": 1, "a": [1]})),
+        };
+        log.append_batch(vec![
+            opened(serde_json::json!({"b": 2, "a": "x"})),
+            opened(serde_json::json!(7)),
+            opened(serde_json::json!(true)),
+            opened(serde_json::json!(1.5)),
+            opened(serde_json::json!(["k"])),
+        ])
+        .await
+        .expect("append");
+        let conn = Connection::open(dir.path().join("events.db")).expect("open");
+        let column = projection_rows(&conn, 0, u64::MAX, 100_000).expect("rows");
+        let stored = global_page(&conn, 0, u64::MAX, PageLimit::events(100_000)).expect("records");
+        assert_eq!(column.len(), stored.items.len());
+        for (row, record) in column.iter().zip(&stored.items) {
+            assert_eq!(
+                &ProjectionRow::of(record, &row.kind),
+                row,
+                "global_seq {}",
+                row.global_seq
+            );
+        }
+        assert_matches_old_queries(&conn);
+    }
+
+    /// M1: a backfill that fails in the middle of a chunk through the real
+    /// `open` (a trigger aborts the chunk's commit) rolls that chunk back,
+    /// and the next open finishes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_that_fails_mid_chunk_resumes_at_the_next_open() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("events.db");
+        old_database_rows(&path, 3 * BACKFILL_CHUNK as u64 + 100);
+        {
+            let mut conn = Connection::open(&path).expect("open");
+            migrate(&mut conn).expect("migrate");
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER stop_backfill BEFORE UPDATE ON projection_state \
+                 WHEN NEW.applied_global_seq > {} BEGIN SELECT RAISE(ABORT, 'interrupted'); END;",
+                BACKFILL_CHUNK
+            ))
+            .expect("trigger");
+        }
+        let error = SqliteEventLog::open(dir.path())
+            .await
+            .err()
+            .expect("open fails");
+        assert!(error.to_string().contains("interrupted"), "{error}");
+        {
+            let conn = Connection::open(&path).expect("open");
+            assert_eq!(projection_mark(&conn).expect("mark"), BACKFILL_CHUNK as u64);
+            conn.execute_batch("DROP TRIGGER stop_backfill")
+                .expect("drop");
+        }
+        let log = SqliteEventLog::open(dir.path()).await.expect("reopen");
+        assert_matches_fold(&log).await;
+        drop(log);
+        let mut conn = Connection::open(&path).expect("open");
+        assert_matches_old_queries(&conn);
+        let live = projection_rows_table(&conn);
+        rebuild(&mut conn);
+        assert_eq!(projection_rows_table(&conn), live);
+    }
+
+    /// The child side of the kill test: open (and backfill) the database
+    /// named by `LOOP_B2_KILL_DB`, with small chunks, then wait to be killed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "run by backfill_killed_by_the_os_resumes"]
+    async fn backfill_child_process() {
+        let Ok(dir) = std::env::var("LOOP_B2_KILL_DB") else {
+            return;
+        };
+        let _log = SqliteEventLog::open(&dir).await.expect("child open");
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
+
+    /// M1: a process killed (SIGKILL) while `open` backfills leaves the mark
+    /// at a chunk boundary; the next open finishes, equal to a rebuild.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backfill_killed_by_the_os_resumes() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("events.db");
+        old_database_rows(&path, 60_000);
+        let max: u64 = Connection::open(&path)
+            .expect("open")
+            .query_row(MAX_GLOBAL_SQL, [], |r| r.get(0))
+            .expect("max");
+        let mut child = std::process::Command::new(std::env::current_exe().expect("exe"))
+            .args([
+                "--exact",
+                "log::sqlite::tests::backfill_child_process",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("LOOP_B2_KILL_DB", dir.path())
+            .env("LOOP_B2_BACKFILL_CHUNK", "16")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mark = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never backfilled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let Ok(conn) = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            else {
+                continue;
+            };
+            if let Ok(mark) = projection_mark(&conn) {
+                if mark > 0 {
+                    break mark;
+                }
+            }
+        };
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        let after_kill = projection_mark(&Connection::open(&path).expect("open")).expect("mark");
+        assert!(after_kill >= mark);
+        assert!(
+            after_kill < max,
+            "killed before the end ({after_kill} of {max})"
+        );
+        assert_eq!(after_kill % 16, 0, "the mark stops at a chunk boundary");
+        let log = SqliteEventLog::open(dir.path()).await.expect("reopen");
+        drop(log);
+        let mut conn = Connection::open(&path).expect("open");
+        assert_eq!(projection_mark(&conn).expect("mark"), max);
+        let live = projection_rows_table(&conn);
+        rebuild(&mut conn);
+        assert_eq!(projection_rows_table(&conn), live);
+    }
+
+    /// M2: an append whose caller stopped waiting while it was still queued
+    /// commits later. Reads may miss it until then; `sync` waits for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_waits_for_an_abandoned_queued_append() {
+        let dir = tempfile::tempdir().expect("dir");
+        let log = SqliteEventLog::open(dir.path()).await.expect("open");
+        let session = SessionKey::from("s");
+        let started = |turn: &str| {
+            kit::update_with(
+                "s",
+                turn,
+                1,
+                loop_protocol::SessionUpdate::TurnStarted {
+                    turn_id: turn.into(),
+                },
+            )
+        };
+        log.append_batch(vec![started("turn-1")])
+            .await
+            .expect("append");
+        // Hold the writer, queue `turn-2`, then drop the caller.
+        let (release, paused) = std::sync::mpsc::channel();
+        log.sender
+            .send(Command::Pause(paused))
+            .await
+            .expect("pause");
+        let queued = {
+            let log = log.clone();
+            tokio::spawn(async move { log.append_batch(vec![started("turn-2")]).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        queued.abort();
+        let _ = queued.await;
+        // A reader does not see the queued append yet.
+        assert_eq!(
+            log.turn_ids(&session).await.expect("turns"),
+            vec![TurnId::from("turn-1")]
+        );
+        let sync = {
+            let log = log.clone();
+            tokio::spawn(async move { log.sync().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!sync.is_finished(), "sync waits for the queued append");
+        release.send(()).expect("release");
+        sync.await.expect("join").expect("sync");
+        // After sync, the abandoned append is visible: no turn id is reused.
+        assert_eq!(
+            log.turn_ids(&session).await.expect("turns"),
+            vec![TurnId::from("turn-1"), TurnId::from("turn-2")]
+        );
+    }
+
+    /// Time of the backfill of a pre-B2 database (review item M1). Ignored.
+    /// `LOOP_B2_BACKFILL_EVENTS` [200000] sets the event count. The rows are
+    /// a Runtime-like mix: per turn a prompt, a turn start and 100 text
+    /// chunks, over 1,000 Sessions.
+    #[test]
+    #[ignore = "measurement; run by hand"]
+    fn backfill_cost() {
+        let total: u64 = std::env::var("LOOP_B2_BACKFILL_EVENTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("events.db");
+        old_database_rows(&path, total);
+        let mut conn = Connection::open(&path).expect("open");
+        let start = std::time::Instant::now();
+        migrate(&mut conn).expect("migrate");
+        assert!(backfill(&mut conn, BACKFILL_CHUNK, None).expect("backfill"));
+        println!(
+            "BACKFILL| {total} events: {:.2} s",
+            start.elapsed().as_secs_f64()
+        );
+    }
+
+    /// An old-schema database with `total` Runtime-like rows, written fast.
+    fn old_database_rows(path: &Path, total: u64) {
+        let mut conn = Connection::open(path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=OFF;")
+            .expect("pragmas");
+        conn.execute_batch(
+            "CREATE TABLE migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);",
+        )
+        .expect("migrations");
+        for (id, sql) in &MIGRATIONS[..3] {
+            conn.execute_batch(sql).expect("old migration");
+            conn.execute(
+                "INSERT INTO migrations (id, applied_at) VALUES (?1, 0)",
+                [id],
+            )
+            .expect("record");
+        }
+        let tx = conn.transaction().expect("tx");
+        {
+            let mut insert = tx.prepare(INSERT_SQL).expect("prepare");
+            let mut seqs: HashMap<String, u64> = HashMap::new();
+            let mut global = 0u64;
+            let mut turn = 0u64;
+            while global < total {
+                turn += 1;
+                let session = format!("s{}", turn % 1000);
+                let turn_id = format!("turn-{}", turn / 1000 + 1);
+                let mut events = vec![kit::update_with(
+                    &session,
+                    &turn_id,
+                    turn as i64,
+                    loop_protocol::SessionUpdate::TurnStarted {
+                        turn_id: turn_id.as_str().into(),
+                    },
+                )];
+                events.insert(
+                    0,
+                    Event {
+                        generation: 1,
+                        session_key: Some(session.as_str().into()),
+                        turn: None,
+                        ts_ms: turn as i64,
+                        kind: EventKind::PromptSent(serde_json::json!({"content": []})),
+                    },
+                );
+                for _ in 0..100 {
+                    let mut chunk = kit::chunk(&session, 100);
+                    chunk.turn = Some(turn_id.as_str().into());
+                    if let EventKind::Update(envelope) = &mut chunk.kind {
+                        envelope.turn = chunk.turn.clone();
+                    }
+                    events.push(chunk);
+                }
+                for event in events {
+                    if global >= total {
+                        break;
+                    }
+                    global += 1;
+                    let seq = match &event.kind {
+                        EventKind::Update(_) => {
+                            let seq = seqs.entry(session.clone()).or_default();
+                            *seq += 1;
+                            Some(*seq)
+                        }
+                        _ => None,
+                    };
+                    let record = stamp(event, global, seq);
+                    let raw = serde_json::to_value(&record.event.kind).expect("json");
+                    let kind = raw["kind"].as_str().expect("kind").to_owned();
+                    let payload = serde_json::json!({"v":1,"event":raw}).to_string();
+                    insert
+                        .execute(params![
+                            global as i64,
+                            1,
+                            session,
+                            seq.map(|s| s as i64),
+                            kind,
+                            record.event.turn.as_ref().map(TurnId::as_str),
+                            record.event.ts_ms,
+                            payload
+                        ])
+                        .expect("insert");
+                }
+            }
+        }
+        tx.commit().expect("commit");
+    }
+
     /// A database made by the code before step B2 (for example by the load
     /// tool at the parent commit). Set `LOOP_B2_OLD_EVENTS_DB` to its path;
     /// the test copies it, opens the copy and checks the backfill.
@@ -1470,9 +2305,9 @@ mod tests {
         assert_matches_fold(&log).await;
         drop(log);
         let mut conn = Connection::open(dir.path().join("events.db")).expect("open");
-        let live = projection_rows(&conn);
+        let live = projection_rows_table(&conn);
         println!("sessions: {}", live.0.len());
         rebuild(&mut conn);
-        assert_eq!(projection_rows(&conn), live);
+        assert_eq!(projection_rows_table(&conn), live);
     }
 }

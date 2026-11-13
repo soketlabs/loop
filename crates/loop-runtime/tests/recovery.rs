@@ -508,6 +508,9 @@ impl EventLog for CrashBetweenChunks {
     async fn mark_recovered(&self, generation: u64, ms: i64) -> loop_runtime::log::Result<()> {
         self.inner.mark_recovered(generation, ms).await
     }
+    async fn sync(&self) -> loop_runtime::log::Result<()> {
+        self.inner.sync().await
+    }
     async fn read_session_page(
         &self,
         session: &loop_protocol::SessionKey,

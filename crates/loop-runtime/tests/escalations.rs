@@ -575,6 +575,9 @@ impl EventLog for DelayedDecision {
     ) -> loop_runtime::log::Result<()> {
         self.0.finish_generation(generation, stopped).await
     }
+    async fn sync(&self) -> loop_runtime::log::Result<()> {
+        self.0.sync().await
+    }
     async fn read_session_page(
         &self,
         session: &loop_protocol::SessionKey,
