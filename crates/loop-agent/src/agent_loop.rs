@@ -11,6 +11,10 @@ use loop_ai::{
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::harness::compaction::{
+    context_tokens, fixed_overhead, fixed_overhead_estimate, is_context_overflow_error,
+    should_compact, AutoCompactionError, CompactionTrigger,
+};
 use crate::stream_fn::{resolve_stream_fn, StreamFn};
 use crate::telemetry::{
     preflight_span, record_tool_result, tool_span, turn_span, GenerationObserver, RunObserver,
@@ -18,7 +22,8 @@ use crate::telemetry::{
 use crate::types::{
     AfterToolCallContext, AgentContext, AgentEvent, AgentEventSink, AgentLoopConfig,
     AgentLoopTurnUpdate, AgentMessage, AgentTool, AgentToolResult, AgentToolUpdateCallback,
-    BeforeToolCallContext, BeforeToolCallResult, ToolExecutionMode,
+    BeforeToolCallContext, BeforeToolCallResult, CompactionRequest, LoopCompaction,
+    ToolExecutionMode,
 };
 
 /// Observational event stream (Unpin).
@@ -302,6 +307,19 @@ async fn run_loop(
     let mut first_turn = true;
     let mut turn_index = 0u64;
     let mut length_continuations = 0u32;
+    let mut compaction = CompactionState {
+        usage_valid_from: config.compaction.as_ref().map_or(0, |c| c.usage_valid_from),
+        threshold_failed: false,
+        compactions: 0,
+        overhead_estimate: fixed_overhead_estimate(
+            &current_context.system_prompt,
+            &current_context
+                .tools
+                .as_ref()
+                .map(|ts| ts.iter().map(|t| t.to_llm_tool()).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        ),
+    };
     let mut pending_messages = if let Some(getter) = &config.get_steering_messages {
         getter().await
     } else {
@@ -341,10 +359,16 @@ async fn run_loop(
                 }
             }
 
-            let message =
-                stream_assistant_response(current_context, &config, cancel, emit, stream_fn)
-                    .instrument(turn.clone())
-                    .await;
+            let message = request_with_compaction(
+                current_context,
+                &config,
+                &mut compaction,
+                cancel,
+                emit,
+                stream_fn,
+            )
+            .instrument(turn.clone())
+            .await;
             new_messages.push(AgentMessage::assistant(message.clone()));
 
             if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
@@ -422,6 +446,8 @@ async fn run_loop(
                 {
                     if let Some(ctx) = context {
                         *current_context = ctx;
+                        // Usage on the replaced messages may not describe them.
+                        compaction.usage_valid_from = current_context.messages.len();
                     }
                     if let Some(model) = model {
                         config.model = model;
@@ -488,6 +514,235 @@ async fn run_loop(
     Ok(())
 }
 
+/// Automatic compaction state of one run.
+struct CompactionState {
+    /// Assistant usage before this context index predates a compaction.
+    usage_valid_from: usize,
+    /// Compaction before a request cannot help in this run (it failed, or
+    /// the window is too small): later requests do not try again. An
+    /// overflow still gets its one recovery.
+    threshold_failed: bool,
+    /// Automatic compactions in this run that asked the model for a
+    /// summary. Compactions that only shorten tool outputs are free; their
+    /// own rule stops them when they free too little.
+    compactions: u32,
+    /// Estimated tokens of the system prompt and tool definitions.
+    overhead_estimate: u64,
+}
+
+/// Most automatic compactions with a summary request in one run, so a
+/// context that compaction cannot shrink never pays for summaries without
+/// end.
+pub const MAX_COMPACTIONS_PER_RUN: u32 = 8;
+
+/// One model request, with automatic compaction around it:
+///
+/// - before the request, compact when the context is within the reserve of
+///   the window (a failure is a notice; the request is still sent);
+/// - when the provider refuses the request as too long, compact once and
+///   send it once more. If that compaction fails, or the retry overflows
+///   too, the turn ends with the error.
+///
+/// The response's `MessageEnd` is emitted only for the response that is
+/// kept, so a refused request never reaches the Session tree.
+async fn request_with_compaction(
+    context: &mut AgentContext,
+    config: &AgentLoopConfig,
+    state: &mut CompactionState,
+    cancel: Option<&CancellationToken>,
+    emit: &AgentEventSink,
+    stream_fn: &StreamFn,
+) -> AssistantMessage {
+    let Some(compaction) = config.compaction.as_ref().filter(|c| c.settings.enabled) else {
+        return stream_assistant_response(context, config, cancel, emit, stream_fn).await;
+    };
+    let window = config.model.context_window;
+
+    // An unknown window (0) has no threshold; overflow recovery still works.
+    if window > 0 && !state.threshold_failed && state.compactions < MAX_COMPACTIONS_PER_RUN {
+        let tokens = context_tokens(
+            &context.messages,
+            state.usage_valid_from,
+            &context.system_prompt,
+        );
+        if should_compact(tokens, window, &compaction.settings) {
+            match compact_context(
+                context,
+                config,
+                compaction,
+                state,
+                cancel,
+                emit,
+                CompactionTrigger::Threshold,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(AutoCompactionError::Cancelled) => {
+                    return finish_response(
+                        context,
+                        aborted_response(&config.model),
+                        false,
+                        false,
+                        emit,
+                    )
+                    .await;
+                }
+                // Nothing older to cut yet: later rounds may have some.
+                Err(AutoCompactionError::NothingToCompact) => {}
+                Err(error) => {
+                    state.threshold_failed = true;
+                    tracing::warn!(%error, "automatic compaction failed");
+                    emit_ev(
+                        emit,
+                        AgentEvent::Progress {
+                            message: format!("automatic compaction is off for this turn: {error}"),
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    let (message, pushed, announced) =
+        stream_attempt(context, config, cancel, emit, stream_fn).await;
+    if !is_context_overflow_error(&config.model, &message)
+        || cancel.is_some_and(CancellationToken::is_cancelled)
+    {
+        return finish_response(context, message, pushed, announced, emit).await;
+    }
+
+    // The refused request leaves no trace in the context.
+    if pushed {
+        context.messages.pop();
+    }
+    // Whether clients have an open message (a `MessageStart` of the newest
+    // attempt): the error then ends it rather than starting another.
+    let mut open = announced;
+    let failure = if state.compactions >= MAX_COMPACTIONS_PER_RUN {
+        let reason = message.error_message.clone().unwrap_or_default();
+        format!(
+            "The context is too long for the model and this turn already asked for {MAX_COMPACTIONS_PER_RUN} summaries: {reason}"
+        )
+    } else {
+        match compact_context(
+            context,
+            config,
+            compaction,
+            state,
+            cancel,
+            emit,
+            CompactionTrigger::Overflow,
+        )
+        .await
+        {
+            Ok(()) => {
+                let (retry, pushed, announced) =
+                    stream_attempt(context, config, cancel, emit, stream_fn).await;
+                if !is_context_overflow_error(&config.model, &retry) {
+                    return finish_response(context, retry, pushed, announced, emit).await;
+                }
+                let reason = retry.error_message.clone().unwrap_or_default();
+                if pushed {
+                    context.messages.pop();
+                }
+                open = announced;
+                format!(
+                    "The context is still too long for the model after automatic compaction: {reason}"
+                )
+            }
+            Err(AutoCompactionError::Cancelled) => {
+                return finish_response(
+                    context,
+                    aborted_response(&config.model),
+                    false,
+                    false,
+                    emit,
+                )
+                .await;
+            }
+            Err(error) => {
+                let reason = message.error_message.clone().unwrap_or_default();
+                format!(
+                    "The context is too long for the model and automatic compaction failed ({error}): {reason}"
+                )
+            }
+        }
+    };
+    let mut failed = message;
+    failed.stop_reason = StopReason::Error;
+    failed.error_message = Some(failure);
+    finish_response(context, failed, false, open, emit).await
+}
+
+/// Compact `context` through the run's [`CompactContextFn`] and report it.
+async fn compact_context(
+    context: &mut AgentContext,
+    config: &AgentLoopConfig,
+    compaction: &LoopCompaction,
+    state: &mut CompactionState,
+    cancel: Option<&CancellationToken>,
+    emit: &AgentEventSink,
+    trigger: CompactionTrigger,
+) -> Result<(), AutoCompactionError> {
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Err(AutoCompactionError::Cancelled);
+    }
+    let overhead = fixed_overhead(
+        &context.messages,
+        state.usage_valid_from,
+        state.overhead_estimate,
+    );
+    let window = config.model.context_window;
+    let reserve = compaction.settings.reserve_tokens;
+    if trigger == CompactionTrigger::Threshold && window > 0 && window <= reserve + overhead {
+        return Err(AutoCompactionError::WindowTooSmall {
+            window,
+            reserve,
+            overhead,
+        });
+    }
+    let outcome = (compaction.compact)(CompactionRequest {
+        messages: context.messages.clone(),
+        trigger,
+        model: config.model.clone(),
+        cancel: cancel.cloned(),
+        overhead_tokens: overhead,
+        emit: Some(Arc::clone(emit)),
+    })
+    .await?;
+    if outcome.summarized {
+        state.compactions += 1;
+    }
+    if trigger == CompactionTrigger::Overflow {
+        // The context changed: the threshold may help again.
+        state.threshold_failed = false;
+    }
+    context.messages = outcome.messages;
+    state.usage_valid_from = context.messages.len();
+    emit_ev(
+        emit,
+        AgentEvent::Progress {
+            message: format!(
+                "context compacted: ~{} to ~{} tokens",
+                outcome.tokens_before + overhead,
+                outcome.tokens_after + overhead
+            ),
+        },
+    )
+    .await;
+    Ok(())
+}
+
+/// The response of a request that a cancel stopped before it was sent.
+fn aborted_response(model: &loop_ai::Model) -> AssistantMessage {
+    let mut message = AssistantMessage::pending(model);
+    message.stop_reason = StopReason::Aborted;
+    message.error_message = Some("aborted".into());
+    message
+}
+
 async fn stream_assistant_response(
     context: &mut AgentContext,
     config: &AgentLoopConfig,
@@ -495,6 +750,61 @@ async fn stream_assistant_response(
     emit: &AgentEventSink,
     stream_fn: &StreamFn,
 ) -> AssistantMessage {
+    let (message, pushed, announced) =
+        stream_attempt(context, config, cancel, emit, stream_fn).await;
+    finish_response(context, message, pushed, announced, emit).await
+}
+
+/// Record the final response: in the context (replacing its streamed
+/// partial when `pushed`) and as `MessageEnd`, after a `MessageStart` unless
+/// one was `announced`.
+async fn finish_response(
+    context: &mut AgentContext,
+    final_message: AssistantMessage,
+    pushed: bool,
+    announced: bool,
+    emit: &AgentEventSink,
+) -> AssistantMessage {
+    if pushed {
+        if let Some(last) = context.messages.last_mut() {
+            *last = AgentMessage::assistant(final_message.clone());
+        }
+    } else {
+        context
+            .messages
+            .push(AgentMessage::assistant(final_message.clone()));
+    }
+    if !announced {
+        emit_ev(
+            emit,
+            AgentEvent::MessageStart {
+                message: AgentMessage::assistant(final_message.clone()),
+            },
+        )
+        .await;
+    }
+    emit_ev(
+        emit,
+        AgentEvent::MessageEnd {
+            message: AgentMessage::assistant(final_message.clone()),
+        },
+    )
+    .await;
+    final_message
+}
+
+/// Send one request and stream its response. Returns the final message,
+/// whether its partial was pushed to the context, and whether its
+/// `MessageStart` was sent. `MessageStart` waits for the first content, so a
+/// request refused before any content (a context-length error) shows no
+/// message; [`finish_response`] completes it.
+async fn stream_attempt(
+    context: &mut AgentContext,
+    config: &AgentLoopConfig,
+    cancel: Option<&CancellationToken>,
+    emit: &AgentEventSink,
+    stream_fn: &StreamFn,
+) -> (AssistantMessage, bool, bool) {
     let mut messages = context.messages.clone();
     if let Some(transform) = &config.transform_context {
         messages = transform(messages, cancel.cloned()).await;
@@ -542,6 +852,7 @@ async fn stream_assistant_response(
     let mut stream = response;
     let mut partial_message: Option<AssistantMessage> = None;
     let mut added_partial = false;
+    let mut announced = false;
 
     while let Some(event) = stream.next().await {
         generation.on_event(&event);
@@ -552,13 +863,6 @@ async fn stream_assistant_response(
                     .messages
                     .push(AgentMessage::assistant(partial.clone()));
                 added_partial = true;
-                emit_ev(
-                    emit,
-                    AgentEvent::MessageStart {
-                        message: AgentMessage::assistant(partial.clone()),
-                    },
-                )
-                .await;
             }
             AssistantMessageEvent::TextStart { partial, .. }
             | AssistantMessageEvent::TextDelta { partial, .. }
@@ -569,6 +873,16 @@ async fn stream_assistant_response(
             | AssistantMessageEvent::ToolcallStart { partial, .. }
             | AssistantMessageEvent::ToolcallDelta { partial, .. }
             | AssistantMessageEvent::ToolcallEnd { partial, .. } => {
+                if let Some(started) = partial_message.as_ref().filter(|_| !announced) {
+                    announced = true;
+                    emit_ev(
+                        emit,
+                        AgentEvent::MessageStart {
+                            message: AgentMessage::assistant(started.clone()),
+                        },
+                    )
+                    .await;
+                }
                 if partial_message.is_some() {
                     partial_message = Some(partial.clone());
                     if let Some(last) = context.messages.last_mut() {
@@ -590,30 +904,7 @@ async fn stream_assistant_response(
 
     let final_message = stream.result().await;
     generation.finish(&final_message);
-    if added_partial {
-        if let Some(last) = context.messages.last_mut() {
-            *last = AgentMessage::assistant(final_message.clone());
-        }
-    } else {
-        context
-            .messages
-            .push(AgentMessage::assistant(final_message.clone()));
-        emit_ev(
-            emit,
-            AgentEvent::MessageStart {
-                message: AgentMessage::assistant(final_message.clone()),
-            },
-        )
-        .await;
-    }
-    emit_ev(
-        emit,
-        AgentEvent::MessageEnd {
-            message: AgentMessage::assistant(final_message.clone()),
-        },
-    )
-    .await;
-    final_message
+    (final_message, added_partial, announced)
 }
 
 struct ExecutedToolCallBatch {

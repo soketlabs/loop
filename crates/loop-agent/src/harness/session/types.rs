@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::harness::types::SessionError;
-use crate::types::{AgentMessage, AgentThinkingLevel};
+use crate::types::{AgentMessage, AgentThinkingLevel, CustomAgentMessage};
 
 /// Session metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -486,22 +486,48 @@ impl Session {
 /// compaction entries without a retained range replace all prior messages.
 pub fn default_context_from_entries(entries: &[SessionTreeEntry]) -> SessionContext {
     let mut ctx = SessionContext::default();
+    // The entry behind each context message, for compactions that shorten
+    // tool outputs by entry.
+    let mut ids: Vec<&str> = Vec::new();
     for e in entries {
         match e {
             SessionTreeEntry::Compaction {
                 summary,
                 first_kept_entry_id,
+                details,
                 ..
             } => {
+                // Tool outputs the compaction shortened stay shortened.
+                crate::harness::compaction::apply_shortened(
+                    &mut ctx.messages,
+                    &ids,
+                    details.as_ref(),
+                );
                 if first_kept_entry_id.is_none() {
                     ctx.messages.clear();
+                    ids.clear();
+                }
+                // A compaction whose kept part reaches back past an earlier
+                // compaction summarized that earlier summary too.
+                if matches!(
+                    ctx.messages.first(),
+                    Some(AgentMessage::Custom(
+                        CustomAgentMessage::CompactionSummary { .. }
+                    ))
+                ) {
+                    ctx.messages.remove(0);
+                    ids.remove(0);
                 }
                 ctx.messages.insert(
                     0,
                     crate::messages::create_compaction_summary_message(summary),
                 );
+                ids.insert(0, e.id());
             }
-            SessionTreeEntry::Message { message, .. } => ctx.messages.push(message.clone()),
+            SessionTreeEntry::Message { message, .. } => {
+                ctx.messages.push(message.clone());
+                ids.push(e.id());
+            }
             SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => {
                 ctx.thinking_level = *thinking_level;
             }
@@ -516,6 +542,7 @@ pub fn default_context_from_entries(entries: &[SessionTreeEntry]) -> SessionCont
             SessionTreeEntry::BranchSummary { summary, .. } => {
                 ctx.messages
                     .push(crate::messages::create_branch_summary_message(summary));
+                ids.push(e.id());
             }
             _ => {}
         }
