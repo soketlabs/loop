@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::harness::sandbox::protect::ProtectedBind;
-use crate::harness::sandbox::traits::SandboxError;
+use crate::harness::sandbox::SandboxError;
 use crate::harness::types::{ExecutionError, ExecutionErrorCode, ShellOutput};
 
 /// Options for `podman run`.
@@ -968,7 +968,7 @@ exec "$@"
             let dir = tempfile::tempdir().unwrap();
             let (program, log) = fake_podman(dir.path());
             let client = RealPodmanClient::with_program(&program);
-            let mut opts = shell(command, (!cancel).then_some(1500));
+            let opts = shell(command, (!cancel).then_some(1500));
             if cancel {
                 let token = opts.cancel.clone().unwrap();
                 tokio::spawn(async move {

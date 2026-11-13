@@ -2279,6 +2279,7 @@ dependencies = [
  "loop-protocol",
  "loop-telemetry",
  "loop-test-support",
+ "loop-workspace",
  "mime_guess",
  "opentelemetry_sdk",
  "parking_lot",
@@ -2597,6 +2598,33 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "loop-workspace"
+version = "0.6.0"
+dependencies = [
+ "async-trait",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "loop-workspace-testkit"
+version = "0.6.0"
+dependencies = [
+ "async-trait",
+ "loop-agent",
+ "loop-workspace",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
