@@ -182,6 +182,57 @@ pub fn resolve(
     RuntimeToolLock::new(lock, &root).map(Some)
 }
 
+/// One locked Session's folder and the lock root, both as they resolved
+/// when the Session opened. Every check compares against these stored
+/// paths and never resolves the folder again to decide what is inside: a
+/// folder replaced by a link after it opened must not move the boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Confinement {
+    folder: PathBuf,
+    root: PathBuf,
+}
+
+impl Confinement {
+    /// `folder`, which must be the root or inside it, both resolved now.
+    pub fn new(folder: &Path, root: &Path) -> Result<Self, ToolLockError> {
+        let outside = || ToolLockError::OutsideRoot {
+            cwd: folder.to_path_buf(),
+        };
+        let root = root.canonicalize().map_err(|_| outside())?;
+        let folder = folder.canonicalize().map_err(|_| outside())?;
+        if !folder.starts_with(&root) {
+            return Err(outside());
+        }
+        Ok(Self { folder, root })
+    }
+
+    /// The Session's folder, as it resolved when the Session opened.
+    pub fn folder(&self) -> &Path {
+        &self.folder
+    }
+
+    /// Whether the folder or the root no longer resolves to itself: one of
+    /// them, or a folder above, was replaced by a link. Every call of the
+    /// Session is then refused.
+    pub fn moved(&self) -> bool {
+        super::policy::resolve(&self.folder).as_deref() != Some(self.folder.as_path())
+            || super::policy::resolve(&self.root).as_deref() != Some(self.root.as_path())
+    }
+
+    /// Whether a locked read of `path` stays inside the folder: the folder
+    /// has not moved, and `path` with symlinks and `..` resolved is inside
+    /// the stored folder and root and is not a hard-linked file.
+    pub fn allows(&self, path: &Path) -> bool {
+        if self.moved() {
+            return false;
+        }
+        let Some(real) = super::policy::resolve(path) else {
+            return false;
+        };
+        real.starts_with(&self.folder) && real.starts_with(&self.root) && !hard_linked(&real)
+    }
+}
+
 /// Whether a locked read of `path` stays inside `folder`: the path, with
 /// symlinks and `..` resolved, is in the folder, and it is not a file with
 /// more than one hard link (a hard link to a file outside the folder looks
@@ -315,6 +366,31 @@ mod tests {
         ] {
             assert!(lock.admit(&cwd).is_err(), "{}", cwd.display());
         }
+    }
+
+    /// Review N1: a folder swapped for a link after the Session opened
+    /// does not move the boundary; every check refuses.
+    #[cfg(unix)]
+    #[test]
+    fn a_swapped_folder_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("alice");
+        let sub = root.join("sub");
+        let bob = base.join("bob");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&bob).unwrap();
+        std::fs::write(sub.join("mine.txt"), "m").unwrap();
+        std::fs::write(bob.join("diary.txt"), "b").unwrap();
+        let confined = Confinement::new(&sub, &root).unwrap();
+        assert!(confined.allows(&sub.join("mine.txt")));
+        assert!(!confined.moved());
+        std::fs::rename(&sub, root.join("sub-old")).unwrap();
+        std::os::unix::fs::symlink(&bob, &sub).unwrap();
+        assert!(confined.moved());
+        assert!(!confined.allows(&sub.join("diary.txt")));
+        assert!(!confined.allows(&sub));
+        assert!(Confinement::new(&bob, &root).is_err());
     }
 
     #[cfg(unix)]

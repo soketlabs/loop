@@ -224,7 +224,14 @@ impl WorkspaceResources {
                 opts.system_prompt.as_deref(),
                 opts.append_system_prompt.as_deref(),
             );
-        let host: Arc<dyn ExecutionEnv> = Arc::new(HostExecutionEnv::new(&cwd));
+        let host: Arc<dyn ExecutionEnv> = if globals.tool_lock().is_some() {
+            // Each file read is checked on the opened file itself, so a path
+            // changed into a link between the gate's check and the open is
+            // refused.
+            Arc::new(HostExecutionEnv::new(&cwd).confine_reads(cwd.clone()))
+        } else {
+            Arc::new(HostExecutionEnv::new(&cwd))
+        };
         let web = crate::web_tools::WebTools::from_settings(
             &settings,
             Some(Arc::clone(&globals.credentials)),
@@ -773,8 +780,14 @@ impl SessionFactory {
             crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
             &workspace.cwd,
         );
-        if let Some(lock) = globals.tool_lock() {
-            tool_gate.lock_tools(lock);
+        if let Some(lock) = globals.tool_lock_config() {
+            tool_gate.lock_tools(lock.lock());
+            // The folder and root as they resolve now: later checks compare
+            // against these, so a folder swapped for a link is refused.
+            tool_gate.confine(crate::permissions::tool_lock::Confinement::new(
+                &workspace.cwd,
+                lock.root(),
+            )?);
         }
         let mut tools = build_tools(
             Arc::clone(&tool_env),

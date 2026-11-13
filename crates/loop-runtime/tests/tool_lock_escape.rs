@@ -189,6 +189,7 @@ fn attacker(seen: Arc<Mutex<Seen>>) -> loop_ai::providers::FauxResponder {
                     "grep",
                     json!({"pattern": "BOBSECRET", "path": "sub", "hidden": true}),
                 ),
+                call(9, "read", json!({"path": "diary.txt"})),
             ])
         };
         Box::pin(std::future::ready(r))
@@ -244,7 +245,7 @@ async fn reads_never_leave_the_folder() {
     turn(&rt, &session).await;
     {
         let s = seen.lock().unwrap();
-        assert_eq!(s.results.len(), 9, "{:#?}", s.results);
+        assert_eq!(s.results.len(), 10, "{:#?}", s.results);
         for (tool, _, text) in &s.results {
             assert!(!text.contains("BOBSECRET"), "`{tool}` leaked: {text}");
         }
@@ -288,6 +289,33 @@ async fn reads_never_leave_the_folder() {
     .await
     .unwrap();
     assert!(!format!("{skills:?}").contains("BOBSECRET"), "{skills:?}");
+    let _ = tokio::time::timeout(Duration::from_secs(5), rt.shutdown()).await;
+}
+
+/// Review N1: a Session folder that is admitted, then replaced by a link
+/// to another user's folder, does not move the boundary. Every call of the
+/// Session is refused and nothing of bob's is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_swapped_after_open_does_not_escape() {
+    let w = world();
+    let sub = w.alice.join("sub");
+    std::fs::write(sub.join("mine.txt"), "MINE\n").unwrap();
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let rt = locked(&w, seen.clone()).await;
+    let session = rt.new_session(spec(&sub)).await.unwrap();
+    // Through an upload: rename the folder and put a link to bob's there.
+    std::fs::rename(&sub, w.alice.join("sub-old")).unwrap();
+    std::os::unix::fs::symlink(&w.bob, &sub).unwrap();
+    turn(&rt, &session).await;
+    {
+        let s = seen.lock().unwrap();
+        assert_eq!(s.results.len(), 10, "{:#?}", s.results);
+        for (tool, is_error, text) in &s.results {
+            assert!(!text.contains("BOBSECRET"), "`{tool}` leaked: {text}");
+            assert!(is_error, "`{tool}` ran in a moved folder: {text}");
+            assert!(text.contains("moved or replaced"), "`{tool}`: {text}");
+        }
+    }
     let _ = tokio::time::timeout(Duration::from_secs(5), rt.shutdown()).await;
 }
 

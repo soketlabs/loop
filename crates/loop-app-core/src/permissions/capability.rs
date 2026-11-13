@@ -119,7 +119,11 @@ impl Scope {
                     None if call.tool == "read" => return false,
                     None => ".",
                 };
-                super::tool_lock::inside_folder(&call.cwd.join(path), &call.cwd)
+                let target = call.cwd.join(path);
+                match &call.confinement {
+                    Some(confined) => confined.allows(&target),
+                    None => super::tool_lock::inside_folder(&target, &call.cwd),
+                }
             }
         }
     }

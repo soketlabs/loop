@@ -91,6 +91,9 @@ pub struct ToolGate {
     /// over the Policy on every check ([`Self::effective_policy`]), so
     /// [`Self::set_policy`] cannot drop it.
     tool_lock: std::sync::OnceLock<crate::permissions::tool_lock::ToolLock>,
+    /// Under a tool lock: the Session's folder and root as they resolved
+    /// when it opened. Set once; every path check compares against it.
+    confinement: std::sync::OnceLock<Arc<crate::permissions::tool_lock::Confinement>>,
 }
 
 /// See [`ToolGate::set_mode_recorder`].
@@ -173,6 +176,22 @@ impl ToolGate {
     /// The tool lock in force, if any.
     pub fn tool_lock(&self) -> Option<crate::permissions::tool_lock::ToolLock> {
         self.tool_lock.get().copied()
+    }
+
+    /// Bind a locked gate's reads to `confinement` for good. A second one
+    /// is ignored; the first one stays.
+    pub fn confine(&self, confinement: crate::permissions::tool_lock::Confinement) {
+        let _ = self.confinement.set(Arc::new(confinement));
+        self.allowed.lock().clear();
+    }
+
+    /// Whether a locked gate may let a read of `path` through: inside the
+    /// stored folder and root. A locked gate without a confinement refuses.
+    fn locked_read_ok(&self, path: &std::path::Path) -> bool {
+        match self.confinement.get() {
+            Some(confined) => confined.allows(path),
+            None => false,
+        }
     }
 
     /// The Policy every check uses: the one set, with the tool lock's layer
@@ -286,6 +305,16 @@ impl ToolGate {
     /// What the mode and the Policy say about a call, before hooks and the
     /// approver.
     pub async fn decide(&self, tool: &str, args: &serde_json::Value) -> Decision {
+        if let Some(confined) = self.confinement.get() {
+            if confined.moved() {
+                return Decision::Deny(format!(
+                    "`{tool}` is refused: this Session's folder {} was moved or replaced \
+                     after the Session opened, so the tool lock refuses every call of this \
+                     Session. Open a new Session.",
+                    confined.folder().display()
+                ));
+            }
+        }
         let call = self.call(tool, args).await;
         self.effective_policy()
             .decide(self.mode(), &self.rules(), &call)
@@ -297,6 +326,7 @@ impl ToolGate {
         let kind = self.kind(tool).await;
         Call {
             rule_bases: self.rule_bases.lock().clone(),
+            confinement: self.confinement.get().cloned(),
             ..Call::resolve_in(tool, kind, args, &workspace, &cwd)
         }
     }
@@ -404,9 +434,7 @@ impl ToolGate {
             // Under a tool lock every walked entry must resolve inside the
             // Session's folder: a symlink or hard link out is hidden, and a
             // walk never enters a linked folder outside.
-            if gate.tool_lock().is_some()
-                && !crate::permissions::tool_lock::inside_folder(path, &cwd)
-            {
+            if gate.tool_lock().is_some() && !gate.locked_read_ok(path) {
                 return false;
             }
             let bases = gate.rule_bases.lock().clone();

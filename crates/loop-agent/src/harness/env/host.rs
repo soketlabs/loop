@@ -19,6 +19,9 @@ use crate::harness::utils::sanitize_binary_output;
 /// Local filesystem + shell execution environment.
 pub struct HostExecutionEnv {
     cwd: PathBuf,
+    /// Under a tool lock: the folder every file read must stay in, checked
+    /// on the opened file ([`HostExecutionEnv::confine_reads`]).
+    confined: Option<PathBuf>,
 }
 
 impl HostExecutionEnv {
@@ -26,7 +29,21 @@ impl HostExecutionEnv {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         let cwd = cwd.into();
         let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
-        Self { cwd }
+        Self {
+            cwd,
+            confined: None,
+        }
+    }
+
+    /// Refuse every file read whose opened file is not a regular file with
+    /// one link inside `folder` (resolved now). The check runs on the open
+    /// file, not on its path, so a path that turns into a link to a file
+    /// outside between a caller's check and the open is refused. On a
+    /// platform where Loop cannot name an open file's path, every read is
+    /// refused.
+    pub fn confine_reads(mut self, folder: PathBuf) -> Self {
+        self.confined = Some(std::fs::canonicalize(&folder).unwrap_or(folder));
+        self
     }
 
     /// Create rooted at the process current directory.
@@ -45,6 +62,84 @@ impl HostExecutionEnv {
         };
         FileError::new(code, err.to_string())
     }
+}
+
+/// Read `path` only if the file actually opened is a regular file with one
+/// link inside `folder`.
+async fn read_confined(path: PathBuf, folder: PathBuf) -> Result<Vec<u8>, FileError> {
+    tokio::task::spawn_blocking(move || read_confined_now(&path, &folder))
+        .await
+        .map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))?
+}
+
+fn read_confined_now(path: &Path, folder: &Path) -> Result<Vec<u8>, FileError> {
+    use std::io::Read;
+    let outside = || {
+        FileError::new(
+            FileErrorCode::PermissionDenied,
+            format!(
+                "{} is outside this Session's folder, or is a link: the tool lock refuses it",
+                path.display()
+            ),
+        )
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A FIFO or device must not block the read.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).map_err(HostExecutionEnv::map_io)?;
+    let meta = file.metadata().map_err(HostExecutionEnv::map_io)?;
+    if !meta.is_file() {
+        return Err(outside());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            return Err(outside());
+        }
+    }
+    match opened_path(&file) {
+        Some(real) if real.starts_with(folder) => {}
+        _ => return Err(outside()),
+    }
+    let mut bytes = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(HostExecutionEnv::map_io)?;
+    Ok(bytes)
+}
+
+/// The path of the file `file` has open, as the kernel names it.
+#[cfg(target_os = "macos")]
+fn opened_path(file: &std::fs::File) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::AsRawFd;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize + 1];
+    // SAFETY: `buf` holds PATH_MAX + 1 bytes, as F_GETPATH needs, and the
+    // descriptor stays open for the call.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+    if rc == -1 {
+        return None;
+    }
+    let len = buf.iter().position(|b| *b == 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+}
+
+/// The path of the file `file` has open, as the kernel names it.
+#[cfg(target_os = "linux")]
+fn opened_path(file: &std::fs::File) -> Option<PathBuf> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+}
+
+/// Loop cannot name an open file's path here, so a confined read fails.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn opened_path(_file: &std::fs::File) -> Option<PathBuf> {
+    None
 }
 
 #[async_trait]
@@ -67,11 +162,20 @@ impl FileSystem for HostExecutionEnv {
 
     async fn read_text_file(&self, path: &Path) -> Result<String, FileError> {
         let path = self.absolute_path(path)?;
+        if let Some(folder) = &self.confined {
+            let bytes = read_confined(path, folder.clone()).await?;
+            return String::from_utf8(bytes).map_err(|_| {
+                FileError::new(FileErrorCode::Io, "stream did not contain valid UTF-8")
+            });
+        }
         tokio::fs::read_to_string(&path).await.map_err(Self::map_io)
     }
 
     async fn read_binary_file(&self, path: &Path) -> Result<Vec<u8>, FileError> {
         let path = self.absolute_path(path)?;
+        if let Some(folder) = &self.confined {
+            return read_confined(path, folder.clone()).await;
+        }
         tokio::fs::read(&path).await.map_err(Self::map_io)
     }
 
@@ -561,5 +665,48 @@ mod tests {
     async fn commands_do_not_read_loops_stdin() {
         let out = run("cat; echo end", Some(5_000), None).await.unwrap();
         assert_eq!(out.stdout.trim(), "end");
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod confined_tests {
+    use super::*;
+
+    /// The check runs on the opened file: a link out, a hard link and a
+    /// FIFO are refused even when nothing checked the path first.
+    #[tokio::test]
+    async fn a_confined_read_checks_the_opened_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let ws = base.join("ws");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::write(ws.join("own.txt"), "OWN").unwrap();
+        std::fs::write(base.join("secret.txt"), "SECRET").unwrap();
+        std::os::unix::fs::symlink(base.join("secret.txt"), ws.join("link.txt")).unwrap();
+        std::fs::hard_link(base.join("secret.txt"), ws.join("hard.txt")).unwrap();
+        let env = HostExecutionEnv::new(&ws).confine_reads(ws.clone());
+        assert_eq!(
+            env.read_text_file(Path::new("own.txt")).await.unwrap(),
+            "OWN"
+        );
+        for path in ["link.txt", "hard.txt", "../secret.txt", "sub"] {
+            let error = env.read_binary_file(Path::new(path)).await.unwrap_err();
+            assert_ne!(error.code, FileErrorCode::NotFound, "{path}: {error:?}");
+        }
+        // The folder swapped for a link after the env was made.
+        std::fs::rename(ws.join("sub"), base.join("sub-old")).unwrap();
+        std::fs::create_dir_all(base.join("bob")).unwrap();
+        std::fs::write(base.join("bob/diary.txt"), "BOB").unwrap();
+        std::os::unix::fs::symlink(base.join("bob"), ws.join("sub")).unwrap();
+        assert!(env
+            .read_text_file(Path::new("sub/diary.txt"))
+            .await
+            .is_err());
+        // Unconfined, the same reads work.
+        let open = HostExecutionEnv::new(&ws);
+        assert_eq!(
+            open.read_text_file(Path::new("link.txt")).await.unwrap(),
+            "SECRET"
+        );
     }
 }
