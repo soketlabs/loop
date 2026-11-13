@@ -142,6 +142,142 @@ async fn websocket_clients_list_attach_and_cannot_call_host_methods() {
     }).await;
 }
 
+/// At least 32 bytes, as the Runtime requires of an edge token.
+const EDGE_SECRET: &str = "edge-secret-token-edge-secret-token-0123";
+
+#[tokio::test]
+async fn an_edge_gateway_names_the_user_and_each_token_opens_only_its_listener() {
+    bounded(async {
+        use loop_protocol::rpc::{methods, InitializeResult};
+        use loop_protocol::{Caller, Principal, PrincipalKind, Tenant};
+        use loop_wire::{Connection, Incoming};
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let fx = Fixture::new();
+        let private = fx.home.join("edge");
+        std::fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
+        let token_file = private.join("edge.token");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&token_file)
+            .unwrap();
+        std::fs::write(&token_file, format!("{EDGE_SECRET}\n")).unwrap();
+        let edge_flags = [
+            "--unstable-edge-listen",
+            "127.0.0.1:0",
+            "--unstable-edge-token-file",
+            token_file.to_str().unwrap(),
+        ];
+        // Without a tool lock the edge listener is refused at start.
+        let mut args = vec!["runtime", "start", "--listen", "127.0.0.1:0"];
+        args.extend_from_slice(&edge_flags);
+        let refused = fx.command(&args).output().await.unwrap();
+        assert!(!refused.status.success());
+        let error = String::from_utf8_lossy(&refused.stderr);
+        assert!(error.contains("needs --tool-lock chat"), "{error}");
+        let root = fx.work.to_str().unwrap().to_owned();
+        let mut args = vec!["--listen", "127.0.0.1:0", "--tool-lock", "chat", "--tool-lock-root", &root];
+        args.extend_from_slice(&edge_flags);
+        let serve = fx.serve_with(&args).await;
+        serve.wait_text("Edge Gateway listener on ws://").await;
+        let output = serve.output();
+        let edge_url = output
+            .split("Edge Gateway listener on ")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .unwrap()
+            .trim()
+            .to_owned();
+        let local = fx.client().await;
+        let status = serde_json::to_value(local.status().await.unwrap()).unwrap();
+        let user_url = status["listen_url"].as_str().unwrap().to_owned();
+        let runtime_token = std::fs::read_to_string(fx.agent.join("run/runtime.token")).unwrap();
+
+        // Each token opens only its own listener.
+        let refused = loop_wire::socket::websocket_connect(&edge_url, runtime_token.trim()).await;
+        assert_eq!(refused.err().map(|e| e.kind()), Some(std::io::ErrorKind::PermissionDenied));
+        let refused = loop_wire::socket::websocket_connect(&user_url, EDGE_SECRET).await;
+        assert_eq!(refused.err().map(|e| e.kind()), Some(std::io::ErrorKind::PermissionDenied));
+
+        // The gateway names a user; initialize reports that user.
+        let principal =
+            Principal::new(PrincipalKind::Person, "https://idp.example", "user-1").unwrap();
+        let caller = Caller::asserted(principal, Tenant::new("acme").unwrap()).unwrap();
+        let transport =
+            loop_wire::socket::websocket_connect_edge(&edge_url, EDGE_SECRET, &caller)
+                .await
+                .unwrap();
+        let (conn, mut incoming) = Connection::new(transport);
+        let resolver = conn.clone();
+        tokio::spawn(async move {
+            while let Some(message) = incoming.recv().await {
+                if let Incoming::Response { id, result } = message {
+                    resolver.resolve(id, result).await;
+                }
+            }
+            resolver.fail_pending().await;
+        });
+        let initialized = conn
+            .request(
+                methods::INITIALIZE,
+                json!({"protocol_version": 1, "client_info": {"name": "gateway", "version": "0"},
+                       "tenant": "local", "principal": {"kind": "person", "issuer": "local", "id": "uid:0"}}),
+            )
+            .await
+            .unwrap();
+        let result: InitializeResult = serde_json::from_value(initialized).unwrap();
+        assert_eq!(result.principal.as_ref(), Some(caller.principal()));
+        assert_eq!(result.tenant.as_ref(), Some(caller.tenant()));
+        assert_eq!(result.via.unwrap().as_str(), "edge");
+        assert!(result.capabilities.tool_lock.is_some());
+        // An edge user never runs shell commands on the Runtime host.
+        let made = conn
+            .request(methods::SESSION_NEW, json!({}))
+            .await
+            .unwrap();
+        let shell = conn
+            .request(methods::SESSION_SHELL, json!({"session": made, "command": "id"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(shell, loop_wire::RpcError::Remote { code, .. }
+                if code == loop_protocol::rpc::error_codes::FORBIDDEN),
+            "{shell:?}"
+        );
+        conn.close();
+
+        // The ordinary WebSocket is the local user via the token.
+        let transport = loop_wire::socket::websocket_connect(&user_url, runtime_token.trim())
+            .await
+            .unwrap();
+        let (conn, mut incoming) = Connection::new(transport);
+        let resolver = conn.clone();
+        tokio::spawn(async move {
+            while let Some(message) = incoming.recv().await {
+                if let Incoming::Response { id, result } = message {
+                    resolver.resolve(id, result).await;
+                }
+            }
+            resolver.fail_pending().await;
+        });
+        let initialized = conn
+            .request(
+                methods::INITIALIZE,
+                json!({"protocol_version": 1, "client_info": {"name": "ws", "version": "0"}}),
+            )
+            .await
+            .unwrap();
+        let result: InitializeResult = serde_json::from_value(initialized).unwrap();
+        assert_eq!(result.principal, Some(loop_wire::local_principal()));
+        assert_eq!(result.tenant, Some(Tenant::local()));
+        assert_eq!(result.via.unwrap().as_str(), "token");
+        conn.close();
+        serve.stop().await;
+    })
+    .await;
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn seatbelt_cannot_read_the_running_websocket_listeners_token() {

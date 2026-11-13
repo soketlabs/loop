@@ -204,6 +204,16 @@ struct LiveSession {
     /// A sandbox chosen during a turn, started and waiting for the turn to
     /// end; the running tool calls keep the one they started in.
     pending_sandbox: Mutex<Option<admin::PendingSandbox>>,
+    /// The caller whose request last LOADED this Session into memory: the
+    /// one that created, forked, cloned or imported it, or the one whose
+    /// load, attach or prompt reloaded it after an unload. A Subagent copies
+    /// its parent's. `None` for an in-process call, and after a restart until
+    /// a caller reloads it. In memory only.
+    ///
+    /// It is NOT the Session's owner and must never be used for
+    /// authorization: another caller's reload replaces it. Ownership comes
+    /// from a record stored when the Session is created (later work).
+    loaded_by: Option<loop_protocol::Caller>,
 }
 /// What the pump has committed and published of one Session. The pump is
 /// the only writer of a loaded Session's updates, so `published` and
@@ -524,6 +534,17 @@ impl Runtime {
         self.close_grace = grace;
         self
     }
+    /// The caller whose request last loaded the live Session `key`
+    /// (ADR-0009), or `None` when it is not loaded or was loaded in process.
+    /// Not the owner: never use it for authorization (see `LiveSession`).
+    pub fn loaded_by(&self, key: &SessionKey) -> Option<loop_protocol::Caller> {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sessions.get(key).and_then(|live| live.loaded_by.clone())
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }
