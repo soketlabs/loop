@@ -81,7 +81,9 @@ Values of the built-in drivers:
 |---|---|---|---|---|---|---|
 | `host` | none | confined only with `confineReads` (tool lock) | not confined | no | not enforced | output 1 MiB |
 | `seatbelt` | partial | not confined (credentials denied) | confined | yes | `sandbox.network` (allowed or denied) | output 1 MiB |
-| `podman` | full or partial | confined | confined | yes | not enforced (Linux does not enforce `sandbox.network` yet) | CPU, memory from options |
+| `podman` | full or partial | confined | confined | yes | not enforced (Linux does not enforce `sandbox.network` or `sandbox.allowWrite` yet; linux-live-check) | CPU, memory from options |
+
+The `podman` values are from the code, not from a kit run: the kit did not run on Linux in C1.
 
 ## 4. Paths
 
@@ -102,8 +104,8 @@ Values of the built-in drivers:
 | git | Workspace | It is a command on Workspace files. Credentials for push come through a Connector, not the Workspace |
 | Skills scripts (scripts that a skill tells the model to run) | Workspace | They are commands |
 | Skill and context file *reading* (`AGENTS.md`, `SKILL.md`, `.loop/`) | Through `FileSystem` of the Workspace (C2) | The files are in the project. Today they are read with `std::fs` on the host |
-| Project hooks (`.loop/` hooks) | Workspace (C3) | A project hook is project code. On the host it escapes the sandbox |
-| Global hooks (user settings) | Runtime host | The user wrote them; they may need host tools. Unchanged |
+| Project hooks (`.loop/hooks/*.json`, collected in `resources/mod.rs` ~159) | Workspace (C3) | A project hook is project code. On the host it escapes the sandbox. Today `load_hooks` merges project and global hook files into one list; C3 must keep the origin of each hook |
+| Global hooks (`<agent dir>/hooks/*.json`) | Runtime host | The user wrote them; they may need host tools. Unchanged |
 | MCP stdio servers of the project | Workspace (C3) | Project code |
 | MCP servers that are Connectors (they hold credentials) | Runtime side | ADR 0006: Connectors run outside the Workspace; credentials never enter it |
 | Document reader child (`loop __doc-to-text`) | Runtime host, fed bytes read through `env()` | Already so. Bytes come through the Workspace; the parser has no keys, no network use and strict limits |
@@ -115,9 +117,9 @@ Values of the built-in drivers:
 | Item | Where it applies | Rule for drivers |
 |---|---|---|
 | Tool env policy (`removed_tool_env_names`, `tools.passEnv`) | `SessionExecutionEnv` in loop-agent wraps `env()` | The driver must honour `ShellExecOptions.env` and `inherit_env = false` exactly (the kit checks it). `spawn` is a new path around this wrapper: C4/C5 must add a Session wrapper that applies the same split to `SpawnRequest` before it reaches the driver. A driver with `own_environment` keeps only its allowlist, and `tools.passEnv` does not apply (as now) |
-| Protected paths (`protect.rs`) | Inside the Podman backend | A driver that mounts the project must keep `.git`, `.loop` and the agent folder read-only. The remote driver gets the list in the spec options and enforces it in the guest |
+| Protected paths (`protect.rs`; Seatbelt has the same rules) | Inside the Podman and Seatbelt backends | Shell commands must not write the project `.loop`, git config, git hooks and pointers, and the `core.hooksPath` folder (Podman makes them read-only bind mounts, with placeholders for missing paths). A remote driver gets the same list and enforces it in the guest |
 | Permission gate | Runtime, before the tool call | Unchanged. The gate never depends on the driver. A driver refusal is a second layer |
-| Tool lock (`--tool-lock chat`) | Session factory: sandbox off, `HostExecutionEnv::confine_reads` | Unchanged in C1. The `host` driver with option `confineReads` gives the same env, and the kit runs it. C4 may route the lock through it. A remote driver under a lock must report `confines_reads` or be refused |
+| Tool lock (`--tool-lock chat`) | Two layers. (1) The permission gate: `permissions::tool_lock::Confinement` (folder and lock root, resolved once at open) in `tool_gate.rs` refuses tools and paths before the call. (2) The env: sandbox off and `HostExecutionEnv::confine_reads` check the opened file | Layer 1 is Runtime side and does not depend on the driver. Layer 2 is a driver property (`confines_reads`). Unchanged in C1. The `host` driver with option `confineReads` gives the same env, and the kit runs it. C4 may route the lock through it. A remote driver under a lock must report `confines_reads` or be refused |
 | `sandbox.mode` | Selects the kind: `off` → no driver (host env as now), `local` → kind `local` | C5 adds `remote` |
 | `sandbox.network` | Spec option `network` | Seatbelt enforces it; Podman reports `not_enforced`. A remote driver must enforce it through the egress proxy |
 | `sandbox.allowWrite`, `allowRead`, `denyHomeReads` | Spec options | Host paths. A remote driver ignores them and says so in `info()` |
@@ -217,13 +219,13 @@ Runs in this repository: `host`, `host` with `confineReads`, the tool env policy
 
 ## 14. Migration
 
-Each task can run in parallel with the others, because the file sets do not overlap.
+Order: C2 and C4 can start now, in parallel. C3 needs `Workspace::spawn` and the Session env wrapper for it from C4, so C3 starts after C4 lands that part (or C3 lands its code behind the `Unsupported` fallback: run on the host as now when `spawn` is unsupported). C5 starts after C4. The contract crate `crates/core/loop-workspace` is owned by C4; C2, C3 and C5 ask C4 for contract changes. Shared files: `config/settings.rs` (C4 adds `sandbox.driver`, C5 adds `mode = remote`: C5 rebases on C4), `session_factory.rs` sandbox part (C4, then C5). Protocol methods for files and terminal (`loop-protocol`) are not in C2-C5; a separate protocol task uses `WorkspacePath`.
 
 | Task | Work | Files it owns |
 |---|---|---|
-| **C2** Remove local-path assumptions | Stop using `env.cwd()` as a host path: `tools/mod.rs` ~229 (document reader child gets `env.cwd()` as its working folder) and ~633 (relative `cwd` join is fine; keep it in the namespace), `tools/mod.rs` ~431 `through_link` (uses `canonical_path` through `env`: keep, document), `search.rs` ~308, `documents/mod.rs` ~171 and ~182 (pass a host temp folder to the child, not the Workspace root). Read context files (`system_prompt.rs` ~187-275) and skills (`skills.rs` `load_skills`, `loop-app-core/src/resources/mod.rs` ~105) through `FileSystem`. Add `WorkspacePath` where the protocol names files | `crates/loop-agent/src/harness/tools/**`, `crates/loop-app-core/src/system_prompt.rs`, `crates/loop-agent/src/harness/skills.rs`, `crates/loop-app-core/src/resources/**` |
+| **C2** Remove local-path assumptions | Stop using `env.cwd()` as a host path: `tools/mod.rs` ~229 and `documents/mod.rs` ~171, ~182 (the reader child gets `env.cwd()` as `workspace`; `documents/child.rs` uses it only to refuse a reader binary that lies inside the Workspace, and runs the child in the host temp folder. For a remote driver pass `None`: the reader cannot be inside a remote Workspace) and ~633 (relative `cwd` join is fine; keep it in the namespace), `tools/mod.rs` ~431 `through_link` (uses `canonical_path` through `env`: keep, document), `search.rs` ~308 (relative paths of results are made from `cwd`; keep it in the driver namespace and never walk it with host APIs). Read context files (`system_prompt.rs` ~187-275) and skills (`skills.rs` `load_skills`, `loop-app-core/src/resources/mod.rs` ~105) through `FileSystem`. Add `WorkspacePath` where the protocol names files | `crates/loop-agent/src/harness/tools/**`, `crates/loop-app-core/src/system_prompt.rs`, `crates/loop-agent/src/harness/skills.rs`, `crates/loop-app-core/src/resources/**` |
 | **C3** Hooks and MCP stdio in the Workspace | Project hooks (`loop-app-core/src/hook_command.rs` ~63 spawns on the host) and project MCP stdio servers (`loop-mcp/src/client.rs` ~122) start through `Workspace::spawn` when a Workspace is on. Global hooks and Connector MCP servers stay on the Runtime side | `crates/loop-app-core/src/hook_command.rs`, `hooks_load.rs`, `crates/loop-mcp/**` |
-| **C4** Local drivers on the trait | Implement `spawn` (and PTY) and chunked transfer for `host`, `seatbelt`, `podman`. Add a Session wrapper that applies the tool env policy to `spawn`. Add the `worktree` driver. Route sandbox-off through the `host` driver, the tool lock through `host` with `confineReads`. Add `sandbox.driver` if chosen (Q1) | `crates/loop-agent/src/harness/sandbox/**`, `env/**`, `crates/loop-app-core/src/sandbox_builder.rs`, `session_factory.rs` (sandbox part) |
+| **C4** Local drivers on the trait | Implement `spawn` (and PTY) and chunked transfer for `host`, `seatbelt`, `podman`. Host `read_chunk` must go through the `confine_reads` check. `TaggedSandbox` does not implement `Workspace` yet; add it. Fix the Podman timeout and cancel defects D2 and D3 of `docs/probes/linux-live-check.md`, which the kit check `exec_timeout_and_cancel` will find. Add a Session wrapper that applies the tool env policy to `spawn`. Add the `worktree` driver. Route sandbox-off through the `host` driver, the tool lock through `host` with `confineReads`. Add `sandbox.driver` if chosen (Q1) | `crates/loop-agent/src/harness/sandbox/**`, `env/**`, `crates/loop-app-core/src/sandbox_builder.rs`, `session_factory.rs` (sandbox part) |
 | **C5** Reference remote driver | A `remote` driver: `ExecutionEnv` and `Workspace` over a socket, plus a small agent binary in the sandbox (`exec`, files, spawn, transfer). `attach` after restart. `sandbox.mode = remote`. Run the kit against it in CI with a local container as the "remote" | New crates `crates/extend/loop-workspace-remote` and `…-agent`, `crates/loop-app-core/src/config/settings.rs` (mode value) |
 
 ## 15. Open questions
@@ -236,4 +238,5 @@ Each task can run in parallel with the others, because the file sets do not over
 | Q4 | Do project MCP servers run in the Workspace even when they need the network? | Yes; they get the Workspace network policy. A server that needs credentials must be a Connector |
 | Q5 | Global registry or explicit injection for external drivers? | Both: `register_workspace_driver` for binaries, `SandboxBuilder::new(platform, registry)` for tests and embedders |
 | Q6 | Memory snapshots (processes survive sleep)? | Files only for Loop web stage 1. Add a capability flag when a driver can do it |
-| Q7 | `remote` driver transport? | The Runtime connects out to the sandbox agent over a Unix or vsock socket in the pod; no inbound port. Reuse `loop-wire` framing |
+| Q7 | `remote` driver transport? | In the cluster, the Runtime cell connects to the sandbox agent (a socket inside the pod network; the sandbox has no route out except the egress proxy). This is separate from the ADR 0008 control link, where the Runtime dials out to the Edge Gateway. Reuse `loop-wire` framing |
+| Q8 | How does an external `local` driver replace the built-in one? | Today selection takes the first `local` driver, so an external one wins only if it reuses the id `podman` or `seatbelt`. With Q1, `sandbox.driver` names it directly |

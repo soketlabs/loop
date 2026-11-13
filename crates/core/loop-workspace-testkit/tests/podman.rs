@@ -1,19 +1,19 @@
 //! The conformance suite against the Podman driver. It needs Podman and a
-//! container image, so it runs only on Linux with
+//! container image, so it runs only on a platform the driver supports
+//! (Linux) and only with
 //! `LOOP_WORKSPACE_KIT_PODMAN=1`. Optional: `LOOP_WORKSPACE_KIT_RUNTIME`
 //! (`runc`, `crun`, `runsc` or `krun`; default `runc`) and
 //! `LOOP_WORKSPACE_KIT_ISOLATION` (`full` or `partial`; default `full`).
 
-#![cfg(target_os = "linux")]
-
 mod common;
 
-use loop_agent::harness::sandbox::{podman_driver, WorkspaceSpec};
+use loop_agent::harness::sandbox::{podman_driver, HostOs, WorkspaceSpec};
 use loop_workspace_testkit::{run_all, DriverFixture};
 use serde_json::json;
 
 fn enabled() -> bool {
     std::env::var("LOOP_WORKSPACE_KIT_PODMAN").as_deref() == Ok("1")
+        && podman_driver().supports(HostOs::current())
 }
 
 fn fixture() -> DriverFixture {
