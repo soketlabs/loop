@@ -809,3 +809,52 @@ async fn a_later_compaction_replaces_an_earlier_summary() {
     assert_eq!(ids[0], c2.id());
     assert_eq!(ids[1], a.id());
 }
+
+/// A `keepRecentTokens` larger than the model's window still frees room:
+/// the kept part is limited to half the usable window.
+#[tokio::test]
+async fn a_keep_budget_above_the_window_still_compacts() {
+    let mut s = settings();
+    s.keep_recent_tokens = 20_000;
+    let f = fixture(s).await;
+    f.provider.push(std::iter::repeat_n(Reply::Tool, 24));
+    f.provider.push([Reply::Text("all done")]);
+    let answer = f.harness.prompt("run big").await.unwrap();
+    assert_eq!(answer.as_assistant().unwrap().stop_reason, StopReason::Stop);
+    assert!(f.provider.summary_requests() >= 1);
+    for r in f.provider.main_requests() {
+        assert!(r.tokens <= WINDOW, "a request of {} tokens", r.tokens);
+        assert_pairs(&r.messages);
+    }
+}
+
+/// `abort` stops a manual compaction's summary request; nothing is written.
+#[tokio::test]
+async fn abort_stops_a_manual_compaction() {
+    let f = fixture(settings()).await;
+    for i in 0..3 {
+        f.harness
+            .prompt(long(&format!("turn {i}"), 600))
+            .await
+            .unwrap();
+    }
+    let before = f.harness.read_session_entries().await.unwrap().len();
+    f.provider.summaries.lock().push_back(SummaryReply::Hang);
+    let started = Arc::clone(&f.provider.started);
+    let harness = Arc::clone(&f.harness);
+    let compact = tokio::spawn(async move { harness.compact(None).await });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("the summary request started");
+    f.harness.abort();
+    let result = tokio::time::timeout(Duration::from_secs(5), compact)
+        .await
+        .expect("the compaction stopped")
+        .unwrap();
+    assert!(result.unwrap_err().to_string().contains("cancelled"));
+    assert_eq!(
+        f.harness.read_session_entries().await.unwrap().len(),
+        before
+    );
+    f.harness.prompt("still works").await.unwrap();
+}

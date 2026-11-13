@@ -1102,8 +1102,16 @@ impl AgentHarness {
 
         let model = self.require_model().await?;
         let options = self.stream_options.read().await.clone();
-        // Not part of a turn: `abort` does not reach it, dropping the call does.
+        // `abort` cancels the summary request, as it cancels a turn.
         let cancel = CancellationToken::new();
+        *self.cancel.lock() = Some(cancel.clone());
+        struct ClearCancel<'a>(&'a AgentHarness);
+        impl Drop for ClearCancel<'_> {
+            fn drop(&mut self) {
+                self.0.cancel.lock().take();
+            }
+        }
+        let _clear = ClearCancel(self);
         let (summary, usage) = summarize(
             &self.hooks,
             &self.stream_fn,

@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     compaction_details, estimate_agent_messages_tokens, find_auto_cut_point, has_user_message,
     latest_user_text, request_summary, summary_with_request, AutoCompactionError,
-    CompactionSettings,
+    CompactionSettings, CompactionTrigger,
 };
 use crate::harness::hooks::{HarnessHookEvent, HookRegistry};
 use crate::harness::session::types::{PendingSessionWrite, SessionTreeEntry};
@@ -245,15 +245,23 @@ impl TurnCompactor {
                 "a context message has no model message".into(),
             ));
         }
+        let tokens_before = estimate_agent_messages_tokens(&messages);
         let usable = request
             .model
             .context_window
             .saturating_sub(self.settings.reserve_tokens);
-        let cut = find_auto_cut_point(&llm, self.settings.keep_recent_tokens, usable / 2);
+        // Keep at most half the usable window, so a `keep_recent_tokens` near
+        // or above a small model's window still frees room. After an
+        // overflow the provider's real limit is below the estimate: keep at
+        // most half the context.
+        let mut keep = self.settings.keep_recent_tokens.min(usable / 2);
+        if request.trigger == CompactionTrigger::Overflow {
+            keep = keep.min(tokens_before / 2);
+        }
+        let cut = find_auto_cut_point(&llm, keep, usable / 2);
         if cut == 0 {
             return Err(AutoCompactionError::NothingToCompact);
         }
-        let tokens_before = estimate_agent_messages_tokens(&messages);
         let (summary, usage) = summarize(
             &self.hooks,
             &self.stream_fn,
