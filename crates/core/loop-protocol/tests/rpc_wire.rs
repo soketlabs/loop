@@ -936,6 +936,25 @@ fn forbidden_error_and_admin_capabilities_wire() {
 }
 
 #[test]
+fn tool_locked_error_wire() {
+    use loop_protocol::rpc::{error_codes, RpcErrorBody};
+    use loop_protocol::{BackendError, ToolLock};
+    let error = BackendError::ToolLocked {
+        what: "session/shell".into(),
+        lock: ToolLock::Chat,
+    };
+    let body = RpcErrorBody::from(&error);
+    assert_eq!(error_codes::TOOL_LOCKED, -32007);
+    assert_eq!(
+        serde_json::to_value(&body).unwrap(),
+        json!({"code":-32007,
+            "message":"session/shell is off: this Runtime runs with the `chat` tool lock",
+            "data":{"what":"session/shell","lock":"chat"}})
+    );
+    assert_eq!(body.into_backend_error(), error);
+}
+
+#[test]
 fn skill_and_workflow_requests_and_progress_have_stable_wire_shapes() {
     use loop_protocol::session_services::*;
     let session =

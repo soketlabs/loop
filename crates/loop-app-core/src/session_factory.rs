@@ -11,6 +11,10 @@ pub struct GlobalResources {
     pub models: Arc<Models>,
     pub sessions_db: PathBuf,
     pub repository: SessionRepository,
+    /// The Runtime's tool lock, fixed for the life of the process: every
+    /// workspace and Session built from these resources is locked
+    /// ([`crate::permissions::tool_lock`]).
+    tool_lock: Option<crate::permissions::tool_lock::ToolLock>,
 }
 
 impl GlobalResources {
@@ -61,6 +65,20 @@ impl GlobalResources {
         Self::from_parts(agent_dir, credentials, models)
     }
 
+    /// These resources with the Runtime's tool lock. Call it before the
+    /// resources are shared: no later call can remove the lock.
+    pub fn with_tool_lock(mut self, lock: Option<crate::permissions::tool_lock::ToolLock>) -> Self {
+        if self.tool_lock.is_none() {
+            self.tool_lock = lock;
+        }
+        self
+    }
+
+    /// The tool lock in force for every Session, if any.
+    pub fn tool_lock(&self) -> Option<crate::permissions::tool_lock::ToolLock> {
+        self.tool_lock
+    }
+
     fn from_parts(
         agent_dir: PathBuf,
         credentials: Arc<FileCredentialStore>,
@@ -75,6 +93,7 @@ impl GlobalResources {
             models,
             sessions_db,
             repository: create_session_repository(store, None),
+            tool_lock: None,
         })
     }
 }
@@ -153,7 +172,11 @@ impl WorkspaceResources {
         if settings.sandbox.mode != "local" {
             settings.sandbox.mode = "off".into();
         }
-        let resources = load_resources(&globals.agent_dir, &cwd, project_trusted, &settings);
+        let mut resources = load_resources(&globals.agent_dir, &cwd, project_trusted, &settings);
+        let mut locked_notices = Vec::new();
+        if let Some(lock) = globals.tool_lock {
+            locked_notices = lock_workspace(lock, &mut settings, &mut resources);
+        }
         let hooks = crate::hooks_load::load_hooks(&resources.hook_paths);
         let context_files = if opts.no_context_files {
             vec![]
@@ -179,8 +202,12 @@ impl WorkspaceResources {
         let mcp_client = Arc::new(loop_mcp::McpClientManager::with_oauth_dir(
             globals.agent_dir.join("mcp-auth"),
         ));
-        let entries =
-            enabled_mcp_server_entries(&settings.mcp_servers, &settings.disabled_mcp_servers);
+        let entries = if globals.tool_lock.is_some() {
+            // No MCP server starts or connects under a tool lock.
+            Vec::new()
+        } else {
+            enabled_mcp_server_entries(&settings.mcp_servers, &settings.disabled_mcp_servers)
+        };
         if !entries.is_empty() {
             for (name, result) in mcp_client.connect_all(&entries).await {
                 match result {
@@ -190,6 +217,7 @@ impl WorkspaceResources {
             }
         }
         let mut startup_notices = settings.project_notices.clone();
+        startup_notices.extend(locked_notices);
         if !standalone && !project_trusted {
             startup_notices.push(format!(
                 "Workspace {} has no recorded trust; using global settings and resources only",
@@ -367,6 +395,8 @@ impl OpenedSession {
             bash_limits,
             self.tool_gate.search_filter(),
         );
+        let lock = self.tool_gate.tool_lock();
+        retain_locked(lock, &mut tools);
         let snippets = default_tool_snippets();
         let selected: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         let system_prompt = build_system_prompt(BuildSystemPromptOptions {
@@ -384,6 +414,7 @@ impl OpenedSession {
             .await,
         );
         tools.extend(kept);
+        retain_locked(lock, &mut tools);
         harness
             .set_tools(tools)
             .await
@@ -403,6 +434,60 @@ impl OpenedSession {
         notices.extend(workspace.startup_notices.iter().cloned());
         Ok(notices)
     }
+}
+
+/// Keep only the tools `lock` offers; all of them without a lock.
+fn retain_locked(
+    lock: Option<crate::permissions::tool_lock::ToolLock>,
+    tools: &mut Vec<loop_agent::AgentTool>,
+) {
+    if let Some(lock) = lock {
+        tools.retain(|tool| crate::permissions::tool_lock::offers(lock, &tool.name));
+    }
+}
+
+/// Take out of a workspace what can start a process or reach past the
+/// lock without a tool call: hooks, Rhai extensions, skills that run code,
+/// and private web addresses. MCP servers are not started (see
+/// `load_resolved`). Returns the notices for the Session.
+fn lock_workspace(
+    lock: crate::permissions::tool_lock::ToolLock,
+    settings: &mut Settings,
+    resources: &mut LoadedResources,
+) -> Vec<String> {
+    use crate::permissions::tool_lock::skill_runs_code;
+    let mut notices = vec![format!(
+        "Tool lock `{lock}`: this Runtime offers only reading files in the workspace and \
+         the web tools. Shell, file changes, Subagents, workflows, MCP servers and hooks are \
+         off."
+    )];
+    resources.hook_paths.clear();
+    resources.extension_paths.clear();
+    let before = resources.skills.len() + resources.disabled_skills.len();
+    resources.skills.retain(|skill| !skill_runs_code(skill));
+    resources
+        .disabled_skills
+        .retain(|skill| !skill_runs_code(skill));
+    let dropped = before - resources.skills.len() - resources.disabled_skills.len();
+    if dropped > 0 {
+        notices.push(format!(
+            "Tool lock `{lock}`: {dropped} skill(s) with scripts or other files that are not \
+             text are off"
+        ));
+    }
+    if !settings.mcp_servers.is_empty() {
+        notices.push(format!(
+            "Tool lock `{lock}`: {} MCP server(s) are not started",
+            settings.mcp_servers.len()
+        ));
+    }
+    if let Some(fetch) = settings.web_fetch.as_mut() {
+        fetch.allow_private_addresses = false;
+    }
+    if let Some(search) = settings.web_search.as_mut() {
+        search.allow_private_addresses = false;
+    }
+    notices
 }
 
 impl SessionFactory {
@@ -654,12 +739,18 @@ impl SessionFactory {
             crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
             &workspace.cwd,
         );
-        let tools = build_tools(
+        if let Some(lock) = globals.tool_lock {
+            tool_gate.lock_tools(lock);
+        }
+        let mut tools = build_tools(
             Arc::clone(&tool_env),
             &workspace.web,
             bash_limits,
             tool_gate.search_filter(),
         );
+        // Not built, so the prompt never names them; the gate's tool filter
+        // and its check also remove and refuse them ([`ToolGate::available`]).
+        retain_locked(globals.tool_lock, &mut tools);
 
         // The prompt lists the tools that were actually built (web_search may be
         // unconfigured), so it can never promise a tool the agent cannot call.
@@ -703,6 +794,9 @@ impl SessionFactory {
             .await;
 
         let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
+        if let Some(lock) = globals.tool_lock {
+            native.lock_tools(lock);
+        }
         native.set_default_effort(default_effort);
         native.set_default_model(default_model);
 
@@ -739,6 +833,7 @@ impl SessionFactory {
         if !mcp_tools.is_empty() {
             let mut all_tools = harness.get_tools().await;
             all_tools.extend(mcp_tools);
+            retain_locked(globals.tool_lock, &mut all_tools);
             harness
                 .set_tools(all_tools)
                 .await
@@ -820,6 +915,73 @@ impl SessionFactory {
             .await
             .insert(cwd, Arc::new(OnceCell::new_with(Some(Arc::clone(&fresh)))));
         Ok((fresh, old))
+    }
+}
+
+#[cfg(test)]
+mod tool_lock_tests {
+    use super::*;
+
+    /// Global settings cannot widen the lock: hooks, extensions, skills
+    /// with scripts and private web addresses are taken out.
+    #[test]
+    fn a_locked_workspace_drops_what_starts_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = |name: &str, script: bool| {
+            let root = dir.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("SKILL.md"), "x").unwrap();
+            if script {
+                std::fs::write(root.join("run.sh"), "x").unwrap();
+            }
+            loop_agent::harness::types::Skill {
+                name: name.into(),
+                description: String::new(),
+                body: String::new(),
+                path: root.join("SKILL.md"),
+                disable_model_invocation: false,
+            }
+        };
+        let mut resources = LoadedResources {
+            skills: vec![skill("text", false), skill("script", true)],
+            disabled_skills: vec![skill("off-script", true)],
+            hook_paths: vec![dir.path().join("h.json")],
+            extension_paths: vec![dir.path().join("e.rhai")],
+            ..Default::default()
+        };
+        let mut settings: Settings = serde_json::from_value(serde_json::json!({
+            "webFetch": {"allowPrivateAddresses": true},
+            "webSearch": {"allowPrivateAddresses": true},
+            "mcpServers": {"s": {"command": "sh"}}
+        }))
+        .unwrap();
+        let notices = lock_workspace(
+            crate::permissions::tool_lock::ToolLock::Chat,
+            &mut settings,
+            &mut resources,
+        );
+        assert!(resources.hook_paths.is_empty() && resources.extension_paths.is_empty());
+        let names: Vec<_> = resources.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["text"]);
+        assert!(resources.disabled_skills.is_empty());
+        assert!(!settings.web_fetch.unwrap().allow_private_addresses);
+        assert!(!settings.web_search.unwrap().allow_private_addresses);
+        assert_eq!(notices.len(), 3, "{notices:?}");
+    }
+
+    #[test]
+    fn only_offered_tools_are_built() {
+        let mut tools = vec![
+            loop_agent::harness::tools::create_todo_tool(),
+            loop_agent::harness::tools::create_exit_plan_tool(),
+        ];
+        retain_locked(None, &mut tools);
+        assert_eq!(tools.len(), 2);
+        retain_locked(
+            Some(crate::permissions::tool_lock::ToolLock::Chat),
+            &mut tools,
+        );
+        assert!(tools.is_empty());
     }
 }
 

@@ -655,6 +655,8 @@ pub mod error_codes {
     pub const CONFLICT: i64 = -32005;
     /// [`crate::BackendError::Forbidden`]; data is the method name.
     pub const FORBIDDEN: i64 = -32006;
+    /// [`crate::BackendError::ToolLocked`]; data is `{"what": …, "lock": …}`.
+    pub const TOOL_LOCKED: i64 = -32007;
 }
 
 /// A JSON-RPC error: code, message and optional data.
@@ -689,6 +691,10 @@ impl From<&BackendError> for RpcErrorBody {
             BackendError::Forbidden(method) => {
                 (error_codes::FORBIDDEN, Some(Value::from(method.as_str())))
             }
+            BackendError::ToolLocked { what, lock } => (
+                error_codes::TOOL_LOCKED,
+                Some(serde_json::json!({ "what": what, "lock": lock })),
+            ),
         };
         Self {
             code,
@@ -723,6 +729,11 @@ impl RpcErrorBody {
             error_codes::FORBIDDEN => {
                 BackendError::Forbidden(data.as_str().unwrap_or(&self.message).to_owned())
             }
+            error_codes::TOOL_LOCKED => BackendError::ToolLocked {
+                what: data["what"].as_str().unwrap_or(&self.message).to_owned(),
+                lock: serde_json::from_value(data["lock"].clone())
+                    .unwrap_or(crate::ToolLock::Unknown),
+            },
             _ => BackendError::failed(ErrorCategory::Protocol, self.message),
         }
     }

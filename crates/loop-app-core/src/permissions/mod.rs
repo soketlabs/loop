@@ -24,12 +24,14 @@
 //! - [`rules`]: `toolPermissions` patterns and bash command splitting.
 //! - [`policy`]: [`decide`], a function of the mode, the rules and a
 //!   [`Call`] the gate resolved first.
+//! - [`tool_lock`]: the Runtime's tool lock as the top Policy layer.
 
 pub mod capability;
 pub mod layers;
 pub mod mode;
 pub mod policy;
 pub mod rules;
+pub mod tool_lock;
 
 pub use capability::{Capability, Scope, Setting, State};
 pub use layers::{Ceiling, Layer, LayerSource, Policy};

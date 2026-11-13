@@ -87,6 +87,9 @@ pub enum Scope {
     ReadOnlyCommands,
     /// MCP tools their server marks read-only (`readOnlyHint`).
     ReadOnlyHint,
+    /// Calls whose `path` (default: the cwd) resolves inside the workspace,
+    /// symlinks and `..` followed. For reads under a tool lock.
+    InsideWorkspace,
 }
 
 impl Scope {
@@ -108,6 +111,10 @@ impl Scope {
                         .is_some_and(read_only_command)
             }
             Self::ReadOnlyHint => call.kind == ToolKind::Read,
+            Self::InsideWorkspace => {
+                let path = call.path().unwrap_or(".");
+                super::inside_workspace(&call.cwd.join(path).to_string_lossy(), &call.workspace)
+            }
         }
     }
 }
@@ -120,6 +127,8 @@ impl Scope {
             Self::Workspace => matches!(call.tool.as_str(), "write" | "edit"),
             Self::ReadOnlyCommands => call.tool == "bash",
             Self::ReadOnlyHint => self.contains(call),
+            // The path is not known before the call.
+            Self::InsideWorkspace => true,
         }
     }
 }

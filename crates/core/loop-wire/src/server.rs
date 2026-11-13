@@ -255,6 +255,14 @@ async fn run(
                             capabilities.host_usage = offered.host_usage && host;
                             capabilities.host_defaults = offered.host_defaults && host;
                             capabilities.runtime_stop_empty = offered.runtime_stop_empty && host;
+                            // A tool lock holds on every connection: the
+                            // client can hide what it turns off. The backend
+                            // still refuses those calls itself.
+                            capabilities.tool_lock = offered.tool_lock;
+                            if capabilities.tool_lock.is_some() {
+                                capabilities.local_shell = false;
+                                capabilities.workflow = false;
+                            }
                             let result = InitializeResult {
                                 protocol_version: negotiate(params.protocol_version),
                                 server_info: info.clone(),

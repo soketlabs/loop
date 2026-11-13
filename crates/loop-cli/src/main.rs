@@ -172,6 +172,13 @@ enum RuntimeCommand {
         /// `runtime.maxActiveTurns` in settings.json, else 8].
         #[arg(long)]
         max_active_turns: Option<usize>,
+        /// Lock the tools of every Session for the life of the Runtime.
+        /// `chat`: only reading files in the workspace and the web tools; no
+        /// shell, file changes, Subagents, workflows, MCP servers or hooks.
+        /// Nothing can widen it [default: the `LOOP_TOOL_LOCK` environment
+        /// variable, else no lock].
+        #[arg(long, value_name = "LOCK")]
+        tool_lock: Option<String>,
     },
     /// Ask the running Runtime to stop, through its socket, and wait up to
     /// 10 s for it to go. Never signals a process.
@@ -374,6 +381,7 @@ async fn real_main() -> anyhow::Result<()> {
                         socket,
                         max_sessions,
                         max_active_turns,
+                        tool_lock,
                     } => {
                         let cwd = match &cli.cwd {
                             Some(cwd) => std::path::absolute(cwd)?,
@@ -387,6 +395,7 @@ async fn real_main() -> anyhow::Result<()> {
                             max_active_turns: *max_active_turns,
                             permission_mode: cli.permission_mode.clone(),
                             cwd,
+                            tool_lock: tool_lock.clone(),
                         })
                         .await
                     }
@@ -813,6 +822,11 @@ mod tests {
         };
         assert_eq!(socket, Some(PathBuf::from("/tmp/x.sock")));
         assert_eq!((max_sessions, max_active_turns), (Some(3), Some(2)));
+        let cli = parse(&["loop", "runtime", "start", "--tool-lock", "chat"]);
+        let Some(Commands::Runtime(RuntimeCommand::Start { tool_lock, .. })) = cli.command else {
+            panic!("not runtime start")
+        };
+        assert_eq!(tool_lock.as_deref(), Some("chat"));
         let cli = parse(&["loop", "runtime", "stop", "--socket", "/tmp/x.sock"]);
         assert!(matches!(
             cli.command,

@@ -228,6 +228,17 @@
           "description": "Runs commands through Loop's terminal instead of its own.",
           "type": "boolean"
         },
+        "tool_lock": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolLock"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The Runtime's tool lock (`loop runtime start --tool-lock`), when it\nhas one. It holds for every Session for the life of the Runtime: a\nclient can hide the shell, file edits and workflows."
+        },
         "usage": {
           "default": false,
           "description": "Reports token usage.",
@@ -4156,6 +4167,21 @@
         "path"
       ],
       "type": "object"
+    },
+    "ToolLock": {
+      "description": "A Runtime-wide tool lock: a fixed set of tools for every Session, which\nno setting, Session option or permission mode can widen.",
+      "oneOf": [
+        {
+          "const": "chat",
+          "description": "Chat only: reading files in the Session's workspace and the web\ntools. No shell, file writes, Subagents, workflows, MCP servers or\nhooks.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "A lock this reader does not know. Treat it as locking everything.",
+          "type": "string"
+        }
+      ]
     },
     "TracingParams": {
       "description": "Host telemetry operation; setup payloads may contain credentials.",

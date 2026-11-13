@@ -15,6 +15,7 @@ fn serve(agent: &Path, args: &[&str]) -> Command {
         .env("LOOP_CODING_AGENT_SESSION_DIR", agent.join("sessions"))
         .env_remove("LOOP_DEBUG")
         .env_remove("RUST_LOG")
+        .env_remove("LOOP_TOOL_LOCK")
         .current_dir(agent)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -252,6 +253,70 @@ async fn a_client_connects_through_remote_backend() {
     assert!(status.success());
 }
 
+#[tokio::test]
+async fn an_unknown_tool_lock_stops_startup() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for (flag, env) in [(Some("chatt"), None), (None, Some("CHAT"))] {
+            let (_dir, agent) = agent_dir();
+            let mut cmd = serve(&agent, &[]);
+            if let Some(flag) = flag {
+                cmd.args(["--tool-lock", flag]);
+            }
+            if let Some(env) = env {
+                cmd.env("LOOP_TOOL_LOCK", env);
+            }
+            let output = cmd.output().await.unwrap();
+            assert!(!output.status.success());
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains("unknown tool lock"), "{error}");
+            assert!(!agent.join("run/runtime.pid").exists());
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// `LOOP_TOOL_LOCK=chat` locks the Runtime: `initialize` advertises it and
+/// hides the shell and workflows, and `loop runtime status` shows it.
+#[tokio::test]
+async fn the_tool_lock_from_the_environment_is_advertised() {
+    use loop_protocol::{AgentBackend, HostServices};
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let (_dir, agent) = agent_dir();
+        let socket = agent.join("run/runtime.sock");
+        let mut child = serve(&agent, &[])
+            .env("LOOP_TOOL_LOCK", "chat")
+            .spawn()
+            .unwrap();
+        wait_for(&socket, &mut child).await;
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let backend = loop_wire::RemoteBackend::connect(
+            loop_wire::socket::unix(stream),
+            loop_protocol::rpc::PeerInfo {
+                name: "test".into(),
+                version: "0".into(),
+            },
+            std::sync::Arc::new(NoHost) as std::sync::Arc<dyn HostServices>,
+        )
+        .await
+        .unwrap();
+        let offered = backend.capabilities();
+        assert_eq!(offered.tool_lock, Some(loop_protocol::ToolLock::Chat));
+        assert!(!offered.local_shell && !offered.workflow);
+        drop(backend);
+        let output = run(&agent, &["runtime", "status"]).await;
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("tool lock: chat"), "{text}");
+        let output = run(&agent, &["runtime", "status", "--json"]).await;
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["tool_lock"], "chat");
+        signal(&child, "-TERM");
+        child.wait().await.unwrap();
+    })
+    .await
+    .expect("test timed out");
+}
+
 struct NoHost;
 #[async_trait::async_trait]
 impl loop_protocol::HostServices for NoHost {
@@ -301,6 +366,7 @@ fn loop_cmd(agent: &Path, args: &[&str]) -> Command {
         .env("LOOP_CODING_AGENT_SESSION_DIR", agent.join("sessions"))
         .env_remove("LOOP_DEBUG")
         .env_remove("RUST_LOG")
+        .env_remove("LOOP_TOOL_LOCK")
         .current_dir(agent)
         .stdin(Stdio::null())
         .kill_on_drop(true);

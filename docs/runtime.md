@@ -109,6 +109,7 @@ running after you close the terminal, use your usual tool, such as `nohup`,
 | `--max-active-turns N` | `runtime.maxActiveTurns`, else 8 | Most turns running at once. More turns wait in a queue; they are not refused |
 | `--permission-mode MODE` | from settings | `read-only`, `ask`, `accept-edits`, `full-access` or `plan` |
 | `--cwd DIR` | current folder | Folder for Sessions that name none |
+| `--tool-lock LOCK` | `LOOP_TOOL_LOCK`, else off | `chat`: lock the tools of every Session for the life of the Runtime. See [Tool lock](#tool-lock) |
 
 The two limits can also be set in the global `~/.loop/agent/settings.json`
 (a project's settings cannot change them, since one Runtime serves many
@@ -130,6 +131,52 @@ Only one Runtime can use an agent directory, or a Session database, at a time.
 A second `loop runtime start` exits with `a Runtime is already running (pid N)`, or
 with `another Runtime already owns the Session database at …` when only the
 Session database is shared.
+
+### Tool lock
+
+`--tool-lock chat` (or `LOOP_TOOL_LOCK=chat` in the Runtime's environment)
+is for a host that runs Runtimes of many users side by side and must not let
+any of them run commands or change files. The flag wins over the variable.
+An empty variable means no lock. Any other value stops
+`loop runtime start` with ``unknown tool lock `…` ``, so a typo never starts a
+Runtime without its lock.
+
+With the `chat` lock, every Session of the Runtime:
+
+- is offered only `read`, `grep`, `glob`, `ls` (documents included, through
+  `read`), `web_fetch` and `web_search`. Every other tool is not sent to the
+  model at all: `bash`, `write`, `edit`, `subagent`, `todo`, `exit_plan`, the
+  workflow tools and every MCP tool. A tool that a later version adds is off
+  too, unless the lock names it. If a call to a removed tool arrives anyway,
+  the gate refuses it.
+- reads only inside its workspace (the git root of its folder, or the
+  folder). A path that leads out, also through a symlink or `..`, is
+  refused.
+- starts no MCP server (stdio or remote), loads no hooks and no Rhai
+  extensions, and has no skill whose folder holds anything but text files
+  (`.md`, `.markdown`, `.txt`). Prompt templates are text and stay.
+- can't fetch or search private addresses, even if `allowPrivateAddresses`
+  is set.
+- refuses `session/shell` and `session/workflow` with the typed error
+  `ToolLocked` (JSON-RPC code `-32007`, data
+  `{"what": "session/shell", "lock": "chat"}`).
+
+Nothing widens the lock: not the global or a project's `settings.json`
+(`permissionMode`, `toolPermissions` allow rules, `mcpServers`, hooks,
+`tools.passEnv`), not Session options, not `session/permission_mode` (also
+`full-access` and `plan`), not the `workspace/*` setters or
+`workspace/reload`, and not a skill. It holds until the Runtime stops.
+
+The lock is the top Policy layer (see [permissions](permissions.md)): it
+turns off the shell, file writes and other tools, and offers only the tools
+it names. Clients see it in `initialize`: `capabilities.tool_lock` is `"chat"`,
+and `local_shell` and `workflow` are false, so a client can hide those
+controls. `loop runtime status` shows `tool lock: chat` (`"tool_lock"` with
+`--json`).
+
+The lock does not isolate the process. The Runtime still reads documents in
+its own child process, and it still runs as one operating-system user: use
+the sandbox, or one container per user, for that.
 
 ### Check and stop it
 
