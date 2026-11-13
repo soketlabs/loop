@@ -291,6 +291,14 @@ pub struct Settings {
     /// folders). A command-line flag overrides each.
     #[serde(default, skip_serializing_if = "RuntimeSettings::is_empty")]
     pub runtime: RuntimeSettings,
+    /// `tools` settings (global only; see [`ToolsSettings`]).
+    #[serde(default, skip_serializing_if = "ToolsSettings::is_empty")]
+    pub tools: ToolsSettings,
+    /// Notices about project settings that Loop ignored. Set by
+    /// [`Settings::merge_project`]; never read from or written to a file.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub project_notices: Vec<String>,
     /// Top-level keys the file this value was loaded from names. `None` for a
     /// value built in code or parsed from a string: `merge_project` then
     /// treats a key as set when it differs from its default.
@@ -298,6 +306,23 @@ pub struct Settings {
     #[serde(skip)]
     #[doc(hidden)]
     pub explicit_keys: Option<BTreeSet<String>>,
+}
+
+/// `tools` settings. Global only: a project settings file cannot set them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolsSettings {
+    /// Environment variable names that stay in the environment of the `bash`
+    /// tool and `!shell` commands, although Loop removes provider keys and
+    /// Runtime tokens by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pass_env: Vec<String>,
+}
+
+impl ToolsSettings {
+    fn is_empty(&self) -> bool {
+        self.pass_env.is_empty()
+    }
 }
 
 /// `runtime` settings. Values are kept as written and checked when the
@@ -424,6 +449,8 @@ impl Default for Settings {
             providers: Vec::new(),
             agents: Vec::new(),
             runtime: RuntimeSettings::default(),
+            tools: ToolsSettings::default(),
+            project_notices: Vec::new(),
             explicit_keys: None,
         }
     }
@@ -610,6 +637,12 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
     }
     if sets("uiMode") {
         base.ui_mode = project.ui_mode.clone();
+    }
+    if !project.tools.pass_env.is_empty() {
+        let notice = "Ignored `tools.passEnv` in the project settings file: it is a global-only \
+                      setting. Set it in the global settings file instead.";
+        tracing::warn!("{notice}");
+        base.project_notices.push(notice.to_owned());
     }
     base.sandbox.overlay_project(project.sandbox);
     if let Some(project_fetch) = project.web_fetch {
@@ -1055,6 +1088,74 @@ mod tests {
         assert_eq!(default.permission_mode, None, "looser than the default ask");
         default.merge_project(Settings::default());
         assert_eq!(default.permission_mode, None);
+    }
+
+    #[test]
+    fn project_pass_env_is_ignored_with_a_notice_and_global_pass_env_stays() {
+        let mut global: Settings =
+            serde_json::from_str(r#"{"tools":{"passEnv":["GLOBAL_NAME"]}}"#).unwrap();
+        let project: Settings =
+            serde_json::from_str(r#"{"tools":{"passEnv":["OPENAI_API_KEY"]}}"#).unwrap();
+        global.merge_project(project);
+        assert_eq!(global.tools.pass_env, ["GLOBAL_NAME"]);
+        assert_eq!(global.project_notices.len(), 1);
+        assert!(global.project_notices[0].contains("tools.passEnv"));
+        // A project without the key adds no notice.
+        let mut global = Settings::default();
+        global.merge_project(serde_json::from_str("{}").unwrap());
+        assert!(global.project_notices.is_empty());
+        // The notices are never written to a settings file.
+        let json = serde_json::to_value(&global).unwrap();
+        assert!(json.get("projectNotices").is_none() && json.get("tools").is_none());
+    }
+
+    #[test]
+    fn project_overlay_names_in_pass_env_never_reach_the_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".loop")).unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"tools":{"passEnv":["KEEP_ME"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join(".loop/settings.json"),
+            r#"{"tools":{"passEnv":["OPENAI_API_KEY"]}}"#,
+        )
+        .unwrap();
+        let settings = load_settings(dir.path(), project.path(), true).unwrap();
+        let policy = crate::config::tool_env::tool_env_policy(dir.path(), &settings);
+        assert!(policy.removes("OPENAI_API_KEY"));
+        assert!(!policy.removes("KEEP_ME"));
+    }
+
+    #[test]
+    fn models_json_api_key_envs_join_the_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("models.json"),
+            r#"{"providers":[
+                {"id":"a","apiKeyEnv":["CAMEL_KEY","OTHER_KEY"],"models":["m"]},
+                {"id":"b","api_key_env":["SNAKE_KEY"],"models":["m"]},
+                {"id":"c","models":["m"]}]}"#,
+        )
+        .unwrap();
+        let policy = crate::config::tool_env::tool_env_policy(dir.path(), &Settings::default());
+        for name in ["CAMEL_KEY", "OTHER_KEY", "SNAKE_KEY", "OPENAI_API_KEY"] {
+            assert!(policy.removes(name), "{name}");
+        }
+        assert!(!policy.removes("GITHUB_TOKEN"));
+        // `webSearch.apiKeyEnv` names are removed too.
+        let settings: Settings =
+            serde_json::from_str(r#"{"webSearch":{"apiKeyEnv":["MY_SEARCH_KEY"]}}"#).unwrap();
+        let policy = crate::config::tool_env::tool_env_policy(dir.path(), &settings);
+        assert!(policy.removes("MY_SEARCH_KEY") && policy.removes("TAVILY_API_KEY"));
+        // No file, or a broken one, adds nothing and does not fail.
+        std::fs::write(dir.path().join("models.json"), "{not json").unwrap();
+        assert!(
+            crate::config::tool_env::custom_key_envs(dir.path(), &Settings::default()).is_empty()
+        );
     }
 
     #[test]

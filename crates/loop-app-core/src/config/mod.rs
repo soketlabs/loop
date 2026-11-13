@@ -4,6 +4,7 @@ pub mod auth;
 pub mod paths;
 pub mod providers;
 pub mod settings;
+pub mod tool_env;
 pub mod tracing;
 pub mod trust;
 pub mod workspace_settings;
@@ -13,7 +14,7 @@ pub use paths::*;
 pub use providers::{
     is_web_search_provider, web_search_display_name, CustomProviderEntry, ProviderLoginRequest,
 };
-pub use settings::{load_settings, RuntimeSettings, Settings};
+pub use settings::{load_settings, RuntimeSettings, Settings, ToolsSettings};
 #[cfg(feature = "telemetry")]
 pub use tracing::{
     describe_tracing_status, resolve_tracing_destination, TracingControl, TracingSetupRequest,

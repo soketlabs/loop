@@ -189,7 +189,7 @@ impl WorkspaceResources {
                 }
             }
         }
-        let mut startup_notices = Vec::new();
+        let mut startup_notices = settings.project_notices.clone();
         if !standalone && !project_trusted {
             startup_notices.push(format!(
                 "Workspace {} has no recorded trust; using global settings and resources only",
@@ -582,12 +582,15 @@ impl SessionFactory {
 
         let (sandbox, tool_env, disabled) = workspace.execution().await?;
         let sandbox = sandbox.clone();
-        let tool_env = match env {
-            Some(values) => {
-                loop_agent::harness::SessionExecutionEnv::wrap(Arc::clone(tool_env), values)
-            }
-            None => Arc::clone(tool_env),
-        };
+        // One policy for the tools built here and for the harness's own
+        // rebuilds, so a removal note is reported once per turn across both.
+        let tool_env_policy =
+            crate::config::tool_env::tool_env_policy(&globals.agent_dir, &settings);
+        let tool_env = loop_agent::harness::SessionExecutionEnv::for_tools(
+            Arc::clone(tool_env),
+            env,
+            &tool_env_policy,
+        );
         if *disabled {
             settings.sandbox.mode = "off".into();
         }
@@ -686,6 +689,7 @@ impl SessionFactory {
             },
         }));
         harness.set_session_environment(env.cloned());
+        harness.set_tool_env_policy(tool_env_policy);
         harness.set_thinking_level(effort).await;
         harness.set_bash_limits(bash_limits);
         harness

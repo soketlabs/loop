@@ -647,6 +647,7 @@ pub fn create_bash_tool_with(
                     }));
                 }
                 let sandboxed = env.sandboxed();
+                let note_env = Arc::clone(&env);
                 let captured = execute_shell_with_capture(env, &command, options, None)
                     .await
                     .map_err(|e| {
@@ -665,6 +666,10 @@ pub fn create_bash_tool_with(
                 if bash_permission_hint(&text, captured.exit_code, sandboxed) {
                     text.push_str("\n\n");
                     text.push_str(PERMISSION_DENIED_HINT);
+                }
+                if let Some(note) = note_env.removed_env_note(&captured.text, captured.exit_code) {
+                    text.push_str("\n\n");
+                    text.push_str(&note);
                 }
                 Ok(AgentToolResult {
                     content: vec![ToolResultContent::Text(TextContent {

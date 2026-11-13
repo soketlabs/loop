@@ -959,6 +959,52 @@ async fn differing_provider_environment_warns_without_exposing_either_key() {
     .unwrap();
 }
 
+/// A Session opened without a caller environment (`loop session new`) uses the
+/// Runtime's own environment. It must not hand provider keys to tools either.
+/// The child copy of this binary has the keys in its environment.
+#[cfg(unix)]
+#[test]
+fn a_session_without_a_caller_environment_gets_no_provider_keys() {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runtime::admin_tests::session_without_caller_environment_child",
+            "--nocapture",
+        ])
+        .env("LOOP_TOOLENV_RUNTIME_CHILD", "1")
+        .env("OPENAI_API_KEY", "canary")
+        .env("LOOP_RUNTIME_TOKEN", "canary")
+        .env("GITHUB_TOKEN", "canary")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_without_caller_environment_child() {
+    if std::env::var_os("LOOP_TOOLENV_RUNTIME_CHILD").is_none() {
+        return;
+    }
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let result = LocalShell::run(
+            rt.as_ref(),
+            &session,
+            "printf '%s:%s:%s' \"$OPENAI_API_KEY\" \"$LOOP_RUNTIME_TOKEN\" \"$GITHUB_TOKEN\"",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.stdout, "::canary");
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn credential_warnings_follow_only_the_selected_provider_and_refresh_on_resume() {
     tokio::time::timeout(LIMIT, async {

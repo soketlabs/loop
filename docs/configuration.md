@@ -58,6 +58,7 @@ Common settings in `settings.json`:
 | `permissionMode` | `ask` | `read-only`, `ask`, `accept-edits`, `full-access` or `plan`; see [permissions](permissions.md). A project may only choose a stricter mode |
 | `toolPermissions` | `write`, `edit`, `bash`: `ask`; `read`, `grep`, `glob`, `ls`, `web_fetch`, `web_search`: `allow` | Per-tool rules, `allow`, `ask` or `deny`, with optional patterns such as `bash(git status*)`. `deny` applies in every mode; with nobody to ask, `ask` refuses the call. A project may only add `ask`/`deny` rules |
 | `bash.defaultTimeoutMs`, `bash.maxTimeoutMs` | `120000`, `600000` | `bash` time limits; a call may ask for up to the maximum (global only) |
+| `tools.passEnv` | empty | Variable names that stay in the environment of the `bash` tool and `!shell` commands, although Loop removes provider keys and Runtime tokens from them. See [Tool environment](#tool-environment) (global only; a project file cannot set it) |
 | `doubleEscapeAction` | `tree` | What pressing **Esc** twice quickly does while Loop is idle (one **Esc** interrupts a running turn): `tree` opens `/tree`, `fork` opens `/fork`, anything else does nothing |
 | `responseHeaderTimeoutMs` | `120000` | How long to wait for the model's response headers before a request fails; `0` waits indefinitely (for slow models or long-running work). `timeouts.responseHeaderMs` takes precedence when set; see [stream timeouts](stream-timeouts.md). `/ttfb [off\|on\|60s\|120000]` changes it for the session; `/ttfb on` chooses 120 seconds. Esc still aborts the turn |
 | `fileEditReview` | `newSession` | Kept for old settings files: with no `permissionMode`, `never` starts in `accept-edits`. Other values change nothing |
@@ -75,6 +76,51 @@ Common settings in `settings.json`:
 | `runtime.maxSessions`, `runtime.maxActiveTurns` | `16`, `8` | Limits of `loop runtime start`; see [the Runtime](runtime.md#start-the-runtime). Each must be a whole number of at least 1. A command-line flag overrides it (global only) |
 | `runtime.idleShutdownMinutes` | `10` | Minutes an auto-started Runtime waits with nothing attached or running before it exits. `0` disables it. An owner from `loop runtime start` never idles out (global only) |
 | `runtime.forwardEnv` | empty | Extra environment variable names a Surface forwards to a Runtime over WebSocket, on top of the built-in allowlist. Unix sockets forward the full environment. Values are never logged (global only) |
+
+## Tool environment
+
+Loop removes these variables from the environment of the `bash` tool and of
+`!shell` commands, in standalone mode and in the Runtime:
+
+- every built-in provider key variable: `SOKET_API_KEY`, `TENSORSTUDIO_API_KEY`,
+  `LOOP_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+  `GEMINI_API_KEY` and `GOOGLE_API_KEY`;
+- every name in `apiKeyEnv` of the custom providers in `models.json`;
+- the default key variables of the built-in web search backends
+  (`TAVILY_API_KEY`, `BRAVE_API_KEY`, `TINYFISH_API_KEY`; the Soket backend uses
+  the Soket names above) and every name in `webSearch.apiKeyEnv`;
+- the other secrets that Loop reads: `LOOP_PDF_OCR_API_KEY`,
+  `LANGFUSE_SECRET_KEY` and `LANGFUSE_PUBLIC_KEY`;
+- the Runtime token variable `LOOP_RUNTIME_TOKEN`.
+
+The list is exact names, not a pattern. `GITHUB_TOKEN`, `NPM_TOKEN`, `AWS_*` and
+all other variables stay. Name a variable in `tools.passEnv` in the global
+`settings.json` to keep it:
+
+```json
+{ "tools": { "passEnv": ["OPENAI_API_KEY"] } }
+```
+
+A project `.loop/settings.json` cannot set `tools.passEnv`. Loop ignores it and
+shows a notice at startup. Over a WebSocket, a name in `tools.passEnv` is also
+forwarded, like a name in `runtime.forwardEnv` (see [the Runtime](runtime.md)).
+The Runtime reads `tools.passEnv` from the global settings of the host that runs
+the tools. With the sandbox on, the sandbox controls the environment of commands
+(on macOS it keeps only an allowlist of names), and `tools.passEnv` does not
+change that.
+
+When a `bash` command fails and its output names a removed variable that was
+set, Loop adds one short note to the result, for example `Note: OPENAI_API_KEY
+was removed from the command environment by Loop; allow it with tools.passEnv in
+global settings.` A variable gets at most one note for each turn. `!shell` shows
+no note.
+
+Scope: this applies to `bash` and `!shell` only. [Hooks](hooks.md) and MCP
+servers are not changed. An MCP server gets the `env` values set in its
+configuration as written. Loop reads the `apiKeyEnv` names when a Session
+starts, so a change to `models.json` or `webSearch` applies to new Sessions. With the sandbox
+off, this removal reduces accidental leaks. It is not a security boundary: see
+[the Runtime](runtime.md#tool-environment-and-the-sandbox).
 
 On macOS, `/sandbox local` starts Seatbelt after a preflight. Shell commands may
 write the real project, private sandbox temp directory and `sandbox.allowWrite`; file tools
