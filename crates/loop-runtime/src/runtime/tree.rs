@@ -84,6 +84,20 @@ fn destination_result(id: &str, receipt: &str) -> BackendResult<DestinationResul
         draft: receipt["draft"].as_str().map(str::to_owned),
     })
 }
+/// `future` with the current request's caller ([`loop_protocol::Caller`])
+/// in scope, for a task spawned on its behalf: the task-local caller is lost
+/// across `tokio::spawn`.
+fn in_caller_scope<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let caller = loop_protocol::Caller::current();
+    async move {
+        match caller {
+            Some(caller) => caller.scope(future).await,
+            None => future.await,
+        }
+    }
+}
 /// A destination created but not yet admitted. Dropped early, it rolls back
 /// before releasing the destination lock, so no retry reads its receipt first.
 struct Unadmitted {
@@ -690,7 +704,8 @@ impl Runtime {
     /// Fork before a user message. Its text is returned to the initiating draft.
     pub async fn fork(&self, params: ForkParams) -> BackendResult<DestinationResult> {
         match self.shared() {
-            Some(me) => tokio::spawn(async move { me.fork_owned(params).await })
+            // The caller does not cross the spawn on its own.
+            Some(me) => tokio::spawn(in_caller_scope(async move { me.fork_owned(params).await }))
                 .await
                 .map_err(failed)?,
             None => self.fork_owned(params).await,
@@ -716,9 +731,12 @@ impl Runtime {
     /// Copy a full committed branch into another leased Session.
     pub async fn clone_session(&self, params: CloneParams) -> BackendResult<DestinationResult> {
         match self.shared() {
-            Some(me) => tokio::spawn(async move { me.clone_session_owned(params).await })
-                .await
-                .map_err(failed)?,
+            // The caller does not cross the spawn on its own.
+            Some(me) => tokio::spawn(in_caller_scope(async move {
+                me.clone_session_owned(params).await
+            }))
+            .await
+            .map_err(failed)?,
             None => self.clone_session_owned(params).await,
         }
     }
@@ -792,9 +810,12 @@ impl Runtime {
     /// Validate a bounded payload and import into a known workspace.
     pub async fn import(&self, params: ImportParams) -> BackendResult<DestinationResult> {
         match self.shared() {
-            Some(me) => tokio::spawn(async move { me.import_owned(params).await })
-                .await
-                .map_err(failed)?,
+            // The caller does not cross the spawn on its own.
+            Some(me) => tokio::spawn(in_caller_scope(
+                async move { me.import_owned(params).await },
+            ))
+            .await
+            .map_err(failed)?,
             None => self.import_owned(params).await,
         }
     }

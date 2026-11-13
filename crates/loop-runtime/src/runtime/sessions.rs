@@ -286,9 +286,11 @@ impl Runtime {
                 None => (0, workspace_root(&opened.workspace.cwd), None),
             };
             let parent = child.as_ref().map(|c| c.parent.reference.key.clone());
-            // A Subagent acts as the person who started its parent (ADR-0009).
-            let opened_by = match &child {
-                Some(child) => child.parent.opened_by.clone(),
+            // A Subagent acts for the person its parent acts for (ADR-0009),
+            // so it copies the parent's `loaded_by`. That is the parent's last
+            // loader, not an owner, and carries no authority (I3 adds owners).
+            let loaded_by = match &child {
+                Some(child) => child.parent.loaded_by.clone(),
                 None => caller.clone(),
             };
             let receiver = opened.native.subscribe();
@@ -365,7 +367,7 @@ impl Runtime {
                 generation: Mutex::new(None),
                 sandbox_choice: Mutex::new(sandbox_choice),
                 pending_sandbox: Mutex::new(None),
-                opened_by,
+                loaded_by,
             });
             if unannounced {
                 publish(
