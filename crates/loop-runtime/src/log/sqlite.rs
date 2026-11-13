@@ -1,11 +1,51 @@
 use super::*;
 use async_trait::async_trait;
-use loop_protocol::SessionKey;
+use loop_protocol::{SessionKey, TurnId};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde_json::Value;
 use std::path::Path;
 use tokio::sync::{mpsc, oneshot};
 
 type Reply<T> = oneshot::Sender<Result<T>>;
+
+/// The driver error as a store error. `loop-store` has no `rusqlite`
+/// types, so this conversion lives with the SQLite implementation.
+fn db(error: rusqlite::Error) -> EventLogError {
+    EventLogError::Storage(error.to_string())
+}
+
+/// Error of the functions that run on the connection. It exists so that `?`
+/// converts `rusqlite` errors; replies convert it back to the store error.
+#[derive(Debug)]
+struct SqlError(EventLogError);
+type SqlResult<T> = std::result::Result<T, SqlError>;
+
+impl From<rusqlite::Error> for SqlError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self(db(error))
+    }
+}
+impl From<EventLogError> for SqlError {
+    fn from(error: EventLogError) -> Self {
+        Self(error)
+    }
+}
+impl From<serde_json::Error> for SqlError {
+    fn from(error: serde_json::Error) -> Self {
+        Self(error.into())
+    }
+}
+impl From<SqlError> for EventLogError {
+    fn from(error: SqlError) -> Self {
+        error.0
+    }
+}
+
+/// Sequences and generations are stored as signed 64-bit integers.
+fn sql_seq(seq: u64) -> Result<i64> {
+    i64::try_from(seq)
+        .map_err(|_| EventLogError::Invalid("sequence exceeds SQLite integer range".into()))
+}
 enum Command {
     Append(Vec<Event>, Reply<Vec<LoggedEvent>>),
     Read(Option<SessionKey>, u64, Reply<Vec<LoggedEvent>>),
@@ -37,7 +77,7 @@ impl SqliteEventLog {
     /// Open under the caller-resolved agent directory. No environment mutation.
     pub async fn open(agent_dir: impl AsRef<Path>) -> Result<Self> {
         let path = agent_dir.as_ref().join("events.db");
-        let conn = tokio::task::spawn_blocking(move || -> Result<Connection> {
+        let conn = tokio::task::spawn_blocking(move || -> SqlResult<Connection> {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| EventLogError::Storage(e.to_string()))?;
@@ -62,8 +102,8 @@ impl SqliteEventLog {
         self.sender
             .send(make(reply))
             .await
-            .map_err(|_| EventLogError::WriterStopped)?;
-        receive.await.map_err(|_| EventLogError::WriterStopped)?
+            .map_err(|_| EventLogError::Stopped)?;
+        receive.await.map_err(|_| EventLogError::Stopped)?
     }
 }
 
@@ -134,7 +174,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("migrations/003_recovery_kinds.sql"),
     ),
 ];
-fn migrate(conn: &mut Connection) -> Result<()> {
+fn migrate(conn: &mut Connection) -> SqlResult<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);",
     )?;
@@ -187,13 +227,13 @@ fn writer(mut conn: Connection, mut receiver: mpsc::Receiver<Command>) {
                 append_group(&mut conn, all, replies);
             }
             Command::Read(session, after, reply) => {
-                let _ = reply.send(read(&conn, session.as_ref(), after));
+                let _ = reply.send(read(&conn, session.as_ref(), after).map_err(Into::into));
             }
             Command::Latest(session, reply) => {
-                let _ = reply.send(latest(&conn, &session));
+                let _ = reply.send(latest(&conn, &session).map_err(Into::into));
             }
             Command::Turns(session, reply) => {
-                let _ = reply.send(turn_ids(&conn, &session));
+                let _ = reply.send(turn_ids(&conn, &session).map_err(Into::into));
             }
             Command::Prompts(session, reply) => {
                 let _ = reply.send(
@@ -202,20 +242,20 @@ fn writer(mut conn: Connection, mut receiver: mpsc::Receiver<Command>) {
                         [session.as_str()],
                         |row| row.get(0),
                     )
-                    .map_err(Into::into),
+                    .map_err(db),
                 );
             }
             Command::Subagents(reply) => {
-                let _ = reply.send(subagents(&conn));
+                let _ = reply.send(subagents(&conn).map_err(Into::into));
             }
             Command::Allocate(owner, pid, started, reply) => {
-                let _ = reply.send(allocate(&mut conn, &owner, pid, started));
+                let _ = reply.send(allocate(&mut conn, &owner, pid, started).map_err(Into::into));
             }
             Command::Activity(reply) => {
-                let _ = reply.send(activity(&conn));
+                let _ = reply.send(activity(&conn).map_err(Into::into));
             }
             Command::Recovery(from, reply) => {
-                let _ = reply.send(recovery(&conn, from));
+                let _ = reply.send(recovery(&conn, from).map_err(Into::into));
             }
             Command::LastRecovered(reply) => {
                 let _ = reply.send(
@@ -224,40 +264,44 @@ fn writer(mut conn: Connection, mut receiver: mpsc::Receiver<Command>) {
                         [],
                         |row| row.get(0),
                     )
-                    .map_err(Into::into),
+                    .map_err(db),
                 );
             }
             Command::MarkRecovered(generation, at, reply) => {
-                let result = (|| {
+                let result = (|| -> SqlResult<()> {
                     let changed = conn.execute(
                         "UPDATE runtime_generations SET recovered_ms=?1 WHERE generation=?2",
                         params![at, sql_seq(generation)?],
                     )?;
                     if changed == 0 {
-                        return Err(EventLogError::Invalid("unknown Runtime generation".into()));
+                        return Err(
+                            EventLogError::Invalid("unknown Runtime generation".into()).into()
+                        );
                     }
                     Ok(())
                 })();
-                let _ = reply.send(result);
+                let _ = reply.send(result.map_err(Into::into));
             }
             Command::Finish(generation, stopped, reply) => {
-                let result = (|| {
+                let result = (|| -> SqlResult<()> {
                     let changed = conn.execute(
                         "UPDATE runtime_generations SET stopped_ms=?1 WHERE generation=?2",
                         params![stopped, sql_seq(generation)?],
                     )?;
                     if changed == 0 {
-                        return Err(EventLogError::Invalid("unknown Runtime generation".into()));
+                        return Err(
+                            EventLogError::Invalid("unknown Runtime generation".into()).into()
+                        );
                     }
                     Ok(())
                 })();
-                let _ = reply.send(result);
+                let _ = reply.send(result.map_err(Into::into));
             }
         }
     }
 }
 
-fn activity(conn: &Connection) -> Result<std::collections::HashMap<SessionKey, i64>> {
+fn activity(conn: &Connection) -> SqlResult<std::collections::HashMap<SessionKey, i64>> {
     let mut stmt = conn.prepare(
         "SELECT session_key, MAX(ts_ms) FROM events WHERE session_key IS NOT NULL GROUP BY session_key",
     )?;
@@ -275,7 +319,7 @@ fn append_group(
     events: Vec<Event>,
     requests: Vec<(usize, Reply<Vec<LoggedEvent>>)>,
 ) {
-    match append(conn, events) {
+    match append(conn, events).map_err(EventLogError::from) {
         Ok(records) => {
             let mut records = records.into_iter();
             for (len, reply) in requests {
@@ -290,15 +334,18 @@ fn append_group(
     }
 }
 
-fn latest(conn: &Connection, session: &SessionKey) -> Result<u64> {
-    Ok(conn.query_row(
-        "SELECT COALESCE(MAX(session_seq),0) FROM events WHERE session_key=?1",
-        [session.as_str()],
-        |row| row.get(0),
-    )?)
+/// Last Update sequence of one Session. `session_seq IS NOT NULL` changes no
+/// result (`MAX` skips NULL), but it lets the planner use the partial index
+/// `events_session_seq`. Without it each call scans the whole table, once per
+/// appended Update.
+const LATEST_SEQ_SQL: &str =
+    "SELECT COALESCE(MAX(session_seq),0) FROM events WHERE session_key=?1 AND session_seq IS NOT NULL";
+
+fn latest(conn: &Connection, session: &SessionKey) -> SqlResult<u64> {
+    Ok(conn.query_row(LATEST_SEQ_SQL, [session.as_str()], |row| row.get(0))?)
 }
 
-fn subagents(conn: &Connection) -> Result<std::collections::HashSet<SessionKey>> {
+fn subagents(conn: &Connection) -> SqlResult<std::collections::HashSet<SessionKey>> {
     let mut statement = conn.prepare(
         "SELECT DISTINCT session_key FROM events WHERE kind='session_opened' \
          AND session_key IS NOT NULL \
@@ -311,7 +358,7 @@ fn subagents(conn: &Connection) -> Result<std::collections::HashSet<SessionKey>>
     Ok(keys)
 }
 
-fn turn_ids(conn: &Connection, session: &SessionKey) -> Result<Vec<TurnId>> {
+fn turn_ids(conn: &Connection, session: &SessionKey) -> SqlResult<Vec<TurnId>> {
     let mut statement =
         conn.prepare("SELECT DISTINCT turn FROM events WHERE session_key=?1 AND turn IS NOT NULL")?;
     let turns = statement
@@ -321,7 +368,7 @@ fn turn_ids(conn: &Connection, session: &SessionKey) -> Result<Vec<TurnId>> {
     Ok(turns)
 }
 
-fn append(conn: &mut Connection, events: Vec<Event>) -> Result<Vec<LoggedEvent>> {
+fn append(conn: &mut Connection, events: Vec<Event>) -> SqlResult<Vec<LoggedEvent>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut global: u64 =
         tx.query_row("SELECT COALESCE(MAX(global_seq),0) FROM events", [], |r| {
@@ -353,7 +400,11 @@ fn append(conn: &mut Connection, events: Vec<Event>) -> Result<Vec<LoggedEvent>>
 
 const COLUMNS: &str = "global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload";
 
-fn read(conn: &Connection, session: Option<&SessionKey>, after: u64) -> Result<Vec<LoggedEvent>> {
+fn read(
+    conn: &Connection,
+    session: Option<&SessionKey>,
+    after: u64,
+) -> SqlResult<Vec<LoggedEvent>> {
     // All stored sequences fit i64; a larger cursor is simply past the end.
     if after > i64::MAX as u64 {
         return Ok(Vec::new());
@@ -375,7 +426,7 @@ fn read(conn: &Connection, session: Option<&SessionKey>, after: u64) -> Result<V
 /// Turn boundaries, prompts sent and settled, clean stops and Escalation
 /// records, filtered in SQL so recovery never loads streamed text. Recovery
 /// needs only that a prompt was sent, so its content is not loaded either.
-fn recovery(conn: &Connection, from_generation: u64) -> Result<Vec<LoggedEvent>> {
+fn recovery(conn: &Connection, from_generation: u64) -> SqlResult<Vec<LoggedEvent>> {
     if from_generation > i64::MAX as u64 {
         return Ok(Vec::new());
     }
@@ -392,7 +443,7 @@ fn recovery(conn: &Connection, from_generation: u64) -> Result<Vec<LoggedEvent>>
     rows(conn, sql, params![from_generation as i64])
 }
 
-fn rows(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> Result<Vec<LoggedEvent>> {
+fn rows(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> SqlResult<Vec<LoggedEvent>> {
     let mut stmt = conn.prepare(sql)?;
     let mut rows = stmt.query(args)?;
     let mut result = Vec::new();
@@ -423,7 +474,7 @@ fn rows(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> Result<Vec
     Ok(result)
 }
 
-fn allocate(conn: &mut Connection, owner: &str, pid: u32, started: i64) -> Result<u64> {
+fn allocate(conn: &mut Connection, owner: &str, pid: u32, started: i64) -> SqlResult<u64> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let generation: u64 = tx.query_row(
         "SELECT COALESCE(MAX(generation),0)+1 FROM runtime_generations",
@@ -436,4 +487,95 @@ fn allocate(conn: &mut Connection, owner: &str, pid: u32, started: i64) -> Resul
     )?;
     tx.commit()?;
     Ok(generation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(conn: &Connection, sql: &str) -> Vec<String> {
+        let mut statement = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare plan");
+        statement
+            .query_map(["s"], |row| row.get::<_, String>(3))
+            .expect("query plan")
+            .collect::<rusqlite::Result<_>>()
+            .expect("plan rows")
+    }
+
+    /// The per-append sequence query must read the partial index, not scan.
+    /// The old text (no `IS NOT NULL`) shows why: the planner cannot prove
+    /// the index predicate, so it scans `events`.
+    #[test]
+    fn latest_seq_uses_the_session_seq_index() {
+        let mut conn = Connection::open_in_memory().expect("open");
+        migrate(&mut conn).expect("migrate");
+        let old = "SELECT COALESCE(MAX(session_seq),0) FROM events WHERE session_key=?1";
+        let before = plan(&conn, old);
+        let after = plan(&conn, LATEST_SEQ_SQL);
+        println!("old plan: {before:?}");
+        println!("new plan: {after:?}");
+        assert!(
+            !before.iter().any(|row| row.contains("events_session_seq")),
+            "old query should not use the partial index: {before:?}"
+        );
+        assert!(
+            after.iter().any(|row| row.contains("events_session_seq")),
+            "latest() must use events_session_seq: {after:?}"
+        );
+    }
+
+    /// Time of one `latest()` query, old and new text, on 51,200 rows
+    /// (200 Sessions x 256 Updates). Ignored: it only prints numbers.
+    #[test]
+    #[ignore]
+    fn latest_seq_cost() {
+        let mut conn = Connection::open_in_memory().expect("open");
+        migrate(&mut conn).expect("migrate");
+        let tx = conn.transaction().expect("tx");
+        for global in 1..=51_200_i64 {
+            let session = format!("s{}", global % 200);
+            tx.execute(
+                "INSERT INTO events (global_seq,generation,session_key,session_seq,kind,ts_ms,payload) VALUES (?1,1,?2,?3,'update',0,'{}')",
+                params![global, session, global / 200 + 1],
+            )
+            .expect("insert");
+        }
+        tx.commit().expect("commit");
+        let old = "SELECT COALESCE(MAX(session_seq),0) FROM events WHERE session_key=?1";
+        for (name, sql) in [("old", old), ("new", LATEST_SEQ_SQL)] {
+            let start = std::time::Instant::now();
+            let calls = 200;
+            for i in 0..calls {
+                let _: u64 = conn
+                    .query_row(sql, [format!("s{i}")], |row| row.get(0))
+                    .expect("query");
+            }
+            let per_call = start.elapsed().as_secs_f64() * 1000.0 / f64::from(calls);
+            println!("{name}: {per_call:.4} ms per call");
+        }
+    }
+
+    /// Plans of the other per-Session queries, for review. Only the replay
+    /// read is asserted: `session_seq>?2` already implies the index predicate.
+    #[test]
+    fn other_session_query_plans() {
+        let mut conn = Connection::open_in_memory().expect("open");
+        migrate(&mut conn).expect("migrate");
+        let read_sql = format!(
+            "SELECT {COLUMNS} FROM events WHERE session_key=?1 AND session_seq>0 ORDER BY session_seq"
+        );
+        let read_plan = plan(&conn, &read_sql);
+        println!("read_after plan: {read_plan:?}");
+        assert!(read_plan
+            .iter()
+            .any(|row| row.contains("events_session_seq")));
+        for sql in [
+            "SELECT DISTINCT turn FROM events WHERE session_key=?1 AND turn IS NOT NULL",
+            "SELECT COUNT(*) FROM events WHERE session_key=?1 AND kind='prompt_sent'",
+        ] {
+            println!("{sql}: {:?}", plan(&conn, sql));
+        }
+    }
 }

@@ -3,6 +3,7 @@
 mod command_policy;
 mod documents;
 mod file_mutation_queue;
+pub mod lock;
 mod plan;
 mod search;
 pub mod shell;

@@ -74,6 +74,9 @@ pub struct NativeBackend {
     /// Held while a turn is admitted or the model changes, so a model
     /// change never lands between the busy check and a turn's start.
     admission: tokio::sync::Mutex<()>,
+    /// The Runtime's tool lock. Set once, never cleared: it refuses user
+    /// commands and workflows for the life of this backend.
+    tool_lock: std::sync::OnceLock<loop_protocol::ToolLock>,
 }
 
 /// Work that waits for the running turn to end. It is called with `true`
@@ -355,6 +358,7 @@ impl NativeBackend {
             next_turn: Mutex::new(Default::default()),
             cancel_requested: AtomicBool::new(false),
             admission: tokio::sync::Mutex::new(()),
+            tool_lock: std::sync::OnceLock::new(),
         });
         backend.read_config().await;
         let instance = backend.instance.clone();
@@ -1375,9 +1379,34 @@ impl NativeBackend {
     }
 
     /// Check a user command's timeout: by default, and at most, the
-    /// `bash.maxTimeoutMs` limit.
+    /// `bash.maxTimeoutMs` limit. Under a tool lock every command is
+    /// refused here, before the Runtime reserves the Session.
     pub fn shell_timeout(&self, requested: Option<u64>) -> BackendResult<u64> {
+        self.refuse_if_locked("session/shell")?;
         loop_protocol::shell_timeout(requested, self.harness.bash_limits().max_timeout_ms)
+    }
+
+    /// Lock this backend's tools for good: user commands (`session/shell`)
+    /// and workflows are refused from now on. A second lock is ignored; the
+    /// first one stays.
+    pub fn lock_tools(&self, lock: loop_protocol::ToolLock) {
+        let _ = self.tool_lock.set(lock);
+    }
+
+    /// The tool lock in force, if any.
+    pub fn tool_lock(&self) -> Option<loop_protocol::ToolLock> {
+        self.tool_lock.get().copied()
+    }
+
+    /// [`BackendError::ToolLocked`] for `what` when a lock is set.
+    pub(crate) fn refuse_if_locked(&self, what: &str) -> BackendResult<()> {
+        match self.tool_lock() {
+            Some(lock) => Err(BackendError::ToolLocked {
+                what: what.to_owned(),
+                lock,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Prepare a compaction for a caller that commits the returned tree
@@ -1433,6 +1462,9 @@ impl LocalShell for NativeBackend {
         command: &str,
         timeout_ms: Option<u64>,
     ) -> BackendResult<ShellResult> {
+        // `shell_timeout` refuses under a tool lock; checked again here so
+        // no later change to it can let a command through.
+        self.refuse_if_locked("session/shell")?;
         let timeout_ms = self.shell_timeout(timeout_ms)?;
         self.check_session(session).await?;
         let env = self.harness.tool_env().await.map_err(harness_error)?;

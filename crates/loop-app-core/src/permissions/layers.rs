@@ -19,6 +19,9 @@ use super::PermissionMode;
 /// Where a Policy layer comes from, top first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LayerSource {
+    /// Set by whoever started the Runtime process (`loop runtime start
+    /// --tool-lock`), for every Session, for the life of the process.
+    Runtime,
     /// Set on the device by the Org, which the user can't change.
     Managed,
     /// The Org's own layer.
@@ -39,6 +42,7 @@ impl LayerSource {
     /// The name in notices and refusals.
     pub fn label(self) -> &'static str {
         match self {
+            Self::Runtime => "the Runtime's tool lock",
             Self::Managed => "Managed Policy",
             Self::Org => "Org Policy",
             Self::Group => "Group Policy",
@@ -59,6 +63,10 @@ pub struct Layer {
     pub capabilities: BTreeMap<Capability, Setting>,
     /// Capabilities no lower layer may change.
     pub locks: BTreeSet<Capability>,
+    /// When set, the only tools this layer offers, by exact name: every
+    /// other tool is off, whatever its Capability (a plain deny, S4 §4, on
+    /// every name outside the list). It fails closed: a new tool is off.
+    pub tools: Option<BTreeSet<String>>,
 }
 
 impl Layer {
@@ -68,7 +76,21 @@ impl Layer {
             source,
             capabilities: BTreeMap::new(),
             locks: BTreeSet::new(),
+            tools: None,
         }
+    }
+
+    /// Offer only `tools`; every other tool is off.
+    pub fn only_tools<'a>(mut self, tools: impl IntoIterator<Item = &'a str>) -> Self {
+        self.tools = Some(tools.into_iter().map(str::to_owned).collect());
+        self
+    }
+
+    /// Whether this layer's tool list leaves `tool` out.
+    fn leaves_out(&self, tool: &str) -> bool {
+        self.tools
+            .as_ref()
+            .is_some_and(|tools| !tools.contains(tool))
     }
 
     /// Set `capability`.
@@ -121,23 +143,41 @@ impl Policy {
         (Self { layers }, notices)
     }
 
-    /// The settings that apply to `capability`, top first: down to and
+    /// The layers that apply to `capability`, top first: down to and
     /// including the highest layer that locks it.
-    fn settings(&self, capability: &Capability) -> Vec<(LayerSource, &Setting)> {
+    fn applying(&self, capability: &Capability) -> &[Layer] {
         let end = self
             .layers
             .iter()
             .position(|l| l.locks.contains(capability))
             .map_or(self.layers.len(), |i| i + 1);
-        self.layers[..end]
+        &self.layers[..end]
+    }
+
+    /// The settings that apply to `capability`, top first.
+    fn settings(&self, capability: &Capability) -> Vec<(LayerSource, &Setting)> {
+        self.applying(capability)
             .iter()
             .filter_map(|l| l.capabilities.get(capability).map(|s| (l.source, s)))
             .collect()
     }
 
+    /// The highest applying layer whose tool list leaves `call`'s tool out.
+    fn unlisted(&self, call: &Call) -> Option<&Layer> {
+        self.applying(&Capability::of(call))
+            .iter()
+            .find(|l| l.leaves_out(&call.tool))
+    }
+
     /// The strictest state any layer gives `call`; `None` when no layer
-    /// sets its Capability.
+    /// sets its Capability or lists tools.
     pub fn ceiling(&self, call: &Call) -> Option<Ceiling> {
+        if let Some(layer) = self.unlisted(call) {
+            return Some(Ceiling {
+                state: State::Off,
+                source: layer.source,
+            });
+        }
         let capability = Capability::of(call);
         self.settings(&capability)
             .into_iter()
@@ -150,6 +190,9 @@ impl Policy {
 
     /// Whether some call of `call`'s tool could be anything but off.
     pub fn may_allow(&self, call: &Call) -> bool {
+        if self.unlisted(call).is_some() {
+            return false;
+        }
         let capability = Capability::of(call);
         self.settings(&capability)
             .into_iter()
@@ -166,6 +209,19 @@ impl Policy {
         call: &Call,
     ) -> Decision {
         let decision = decide(mode, rules, call);
+        if let Some(layer) = self.unlisted(call) {
+            let offered: Vec<&str> = layer.tools.iter().flatten().map(String::as_str).collect();
+            return Decision::Deny(format!(
+                "`{}` is not allowed: {} offers only {}",
+                call.tool,
+                layer.source.label(),
+                if offered.is_empty() {
+                    "no tools".to_owned()
+                } else {
+                    offered.join(", ")
+                }
+            ));
+        }
         match (self.ceiling(call), decision) {
             (_, Decision::Deny(reason)) => Decision::Deny(reason),
             (
@@ -209,6 +265,20 @@ impl Policy {
         let mut layers = self.layers.clone();
         layers.push(layer);
         Self::new(layers)
+    }
+
+    /// This Policy with `layer` in place of every layer from the same
+    /// source. The gate adds the Runtime's tool lock this way on every
+    /// check, so no replaced Policy can drop it or hold a stale copy.
+    pub fn with_only(&self, layer: Layer) -> Self {
+        let mut layers: Vec<Layer> = self
+            .layers
+            .iter()
+            .filter(|l| l.source != layer.source)
+            .cloned()
+            .collect();
+        layers.push(layer);
+        Self::new(layers).0
     }
 }
 

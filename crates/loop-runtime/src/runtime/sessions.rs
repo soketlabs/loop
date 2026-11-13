@@ -100,6 +100,20 @@ impl Runtime {
                 opts.cwd = PathBuf::from(cwd);
             }
         }
+        // Under a tool lock no Session opens outside the lock root, by any
+        // entry: a new Session, a load from the store, a fork or a child.
+        // The workspace loader checks again.
+        if let Some(lock) = self.factory.globals.tool_lock_config() {
+            if lock.admit(&opts.cwd).is_err() {
+                return Err(BackendError::ToolLocked {
+                    what: format!(
+                        "a Session in {} (outside the tool lock root)",
+                        opts.cwd.display()
+                    ),
+                    lock: lock.lock(),
+                });
+            }
+        }
         if let Some(options) = &spec.options {
             opts.provider = options.provider.clone();
             opts.model = options.model.clone();

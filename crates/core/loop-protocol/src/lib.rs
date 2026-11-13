@@ -27,7 +27,7 @@ pub use backend::{
     StatsSummary, TerminalExit, TerminalOutput, TerminalRequest, TurnHandle, TurnOutcome,
     SHELL_OUTPUT_LIMIT,
 };
-pub use capabilities::Capabilities;
+pub use capabilities::{Capabilities, ToolLock};
 pub use content::ContentBlock;
 pub use error::{ErrorCategory, ErrorInfo};
 pub use ids::{BackendInstanceId, InteractionId, MessageId, SessionKey, ToolCallId, TurnId};

@@ -454,6 +454,43 @@ async fn a_user_command_defaults_to_the_bash_maximum() {
     assert!(refused.to_string().contains("30000"), "{refused}");
 }
 
+#[tokio::test]
+async fn a_tool_lock_refuses_user_commands_and_cannot_be_lifted() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let command = format!("touch {}", marker.display());
+    let backend = backend(Vec::new(), Vec::new()).await;
+    let session = backend.current_session().await;
+    // Control: without a lock the command runs.
+    let ran = backend
+        .local_shell()
+        .unwrap()
+        .run(&session, &command, None)
+        .await
+        .unwrap();
+    assert_eq!(ran.exit_code, 0);
+    assert!(marker.exists());
+    std::fs::remove_file(&marker).unwrap();
+
+    backend.lock_tools(loop_protocol::ToolLock::Chat);
+    // A second, different lock does not replace the first.
+    backend.lock_tools(loop_protocol::ToolLock::Unknown);
+    assert_eq!(backend.tool_lock(), Some(loop_protocol::ToolLock::Chat));
+    let locked = BackendError::ToolLocked {
+        what: "session/shell".into(),
+        lock: loop_protocol::ToolLock::Chat,
+    };
+    assert_eq!(backend.shell_timeout(None).unwrap_err(), locked);
+    let refused = backend
+        .local_shell()
+        .unwrap()
+        .run(&session, &command, None)
+        .await
+        .unwrap_err();
+    assert_eq!(refused, locked);
+    assert!(!marker.exists(), "the command ran under the lock");
+}
+
 /// A cancel after the turn's end, while its tree writes are pending, still
 /// releases the held end; the next prompt's updates flow.
 #[tokio::test]

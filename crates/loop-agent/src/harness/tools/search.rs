@@ -345,7 +345,11 @@ impl Walk {
                 // Read ignore rules through the capability too: the host walker
                 // would otherwise read a symlinked .gitignore outside the jail.
                 for name in [".gitignore", ".ignore"] {
-                    if let Ok(text) = self.env.read_text_file(&path.join(name)).await {
+                    // An ignore file the filter hides is not read either: under a
+                    // tool lock it may link out of the folder.
+                    let ignore = path.join(name);
+                    if self.filter.as_ref().is_some_and(|f| !f(self.tool, &ignore)) { continue; }
+                    if let Ok(text) = self.env.read_text_file(&ignore).await {
                         let mut builder = GitignoreBuilder::new(&path);
                         for line in text.lines() { let _ = builder.add_line(None, line); }
                         if let Ok(rules) = builder.build() { ignores.push(Arc::new(rules)); }

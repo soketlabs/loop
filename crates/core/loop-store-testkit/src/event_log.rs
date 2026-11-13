@@ -5,10 +5,11 @@
 //! The `*_on` functions run one check on a log you already hold; use them
 //! when a test needs the log for more than one step (for example a reopen).
 //!
-//! The checks use these `loop_runtime::log` items: `Event`, `EventKind`,
+//! The checks use these `loop_store` items: `Event`, `EventKind`,
 //! `EventLog`, `MAX_BATCH_EVENTS` and `WRITER_QUEUE_CAPACITY`. A store that
 //! implements a different queue capacity must still pass: the capacity is
-//! only a constant the Runtime exports.
+//! only a constant of the contract. `loop_runtime::log` re-exports the same
+//! items.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use loop_protocol::{Origin, SessionKey, SessionUpdate, UpdateEnvelope};
-use loop_runtime::log::{Event, EventKind, EventLog, MAX_BATCH_EVENTS, WRITER_QUEUE_CAPACITY};
+use loop_store::{Event, EventKind, EventLog, MAX_BATCH_EVENTS, WRITER_QUEUE_CAPACITY};
 use serde_json::json;
 
 use crate::Fixture;

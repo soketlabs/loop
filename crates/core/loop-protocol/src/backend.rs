@@ -46,6 +46,14 @@ pub enum BackendError {
     /// The transport may not call this method: a host-only method, or a
     /// trust change, arrived on a connection without host-local authority.
     Forbidden(String),
+    /// The Runtime's tool lock turns this operation off for every Session,
+    /// for the life of the Runtime.
+    ToolLocked {
+        /// What was refused, such as `session/shell`.
+        what: String,
+        /// The lock in force.
+        lock: crate::ToolLock,
+    },
 }
 
 impl BackendError {
@@ -69,6 +77,10 @@ impl fmt::Display for BackendError {
             Self::Forbidden(method) => write!(
                 f,
                 "{method} is only available on the Runtime host; run it there"
+            ),
+            Self::ToolLocked { what, lock } => write!(
+                f,
+                "{what} is off: this Runtime runs with the `{lock}` tool lock"
             ),
         }
     }
