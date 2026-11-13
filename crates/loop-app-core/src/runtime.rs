@@ -26,9 +26,9 @@ use crate::config::settings::{
 };
 use crate::config::trust::TrustStore;
 use crate::model_selection::StartupModel;
-use crate::resources::{load_resources, LoadedResources};
+use crate::resources::{load_resources_in, LoadedResources};
 use crate::system_prompt::{
-    build_system_prompt, default_tool_snippets, load_context_files, BuildSystemPromptOptions,
+    build_system_prompt, default_tool_snippets, load_context_files_in, BuildSystemPromptOptions,
     ContextFile,
 };
 use crate::theme::{theme_search_dirs, Theme};

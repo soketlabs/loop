@@ -2,9 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use loop_agent::harness::prompt_templates::load_prompt_templates;
-use loop_agent::harness::skills::load_skills;
-use loop_agent::harness::types::{PromptTemplate, Skill};
+use loop_agent::harness::prompt_templates::{load_prompt_templates, load_prompt_templates_in};
+use loop_agent::harness::skills::{load_skills, load_skills_in};
+use loop_agent::harness::types::{FileSystem, PromptTemplate, Skill};
 
 use crate::config::paths::get_project_dir;
 use crate::config::Settings;
@@ -56,7 +56,76 @@ impl LoadedResources {
     }
 }
 
+/// Where a resource folder lives. A global folder belongs to the user of the
+/// Runtime and is a Runtime host path. A project folder belongs to the
+/// Workspace and is a path in the namespace of its execution environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Scope {
+    Global,
+    Project,
+}
+
+/// The skill folders in precedence order (the first skill of a name wins).
+fn skill_dirs(
+    agent_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+    settings: &Settings,
+) -> Vec<(PathBuf, Scope)> {
+    let mut skill_dirs = Vec::new();
+
+    skill_dirs.push((agent_dir.join("skills"), Scope::Global));
+    // Cross-harness user skills (shared with Claude Code)
+    if let Some(home) = dirs::home_dir() {
+        skill_dirs.push((home.join(".agents").join("skills"), Scope::Global));
+        skill_dirs.push((home.join(".claude").join("skills"), Scope::Global));
+    }
+    if project_trusted {
+        skill_dirs.push((get_project_dir(cwd).join("skills"), Scope::Project));
+        // Walk ancestors for .agents/skills and .claude/skills
+        let mut dir = cwd.to_path_buf();
+        loop {
+            skill_dirs.push((dir.join(".agents").join("skills"), Scope::Project));
+            skill_dirs.push((dir.join(".claude").join("skills"), Scope::Project));
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
+
+    // Extra skill paths from settings: the user's own, so host paths. A
+    // folder that is not there is left out.
+    for entry in &settings.skills {
+        let path = expand_path(entry, agent_dir);
+        if path.is_dir() {
+            skill_dirs.push((path, Scope::Global));
+        }
+    }
+    skill_dirs
+}
+
+/// The prompt template folders in precedence order.
+fn prompt_dirs(
+    agent_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+    settings: &Settings,
+) -> Vec<(PathBuf, Scope)> {
+    let mut prompt_dirs = vec![(agent_dir.join("prompts"), Scope::Global)];
+    if project_trusted {
+        prompt_dirs.push((get_project_dir(cwd).join("prompts"), Scope::Project));
+    }
+    for entry in &settings.prompts {
+        prompt_dirs.push((expand_path(entry, agent_dir), Scope::Global));
+    }
+    prompt_dirs
+}
+
 /// Load skills, prompts, extensions, hooks for agent + optional trusted project.
+///
+/// Every folder is read on the Runtime host. A Session on a Workspace loads
+/// through [`load_resources_in`], which reads the project folders through the
+/// Workspace.
 pub fn load_resources(
     agent_dir: &Path,
     cwd: &Path,
@@ -64,38 +133,9 @@ pub fn load_resources(
     settings: &Settings,
 ) -> LoadedResources {
     let mut out = LoadedResources::default();
-    let mut skill_dirs = Vec::new();
-
-    skill_dirs.push(agent_dir.join("skills"));
-    // Cross-harness user skills (shared with Claude Code)
-    if let Some(home) = dirs::home_dir() {
-        skill_dirs.push(home.join(".agents").join("skills"));
-        skill_dirs.push(home.join(".claude").join("skills"));
-    }
-    if project_trusted {
-        skill_dirs.push(get_project_dir(cwd).join("skills"));
-        // Walk ancestors for .agents/skills and .claude/skills
-        let mut dir = cwd.to_path_buf();
-        loop {
-            skill_dirs.push(dir.join(".agents").join("skills"));
-            skill_dirs.push(dir.join(".claude").join("skills"));
-            if !dir.pop() {
-                break;
-            }
-        }
-    }
-
-    // Extra skill paths from settings
-    for entry in &settings.skills {
-        let path = expand_path(entry, agent_dir);
-        if path.is_dir() {
-            skill_dirs.push(path);
-        }
-    }
-
     let mut seen_dirs = std::collections::HashSet::new();
     let mut seen_skills = std::collections::HashSet::new();
-    for dir in skill_dirs {
+    for (dir, _) in skill_dirs(agent_dir, cwd, project_trusted, settings) {
         if !dir.is_dir() {
             continue;
         }
@@ -103,39 +143,139 @@ pub fn load_resources(
             continue;
         }
         let (skills, _) = load_skills(&dir);
-        for skill in skills {
-            if !seen_skills.insert(skill.name.clone()) {
-                continue;
-            }
-            if settings.disabled_skills.contains(&skill.name) {
-                out.disabled_skills.push(skill);
-            } else {
-                out.skills.push(skill);
-            }
-        }
+        add_skills(&mut out, &mut seen_skills, settings, skills);
     }
 
-    // Prompts
-    let mut prompt_dirs = vec![agent_dir.join("prompts")];
-    if project_trusted {
-        prompt_dirs.push(get_project_dir(cwd).join("prompts"));
-    }
-    for entry in &settings.prompts {
-        prompt_dirs.push(expand_path(entry, agent_dir));
-    }
     let mut seen_prompts = std::collections::HashSet::new();
-    for dir in prompt_dirs {
+    for (dir, _) in prompt_dirs(agent_dir, cwd, project_trusted, settings) {
         if !dir.is_dir() {
             continue;
         }
         let (templates, _) = load_prompt_templates(&dir);
-        for tmpl in templates {
-            if seen_prompts.insert(tmpl.name.clone()) {
-                out.prompts.push(tmpl);
-            }
-        }
+        add_prompts(&mut out, &mut seen_prompts, templates);
     }
 
+    collect_rest(&mut out, agent_dir, cwd, project_trusted, settings);
+    out
+}
+
+/// [`load_resources`] for a Session on a Workspace: the project folders
+/// (the project's `skills` and `prompts`, and the `.agents/skills` and
+/// `.claude/skills` of the working directory and its parents) are read
+/// through `workspace`, the execution environment of that Workspace. The
+/// global folders (the agent directory, the user's `~/.agents` and
+/// `~/.claude`, and folders named in settings) stay Runtime host reads.
+/// Trust works as before: with `project_trusted` false no project folder
+/// is read, and a Runtime under a tool lock passes `false`.
+pub async fn load_resources_in(
+    workspace: &dyn FileSystem,
+    agent_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+    settings: &Settings,
+) -> LoadedResources {
+    let mut out = LoadedResources::default();
+    let mut seen_dirs = std::collections::HashSet::new();
+    let mut seen_skills = std::collections::HashSet::new();
+    for (dir, scope) in skill_dirs(agent_dir, cwd, project_trusted, settings) {
+        let (key, skills) = match scope {
+            Scope::Global => {
+                if !dir.is_dir() {
+                    continue;
+                }
+                let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+                if seen_dirs.contains(&(scope, key.clone())) {
+                    continue;
+                }
+                (key, load_skills(&dir).0)
+            }
+            Scope::Project => {
+                if !workspace_is_dir(workspace, &dir).await {
+                    continue;
+                }
+                let key = workspace
+                    .canonical_path(&dir)
+                    .await
+                    .unwrap_or_else(|_| dir.clone());
+                if seen_dirs.contains(&(scope, key.clone())) {
+                    continue;
+                }
+                (key, load_skills_in(workspace, &dir).await.0)
+            }
+        };
+        seen_dirs.insert((scope, key));
+        add_skills(&mut out, &mut seen_skills, settings, skills);
+    }
+
+    let mut seen_prompts = std::collections::HashSet::new();
+    for (dir, scope) in prompt_dirs(agent_dir, cwd, project_trusted, settings) {
+        let templates = match scope {
+            Scope::Global => {
+                if !dir.is_dir() {
+                    continue;
+                }
+                load_prompt_templates(&dir).0
+            }
+            Scope::Project => {
+                if !workspace_is_dir(workspace, &dir).await {
+                    continue;
+                }
+                load_prompt_templates_in(workspace, &dir).await.0
+            }
+        };
+        add_prompts(&mut out, &mut seen_prompts, templates);
+    }
+
+    collect_rest(&mut out, agent_dir, cwd, project_trusted, settings);
+    out
+}
+
+/// Whether `dir` is a folder in the Workspace (a link to one counts).
+async fn workspace_is_dir(workspace: &dyn FileSystem, dir: &Path) -> bool {
+    workspace.file_info(dir).await.is_ok_and(|info| info.is_dir)
+}
+
+fn add_skills(
+    out: &mut LoadedResources,
+    seen_skills: &mut std::collections::HashSet<String>,
+    settings: &Settings,
+    skills: Vec<Skill>,
+) {
+    for skill in skills {
+        if !seen_skills.insert(skill.name.clone()) {
+            continue;
+        }
+        if settings.disabled_skills.contains(&skill.name) {
+            out.disabled_skills.push(skill);
+        } else {
+            out.skills.push(skill);
+        }
+    }
+}
+
+fn add_prompts(
+    out: &mut LoadedResources,
+    seen_prompts: &mut std::collections::HashSet<String>,
+    templates: Vec<PromptTemplate>,
+) {
+    for tmpl in templates {
+        if seen_prompts.insert(tmpl.name.clone()) {
+            out.prompts.push(tmpl);
+        }
+    }
+}
+
+/// Extensions, hooks and themes. These are found on the Runtime host: the
+/// Rhai extensions run in the Runtime, the hook files belong to the hook
+/// loader (`hooks_load`, which reads them from these paths), and themes
+/// are a Surface matter.
+fn collect_rest(
+    out: &mut LoadedResources,
+    agent_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+    settings: &Settings,
+) {
     // Extensions
     collect_rhai(&agent_dir.join("extensions"), &mut out.extension_paths);
     if project_trusted {
@@ -169,8 +309,6 @@ pub fn load_resources(
             out.theme_dirs.push(p);
         }
     }
-
-    out
 }
 
 fn expand_path(entry: &str, agent_dir: &Path) -> PathBuf {

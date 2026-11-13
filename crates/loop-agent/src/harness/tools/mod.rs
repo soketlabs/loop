@@ -224,9 +224,10 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         let previous_text = if created {
                             documents::Previous::Text(String::new())
                         } else {
+                            let root = documents::reader_root(env.as_ref()).await;
                             until_cancelled(
                                 cancel,
-                                documents::text_of(&abs, &previous, cancel, env.cwd()),
+                                documents::text_of(&abs, &previous, cancel, &root),
                             )
                             .await??
                         };
@@ -630,7 +631,7 @@ pub fn create_bash_tool_with(
                 // Ensure relative cwd resolves against env.cwd
                 if let Some(ref c) = options.cwd {
                     if c.is_relative() {
-                        options.cwd = Some(env.cwd().join(c));
+                        options.cwd = Some(env.join_path(env.cwd(), c));
                     }
                 }
                 if let Some(on_update) = on_update {

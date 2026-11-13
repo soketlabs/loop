@@ -247,27 +247,9 @@ impl WorkspaceResources {
         if settings.sandbox.mode != "local" {
             settings.sandbox.mode = "off".into();
         }
-        let mut resources = load_resources(&globals.agent_dir, &cwd, project_trusted, &settings);
-        let mut locked_notices = Vec::new();
-        if let Some(lock) = globals.tool_lock() {
-            locked_notices = lock_workspace(lock, &mut settings, &mut resources);
-        }
-        let hooks = crate::hooks_load::load_hooks(&resources.hook_paths);
-        let context_files = if opts.no_context_files {
-            vec![]
-        } else if standalone || project_trusted {
-            load_context_files(&prompt_cwd, &globals.agent_dir)
-        } else {
-            crate::system_prompt::load_global_context_files(&globals.agent_dir)
-        };
-        let (custom_system_prompt, append_system_prompt) =
-            crate::system_prompt::resolve_system_prompt_files_in(
-                &globals.agent_dir,
-                &prompt_cwd,
-                project_trusted,
-                opts.system_prompt.as_deref(),
-                opts.append_system_prompt.as_deref(),
-            );
+        // The workspace env exists before the loaders run: project resources
+        // (skills, prompts, context files, system prompt files) are read
+        // through it, global ones stay host reads.
         let host: Arc<dyn ExecutionEnv> = if globals.tool_lock().is_some() {
             // Each file read is checked on the opened file itself, so a path
             // changed into a link between the gate's check and the open is
@@ -276,6 +258,30 @@ impl WorkspaceResources {
         } else {
             Arc::new(HostExecutionEnv::new(&cwd))
         };
+        let mut resources =
+            load_resources_in(&*host, &globals.agent_dir, &cwd, project_trusted, &settings).await;
+        let mut locked_notices = Vec::new();
+        if let Some(lock) = globals.tool_lock() {
+            locked_notices = lock_workspace(lock, &mut settings, &mut resources);
+        }
+        let hooks = crate::hooks_load::load_hooks(&resources.hook_paths);
+        let context_files = if opts.no_context_files {
+            vec![]
+        } else if standalone || project_trusted {
+            load_context_files_in(&*host, &prompt_cwd, &globals.agent_dir).await
+        } else {
+            crate::system_prompt::load_global_context_files(&globals.agent_dir)
+        };
+        let (custom_system_prompt, append_system_prompt) =
+            crate::system_prompt::resolve_system_prompt_files_via(
+                &*host,
+                &globals.agent_dir,
+                &prompt_cwd,
+                project_trusted,
+                opts.system_prompt.as_deref(),
+                opts.append_system_prompt.as_deref(),
+            )
+            .await;
         let web = crate::web_tools::WebTools::from_settings(
             &settings,
             Some(Arc::clone(&globals.credentials)),
