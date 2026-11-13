@@ -7,7 +7,7 @@
 //!   [`loop_agent::harness::tools::lock::CHAT_TOOLS`] is off, so a new tool,
 //!   an MCP tool or the `subagent` tool is off too (fail closed);
 //! - the shell, file writes and other tools are off, and Locked;
-//! - reads are on only inside the Session's workspace.
+//! - reads are on only inside the Session's folder (its cwd).
 //!
 //! "Off" removes the tool from the toolset and refuses a call that arrives
 //! anyway. Lower layers, the permission mode, allow rules, hooks and grants
@@ -40,7 +40,7 @@ pub fn layer(lock: ToolLock) -> Layer {
         .lock(Capability::Other)
         .set(
             Capability::ReadFiles,
-            Setting::within(State::Off, Scope::InsideWorkspace, State::On),
+            Setting::within(State::Off, Scope::InsideCwd, State::On),
         )
         .only_tools(tools.iter().copied())
 }
@@ -180,6 +180,11 @@ mod tests {
     fn reads_stay_inside_the_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
+        // A `.git` above the Session's folder must not widen reads to the
+        // git root: `sibling` is another user's folder.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("sibling")).unwrap();
+        std::fs::write(root.join("sibling/secret.txt"), "secret").unwrap();
         let ws = root.join("ws");
         std::fs::create_dir_all(ws.join("docs")).unwrap();
         std::fs::write(ws.join("docs/a.txt"), "a").unwrap();
@@ -188,7 +193,10 @@ mod tests {
         std::os::unix::fs::symlink(root.join("other.txt"), ws.join("link")).unwrap();
         let (policy, _) = Policy::new(vec![layer(ToolLock::Chat)]);
         let decide = |tool: &str, args: serde_json::Value| {
-            let call = Call::new(tool, args, &ws);
+            let call = Call {
+                cwd: ws.clone(),
+                ..Call::new(tool, args, &root)
+            };
             policy.decide(PermissionMode::FullAccess, &defaults(), &call)
         };
         assert_eq!(
@@ -207,6 +215,12 @@ mod tests {
             ("read", json!({"path": "/etc/passwd"})),
             ("grep", json!({"pattern": "x", "path": ".."})),
             ("ls", json!({"path": "/"})),
+            ("read", json!({})),
+            ("read", json!({"path": "../sibling/secret.txt"})),
+            (
+                "grep",
+                json!({"pattern": "secret", "path": root.join("sibling")}),
+            ),
             ("glob", json!({"pattern": "*", "path": "../"})),
         ] {
             assert!(

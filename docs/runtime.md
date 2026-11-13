@@ -149,9 +149,9 @@ With the `chat` lock, every Session of the Runtime:
   workflow tools and every MCP tool. A tool that a later version adds is off
   too, unless the lock names it. If a call to a removed tool arrives anyway,
   the gate refuses it.
-- reads only inside its workspace (the git root of its folder, or the
-  folder). A path that leads out, also through a symlink or `..`, is
-  refused.
+- reads only inside its own folder (its cwd, not the git root above it).
+  A path that leads out, also through a symlink or `..`, is refused, and
+  `read` must name a path.
 - starts no MCP server (stdio or remote), loads no hooks and no Rhai
   extensions, and has no skill whose folder holds anything but text files
   (`.md`, `.markdown`, `.txt`). Prompt templates are text and stay.

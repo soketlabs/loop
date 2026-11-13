@@ -60,6 +60,7 @@ fn user_text(message: &Message) -> Option<String> {
 fn model(dirs: &Dirs, seen: Arc<Mutex<Seen>>) -> FauxResponder {
     let marker = dirs.marker("bash");
     let ws = dirs.ws.clone();
+    let secret = dirs.secret();
     Arc::new(move |context: &Context| {
         let last = context
             .messages
@@ -125,6 +126,14 @@ fn model(dirs: &Dirs, seen: Arc<Mutex<Seen>>) -> FauxResponder {
                 call(4, "todo", json!({"todos": []})),
                 call(5, "mcp__lock__run", json!({})),
                 call(6, "read", json!({"path": "token.txt"})),
+                // Reads that leave the Session's folder.
+                call(7, "read", json!({"path": secret})),
+                call(8, "read", json!({"path": "../secret.txt"})),
+                call(9, "grep", json!({"pattern": "SECRET", "path": ".."})),
+                call(10, "ls", json!({"path": "/"})),
+                call(11, "glob", json!({"pattern": "*", "path": ".."})),
+                call(12, "glob", json!({"pattern": "../*.txt"})),
+                call(13, "read", json!({})),
             ])
         };
         Box::pin(std::future::ready(response))
@@ -163,6 +172,9 @@ impl Dirs {
             out,
         };
         std::fs::write(dirs.ws.join("token.txt"), "TOKEN\n").unwrap();
+        std::fs::write(dirs.secret(), "SECRET\n").unwrap();
+        // A git root above the Session's folder must not widen reads.
+        std::fs::create_dir_all(dirs.ws.parent().unwrap().join(".git")).unwrap();
         let touch =
             |name: &str| json!(["sh", "-c", format!("touch {}", dirs.marker(name).display())]);
         let mcp = |name: &str| json!({"command": "sh", "args": ["-c", format!("touch {}", dirs.marker(name).display())]});
@@ -219,6 +231,12 @@ impl Dirs {
         .unwrap();
         trust.set(&dirs.ws, true).unwrap();
         dirs
+    }
+
+    /// Another user's file next to the Session's folder, under the same
+    /// git root.
+    fn secret(&self) -> PathBuf {
+        self.ws.parent().unwrap().join("secret.txt")
     }
 
     fn marker(&self, name: &str) -> PathBuf {
@@ -304,16 +322,19 @@ fn assert_held(dirs: &Dirs, seen: &Seen, what: &str) {
         }
         assert!(tools.iter().any(|t| t == "read"), "{what}: {tools:?}");
     }
-    let mut refused = 0;
-    for (tool, is_error, text) in &seen.results {
-        if tool == "read" {
-            assert!(!is_error && text.contains("TOKEN"), "{what}: read: {text}");
-        } else {
-            assert!(is_error, "{what}: `{tool}` succeeded: {text}");
-            refused += 1;
+    assert_eq!(seen.results.len(), 14, "{what}: {:?}", seen.results);
+    for (i, (tool, is_error, text)) in seen.results.iter().enumerate() {
+        assert!(
+            !text.contains("SECRET"),
+            "{what}: `{tool}` read past the folder: {text}"
+        );
+        match i {
+            6 => assert!(!is_error && text.contains("TOKEN"), "{what}: read: {text}"),
+            // A pattern with `..` matches nothing below the folder.
+            12 => {}
+            _ => assert!(is_error, "{what}: call {i} `{tool}` succeeded: {text}"),
         }
     }
-    assert_eq!(refused, 6, "{what}: {:?}", seen.results);
 }
 
 fn locked_shell() -> BackendError {
@@ -490,6 +511,15 @@ async fn without_the_lock_the_same_attack_runs() {
         );
     }
     assert!(dirs.ws.join("new.txt").exists(), "write did not run");
+    // Without the lock the same out-of-folder read works, so the locked
+    // test checks a real boundary.
+    let results = seen.lock().unwrap().results.clone();
+    assert!(
+        results
+            .iter()
+            .any(|(tool, err, text)| tool == "read" && !err && text.contains("SECRET")),
+        "{results:?}"
+    );
     let offered = seen.lock().unwrap().tools[0].clone();
     for tool in ["bash", "write", "edit", "subagent", "todo"] {
         assert!(offered.iter().any(|t| t == tool), "{tool}: {offered:?}");
