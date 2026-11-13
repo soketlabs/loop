@@ -24,11 +24,11 @@ async fn sqlite_fixture() -> Fixture<dyn EventLog> {
 
 macro_rules! shared_suite {
     ($memory:ident, $sqlite:ident, $suite:ident) => {
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn $memory() {
             kit::$suite(&memory_fixture).await;
         }
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn $sqlite() {
             kit::$suite(&sqlite_fixture).await;
         }
@@ -63,6 +63,28 @@ shared_suite!(
     subagent_sessions
 );
 shared_suite!(memory_prompts_sent, sqlite_prompts_sent, prompts_sent);
+shared_suite!(memory_paged_reads, sqlite_paged_reads, paged_reads);
+shared_suite!(
+    memory_paged_read_under_appends,
+    sqlite_paged_read_under_appends,
+    paged_read_under_appends
+);
+shared_suite!(
+    memory_read_your_writes,
+    sqlite_read_your_writes,
+    read_your_writes
+);
+shared_suite!(
+    memory_long_read_does_not_delay_appends,
+    sqlite_long_read_does_not_delay_appends,
+    long_read_does_not_delay_appends
+);
+shared_suite!(
+    memory_summary_matches_fold,
+    sqlite_summary_matches_fold,
+    summary_matches_fold
+);
+shared_suite!(memory_recovery_pages, sqlite_recovery_pages, recovery_pages);
 
 #[tokio::test]
 async fn sqlite_reopen_keeps_cursors_generations_and_unknown() {

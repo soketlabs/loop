@@ -16,8 +16,9 @@ pub use sqlite::SqliteEventLog;
 /// now `Stopped`.
 pub use loop_store::StoreError as EventLogError;
 pub use loop_store::{
-    is_recovery_record, Event, EventKind, EventLog, LoggedEvent, Result, MAX_BATCH_EVENTS,
-    WRITER_QUEUE_CAPACITY,
+    is_recovery_record, Cursor, Event, EventKind, EventLog, LoggedEvent, Page, PageLimit, Result,
+    SessionSummary, MAX_BATCH_EVENTS, WRITER_QUEUE_CAPACITY,
 };
+pub use sqlite::READER_POOL_SIZE;
 
 use loop_store::{stamp, validate_batch as validate};

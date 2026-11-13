@@ -203,7 +203,10 @@ impl FileSystem for HostExecutionEnv {
             .open(&path)
             .await
             .map_err(Self::map_io)?;
-        file.write_all(data).await.map_err(Self::map_io)
+        file.write_all(data).await.map_err(Self::map_io)?;
+        // A tokio file hands the bytes to a blocking task. Without a flush,
+        // the call can return before the bytes are in the file.
+        file.flush().await.map_err(Self::map_io)
     }
 
     async fn file_info(&self, path: &Path) -> Result<FileInfo, FileError> {

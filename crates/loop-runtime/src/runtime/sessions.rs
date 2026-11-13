@@ -249,6 +249,8 @@ impl Runtime {
                 }
             }
             if !created {
+                // Appends abandoned while queued (a torn-down pump) commit first.
+                self.log.sync().await.map_err(failed)?;
                 // Turn ids stay unique per Session across Runtime generations.
                 let turns = self.log.turn_ids(&reference.key).await.map_err(failed)?;
                 let last = turns
