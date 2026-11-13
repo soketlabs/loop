@@ -1,0 +1,19 @@
+[package]
+name = "loop-workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Workspace driver contract for Loop: where a Session's files and commands live (files, shell, lifecycle, drivers), with no backend"
+
+[dependencies]
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

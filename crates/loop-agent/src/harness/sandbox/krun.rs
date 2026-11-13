@@ -276,6 +276,27 @@ impl KrunSandbox {
 }
 
 #[async_trait]
+impl loop_workspace::Workspace for KrunSandbox {
+    fn driver_id(&self) -> &str {
+        super::drivers::PODMAN_DRIVER_ID
+    }
+    fn capabilities(&self) -> loop_workspace::WorkspaceCapabilities {
+        super::drivers::podman_capabilities(
+            &SandboxConfig {
+                workdir: self.workdir.clone(),
+                options: json!({
+                    "isolation": self.isolation.as_str(),
+                    "cpus": self.cpus,
+                    "ram_mib": self.ram_mib,
+                }),
+                labels: Default::default(),
+            }
+            .into(),
+        )
+    }
+}
+
+#[async_trait]
 impl Sandbox for KrunSandbox {
     fn kind(&self) -> &str {
         "local"

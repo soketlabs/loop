@@ -271,6 +271,64 @@ impl FileSystem for HostExecutionEnv {
             .then(|| crate::harness::types::FileIdentity::from_metadata(&meta)))
     }
 
+    async fn symlink_metadata(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PathMetadata, FileError> {
+        let path = self.absolute_path(path)?;
+        let meta = tokio::fs::symlink_metadata(&path)
+            .await
+            .map_err(Self::map_io)?;
+        Ok(path_metadata(&meta))
+    }
+
+    async fn read_link(&self, path: &Path) -> Result<PathBuf, FileError> {
+        let path = self.absolute_path(path)?;
+        tokio::fs::read_link(&path).await.map_err(Self::map_io)
+    }
+
+    async fn resolve_for_policy(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PolicyPath, FileError> {
+        let absolute = loop_workspace::lexical(&self.absolute_path(path)?);
+        // Walk the components with lstat: any link on the way is reported.
+        let mut has_link = false;
+        let mut prefix = PathBuf::new();
+        for component in absolute.components() {
+            prefix.push(component.as_os_str());
+            match tokio::fs::symlink_metadata(&prefix).await {
+                Ok(meta) if meta.file_type().is_symlink() => has_link = true,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(Self::map_io(e)),
+            }
+        }
+        match tokio::fs::canonicalize(&absolute).await {
+            Ok(resolved) => {
+                let meta = tokio::fs::metadata(&resolved).await.map_err(Self::map_io)?;
+                let info = path_metadata(&meta);
+                Ok(crate::harness::types::PolicyPath {
+                    resolved,
+                    exists: true,
+                    has_link,
+                    uid: info.uid,
+                    nlink: info.nlink,
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(crate::harness::types::PolicyPath {
+                    resolved: absolute,
+                    exists: false,
+                    has_link,
+                    uid: None,
+                    nlink: None,
+                })
+            }
+            Err(e) => Err(Self::map_io(e)),
+        }
+    }
+
     async fn create_temp_dir(&self, prefix: &str) -> Result<PathBuf, FileError> {
         let base = std::env::temp_dir();
         let name = format!("{prefix}-{}", loop_ai::new_id());
@@ -279,6 +337,32 @@ impl FileSystem for HostExecutionEnv {
             .await
             .map_err(Self::map_io)?;
         Ok(path)
+    }
+}
+
+fn path_metadata(meta: &std::fs::Metadata) -> crate::harness::types::PathMetadata {
+    use crate::harness::types::{PathKind, PathMetadata};
+    let kind = if meta.file_type().is_symlink() {
+        PathKind::Symlink
+    } else if meta.is_file() {
+        PathKind::File
+    } else if meta.is_dir() {
+        PathKind::Dir
+    } else {
+        PathKind::Other
+    };
+    #[cfg(unix)]
+    let (uid, nlink) = {
+        use std::os::unix::fs::MetadataExt;
+        (Some(meta.uid()), Some(meta.nlink()))
+    };
+    #[cfg(not(unix))]
+    let (uid, nlink) = (None, None);
+    PathMetadata {
+        kind,
+        size: meta.len(),
+        uid,
+        nlink,
     }
 }
 
@@ -302,6 +386,9 @@ impl Shell for HostExecutionEnv {
         }
         if let Some(env) = &options.env {
             cmd.envs(env);
+        }
+        for name in &options.remove_env {
+            cmd.env_remove(name);
         }
         exec_command(cmd, options, false, None).await
     }
