@@ -494,7 +494,7 @@ pub fn apply_shortened(messages: &mut [AgentMessage], details: Option<&serde_jso
     }
     for message in messages {
         if let AgentMessage::Llm(Message::ToolResult(result)) = message {
-            if ids.iter().any(|id| *id == result.tool_call_id) {
+            if ids.contains(&result.tool_call_id) {
                 shorten_tool_result(result, SHORTENED_OUTPUT_CHARS);
             }
         }
