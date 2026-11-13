@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -12,8 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::run_agent_loop;
 use crate::harness::compaction::{
-    estimate_tokens, generate_branch_summary_fallback, generate_summary_fallback,
-    prepare_compaction, CompactionSettings,
+    compaction_details, context_entry_ids, estimate_tokens, generate_branch_summary_fallback,
+    prepare_compaction, summarize, summary_input_limit, usage_valid_from, AutoCompactionError,
+    CompactionSettings, CompactionTrigger, PendingTurnWrites, TurnCompactor,
 };
 use crate::harness::hooks::{HarnessHookEvent, HookRegistry};
 use crate::harness::prompt_templates::format_prompt_template_invocation;
@@ -30,7 +31,7 @@ use crate::stream_fn::{stream_fn_from_models, StreamFn};
 use crate::types::{
     AfterToolCallContext, AfterToolCallResult, AgentContext, AgentEvent, AgentEventSink,
     AgentLoopConfig, AgentMessage, AgentThinkingLevel, AgentTool, BeforeToolCallContext,
-    BeforeToolCallResult, PromptInput, QueueMode, RunLabels, ToolExecutionMode,
+    BeforeToolCallResult, LoopCompaction, PromptInput, QueueMode, RunLabels, ToolExecutionMode,
 };
 
 type BeforeToolHook = Arc<
@@ -124,7 +125,7 @@ pub struct AgentHarness {
     stream_options: RwLock<SimpleStreamOptions>,
     sandbox: RwLock<SandboxMode>,
     phase: Mutex<AgentHarnessPhase>,
-    pending_writes: Arc<Mutex<Vec<PendingSessionWrite>>>,
+    pending_writes: Arc<Mutex<PendingTurnWrites>>,
     steering: Arc<Mutex<VecDeque<AgentMessage>>>,
     follow_up: Arc<Mutex<VecDeque<AgentMessage>>>,
     next_turn: Mutex<VecDeque<AgentMessage>>,
@@ -139,6 +140,8 @@ pub struct AgentHarness {
     turns_in_flight: std::sync::atomic::AtomicUsize,
     settled: Notify,
     compaction_settings: RwLock<CompactionSettings>,
+    /// Compaction entries turns wrote since [`AgentHarness::take_turn_compactions`].
+    turn_compactions: AtomicU64,
     tool_execution: Mutex<ToolExecutionMode>,
     before_tool_call: Mutex<Option<BeforeToolHook>>,
     after_tool_call: Mutex<Option<AfterToolHook>>,
@@ -176,7 +179,7 @@ impl AgentHarness {
             stream_options: RwLock::new(stream_options),
             sandbox: RwLock::new(options.sandbox),
             phase: Mutex::new(AgentHarnessPhase::Idle),
-            pending_writes: Arc::new(Mutex::new(Vec::new())),
+            pending_writes: Arc::new(Mutex::new(PendingTurnWrites::default())),
             steering: Arc::new(Mutex::new(VecDeque::new())),
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             next_turn: Mutex::new(VecDeque::new()),
@@ -189,6 +192,7 @@ impl AgentHarness {
             turns_in_flight: std::sync::atomic::AtomicUsize::new(0),
             settled: Notify::new(),
             compaction_settings: RwLock::new(CompactionSettings::default()),
+            turn_compactions: AtomicU64::new(0),
             tool_execution: Mutex::new(ToolExecutionMode::Parallel),
             before_tool_call: Mutex::new(None),
             after_tool_call: Mutex::new(None),
@@ -883,6 +887,12 @@ impl AgentHarness {
         self.compaction_settings.read().await.clone()
     }
 
+    /// How many compaction entries turns wrote (automatic compaction) since
+    /// the last call. Each one counts in the Session revision.
+    pub fn take_turn_compactions(&self) -> u64 {
+        self.turn_compactions.swap(0, Ordering::AcqRel)
+    }
+
     /// Append a label to the session (immediate when idle, deferred during a turn).
     pub async fn append_label(&self, label: impl Into<String>) -> Result<(), AgentHarnessError> {
         let label = label.into();
@@ -980,16 +990,10 @@ impl AgentHarness {
     ) -> Result<CompactResult, AgentHarnessError> {
         self.acquire_idle_phase(AgentHarnessPhase::Compaction)
             .await?;
-
-        let result = self
-            .compact_inner(settings, custom_instructions)
-            .await
-            .inspect_err(|_e| {
-                self.release_to_idle();
-            });
-
-        self.release_to_idle();
-        result
+        // Back to idle however this ends, also when the caller drops it
+        // during the summary request.
+        let _idle = IdleOnDrop(self);
+        self.compact_inner(settings, custom_instructions).await
     }
 
     /// Aggregate session / token / cost statistics for `/session`.
@@ -1064,11 +1068,9 @@ impl AgentHarness {
         let settings = self.compaction_settings.read().await.clone();
         self.acquire_idle_phase(AgentHarnessPhase::Compaction)
             .await?;
-        let result = self
-            .prepare_compaction_inner(&settings, custom_instructions)
-            .await;
-        self.release_to_idle();
-        result
+        let _idle = IdleOnDrop(self);
+        self.prepare_compaction_inner(&settings, custom_instructions)
+            .await
     }
 
     async fn prepare_compaction_inner(
@@ -1090,21 +1092,36 @@ impl AgentHarness {
         let prep = prepare_compaction(&ctx.messages, &llm, settings)
             .map_err(|e| AgentHarnessError::Compaction(e.to_string()))?;
 
-        let hook = self
-            .hooks
-            .emit(HarnessHookEvent::SessionBeforeCompact {
-                preparation_cut: prep.cut_index,
-                custom_instructions: custom_instructions.map(|s| s.to_string()),
-            })
-            .await;
-
-        if hook.cancel {
-            return Err(AgentHarnessError::Hook("compaction cancelled".into()));
+        let model = self.require_model().await?;
+        let options = self.stream_options.read().await.clone();
+        // `abort` cancels the summary request, as it cancels a turn.
+        let cancel = CancellationToken::new();
+        *self.cancel.lock() = Some(cancel.clone());
+        struct ClearCancel<'a>(&'a AgentHarness);
+        impl Drop for ClearCancel<'_> {
+            fn drop(&mut self) {
+                self.0.cancel.lock().take();
+            }
         }
-
-        let summary = hook
-            .summary
-            .unwrap_or_else(|| generate_summary_fallback(&prep.to_summarize));
+        let _clear = ClearCancel(self);
+        let (summary, usage) = summarize(
+            &self.hooks,
+            &self.stream_fn,
+            &model,
+            options,
+            &prep.to_summarize,
+            prep.cut_index,
+            custom_instructions,
+            summary_input_limit(&model, settings),
+            &cancel,
+        )
+        .await
+        .map_err(|e| match e {
+            AutoCompactionError::HookCancelled => {
+                AgentHarnessError::Hook("compaction cancelled".into())
+            }
+            other => AgentHarnessError::Compaction(other.to_string()),
+        })?;
 
         let branch = {
             let session = self.session.lock().await;
@@ -1113,11 +1130,23 @@ impl AgentHarness {
                 .await
                 .map_err(AgentHarnessError::Session)?
         };
-        let first_kept_entry_id = first_kept_entry_id_for_cut(&branch, prep.cut_index);
+        let first_kept_entry_id = context_entry_ids(&branch).get(prep.cut_index).cloned();
+        let tokens_after =
+            crate::harness::compaction::estimate_agent_messages_tokens(&prep.retained)
+                .saturating_add(crate::harness::compaction::estimate_agent_messages_tokens(
+                    std::slice::from_ref(&crate::messages::create_compaction_summary_message(
+                        summary.clone(),
+                    )),
+                ));
         let write = PendingSessionWrite::Compaction {
             summary: summary.clone(),
             first_kept_entry_id,
-            details: None,
+            details: Some(compaction_details(
+                CompactionTrigger::Manual,
+                tokens_before,
+                tokens_after,
+                usage.as_ref(),
+            )),
         };
         Ok((
             CompactResult {
@@ -1301,15 +1330,22 @@ impl AgentHarness {
 
     /// Create turn snapshot.
     pub async fn create_turn_state(&self) -> Result<TurnSnapshot, AgentHarnessError> {
+        Ok(self.turn_state().await?.0)
+    }
+
+    /// The turn snapshot and the branch entries its messages come from.
+    async fn turn_state(&self) -> Result<(TurnSnapshot, Vec<SessionTreeEntry>), AgentHarnessError> {
         let tool_env = self.tool_env().await?;
 
-        let ctx = {
+        // `build_context`, keeping the branch for automatic compaction.
+        let branch = {
             let session = self.session.lock().await;
             session
-                .build_context()
+                .read_branch()
                 .await
                 .map_err(AgentHarnessError::Session)?
         };
+        let ctx = crate::harness::session::types::default_context_from_entries(&branch);
 
         let resources = self.resources.read().await.clone();
         let all_tools = self.tools.read().clone();
@@ -1345,15 +1381,18 @@ impl AgentHarness {
             stream_options.base.session_id = Some(session.metadata().id.clone());
         }
 
-        Ok(TurnSnapshot {
-            messages: ctx.messages,
-            system_prompt,
-            model: self.require_model().await?,
-            thinking_level: *self.thinking_level.read().await,
-            tools,
-            stream_options,
-            tool_env,
-        })
+        Ok((
+            TurnSnapshot {
+                messages: ctx.messages,
+                system_prompt,
+                model: self.require_model().await?,
+                thinking_level: *self.thinking_level.read().await,
+                tools,
+                stream_options,
+                tool_env,
+            },
+            branch,
+        ))
     }
 
     /// Prompt the harness; returns last assistant message.
@@ -1429,7 +1468,12 @@ impl AgentHarness {
         // cannot leave the harness stuck in `Turn` with the CLI showing Working…
         let mut result = self.run_turn_inner(input, token.clone()).await;
 
-        let writes = std::mem::take(&mut *self.pending_writes.lock());
+        let PendingTurnWrites {
+            writes,
+            first_kept,
+            shortened,
+            ..
+        } = self.pending_writes.lock().take();
         // Aborted turns should leave no session footprint so a follow-up prompt
         // (or UI "stop") behaves as if the turn never ran.
         let mut write_error = None;
@@ -1437,15 +1481,49 @@ impl AgentHarness {
             let session = self.session.lock().await;
             let store = session.store();
             let sid = session.metadata().id.clone();
-            for w in writes {
-                if let Err(e) = store.append_entry(&sid, w).await {
-                    tracing::error!(session_id = %sid, "session write failed: {e}");
-                    // A turn the Session does not hold is not complete. Later
-                    // entries would hang off the wrong parent, so stop here.
-                    if result.is_ok() {
-                        write_error = Some(e);
+            // Entry ids of the writes so far, for compactions that keep
+            // messages of this turn.
+            let mut written: Vec<String> = Vec::with_capacity(writes.len());
+            for (index, mut w) in writes.into_iter().enumerate() {
+                if let PendingSessionWrite::Compaction {
+                    first_kept_entry_id,
+                    details,
+                    ..
+                } = &mut w
+                {
+                    if let Some(&kept) = first_kept.get(&index) {
+                        *first_kept_entry_id = written.get(kept).cloned();
                     }
-                    break;
+                    // Tool results of this turn it shortened, by entry id.
+                    if let (Some(writes), Some(details)) = (shortened.get(&index), details) {
+                        let mut ids: Vec<serde_json::Value> =
+                            details["shortened"].as_array().cloned().unwrap_or_default();
+                        ids.extend(
+                            writes
+                                .iter()
+                                .filter_map(|w| written.get(*w).cloned())
+                                .map(serde_json::Value::String),
+                        );
+                        details["shortened"] = serde_json::Value::Array(ids);
+                    }
+                }
+                let compaction = matches!(w, PendingSessionWrite::Compaction { .. });
+                match store.append_entry(&sid, w).await {
+                    Ok(entry) => {
+                        written.push(entry.id().to_string());
+                        if compaction {
+                            self.turn_compactions.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(session_id = %sid, "session write failed: {e}");
+                        // A turn the Session does not hold is not complete. Later
+                        // entries would hang off the wrong parent, so stop here.
+                        if result.is_ok() {
+                            write_error = Some(e);
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -1491,7 +1569,7 @@ impl AgentHarness {
             }
         }
         self.emit_progress("preparing turn…").await;
-        let snapshot = self.create_turn_state().await?;
+        let (snapshot, branch) = self.turn_state().await?;
         if token.is_cancelled() {
             return Err(AgentHarnessError::Other("aborted".into()));
         }
@@ -1574,6 +1652,29 @@ impl AgentHarness {
             })
         }));
 
+        let settings = self.compaction_settings.read().await.clone();
+        if settings.enabled {
+            let compactor = Arc::new(TurnCompactor::new(
+                Arc::clone(&self.stream_fn),
+                config.stream_options.clone(),
+                settings.clone(),
+                self.hooks.clone(),
+                Arc::clone(&self.pending_writes),
+                &branch,
+                snapshot.messages.len(),
+                &prompts,
+            ));
+            config.compaction = Some(LoopCompaction {
+                usage_valid_from: usage_valid_from(&branch, snapshot.messages.len()),
+                settings,
+                compact: Arc::new(move |request| {
+                    let compactor = Arc::clone(&compactor);
+                    Box::pin(async move { compactor.compact(request).await })
+                }),
+            });
+        }
+        drop(branch);
+
         let context = AgentContext {
             system_prompt: snapshot.system_prompt.clone(),
             messages: snapshot.messages.clone(),
@@ -1588,9 +1689,7 @@ impl AgentHarness {
             let subscribers = subscribers.clone();
             Box::pin(async move {
                 if let AgentEvent::MessageEnd { message } = &event {
-                    pending.lock().push(PendingSessionWrite::Message {
-                        message: message.clone(),
-                    });
+                    pending.lock().push_loop_message(message.clone());
                 }
                 tracing::debug!(event = event.type_name(), "agent event");
                 for sub in &subscribers {
@@ -1924,29 +2023,13 @@ impl AgentHarness {
     }
 }
 
-/// Map a cut index in the built context messages back to the branch entry that
-/// produced that message. Mirrors the message-production order of
-/// `default_context_from_entries`.
-fn first_kept_entry_id_for_cut(entries: &[SessionTreeEntry], cut_index: usize) -> Option<String> {
-    let mut producer_ids: Vec<&str> = Vec::new();
-    for e in entries {
-        match e {
-            SessionTreeEntry::Message { .. } | SessionTreeEntry::BranchSummary { .. } => {
-                producer_ids.push(e.id());
-            }
-            SessionTreeEntry::Compaction {
-                first_kept_entry_id,
-                ..
-            } => {
-                if first_kept_entry_id.is_none() {
-                    producer_ids.clear();
-                }
-                producer_ids.insert(0, e.id());
-            }
-            _ => {}
-        }
+/// Returns the harness to idle when dropped: an idle-only operation ends
+/// cleanly also when its future is dropped.
+struct IdleOnDrop<'a>(&'a AgentHarness);
+impl Drop for IdleOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.release_to_idle();
     }
-    producer_ids.get(cut_index).map(|s| s.to_string())
 }
 
 /// Counts one turn in flight for [`AgentHarness::wait_for_settled`].

@@ -427,6 +427,9 @@ impl OpenedSession {
             .map_err(|e| anyhow::anyhow!("tool env: {e}"))?;
         let bash_limits = settings.bash.unwrap_or_default().limits();
         harness.set_bash_limits(bash_limits);
+        harness
+            .set_compaction_settings(settings.compaction.harness_settings())
+            .await;
         let mut tools = build_tools(
             env,
             &workspace.web,
@@ -830,6 +833,9 @@ impl SessionFactory {
         harness.set_tool_env_policy(tool_env_policy);
         harness.set_thinking_level(effort).await;
         harness.set_bash_limits(bash_limits);
+        harness
+            .set_compaction_settings(settings.compaction.harness_settings())
+            .await;
         harness
             .set_response_header_timeout_ms(settings.response_header_timeout_ms)
             .await;
