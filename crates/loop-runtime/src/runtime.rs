@@ -525,6 +525,17 @@ impl Runtime {
             max_active_turns: self.limits.max_active_turns as u64,
             max_sessions_from: None,
             max_active_turns_from: None,
+            tool_lock: self.factory.globals.tool_lock(),
+        }
+    }
+    /// Refuse `what` when the Runtime has a tool lock.
+    pub(crate) fn refuse_if_locked(&self, what: &str) -> BackendResult<()> {
+        match self.factory.globals.tool_lock() {
+            Some(lock) => Err(BackendError::ToolLocked {
+                what: what.to_owned(),
+                lock,
+            }),
+            None => Ok(()),
         }
     }
     pub fn event_log(&self) -> &Arc<dyn EventLog> {
@@ -1360,11 +1371,12 @@ impl AgentBackend for Runtime {
         &self.instance
     }
     fn capabilities(&self) -> Capabilities {
+        let locked = self.factory.globals.tool_lock().is_some();
         Capabilities {
             session_environment: true,
             session_config: true,
             session_skills: true,
-            workflow: cfg!(feature = "orchestration"),
+            workflow: cfg!(feature = "orchestration") && !locked,
             session_tree: true,
             session_rename: true,
             session_fork: true,
@@ -1379,7 +1391,7 @@ impl AgentBackend for Runtime {
             efforts: true,
             compaction: true,
             session_stats: true,
-            local_shell: true,
+            local_shell: !locked,
             session_ttfb: true,
             ..Capabilities::default()
         }

@@ -179,6 +179,11 @@ enum RuntimeCommand {
         /// variable, else no lock].
         #[arg(long, value_name = "LOCK")]
         tool_lock: Option<String>,
+        /// With `--tool-lock`: the folder every Session must be in; a
+        /// Session folder outside it is refused. Required with a lock
+        /// [default: the `LOOP_TOOL_LOCK_ROOT` environment variable].
+        #[arg(long, value_name = "DIR")]
+        tool_lock_root: Option<PathBuf>,
     },
     /// Ask the running Runtime to stop, through its socket, and wait up to
     /// 10 s for it to go. Never signals a process.
@@ -382,6 +387,7 @@ async fn real_main() -> anyhow::Result<()> {
                         max_sessions,
                         max_active_turns,
                         tool_lock,
+                        tool_lock_root,
                     } => {
                         let cwd = match &cli.cwd {
                             Some(cwd) => std::path::absolute(cwd)?,
@@ -396,6 +402,7 @@ async fn real_main() -> anyhow::Result<()> {
                             permission_mode: cli.permission_mode.clone(),
                             cwd,
                             tool_lock: tool_lock.clone(),
+                            tool_lock_root: tool_lock_root.clone(),
                         })
                         .await
                     }
@@ -822,11 +829,25 @@ mod tests {
         };
         assert_eq!(socket, Some(PathBuf::from("/tmp/x.sock")));
         assert_eq!((max_sessions, max_active_turns), (Some(3), Some(2)));
-        let cli = parse(&["loop", "runtime", "start", "--tool-lock", "chat"]);
-        let Some(Commands::Runtime(RuntimeCommand::Start { tool_lock, .. })) = cli.command else {
+        let cli = parse(&[
+            "loop",
+            "runtime",
+            "start",
+            "--tool-lock",
+            "chat",
+            "--tool-lock-root",
+            "/srv/users",
+        ]);
+        let Some(Commands::Runtime(RuntimeCommand::Start {
+            tool_lock,
+            tool_lock_root,
+            ..
+        })) = cli.command
+        else {
             panic!("not runtime start")
         };
         assert_eq!(tool_lock.as_deref(), Some("chat"));
+        assert_eq!(tool_lock_root, Some(PathBuf::from("/srv/users")));
         let cli = parse(&["loop", "runtime", "stop", "--socket", "/tmp/x.sock"]);
         assert!(matches!(
             cli.command,

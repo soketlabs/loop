@@ -262,6 +262,13 @@ async fn run(
                             if capabilities.tool_lock.is_some() {
                                 capabilities.local_shell = false;
                                 capabilities.workflow = false;
+                                // Host-only services are refused under a lock
+                                // ([`LOCKED_ADMIN`]).
+                                capabilities.host_providers = false;
+                                capabilities.host_tracing = false;
+                                capabilities.host_mcp_auth = false;
+                                capabilities.host_usage = false;
+                                capabilities.host_defaults = false;
                             }
                             let result = InitializeResult {
                                 protocol_version: negotiate(params.protocol_version),
@@ -808,6 +815,21 @@ async fn session_services(
     })
 }
 
+/// The admin methods a Runtime with a tool lock serves. Each one's writes
+/// are refused by the Runtime under the lock; reads stay.
+pub const LOCKED_ADMIN: &[&str] = &[
+    methods::WORKSPACE_SETTINGS,
+    methods::WORKSPACE_MCP,
+    methods::WORKSPACE_WEB_SEARCH,
+    methods::WORKSPACE_SKILLS,
+    methods::WORKSPACE_TEMPLATES,
+    methods::WORKSPACE_RELOAD,
+    methods::WORKSPACE_TRUST,
+    methods::SESSION_SANDBOX,
+    methods::SESSION_PERMISSION_MODE,
+    methods::RUNTIME_SESSIONS,
+];
+
 /// The admin flags the Runtime's admin service offers; none without one.
 fn admin_offered(runtime: Option<&dyn RuntimeControl>) -> loop_protocol::Capabilities {
     runtime
@@ -826,6 +848,17 @@ async fn admin(
     method: &str,
     params: Value,
 ) -> Result<BackendResult<Value>, (i64, String)> {
+    // Under a tool lock only the admin methods a chat client needs are
+    // served; any other one, a new one included, is refused. The Runtime
+    // still refuses their writes itself.
+    if let Some(lock) = capabilities.tool_lock {
+        if !LOCKED_ADMIN.contains(&method) {
+            return Ok(Err(loop_protocol::BackendError::ToolLocked {
+                what: method.into(),
+                lock,
+            }));
+        }
+    }
     let offered = match method {
         methods::RUNTIME_PROVIDERS => capabilities.host_providers,
         methods::RUNTIME_TRACING => capabilities.host_tracing,

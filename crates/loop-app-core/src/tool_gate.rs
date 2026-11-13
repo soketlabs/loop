@@ -401,6 +401,14 @@ impl ToolGate {
             };
             let workspace = gate.workspace();
             let cwd = gate.cwd(&workspace);
+            // Under a tool lock every walked entry must resolve inside the
+            // Session's folder: a symlink or hard link out is hidden, and a
+            // walk never enters a linked folder outside.
+            if gate.tool_lock().is_some()
+                && !crate::permissions::tool_lock::inside_folder(path, &cwd)
+            {
+                return false;
+            }
             let bases = gate.rule_bases.lock().clone();
             // Not under the lock: matching reads the filesystem.
             let rules = gate.rules();

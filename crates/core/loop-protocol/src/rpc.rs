@@ -283,6 +283,9 @@ pub struct RuntimeStatus {
     /// Where `max_active_turns` came from: `flag`, `settings` or `default`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_active_turns_from: Option<String>,
+    /// The Runtime's tool lock (`--tool-lock`), when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_lock: Option<crate::ToolLock>,
 }
 
 /// `session/close` params. Closing a busy Session requires `force`.

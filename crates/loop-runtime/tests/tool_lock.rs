@@ -275,7 +275,9 @@ async fn runtime(dirs: &Dirs, seen: Arc<Mutex<Seen>>, lock: Option<ToolLock>) ->
     models.set_provider(faux_provider_fn(model(dirs, seen)));
     let globals = GlobalResources::with_models(dirs.agent.clone(), models)
         .unwrap()
-        .with_tool_lock(lock);
+        .with_tool_lock(lock.map(|lock| {
+            loop_app_core::permissions::tool_lock::RuntimeToolLock::new(lock, &dirs.ws).unwrap()
+        }));
     Runtime::new(
         globals,
         dirs.opts(),

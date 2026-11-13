@@ -14,7 +14,7 @@ pub struct GlobalResources {
     /// The Runtime's tool lock, fixed for the life of the process: every
     /// workspace and Session built from these resources is locked
     /// ([`crate::permissions::tool_lock`]).
-    tool_lock: Option<crate::permissions::tool_lock::ToolLock>,
+    tool_lock: Option<crate::permissions::tool_lock::RuntimeToolLock>,
 }
 
 impl GlobalResources {
@@ -67,7 +67,10 @@ impl GlobalResources {
 
     /// These resources with the Runtime's tool lock. Call it before the
     /// resources are shared: no later call can remove the lock.
-    pub fn with_tool_lock(mut self, lock: Option<crate::permissions::tool_lock::ToolLock>) -> Self {
+    pub fn with_tool_lock(
+        mut self,
+        lock: Option<crate::permissions::tool_lock::RuntimeToolLock>,
+    ) -> Self {
         if self.tool_lock.is_none() {
             self.tool_lock = lock;
         }
@@ -76,7 +79,24 @@ impl GlobalResources {
 
     /// The tool lock in force for every Session, if any.
     pub fn tool_lock(&self) -> Option<crate::permissions::tool_lock::ToolLock> {
-        self.tool_lock
+        self.tool_lock.as_ref().map(|lock| lock.lock())
+    }
+
+    /// The lock with its root, if any.
+    pub fn tool_lock_config(&self) -> Option<&crate::permissions::tool_lock::RuntimeToolLock> {
+        self.tool_lock.as_ref()
+    }
+
+    /// Refuse a Session folder outside the tool lock's root; without a lock
+    /// every folder is admitted.
+    pub fn admit_cwd(
+        &self,
+        cwd: &Path,
+    ) -> Result<(), crate::permissions::tool_lock::ToolLockError> {
+        match &self.tool_lock {
+            Some(lock) => lock.admit(cwd).map(|_| ()),
+            None => Ok(()),
+        }
     }
 
     fn from_parts(
@@ -159,6 +179,17 @@ impl WorkspaceResources {
         } else {
             absolute_workspace(&opts.cwd)?
         };
+        // Every workspace a locked Runtime loads, for any Session, fork,
+        // child, reload or admin call, passes here: refuse a folder
+        // outside the root, and treat every folder as untrusted, so nothing
+        // from the folder (project settings, skills, prompts, context
+        // files, hooks, system prompt files) loads.
+        let mut project_trusted = project_trusted;
+        if globals.tool_lock.is_some() {
+            globals.admit_cwd(&cwd)?;
+            project_trusted = false;
+            settings = load_settings(&globals.agent_dir, &cwd, false)?;
+        }
         let prompt_cwd = if standalone {
             opts.cwd.clone()
         } else {
@@ -174,7 +205,7 @@ impl WorkspaceResources {
         }
         let mut resources = load_resources(&globals.agent_dir, &cwd, project_trusted, &settings);
         let mut locked_notices = Vec::new();
-        if let Some(lock) = globals.tool_lock {
+        if let Some(lock) = globals.tool_lock() {
             locked_notices = lock_workspace(lock, &mut settings, &mut resources);
         }
         let hooks = crate::hooks_load::load_hooks(&resources.hook_paths);
@@ -202,7 +233,7 @@ impl WorkspaceResources {
         let mcp_client = Arc::new(loop_mcp::McpClientManager::with_oauth_dir(
             globals.agent_dir.join("mcp-auth"),
         ));
-        let entries = if globals.tool_lock.is_some() {
+        let entries = if globals.tool_lock().is_some() {
             // No MCP server starts or connects under a tool lock.
             Vec::new()
         } else {
@@ -461,6 +492,8 @@ fn lock_workspace(
          the web tools. Shell, file changes, Subagents, workflows, MCP servers and hooks are \
          off."
     )];
+    // No sandbox process starts for a locked Session: no tool runs one.
+    settings.sandbox.mode = "off".into();
     resources.hook_paths.clear();
     resources.extension_paths.clear();
     let before = resources.skills.len() + resources.disabled_skills.len();
@@ -609,6 +642,7 @@ impl SessionFactory {
         if absolute_workspace(&opts.cwd)? != workspace.cwd {
             bail!("Session cwd does not match workspace");
         }
+        self.globals.admit_cwd(&workspace.cwd)?;
         let globals = &self.globals;
         let models = Arc::clone(&globals.models);
         let credentials = Arc::clone(&globals.credentials);
@@ -739,7 +773,7 @@ impl SessionFactory {
             crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
             &workspace.cwd,
         );
-        if let Some(lock) = globals.tool_lock {
+        if let Some(lock) = globals.tool_lock() {
             tool_gate.lock_tools(lock);
         }
         let mut tools = build_tools(
@@ -750,7 +784,7 @@ impl SessionFactory {
         );
         // Not built, so the prompt never names them; the gate's tool filter
         // and its check also remove and refuse them ([`ToolGate::available`]).
-        retain_locked(globals.tool_lock, &mut tools);
+        retain_locked(globals.tool_lock(), &mut tools);
 
         // The prompt lists the tools that were actually built (web_search may be
         // unconfigured), so it can never promise a tool the agent cannot call.
@@ -794,7 +828,7 @@ impl SessionFactory {
             .await;
 
         let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
-        if let Some(lock) = globals.tool_lock {
+        if let Some(lock) = globals.tool_lock() {
             native.lock_tools(lock);
         }
         native.set_default_effort(default_effort);
@@ -833,7 +867,7 @@ impl SessionFactory {
         if !mcp_tools.is_empty() {
             let mut all_tools = harness.get_tools().await;
             all_tools.extend(mcp_tools);
-            retain_locked(globals.tool_lock, &mut all_tools);
+            retain_locked(globals.tool_lock(), &mut all_tools);
             harness
                 .set_tools(all_tools)
                 .await

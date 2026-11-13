@@ -307,6 +307,9 @@ impl Runtime {
         current: &Settings,
         edit: impl FnOnce(&mut WorkspaceOverrides, &Settings),
     ) -> BackendResult<()> {
+        // Every workspace setter writes through here: under a tool lock none
+        // may change what a Session loads.
+        self.refuse_if_locked("changing workspace settings")?;
         let mut store =
             WorkspaceSettingsStore::load(&self.factory.globals.agent_dir).map_err(failed)?;
         let mut overrides = store.get(cwd);
@@ -492,6 +495,11 @@ impl Runtime {
         workspace: &WorkspaceResources,
         choice: &SandboxChoice,
     ) -> BackendResult<SandboxMode> {
+        // No sandbox process starts under a tool lock, also not to restore
+        // the one a Session chose before.
+        if choice.mode != "off" && choice.mode != "disabled" {
+            self.refuse_if_locked("starting a sandbox")?;
+        }
         use loop_app_core::sandbox_builder::{
             parse_local_sandbox_flags, SandboxBuilder, SandboxRequest,
         };
@@ -601,6 +609,21 @@ impl Runtime {
     }
 }
 
+impl Runtime {
+    /// What `mode` lets a Session do, with the tool lock named when there is
+    /// one: the lock caps every mode.
+    fn effective_policy(&self, mode: loop_app_core::permissions::PermissionMode) -> String {
+        match self.factory.globals.tool_lock() {
+            Some(lock) => format!(
+                "{} The Runtime's `{lock}` tool lock caps it: only reading files in the \
+                 Session's folder and the web tools.",
+                mode.description()
+            ),
+            None => mode.description().into(),
+        }
+    }
+}
+
 #[async_trait]
 impl RuntimeAdmin for Runtime {
     fn offered(&self) -> Capabilities {
@@ -615,6 +638,7 @@ impl RuntimeAdmin for Runtime {
             session_sandbox: true,
             permission_mode: true,
             runtime_sessions: true,
+            tool_lock: self.factory.globals.tool_lock(),
             ..Capabilities::default()
         }
     }
@@ -679,6 +703,9 @@ impl RuntimeAdmin for Runtime {
     }
 
     async fn mcp(&self, params: McpParams) -> BackendResult<McpResult> {
+        if matches!(params.action, AdminAction::Enable | AdminAction::Disable) {
+            self.refuse_if_locked("workspace/mcp changes")?;
+        }
         let cwd = self.resolve_workspace(&params.workspace_id)?;
         let _admin = self.admin.lock().await;
         let mut pending_sessions = 0;
@@ -718,6 +745,9 @@ impl RuntimeAdmin for Runtime {
     }
 
     async fn web_search(&self, params: WebSearchParams) -> BackendResult<WebSearchResult> {
+        if params.enabled.is_some() || params.provider.is_some() {
+            self.refuse_if_locked("workspace/web_search changes")?;
+        }
         let cwd = self.resolve_workspace(&params.workspace_id)?;
         let _admin = self.admin.lock().await;
         let mut pending_sessions = 0;
@@ -764,6 +794,9 @@ impl RuntimeAdmin for Runtime {
     }
 
     async fn skills(&self, params: SkillsParams) -> BackendResult<SkillsResult> {
+        if matches!(params.action, AdminAction::Enable | AdminAction::Disable) {
+            self.refuse_if_locked("workspace/skills changes")?;
+        }
         let cwd = self.resolve_workspace(&params.workspace_id)?;
         let _admin = self.admin.lock().await;
         let mut pending_sessions = 0;
@@ -860,13 +893,16 @@ impl RuntimeAdmin for Runtime {
         let path = paths::trust_path(&self.factory.globals.agent_dir);
         let mut pending_sessions = 0;
         if let Some(trusted) = params.trusted {
+            // A locked Runtime treats every folder as untrusted.
+            self.refuse_if_locked("workspace/trust")?;
             // The wire refuses this without host-local authority.
             self.check_workspace(&cwd, params.expected_revision)?;
             let mut store = TrustStore::load(&path).map_err(failed)?;
             store.set(&cwd, trusted).map_err(failed)?;
             pending_sessions = self.reload_workspace(&cwd).await?.3;
         }
-        let trusted = TrustStore::load(&path).map_err(failed)?.get(&cwd) == Some(true);
+        let trusted = self.factory.globals.tool_lock().is_none()
+            && TrustStore::load(&path).map_err(failed)?.get(&cwd) == Some(true);
         Ok(TrustResult {
             revision: self.workspace_revision(&cwd),
             trusted,
@@ -878,6 +914,7 @@ impl RuntimeAdmin for Runtime {
         let live = self.loaded(&params.session).await?;
         let mut mutation = None;
         if params.action == SandboxAction::Set {
+            self.refuse_if_locked("session/sandbox")?;
             let choice = params
                 .config
                 .ok_or_else(|| protocol("give the sandbox config to set"))?;
@@ -930,7 +967,7 @@ impl RuntimeAdmin for Runtime {
             let mode = live.opened.tool_gate.mode();
             return Ok(PermissionModeResult {
                 mode: mode.as_str().into(),
-                effective_policy: mode.description().into(),
+                effective_policy: self.effective_policy(mode),
                 revision: live.opened.native.revision(),
                 seq: None,
                 pending: false,
@@ -956,7 +993,7 @@ impl RuntimeAdmin for Runtime {
             .await?;
         Ok(PermissionModeResult {
             mode: mode.as_str().into(),
-            effective_policy: mode.description().into(),
+            effective_policy: self.effective_policy(mode),
             revision: result.revision,
             seq: Some(result.seq),
             pending: false,

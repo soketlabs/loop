@@ -16,6 +16,7 @@ fn serve(agent: &Path, args: &[&str]) -> Command {
         .env_remove("LOOP_DEBUG")
         .env_remove("RUST_LOG")
         .env_remove("LOOP_TOOL_LOCK")
+        .env_remove("LOOP_TOOL_LOCK_ROOT")
         .current_dir(agent)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -256,7 +257,14 @@ async fn a_client_connects_through_remote_backend() {
 #[tokio::test]
 async fn an_unknown_tool_lock_stops_startup() {
     tokio::time::timeout(Duration::from_secs(30), async {
-        for (flag, env) in [(Some("chatt"), None), (None, Some("CHAT"))] {
+        let cases: [(Option<&str>, Option<&str>, bool, &str); 5] = [
+            (Some("chatt"), None, true, "unknown tool lock"),
+            (None, Some("CHAT"), true, "unknown tool lock"),
+            (None, Some(""), true, "is empty"),
+            (Some("chat"), None, false, "needs a root folder"),
+            (None, None, true, "without a tool lock"),
+        ];
+        for (flag, env, root, want) in cases {
             let (_dir, agent) = agent_dir();
             let mut cmd = serve(&agent, &[]);
             if let Some(flag) = flag {
@@ -265,10 +273,13 @@ async fn an_unknown_tool_lock_stops_startup() {
             if let Some(env) = env {
                 cmd.env("LOOP_TOOL_LOCK", env);
             }
+            if root {
+                cmd.env("LOOP_TOOL_LOCK_ROOT", &agent);
+            }
             let output = cmd.output().await.unwrap();
             assert!(!output.status.success());
             let error = String::from_utf8_lossy(&output.stderr);
-            assert!(error.contains("unknown tool lock"), "{error}");
+            assert!(error.contains(want), "{want}: {error}");
             assert!(!agent.join("run/runtime.pid").exists());
         }
     })
@@ -286,6 +297,7 @@ async fn the_tool_lock_from_the_environment_is_advertised() {
         let socket = agent.join("run/runtime.sock");
         let mut child = serve(&agent, &[])
             .env("LOOP_TOOL_LOCK", "chat")
+            .env("LOOP_TOOL_LOCK_ROOT", &agent)
             .spawn()
             .unwrap();
         wait_for(&socket, &mut child).await;
@@ -367,6 +379,7 @@ fn loop_cmd(agent: &Path, args: &[&str]) -> Command {
         .env_remove("LOOP_DEBUG")
         .env_remove("RUST_LOG")
         .env_remove("LOOP_TOOL_LOCK")
+        .env_remove("LOOP_TOOL_LOCK_ROOT")
         .current_dir(agent)
         .stdin(Stdio::null())
         .kill_on_drop(true);

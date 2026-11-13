@@ -28,6 +28,8 @@ pub struct StartArgs {
     pub cwd: PathBuf,
     /// `--tool-lock`; without it, the `LOOP_TOOL_LOCK` environment variable.
     pub tool_lock: Option<String>,
+    /// `--tool-lock-root`; without it, `LOOP_TOOL_LOCK_ROOT`.
+    pub tool_lock_root: Option<PathBuf>,
 }
 
 /// Run the Runtime until SIGINT, SIGTERM or `loop runtime stop`.
@@ -56,12 +58,15 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     }
     // Refused before anything starts: a typo must never start a Runtime
     // without the lock it asked for.
-    let tool_lock = loop_app_core::permissions::tool_lock::resolve(
+    use loop_app_core::permissions::tool_lock;
+    let tool_lock = tool_lock::resolve(
         args.tool_lock.as_deref(),
-        std::env::var(loop_app_core::permissions::tool_lock::ENV)
-            .ok()
-            .as_deref(),
+        std::env::var(tool_lock::ENV).ok().as_deref(),
+        args.tool_lock_root.as_deref(),
+        std::env::var(tool_lock::ROOT_ENV).ok().as_deref(),
     )?;
+    let lock_name = tool_lock.as_ref().map(|lock| lock.lock());
+    let lock_root = tool_lock.as_ref().map(|lock| lock.root().to_path_buf());
     let agent_dir = paths::get_agent_dir();
     let settings = Settings::load_file(&paths::settings_path(&agent_dir)).unwrap_or_default();
     // Refused before anything starts, naming the flag or settings key.
@@ -185,10 +190,11 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         "Runtime listening"
     );
     eprintln!("loop runtime: listening on {}", socket.display());
-    if let Some(lock) = tool_lock {
+    if let (Some(lock), Some(root)) = (lock_name, &lock_root) {
         eprintln!(
             "loop runtime: tool lock `{lock}`: every Session can only read files in its \
-             workspace and use the web tools"
+             folder and use the web tools; Session folders must be in {}",
+            root.display()
         );
     }
     if let Some(url) = &listen_url {
@@ -207,7 +213,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         agent_dir: agent_dir.clone(),
         listen_url,
         auto_started: args.auto_started,
-        tool_lock,
+        tool_lock: lock_name,
     });
 
     let info = PeerInfo {
@@ -770,19 +776,13 @@ pub async fn status(socket: Option<PathBuf>, json: bool) -> anyhow::Result<bool>
         return Ok(false);
     };
     let status = backend.status().await?;
-    // `initialize` carries the lock; `runtime/status` has no field for it.
-    let tool_lock = loop_protocol::AgentBackend::capabilities(backend.as_ref()).tool_lock;
     let _ = tokio::time::timeout(
         Duration::from_secs(2),
         loop_protocol::AgentBackend::shutdown(backend.as_ref()),
     )
     .await;
     if json {
-        let mut value = serde_json::to_value(&status)?;
-        if let (Some(lock), Some(map)) = (tool_lock, value.as_object_mut()) {
-            map.insert("tool_lock".into(), serde_json::to_value(lock)?);
-        }
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
         println!(
             "Runtime running (pid {}, generation {})",
@@ -807,7 +807,7 @@ pub async fn status(socket: Option<PathBuf>, json: bool) -> anyhow::Result<bool>
             status.max_active_turns,
             from(&status.max_active_turns_from)
         );
-        if let Some(lock) = tool_lock {
+        if let Some(lock) = status.tool_lock {
             println!("tool lock: {lock} (fixed until the Runtime stops)");
         }
     }

@@ -18,6 +18,8 @@
 use loop_agent::harness::tools::lock::CHAT_TOOLS;
 pub use loop_agent::harness::tools::lock::{classify, offers, ToolClass, ToolLock, KNOWN_TOOLS};
 
+use std::path::{Path, PathBuf};
+
 use super::capability::{Capability, Scope, Setting, State};
 use super::layers::{Layer, LayerSource};
 
@@ -45,7 +47,10 @@ pub fn layer(lock: ToolLock) -> Layer {
         .only_tools(tools.iter().copied())
 }
 
-/// Why the lock could not be read.
+/// The environment variable for the folder every Session must be in.
+pub const ROOT_ENV: &str = "LOOP_TOOL_LOCK_ROOT";
+
+/// Why the lock could not be set up, or refuses a folder.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ToolLockError {
     /// The flag or the environment variable names no known lock.
@@ -56,23 +61,148 @@ pub enum ToolLockError {
         /// `--tool-lock` or the environment variable.
         from: &'static str,
     },
+    /// The flag or the environment variable is set but empty.
+    #[error("{from} is empty: name a lock (`chat`) or unset it")]
+    Empty {
+        /// `--tool-lock`, `--tool-lock-root` or an environment variable.
+        from: &'static str,
+    },
+    /// A lock without the folder its Sessions must stay in.
+    #[error("a tool lock needs a root folder: pass --tool-lock-root DIR or set {ROOT_ENV}")]
+    NoRoot,
+    /// A root without a lock: most likely a missing `--tool-lock`.
+    #[error("--tool-lock-root or {ROOT_ENV} is set without a tool lock")]
+    RootWithoutLock,
+    /// The root is not a folder that can be used.
+    #[error("tool lock root {root}: {reason}")]
+    BadRoot {
+        /// The root as given.
+        root: PathBuf,
+        /// Why it can't be used.
+        reason: String,
+    },
+    /// A Session's folder is not inside the root.
+    #[error("{cwd} is not inside the tool lock root")]
+    OutsideRoot {
+        /// The folder asked for.
+        cwd: PathBuf,
+    },
 }
 
-/// The lock from the `--tool-lock` flag, else from [`ENV`]. An empty
-/// variable means no lock; any other unknown name is an error, so a typo
-/// never starts a Runtime without the lock it asked for.
-pub fn resolve(flag: Option<&str>, env: Option<&str>) -> Result<Option<ToolLock>, ToolLockError> {
+/// A Runtime's lock and the folder every Session of it must be in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeToolLock {
+    lock: ToolLock,
+    root: PathBuf,
+}
+
+impl RuntimeToolLock {
+    /// `lock` with every Session inside `root`. The root must be an
+    /// existing folder other than `/`; it is kept with symlinks resolved.
+    pub fn new(lock: ToolLock, root: &Path) -> Result<Self, ToolLockError> {
+        let bad = |reason: String| ToolLockError::BadRoot {
+            root: root.to_path_buf(),
+            reason,
+        };
+        let real = root.canonicalize().map_err(|e| bad(e.to_string()))?;
+        if !real.is_dir() {
+            return Err(bad("not a folder".into()));
+        }
+        if real.parent().is_none() {
+            return Err(bad("the file system root is not allowed".into()));
+        }
+        Ok(Self { lock, root: real })
+    }
+
+    /// The lock.
+    pub fn lock(&self) -> ToolLock {
+        self.lock
+    }
+
+    /// The root, symlinks resolved.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// `cwd` with symlinks resolved, when it is the root or inside it.
+    pub fn admit(&self, cwd: &Path) -> Result<PathBuf, ToolLockError> {
+        let outside = || ToolLockError::OutsideRoot {
+            cwd: cwd.to_path_buf(),
+        };
+        let real = cwd.canonicalize().map_err(|_| outside())?;
+        if real.starts_with(&self.root) {
+            Ok(real)
+        } else {
+            Err(outside())
+        }
+    }
+}
+
+/// The lock from `--tool-lock`, else [`ENV`], with its root from
+/// `--tool-lock-root`, else [`ROOT_ENV`]. A flag wins over its variable.
+/// An unknown or empty name, a lock without a root and a root without a
+/// lock are errors, so a typo never starts a Runtime without the lock it
+/// asked for.
+pub fn resolve(
+    flag: Option<&str>,
+    env: Option<&str>,
+    root_flag: Option<&Path>,
+    root_env: Option<&str>,
+) -> Result<Option<RuntimeToolLock>, ToolLockError> {
     let (value, from) = match (flag, env) {
-        (Some(flag), _) => (flag, "--tool-lock"),
-        (None, Some(env)) if !env.is_empty() => (env, ENV),
-        _ => return Ok(None),
+        (Some(flag), _) => (Some(flag), "--tool-lock"),
+        (None, Some(env)) => (Some(env), ENV),
+        (None, None) => (None, ""),
     };
-    ToolLock::parse(value)
-        .map(Some)
-        .ok_or_else(|| ToolLockError::Unknown {
-            value: value.to_owned(),
-            from,
-        })
+    let root: Option<PathBuf> = match (root_flag, root_env) {
+        (Some(root), _) if root.as_os_str().is_empty() => {
+            return Err(ToolLockError::Empty {
+                from: "--tool-lock-root",
+            })
+        }
+        (Some(root), _) => Some(root.to_path_buf()),
+        (None, Some("")) => return Err(ToolLockError::Empty { from: ROOT_ENV }),
+        (None, Some(root)) => Some(PathBuf::from(root)),
+        (None, None) => None,
+    };
+    let Some(value) = value else {
+        return match root {
+            Some(_) => Err(ToolLockError::RootWithoutLock),
+            None => Ok(None),
+        };
+    };
+    if value.is_empty() {
+        return Err(ToolLockError::Empty { from });
+    }
+    let lock = ToolLock::parse(value).ok_or_else(|| ToolLockError::Unknown {
+        value: value.to_owned(),
+        from,
+    })?;
+    let root = root.ok_or(ToolLockError::NoRoot)?;
+    RuntimeToolLock::new(lock, &root).map(Some)
+}
+
+/// Whether a locked read of `path` stays inside `folder`: the path, with
+/// symlinks and `..` resolved, is in the folder, and it is not a file with
+/// more than one hard link (a hard link to a file outside the folder looks
+/// like a file inside it, so every hard-linked file is refused).
+pub fn inside_folder(path: &Path, folder: &Path) -> bool {
+    let (Some(real), Some(root)) = (super::policy::resolve(path), super::policy::resolve(folder))
+    else {
+        return false;
+    };
+    real.starts_with(&root) && !hard_linked(&real)
+}
+
+#[cfg(unix)]
+fn hard_linked(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.nlink() > 1)
+}
+
+#[cfg(not(unix))]
+fn hard_linked(_path: &Path) -> bool {
+    false
 }
 
 /// Whether a skill may run code: its folder holds anything but text files
@@ -119,20 +249,90 @@ mod tests {
     }
 
     #[test]
-    fn the_flag_wins_and_a_typo_is_an_error() {
-        assert_eq!(resolve(None, None), Ok(None));
-        assert_eq!(resolve(None, Some("")), Ok(None));
-        assert_eq!(resolve(Some("chat"), None), Ok(Some(ToolLock::Chat)));
-        assert_eq!(resolve(None, Some("chat")), Ok(Some(ToolLock::Chat)));
+    fn the_flag_wins_and_a_typo_or_an_empty_value_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let real = root.canonicalize().unwrap();
+        let root_text = root.to_str().unwrap();
+        assert_eq!(resolve(None, None, None, None), Ok(None));
+        let chat = |l: Option<RuntimeToolLock>| l.map(|l| (l.lock(), l.root().to_path_buf()));
+        let want = Some((ToolLock::Chat, real.clone()));
         assert_eq!(
-            resolve(Some("chat"), Some("nope")),
-            Ok(Some(ToolLock::Chat))
+            resolve(Some("chat"), None, Some(root), None).map(chat),
+            Ok(want.clone())
         );
-        let error = resolve(Some("caht"), None).unwrap_err();
-        assert!(error.to_string().contains("--tool-lock"), "{error}");
-        let error = resolve(None, Some("CHAT")).unwrap_err();
-        assert!(error.to_string().contains(ENV), "{error}");
-        assert!(resolve(Some(""), None).is_err(), "an empty flag is a typo");
+        assert_eq!(
+            resolve(None, Some("chat"), None, Some(root_text)).map(chat),
+            Ok(want.clone())
+        );
+        assert_eq!(
+            resolve(Some("chat"), Some("nope"), None, Some(root_text)).map(chat),
+            Ok(want)
+        );
+        let error = |r: Result<Option<RuntimeToolLock>, ToolLockError>| r.unwrap_err().to_string();
+        assert!(error(resolve(Some("caht"), None, Some(root), None)).contains("--tool-lock"));
+        assert!(error(resolve(None, Some("CHAT"), Some(root), None)).contains(ENV));
+        assert!(error(resolve(Some(""), None, Some(root), None)).contains("empty"));
+        assert!(error(resolve(None, Some(""), Some(root), None)).contains("empty"));
+        assert_eq!(
+            resolve(Some("chat"), None, None, None).unwrap_err(),
+            ToolLockError::NoRoot
+        );
+        assert!(error(resolve(Some("chat"), None, None, Some(""))).contains("empty"));
+        assert_eq!(
+            resolve(None, None, Some(root), None).unwrap_err(),
+            ToolLockError::RootWithoutLock
+        );
+        assert!(matches!(
+            resolve(Some("chat"), None, Some(&root.join("missing")), None),
+            Err(ToolLockError::BadRoot { .. })
+        ));
+        assert!(matches!(
+            resolve(Some("chat"), None, Some(Path::new("/")), None),
+            Err(ToolLockError::BadRoot { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_folders_inside_the_root_are_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("alice");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(base.join("bob")).unwrap();
+        std::os::unix::fs::symlink(base.join("bob"), root.join("link")).unwrap();
+        let lock = RuntimeToolLock::new(ToolLock::Chat, &root).unwrap();
+        assert_eq!(lock.admit(&root), Ok(root.clone()));
+        assert_eq!(lock.admit(&root.join("sub")), Ok(root.join("sub")));
+        for cwd in [
+            base.clone(),
+            base.join("bob"),
+            root.join("link"),
+            root.join("sub/../.."),
+            root.join("missing"),
+            PathBuf::from("/"),
+        ] {
+            assert!(lock.admit(&cwd).is_err(), "{}", cwd.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_links_and_symlinks_out_are_not_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let ws = base.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(base.join("secret"), "s").unwrap();
+        std::fs::write(ws.join("own"), "o").unwrap();
+        std::fs::hard_link(base.join("secret"), ws.join("hard")).unwrap();
+        std::os::unix::fs::symlink(base.join("secret"), ws.join("soft")).unwrap();
+        assert!(inside_folder(&ws.join("own"), &ws));
+        assert!(inside_folder(&ws, &ws));
+        assert!(!inside_folder(&ws.join("hard"), &ws));
+        assert!(!inside_folder(&ws.join("soft"), &ws));
+        assert!(!inside_folder(&base, &ws));
     }
 
     /// Every tool Loop registers, in every mode: only the chat tools stay,

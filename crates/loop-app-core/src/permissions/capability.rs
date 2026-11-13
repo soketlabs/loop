@@ -119,7 +119,7 @@ impl Scope {
                     None if call.tool == "read" => return false,
                     None => ".",
                 };
-                super::inside_workspace(&call.cwd.join(path).to_string_lossy(), &call.cwd)
+                super::tool_lock::inside_folder(&call.cwd.join(path), &call.cwd)
             }
         }
     }
