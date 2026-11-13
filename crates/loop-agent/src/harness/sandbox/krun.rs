@@ -452,6 +452,8 @@ pub struct KrunExecutionEnv {
     /// `.git` entries in the project at the start; a shell command that
     /// adds one gets a warning.
     git_entries: Option<Arc<std::collections::BTreeSet<PathBuf>>>,
+    /// New `.git` entries already warned about (once each).
+    warned: parking_lot::Mutex<std::collections::BTreeSet<PathBuf>>,
 }
 
 impl KrunExecutionEnv {
@@ -478,6 +480,7 @@ impl KrunExecutionEnv {
             agent_dir: None,
             read_only: Vec::new(),
             git_entries: None,
+            warned: Default::default(),
         }
     }
 
@@ -946,7 +949,13 @@ impl Shell for KrunExecutionEnv {
             let project = self.host_workdir.clone();
             let scan = tokio::task::spawn_blocking(move || protect::scan_git_entries(&project));
             if let Ok((now, complete)) = scan.await {
-                let added: Vec<_> = now.iter().filter(|p| !before.contains(*p)).collect();
+                let added: Vec<_> = {
+                    let mut warned = self.warned.lock();
+                    now.into_iter()
+                        .filter(|p| !before.contains(p))
+                        .filter(|p| warned.insert(p.clone()))
+                        .collect()
+                };
                 if !complete {
                     tracing::debug!("sandbox: the .git scan of the project stopped early");
                 }

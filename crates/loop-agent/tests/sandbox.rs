@@ -556,6 +556,9 @@ async fn linux_sandbox_warns_when_a_command_makes_a_repository() {
         out.stderr
     );
     assert!(out.stderr.contains("sub/.git"), "{}", out.stderr);
+    // Once per new repository.
+    let out = env.exec("true", ShellExecOptions::default()).await.unwrap();
+    assert!(!out.stderr.contains("warning"), "{}", out.stderr);
     sb.destroy().await.unwrap();
 }
 
