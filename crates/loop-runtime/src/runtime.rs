@@ -207,6 +207,10 @@ struct LiveSession {
     /// A sandbox chosen during a turn, started and waiting for the turn to
     /// end; the running tool calls keep the one they started in.
     pending_sandbox: Mutex<Option<admin::PendingSandbox>>,
+    /// The caller of the connection that loaded this Session, or of its
+    /// parent for a Subagent; `None` for an in-process call. In memory only.
+    /// Later work stamps it on Events and checks ownership against it.
+    opened_by: Option<loop_protocol::Caller>,
 }
 /// What the pump has committed and published of one Session. The pump is
 /// the only writer of a loaded Session's updates, so `published` and
@@ -502,6 +506,16 @@ impl Runtime {
         self.close_grace = grace;
         self
     }
+    /// The caller whose connection loaded the live Session `key` (ADR-0009),
+    /// or `None` when it is not loaded or was loaded in process.
+    pub fn opened_by(&self, key: &SessionKey) -> Option<loop_protocol::Caller> {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sessions.get(key).and_then(|live| live.opened_by.clone())
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }

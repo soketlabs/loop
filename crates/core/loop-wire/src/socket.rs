@@ -82,29 +82,154 @@ pub fn unix(stream: tokio::net::UnixStream) -> Transport {
     crate::transport::lines(read, write)
 }
 
+/// Handshake headers by which an Edge Gateway asserts the end user it
+/// connects for ([`websocket_accept_edge`]). An ordinary WebSocket that
+/// sends any of them is refused.
+pub mod edge_headers {
+    /// `person` or `service`.
+    pub const PRINCIPAL_KIND: &str = "loop-principal-kind";
+    /// Who vouches for the id, such as an OIDC issuer URL. Never `local`.
+    pub const PRINCIPAL_ISSUER: &str = "loop-principal-issuer";
+    /// The id within the issuer, such as an OIDC `sub`.
+    pub const PRINCIPAL_ID: &str = "loop-principal-id";
+    /// The tenant. Never `local` or `system`.
+    pub const TENANT: &str = "loop-tenant";
+    /// All of them.
+    pub const ALL: [&str; 4] = [PRINCIPAL_KIND, PRINCIPAL_ISSUER, PRINCIPAL_ID, TENANT];
+}
+
+/// Most bytes of all identity headers together. The principal and tenant
+/// limits are smaller; this bounds the work before they are checked.
+const MAX_ASSERTION_BYTES: usize = 1024;
+
+fn refusal(status: StatusCode, reason: &str) -> ErrorResponse {
+    let mut refused = ErrorResponse::new(Some(reason.into()));
+    *refused.status_mut() = status;
+    refused
+}
+
+fn bearer_matches(request: &Request, token: &str) -> bool {
+    let expected = format!("Bearer {token}");
+    let given = request
+        .headers()
+        .get("authorization")
+        .map(HeaderValue::as_bytes)
+        .unwrap_or_default();
+    !token.is_empty() && constant_time_eq(given, expected.as_bytes())
+}
+
+/// The caller an edge handshake asserts. Each header must be present once.
+fn asserted_caller(request: &Request) -> Result<loop_protocol::Caller, String> {
+    use loop_protocol::{Caller, Principal, PrincipalKind, Tenant};
+    let headers = request.headers();
+    let total: usize = edge_headers::ALL
+        .iter()
+        .flat_map(|name| headers.get_all(*name))
+        .map(HeaderValue::len)
+        .sum();
+    if total > MAX_ASSERTION_BYTES {
+        return Err("the identity assertion is too large".into());
+    }
+    let one = |name: &'static str| -> Result<&str, String> {
+        let mut values = headers.get_all(name).iter();
+        match (values.next(), values.next()) {
+            (Some(value), None) => value
+                .to_str()
+                .map_err(|_| format!("{name} is not visible ASCII")),
+            (None, _) => Err(format!("{name} is required")),
+            (Some(_), Some(_)) => Err(format!("{name} is given more than once")),
+        }
+    };
+    let kind = match one(edge_headers::PRINCIPAL_KIND)? {
+        "person" => PrincipalKind::Person,
+        "service" => PrincipalKind::Service,
+        _ => return Err(loop_protocol::IdentityError::UnknownKind.to_string()),
+    };
+    let principal = Principal::new(
+        kind,
+        one(edge_headers::PRINCIPAL_ISSUER)?,
+        one(edge_headers::PRINCIPAL_ID)?,
+    )
+    .map_err(|e| e.to_string())?;
+    let tenant = Tenant::new(one(edge_headers::TENANT)?).map_err(|e| e.to_string())?;
+    Caller::asserted(principal, tenant).map_err(|e| e.to_string())
+}
+
 /// Accept a WebSocket on `stream`, which must present
-/// `Authorization: Bearer <token>`. Anything else is refused with 401.
+/// `Authorization: Bearer <token>`. Anything else is refused with 401. A
+/// handshake that carries an [`edge_headers`] identity is refused with 400:
+/// only an edge connection can assert one.
 pub async fn websocket_accept<S>(stream: S, token: &str) -> io::Result<Transport>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let expected = format!("Bearer {token}");
     // The handshake callback's type is tungstenite's; its error is large by design.
     #[allow(clippy::result_large_err)]
     let check = |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
-        let given = request
-            .headers()
-            .get("authorization")
-            .map(HeaderValue::as_bytes)
-            .unwrap_or_default();
-        if !token.is_empty() && constant_time_eq(given, expected.as_bytes()) {
-            Ok(response)
-        } else {
-            let mut refused = ErrorResponse::new(Some("a bearer token is required".into()));
-            *refused.status_mut() = StatusCode::UNAUTHORIZED;
-            Err(refused)
+        if !bearer_matches(request, token) {
+            return Err(refusal(
+                StatusCode::UNAUTHORIZED,
+                "a bearer token is required",
+            ));
+        }
+        if edge_headers::ALL
+            .iter()
+            .any(|name| request.headers().contains_key(*name))
+        {
+            return Err(refusal(
+                StatusCode::BAD_REQUEST,
+                "this connection cannot assert an identity",
+            ));
+        }
+        Ok(response)
+    };
+    handshake(stream, check).await
+}
+
+/// Accept an Edge Gateway connection on `stream`. It must present
+/// `Authorization: Bearer <edge_token>` (401 otherwise) and assert one end
+/// user with every [`edge_headers`] header, once each (400 otherwise). The
+/// returned caller is fixed for the connection's life: it is never read
+/// again, and no request can change it. Serve the transport with
+/// [`crate::serve_with_caller`] and remote authority.
+pub async fn websocket_accept_edge<S>(
+    stream: S,
+    edge_token: &str,
+) -> io::Result<(Transport, loop_protocol::Caller)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut asserted = None;
+    // The handshake callback's type is tungstenite's; its error is large by design.
+    #[allow(clippy::result_large_err)]
+    let check = |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
+        if !bearer_matches(request, edge_token) {
+            return Err(refusal(
+                StatusCode::UNAUTHORIZED,
+                "an edge bearer token is required",
+            ));
+        }
+        match asserted_caller(request) {
+            Ok(caller) => {
+                asserted = Some(caller);
+                Ok(response)
+            }
+            Err(reason) => {
+                tracing::warn!(%reason, "edge identity assertion refused");
+                Err(refusal(StatusCode::BAD_REQUEST, &reason))
+            }
         }
     };
+    let transport = handshake(stream, check).await?;
+    let caller = asserted.ok_or_else(|| io::Error::other("edge handshake gave no identity"))?;
+    Ok((transport, caller))
+}
+
+async fn handshake<S, C>(stream: S, check: C) -> io::Result<Transport>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    C: tokio_tungstenite::tungstenite::handshake::server::Callback + Unpin,
+{
     let ws = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tokio_tungstenite::accept_hdr_async_with_config(stream, check, Some(ws_config())),

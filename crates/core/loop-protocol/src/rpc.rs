@@ -216,6 +216,19 @@ pub struct InitializeResult {
     pub instance: BackendInstanceId,
     /// What the backend supports.
     pub capabilities: Capabilities,
+    /// Who this connection acts for (ADR-0009), fixed when the connection
+    /// was accepted. Absent from an older server, or from a connection that
+    /// has no identity. A request field never changes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<crate::Principal>,
+    /// The tenant this connection's data belongs to. Present with
+    /// `principal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<crate::Tenant>,
+    /// How the principal reached the Runtime (`token`, `edge`); absent on a
+    /// host-local connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<crate::Via>,
 }
 
 /// Params naming one session.
@@ -763,6 +776,8 @@ pub fn json_schema() -> Value {
     let reference = |schema: schemars::Schema| serde_json::to_value(schema).unwrap_or_default();
     let initialize_params = reference(generator.subschema_for::<InitializeParams>());
     let initialize_result = reference(generator.subschema_for::<InitializeResult>());
+    // The stored and audit form of a connection's identity (ADR-0009).
+    let _caller = generator.subschema_for::<crate::Caller>();
     let spec = reference(generator.subschema_for::<SessionSpec>());
     let session = reference(generator.subschema_for::<SessionRef>());
     let load = reference(generator.subschema_for::<LoadParams>());

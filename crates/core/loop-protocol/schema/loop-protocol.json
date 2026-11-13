@@ -81,6 +81,32 @@
       "description": "One configured backend: an agent kind plus its account and settings.",
       "type": "string"
     },
+    "Caller": {
+      "description": "Who a connection acts for: a principal in a tenant, and how it came.\nFixed when the connection is accepted; never changed after.",
+      "properties": {
+        "principal": {
+          "$ref": "#/$defs/Principal"
+        },
+        "tenant": {
+          "$ref": "#/$defs/Tenant"
+        },
+        "via": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Via"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "principal",
+        "tenant"
+      ],
+      "type": "object"
+    },
     "Capabilities": {
       "description": "Features a backend declares. Each must match what the backend can actually\ndo: a surface hides or rejects an operation whose capability is false.",
       "properties": {
@@ -1004,6 +1030,17 @@
           "$ref": "#/$defs/BackendInstanceId",
           "description": "The backend instance behind the server."
         },
+        "principal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Principal"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Who this connection acts for (ADR-0009), fixed when the connection\nwas accepted. Absent from an older server, or from a connection that\nhas no identity. A request field never changes it."
+        },
         "protocol_version": {
           "description": "The version to use: the client's, when the server speaks it, or else\nthe server's highest. A client that can't use it closes.",
           "format": "uint32",
@@ -1013,6 +1050,28 @@
         "server_info": {
           "$ref": "#/$defs/PeerInfo",
           "description": "The server."
+        },
+        "tenant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tenant"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The tenant this connection's data belongs to. Present with\n`principal`."
+        },
+        "via": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Via"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the principal reached the Runtime (`token`, `edge`); absent on a\nhost-local connection."
         }
       },
       "required": [
@@ -2003,6 +2062,55 @@
         {
           "const": "other",
           "description": "A status this reader does not know.",
+          "type": "string"
+        }
+      ]
+    },
+    "Principal": {
+      "description": "A person or Service Identity: `{ kind, issuer, id }`. `issuer` and `id`\nare 1 to 255 visible ASCII characters (no space, no control).",
+      "properties": {
+        "id": {
+          "description": "Stable id within `issuer`, such as `uid:501` or an OIDC `sub`.",
+          "maxLength": 255,
+          "minLength": 1,
+          "pattern": "^[!-~]+$",
+          "type": "string"
+        },
+        "issuer": {
+          "description": "Who vouches for `id`: `local` for this host, or an OIDC issuer URL.",
+          "maxLength": 255,
+          "minLength": 1,
+          "pattern": "^[!-~]+$",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKind",
+          "description": "Person or service."
+        }
+      },
+      "required": [
+        "kind",
+        "issuer",
+        "id"
+      ],
+      "type": "object"
+    },
+    "PrincipalKind": {
+      "description": "What kind of principal acts.",
+      "oneOf": [
+        {
+          "const": "person",
+          "description": "A person.",
+          "type": "string"
+        },
+        {
+          "const": "service",
+          "description": "A Service Identity: unattended work, or the Runtime itself.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "A kind this reader does not know. Read from a newer peer; never\naccepted from an Edge Gateway assertion.",
           "type": "string"
         }
       ]
@@ -3854,6 +3962,13 @@
       ],
       "type": "object"
     },
+    "Tenant": {
+      "description": "The isolation boundary data belongs to. Opaque; `local` and `system` are reserved.",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "type": "string"
+    },
     "ToolCall": {
       "description": "A tool call as first reported.",
       "properties": {
@@ -4708,6 +4823,13 @@
         "log_status"
       ],
       "type": "object"
+    },
+    "Via": {
+      "description": "How the principal reached the Runtime, such as `token` or `edge`. Not a principal.",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[!-~]+$",
+      "type": "string"
     },
     "ViewParams": {
       "description": "An immutable transcript page request.",

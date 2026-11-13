@@ -111,6 +111,8 @@ running after you close the terminal, use your usual tool, such as `nohup`,
 | `--cwd DIR` | current folder | Folder for Sessions that name none |
 | `--tool-lock LOCK` | `LOOP_TOOL_LOCK`, else off | `chat`: lock the tools of every Session for the life of the Runtime. See [Tool lock](#tool-lock) |
 | `--tool-lock-root DIR` | `LOOP_TOOL_LOCK_ROOT` | Required with a lock: every Session folder must be in it |
+| `--edge-listen IP:PORT` | off | Serve a trusted Edge Gateway that names each connection's user. Loopback only. Needs `--edge-token-file`. See [Identity](#identity-who-acts-and-for-which-tenant) |
+| `--edge-token-file FILE` | off | With `--edge-listen`: a private (0600) file with the gateway's bearer token. It must differ from the Runtime token |
 
 The two limits can also be set in the global `~/.loop/agent/settings.json`
 (a project's settings cannot change them, since one Runtime serves many
@@ -348,6 +350,59 @@ methods, including Runtime stop, provider and MCP credentials, tracing, saved
 defaults and usage history, and workspace trust writes are refused. The host's protected Unix socket still
 serves those operations. A slow WebSocket client is disconnected when its queues
 fill and can attach again to replay missed events.
+
+### Identity: who acts and for which tenant
+
+Each connection has an identity: a **principal** (who acts) and a **tenant**
+(the boundary the data belongs to). See ADR-0009. The Runtime sets the
+identity when it accepts the connection. It never reads it from a request,
+and it does not change it while the connection is open.
+
+For local use, nothing changes. You do not configure anything:
+
+| Connection | `principal` | `tenant` | `via` |
+|---|---|---|---|
+| The Unix socket (host authority) | `{person, local, uid:<your uid>}` | `local` | none |
+| A loopback WebSocket with the Runtime token | the same local person | `local` | `token` |
+| An Edge Gateway connection (`--edge-listen`) | the person or service that the gateway names | the tenant that the gateway names | `edge` |
+
+The `initialize` result shows the connection's `principal`, `tenant` and
+`via`. Clients that do not know these fields ignore them. Identity fields in a
+request (for example in `initialize`) are ignored. In this release the
+identity changes no permission: a WebSocket client still has remote authority,
+and an Edge Gateway connection has remote authority too.
+
+**Edge Gateway connections.** This option is for a gateway that signs users in
+(for example with OIDC) and then connects to the Runtime for each user. It is
+off by default. To turn it on, give both flags at start:
+
+```sh
+loop runtime start --edge-listen 127.0.0.1:8790 --edge-token-file /private/edge.token
+```
+
+- The edge listener is separate from `--listen`. The Runtime token does not
+  open an edge connection, and the edge token does not open an ordinary one.
+- The token file must be a 0600 file that you own, in a 0700 directory. The
+  Runtime refuses to start if the edge token is the same as the Runtime token.
+- The gateway names the user once, in the WebSocket handshake, with these
+  headers. Each header must be present exactly once:
+
+  | Header | Value |
+  |---|---|
+  | `Authorization` | `Bearer <edge token>` |
+  | `Loop-Principal-Kind` | `person` or `service` |
+  | `Loop-Principal-Issuer` | the identity provider, such as `https://accounts.google.com`. Not `local` |
+  | `Loop-Principal-Id` | the stable id from that provider, such as the OIDC `sub` |
+  | `Loop-Tenant` | 1 to 64 characters of `a-z`, `0-9`, `.`, `_` and `-`, starting with a letter or digit. Not `local` or `system` |
+
+  The issuer and id are 1 to 255 visible ASCII characters. A wrong token gets
+  HTTP 401. A missing, repeated, malformed, too long or reserved value gets
+  HTTP 400. The Runtime never falls back to the local identity.
+- An ordinary WebSocket client that sends any `Loop-Principal-*` or
+  `Loop-Tenant` header is refused with HTTP 400.
+- Anyone who has the edge token can act as any user in any tenant. Keep the
+  token as private as a root password, and run the gateway on the same host.
+  The Runtime does not check the gateway's claims; it trusts the gateway.
 
 ### Permissions and trust
 

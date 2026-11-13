@@ -30,6 +30,38 @@ pub struct StartArgs {
     pub tool_lock: Option<String>,
     /// `--tool-lock-root`; without it, `LOOP_TOOL_LOCK_ROOT`.
     pub tool_lock_root: Option<PathBuf>,
+    /// `--edge-listen`: a loopback listener for a trusted Edge Gateway that
+    /// names each connection's end user at the handshake. Off by default.
+    pub edge_listen: Option<std::net::SocketAddr>,
+    /// `--edge-token-file`: the gateway's bearer token, in a private file.
+    pub edge_token_file: Option<PathBuf>,
+}
+
+/// The checked edge options: both or neither, loopback only, and a token
+/// read from a private file. Refused before anything starts.
+fn edge_options(
+    listen: Option<std::net::SocketAddr>,
+    token_file: Option<&std::path::Path>,
+) -> anyhow::Result<Option<(std::net::SocketAddr, String)>> {
+    use anyhow::Context;
+    match (listen, token_file) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("--edge-listen and --edge-token-file are used together")
+        }
+        (Some(address), Some(_)) if !address.ip().is_loopback() => {
+            anyhow::bail!("refusing a non-loopback --edge-listen bind: TLS is not yet supported; run the Edge Gateway on this host")
+        }
+        (Some(address), Some(path)) => {
+            let token = loop_wire::token::read(path).with_context(|| {
+                format!(
+                    "could not read the edge token file {}; it must be a 0600 file you own in a 0700 directory",
+                    path.display()
+                )
+            })?;
+            Ok(Some((address, token)))
+        }
+    }
 }
 
 /// Run the Runtime until SIGINT, SIGTERM or `loop runtime stop`.
@@ -43,7 +75,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     };
     use loop_protocol::{rpc::PeerInfo, AgentBackend};
     use loop_runtime::{log::SqliteEventLog, Runtime, RuntimeLimits};
-    use loop_wire::server::{serve_with_control, ServeOptions};
+    use loop_wire::server::{serve_with_caller, serve_with_control, ServeOptions};
 
     if args.listen.is_some_and(|addr| !addr.ip().is_loopback()) {
         anyhow::bail!("refusing a non-loopback WebSocket bind: TLS is required and is not yet supported; use a loopback address and an SSH tunnel");
@@ -65,6 +97,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         args.tool_lock_root.as_deref(),
         std::env::var(tool_lock::ROOT_ENV).ok().as_deref(),
     )?;
+    let edge = edge_options(args.edge_listen, args.edge_token_file.as_deref())?;
     let lock_name = tool_lock.as_ref().map(|lock| lock.lock());
     let lock_root = tool_lock.as_ref().map(|lock| lock.root().to_path_buf());
     let agent_dir = paths::get_agent_dir();
@@ -173,6 +206,20 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         }
         None => None,
     };
+    if let (Some((_, user, _)), Some((_, edge))) = (&websocket, &edge) {
+        if loop_wire::socket::constant_time_eq(user.as_bytes(), edge.as_bytes()) {
+            anyhow::bail!("the edge token must differ from the Runtime token");
+        }
+    }
+    let edge = match edge {
+        Some((address, token)) => Some((
+            tokio::net::TcpListener::bind(address)
+                .await
+                .context("could not bind the loopback edge listener")?,
+            token,
+        )),
+        None => None,
+    };
     let listen_url = websocket
         .as_ref()
         .map(|(listener, _, _)| listener.local_addr().map(|addr| format!("ws://{addr}/")))
@@ -201,6 +248,12 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         eprintln!(
             "loop runtime: listening on {url}; token file: {}",
             agent_dir.join("run/runtime.token").display()
+        );
+    }
+    if let Some((listener, _)) = &edge {
+        eprintln!(
+            "loop runtime: Edge Gateway listener on ws://{}/; the gateway names each connection's user",
+            listener.local_addr()?
         );
     }
     let stop = tokio_util::sync::CancellationToken::new();
@@ -282,8 +335,10 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
                     let info = info.clone();
                     connections.spawn(async move {
                         if let Ok(transport) = loop_wire::socket::websocket_accept(stream, &token).await {
-                            let served = serve_with_control(backend, control, transport, info,
-                                ServeOptions { owns_backend: false, authority: loop_wire::Authority::Remote });
+                            // The token proves the host's user (ADR-0009).
+                            let caller = loop_protocol::Caller::local_token(loop_wire::local_principal());
+                            let served = serve_with_caller(backend, Some(control), transport, info,
+                                ServeOptions { owns_backend: false, authority: loop_wire::Authority::Remote }, caller);
                             let _ = served.done.await;
                         }
                     });
@@ -293,12 +348,44 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             },
+            accepted = async {
+                match &edge {
+                    Some((listener, _)) => listener.accept().await,
+                    None => std::future::pending().await,
+                }
+            } => match accepted {
+                Ok((stream, _)) => {
+                    let token = edge.as_ref().expect("edge listener").1.clone();
+                    let backend: Arc<dyn AgentBackend> = runtime.clone();
+                    let control = control.clone();
+                    let info = info.clone();
+                    connections.spawn(async move {
+                        // The identity is asserted once, at the handshake,
+                        // and fixed for the connection. Edge connections
+                        // never have host authority.
+                        match loop_wire::socket::websocket_accept_edge(stream, &token).await {
+                            Ok((transport, caller)) => {
+                                tracing::info!(principal = %caller.principal(), tenant = %caller.tenant(), "edge connection");
+                                let served = serve_with_caller(backend, Some(control), transport, info,
+                                    ServeOptions { owns_backend: false, authority: loop_wire::Authority::Remote }, caller);
+                                let _ = served.done.await;
+                            }
+                            Err(error) => tracing::warn!(%error, "edge connection refused"),
+                        }
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "edge accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
     tracing::info!("Runtime shutting down");
     drop(listener);
     drop(websocket);
+    drop(edge);
     runtime.shutdown().await;
     connections.abort_all();
     // The Lock is still held, so the socket is ours to remove.
@@ -851,6 +938,41 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn edge_options_are_off_unless_both_are_given_and_safe() {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        assert!(super::edge_options(None, None).unwrap().is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("private");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&private)
+            .unwrap();
+        let file = private.join("edge.token");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&file)
+            .unwrap();
+        writeln!(f, "edge-secret").unwrap();
+        let (address, token) = super::edge_options(Some(loopback), Some(&file))
+            .unwrap()
+            .unwrap();
+        assert_eq!((address, token.as_str()), (loopback, "edge-secret"));
+        assert!(super::edge_options(Some(loopback), None).is_err());
+        assert!(super::edge_options(None, Some(&file)).is_err());
+        let public: std::net::SocketAddr = "0.0.0.0:7801".parse().unwrap();
+        assert!(super::edge_options(Some(public), Some(&file)).is_err());
+        // A token file others can read is refused.
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+        assert!(super::edge_options(Some(loopback), Some(&file)).is_err());
+        assert!(super::edge_options(Some(loopback), Some(&private.join("missing"))).is_err());
+    }
+
     use super::*;
 
     #[test]

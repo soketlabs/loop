@@ -25,9 +25,9 @@ use loop_protocol::rpc::{
     SessionParams, SetEffortParams, SetModeParams, SetModelParams,
 };
 use loop_protocol::{
-    AgentBackend, BackendInstanceId, BackendResult, HostServices, InteractionOutcome,
-    InteractionRequest, NoticeLevel, Origin, SessionKey, SessionUpdate, TurnId, TurnOutcome,
-    UpdateEnvelope,
+    AgentBackend, BackendInstanceId, BackendResult, Caller, HostServices, InteractionOutcome,
+    InteractionRequest, NoticeLevel, Origin, Principal, SessionKey, SessionUpdate, TurnId,
+    TurnOutcome, UpdateEnvelope,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -85,6 +85,31 @@ pub enum Authority {
     Remote,
 }
 
+/// The OS user that runs this process, as a principal in the `local`
+/// issuer: `{ person, local, uid:<euid> }` (ADR-0009).
+pub fn local_principal() -> Principal {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no arguments or preconditions.
+        Principal::local_uid(unsafe { libc::geteuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        Principal::local_uid(0)
+    }
+}
+
+/// The caller a connection gets when its acceptor names none: the host's
+/// user on a host-local connection, and none on any other. A Remote
+/// connection never gets the local identity by default; the acceptor that
+/// checked the bearer token names it with [`serve_with_caller`].
+fn default_caller(authority: Authority) -> Option<Caller> {
+    match authority {
+        Authority::HostLocal => Some(Caller::host(local_principal())),
+        Authority::Remote => None,
+    }
+}
+
 /// Whether `method` with `params` needs host-local authority: the host-only
 /// methods, and a `workspace/trust` change.
 fn host_only(method: &str, params: &Value) -> bool {
@@ -106,7 +131,8 @@ pub fn serve_with_options(
     info: PeerInfo,
     options: ServeOptions,
 ) -> Served {
-    start(backend, None, transport, info, options)
+    let caller = default_caller(options.authority);
+    start(backend, None, transport, info, options, caller)
 }
 
 /// Serve one connection of a shared Runtime: multi-Session methods, per-
@@ -119,7 +145,25 @@ pub fn serve_with_control(
     info: PeerInfo,
     options: ServeOptions,
 ) -> Served {
-    start(backend, Some(control), transport, info, options)
+    let caller = default_caller(options.authority);
+    start(backend, Some(control), transport, info, options, caller)
+}
+
+/// [`serve_with_control`] (or, without `control`, [`serve_with_options`])
+/// for a connection whose acceptor authenticated `caller`: the loopback
+/// WebSocket with the bearer token, or an Edge Gateway connection that
+/// asserted a principal at its handshake. The caller is fixed for the
+/// connection's life; no request can change it. It does not change
+/// `options.authority`: only a host-local transport serves host-only methods.
+pub fn serve_with_caller(
+    backend: Arc<dyn AgentBackend>,
+    control: Option<Arc<dyn RuntimeControl>>,
+    transport: Transport,
+    info: PeerInfo,
+    options: ServeOptions,
+    caller: Caller,
+) -> Served {
+    start(backend, control, transport, info, options, Some(caller))
 }
 
 fn start(
@@ -128,6 +172,7 @@ fn start(
     transport: Transport,
     info: PeerInfo,
     options: ServeOptions,
+    caller: Option<Caller>,
 ) -> Served {
     let (conn, incoming) = Connection::new(transport);
     let interact = Arc::new(AtomicBool::new(true));
@@ -136,8 +181,9 @@ fn start(
         interact: Arc::clone(&interact),
         branch_reset: AtomicBool::new(false),
         id: NEXT_TICKET.fetch_add(1, Ordering::Relaxed),
+        caller,
     });
-    let done = tokio::spawn(run(
+    let served = run(
         backend,
         runtime,
         conn,
@@ -145,8 +191,17 @@ fn start(
         info,
         options,
         host.clone(),
-    ));
+    );
+    let done = tokio::spawn(in_scope(host.caller.clone(), served));
     Served { host, done }
+}
+
+/// Run `future` with `caller` as [`Caller::current`], when there is one.
+async fn in_scope<F: std::future::Future>(caller: Option<Caller>, future: F) -> F::Output {
+    match caller {
+        Some(caller) => caller.scope(future).await,
+        None => future.await,
+    }
 }
 
 /// What the request loop tells the forwarder.
@@ -200,13 +255,16 @@ async fn run(
     // missed; forwarding starts once the client is initialized.
     let updates = backend.subscribe();
     let (control, control_rx) = mpsc::unbounded_channel();
-    let forwarder = tokio::spawn(forward(
-        Arc::clone(&conn),
-        backend.instance().clone(),
-        updates,
-        control_rx,
-        runtime.clone(),
-        host.clone(),
+    let forwarder = tokio::spawn(in_scope(
+        host.caller.clone(),
+        forward(
+            Arc::clone(&conn),
+            backend.instance().clone(),
+            updates,
+            control_rx,
+            runtime.clone(),
+            host.clone(),
+        ),
     ));
     let mut initialized = false;
     while let Some(message) = incoming.recv().await {
@@ -237,6 +295,8 @@ async fn run(
                                 capabilities.efforts = false;
                                 capabilities.modes = false;
                             }
+                            // From the connection, never from `params`.
+                            let caller = host.caller.clone();
                             let offered = admin_offered(runtime.as_deref());
                             let host = options.authority == Authority::HostLocal;
                             capabilities.workspace_settings = offered.workspace_settings;
@@ -270,11 +330,15 @@ async fn run(
                                 capabilities.host_usage = false;
                                 capabilities.host_defaults = false;
                             }
+                            let caller = caller.as_ref();
                             let result = InitializeResult {
                                 protocol_version: negotiate(params.protocol_version),
                                 server_info: info.clone(),
                                 instance: backend.instance().clone(),
                                 capabilities,
+                                principal: caller.map(|c| c.principal().clone()),
+                                tenant: caller.map(|c| c.tenant().clone()),
+                                via: caller.and_then(|c| c.via().cloned()),
                             };
                             conn.respond(id, Ok(to_value(&result)));
                             if !initialized {
@@ -313,8 +377,10 @@ async fn run(
                 let control = control.clone();
                 let host = host.clone();
                 // Each request runs on its own, so a long `session/load`
-                // doesn't hold up a `session/cancel`.
-                tokio::spawn(async move {
+                // doesn't hold up a `session/cancel`. The connection's
+                // caller is in scope for the backend and the Runtime.
+                let caller = host.caller.clone();
+                tokio::spawn(in_scope(caller, async move {
                     handle(
                         backend.as_ref(),
                         runtime.as_deref(),
@@ -325,7 +391,7 @@ async fn run(
                         params,
                     )
                     .await;
-                });
+                }));
             }
         }
     }
@@ -1329,6 +1395,8 @@ struct ClientHost {
     /// Whether the client declared `interact` at `initialize`.
     interact: Arc<AtomicBool>,
     branch_reset: AtomicBool,
+    /// Who this connection acts for. Fixed when the connection was accepted.
+    caller: Option<Caller>,
 }
 
 async fn register_recipient(
@@ -1354,6 +1422,10 @@ async fn register_recipient(
 
 #[async_trait]
 impl crate::control::EscalationRecipient for ClientHost {
+    fn caller(&self) -> Option<Caller> {
+        self.caller.clone()
+    }
+
     fn withdraw(&self, params: loop_protocol::rpc::InteractWithdrawnParams) {
         let _ = self
             .conn
