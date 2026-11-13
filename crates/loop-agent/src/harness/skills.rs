@@ -51,18 +51,35 @@ pub fn load_skills(root: &Path) -> (Vec<Skill>, Vec<SkillDiagnostic>) {
     (skills, diags)
 }
 
-/// Ignore rules of one folder, in the order the `ignore` crate applies them.
+/// Ignore rules of one folder.
 struct IgnoreLevel {
     ignore: Option<Gitignore>,
     gitignore: Option<Gitignore>,
     exclude: Option<Gitignore>,
+    /// The folder has `.git` (a folder or a file) or `.jj`.
+    has_git: bool,
+}
+
+/// The rules of the folders from the top of the file system to the folder
+/// being listed, and what a match needs to know about them.
+struct Rules<'a> {
+    /// The first `above` levels are folders above the walk root.
+    above: usize,
+    /// The walk root as the listing spells it, and as the file system
+    /// resolves it. The folders above the root are the parents of the
+    /// resolved root, and their rules see the path under the resolved root.
+    root: &'a Path,
+    resolved_root: Option<PathBuf>,
+    /// The user's global ignore file (`core.excludesFile`).
+    global: &'a Gitignore,
 }
 
 type IgnoreLevels = Arc<Vec<Arc<IgnoreLevel>>>;
 
-/// The rules in the file `name` of `dir`, read through `fs`.
-async fn read_rules(fs: &dyn FileSystem, dir: &Path, name: &Path) -> Option<Gitignore> {
-    let text = fs.read_text_file(&dir.join(name)).await.ok()?;
+/// The rules in `file` (under `dir`), read through `fs`; patterns are
+/// relative to `dir`.
+async fn read_rules(fs: &dyn FileSystem, dir: &Path, file: &Path) -> Option<Gitignore> {
+    let text = fs.read_text_file(file).await.ok()?;
     let mut builder = GitignoreBuilder::new(dir);
     for line in text.strip_prefix('\u{feff}').unwrap_or(&text).lines() {
         let _ = builder.add_line(None, line);
@@ -70,66 +87,148 @@ async fn read_rules(fs: &dyn FileSystem, dir: &Path, name: &Path) -> Option<Giti
     builder.build().ok()
 }
 
-/// The rules of `dir`. As in the host walker, `.ignore` always counts;
-/// `.gitignore` counts only inside a git repository (`in_repo`, set here
-/// when `dir` has `.git`), and `.git/info/exclude` where `.git` is.
-async fn ignore_level(fs: &dyn FileSystem, dir: &Path, in_repo: &mut bool) -> IgnoreLevel {
-    let has_git = fs.exists(&dir.join(".git")).await.unwrap_or(false);
-    *in_repo |= has_git;
+/// The git dir that holds `info/exclude` for the repository at `dir`: the
+/// `.git` folder, or, when `.git` is a file (a worktree), the common git
+/// dir named by `gitdir:` and its `commondir` file. `None` when the file
+/// does not say (the exclude file is then empty, as in the host walker).
+async fn git_common_dir(fs: &dyn FileSystem, dir: &Path, git_is_file: bool) -> Option<PathBuf> {
+    let git = dir.join(".git");
+    if !git_is_file {
+        return Some(git);
+    }
+    let text = fs.read_text_file(&git).await.ok()?;
+    let line = text.lines().next()?;
+    let real = PathBuf::from(line.strip_prefix("gitdir: ")?);
+    let common = fs.read_text_file(&real.join("commondir")).await.ok()?;
+    let line = common.lines().next()?;
+    Some(if line.starts_with('.') {
+        real.join(line)
+    } else {
+        PathBuf::from(line)
+    })
+}
+
+/// The rules of `dir`. Every ignore file is read when it is there; whether a
+/// rule counts is decided at match time ([`hidden_by_rules`]).
+async fn ignore_level(fs: &dyn FileSystem, dir: &Path) -> IgnoreLevel {
+    let git = fs.file_info(&dir.join(".git")).await.ok();
+    let has_jj = fs.exists(&dir.join(".jj")).await.unwrap_or(false);
+    let exclude = match &git {
+        Some(info) => match git_common_dir(fs, dir, info.is_file).await {
+            Some(git_dir) => read_rules(fs, dir, &git_dir.join("info/exclude")).await,
+            None => None,
+        },
+        None => None,
+    };
     IgnoreLevel {
-        ignore: read_rules(fs, dir, Path::new(".ignore")).await,
-        gitignore: if *in_repo {
-            read_rules(fs, dir, Path::new(".gitignore")).await
-        } else {
-            None
-        },
-        exclude: if has_git {
-            read_rules(fs, dir, Path::new(".git/info/exclude")).await
-        } else {
-            None
-        },
+        ignore: read_rules(fs, dir, &dir.join(".ignore")).await,
+        gitignore: read_rules(fs, dir, &dir.join(".gitignore")).await,
+        exclude,
+        has_git: git.is_some() || has_jj,
     }
 }
 
-/// Whether the rules hide `path`. The deepest folder with a matching rule
-/// decides; inside one folder `.ignore` goes before `.gitignore`.
-fn hidden_by_rules(levels: &[Arc<IgnoreLevel>], path: &Path, is_dir: bool) -> bool {
-    for level in levels.iter().rev() {
-        for rules in [&level.ignore, &level.gitignore, &level.exclude]
-            .into_iter()
-            .flatten()
-        {
-            let found = rules.matched(path, is_dir);
-            if !found.is_none() {
-                return found.is_ignore();
+/// What `rules` say about `path`: `Some(true)` ignore, `Some(false)` whitelist.
+fn verdict(rules: &Option<Gitignore>, path: &Path, is_dir: bool) -> Option<bool> {
+    let found = rules.as_ref()?.matched(path, is_dir);
+    (!found.is_none()).then(|| found.is_ignore())
+}
+
+/// Whether the rules hide `path`, with the precedence of the `ignore` crate
+/// (`Ignore::matched_ignore`):
+/// 1. the first folder, deepest first, with a matching `.ignore` rule decides
+///    over everything else (a whitelist counts as a match);
+/// 2. then the first matching `.gitignore` rule, then the first matching
+///    `.git/info/exclude` rule, then the global file; but these three count
+///    only in a repository (some folder in the chain has `.git` or `.jj`)
+///    and only down from the nearest folder with `.git`, so a repository
+///    above a nested one does not apply;
+/// 3. whatever the first verdict says is final: ignore hides, whitelist shows.
+fn hidden_by_rules(
+    rules: &Rules<'_>,
+    levels: &[Arc<IgnoreLevel>],
+    path: &Path,
+    is_dir: bool,
+) -> bool {
+    let any_git = levels.iter().any(|level| level.has_git);
+    // The folders above the root see the path under the resolved root.
+    let below_resolved = rules
+        .resolved_root
+        .as_ref()
+        .map(|resolved| resolved.join(path.strip_prefix(rules.root).unwrap_or(path)));
+    let (mut ignore, mut gitignore, mut exclude) = (None, None, None);
+    let mut saw_git = false;
+    for (depth, level) in levels.iter().enumerate().rev() {
+        let seen = match (&below_resolved, depth < rules.above) {
+            (Some(resolved), true) => resolved.as_path(),
+            _ => path,
+        };
+        if ignore.is_none() {
+            ignore = verdict(&level.ignore, seen, is_dir);
+        }
+        if any_git && !saw_git {
+            if gitignore.is_none() {
+                gitignore = verdict(&level.gitignore, seen, is_dir);
+            }
+            if exclude.is_none() {
+                exclude = verdict(&level.exclude, seen, is_dir);
             }
         }
+        saw_git = saw_git || level.has_git;
     }
-    false
+    let global = if any_git {
+        let found = rules.global.matched(path, is_dir);
+        (!found.is_none()).then(|| found.is_ignore())
+    } else {
+        None
+    };
+    ignore.or(gitignore).or(exclude).or(global).unwrap_or(false)
+}
+
+/// The user's global ignore file (`core.excludesFile`, else
+/// `$XDG_CONFIG_HOME/git/ignore` or `~/.config/git/ignore`), compiled the
+/// way the host walker does. It belongs to the user of the Runtime, not to
+/// a project, so it is a host read; read it once and pass it to
+/// [`load_skills_in`].
+pub fn host_global_gitignore() -> Gitignore {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Gitignore::empty();
+    };
+    GitignoreBuilder::new(cwd).build_global().0
 }
 
 /// Load skills recursively from a directory of a Workspace, through its
-/// [`FileSystem`]. It finds the same files as [`load_skills`]: hidden folders
-/// count, linked folders are not entered, and ignore files apply as the
-/// host walker applies them, in the order the folder lists its entries.
-/// The git-wide exclude file of the user is not read (it is a host file).
+/// [`FileSystem`]. It finds the same files as [`load_skills`], in the same
+/// order: hidden folders count, linked folders are not entered, and the
+/// ignore files (`.ignore`, `.gitignore`, `.git/info/exclude`, those of the
+/// folders above the root, and `global`) apply with the same precedence.
 pub async fn load_skills_in(
     fs: &dyn FileSystem,
     root: &Path,
+    global: &Gitignore,
 ) -> (Vec<Skill>, Vec<SkillDiagnostic>) {
     let mut skills = Vec::new();
     let mut diags = Vec::new();
     let Ok(root) = fs.absolute_path(root) else {
         return (skills, diags);
     };
-    // Ignore files of the parents of the root count too.
-    let mut chain: Vec<&Path> = root.ancestors().skip(1).collect();
-    chain.reverse();
+    // The folders above the root are the parents of the resolved root. When
+    // it cannot be resolved there are none, as in the host walker.
+    let resolved_root = fs.canonical_path(&root).await.ok();
     let mut above = Vec::new();
-    let mut in_repo = false;
-    for dir in chain {
-        above.push(Arc::new(ignore_level(fs, dir, &mut in_repo).await));
+    if let Some(resolved) = &resolved_root {
+        let mut chain: Vec<&Path> = resolved.ancestors().skip(1).collect();
+        chain.reverse();
+        for dir in chain {
+            above.push(Arc::new(ignore_level(fs, dir).await));
+        }
     }
+    let rules = Rules {
+        above: above.len(),
+        root: &root,
+        resolved_root,
+        global,
+    };
 
     /// An entry still to visit, with the rules of its parent folders.
     struct Entry {
@@ -137,15 +236,13 @@ pub async fn load_skills_in(
         is_dir: bool,
         is_root: bool,
         parent: IgnoreLevels,
-        in_repo: bool,
     }
     let mut visited = HashSet::new();
     let mut stack = vec![Entry {
-        path: root,
+        path: root.clone(),
         is_dir: true,
         is_root: true,
         parent: Arc::new(above),
-        in_repo,
     }];
     while let Some(entry) = stack.pop() {
         if !entry.is_root && entry.path.file_name().and_then(|s| s.to_str()) == Some("SKILL.md") {
@@ -181,23 +278,20 @@ pub async fn load_skills_in(
         if !visited.insert(key) {
             continue;
         }
-        let mut in_repo = entry.in_repo;
-        let level = ignore_level(fs, &entry.path, &mut in_repo).await;
         let mut levels: Vec<_> = entry.parent.iter().cloned().collect();
-        levels.push(Arc::new(level));
+        levels.push(Arc::new(ignore_level(fs, &entry.path).await));
         let levels: IgnoreLevels = Arc::new(levels);
         let Ok(listed) = fs.list_dir(&entry.path).await else {
             continue;
         };
         let children: Vec<Entry> = listed
             .into_iter()
-            .filter(|child| !hidden_by_rules(&levels, &child.path, child.is_dir))
+            .filter(|child| !hidden_by_rules(&rules, &levels, &child.path, child.is_dir))
             .map(|child| Entry {
                 path: child.path,
                 is_dir: child.is_dir,
                 is_root: false,
                 parent: Arc::clone(&levels),
-                in_repo,
             })
             .collect();
         stack.extend(children.into_iter().rev());
