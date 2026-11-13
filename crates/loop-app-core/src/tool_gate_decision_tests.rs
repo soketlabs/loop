@@ -361,7 +361,7 @@ async fn asks_hooks_and_grants_are_recorded_with_who_decided() {
     assert_eq!(record.outcome, DecisionOutcome::Ask);
     assert_eq!(record.answer, Some(DecisionAnswer::Deny));
     assert_eq!(record.by, DecidedBy::Approver);
-    assert!(record.reason.unwrap().contains("not now"));
+    assert_eq!(record.reason.as_deref(), Some("the approver rejected it"));
 
     gate.approver().unwrap().grant_session("bash");
     assert!(
@@ -562,4 +562,136 @@ mod readable_commands {
         assert!(check("echo $'\\''\nrm -rf /\necho '", &[]).is_err());
         assert!(check("ls () ( rm -rf / ); ls", &[]).is_err());
     }
+}
+
+/// No record keeps a secret: an approver's refusal of a fetch with
+/// credentials and a token, of a search, a hook's block text, an ACP
+/// agent's title, and a user command with a token.
+mod records_keep_no_secrets {
+    use super::*;
+
+    const MARKS: &[&str] = &[
+        "S3CRET",
+        "T0KEN",
+        "QUERY-SECRET",
+        "HOOK-SECRET",
+        "CMD-SECRET",
+    ];
+
+    fn clean(records: &[PolicyDecisionRecord]) {
+        let text = serde_json::to_string(records).unwrap();
+        for mark in MARKS {
+            assert!(!text.contains(mark), "{mark} in {text}");
+        }
+    }
+
+    async fn rejected(tool: &str, args: serde_json::Value) -> Vec<PolicyDecisionRecord> {
+        let (gate, mut prompts) = gate_with_approver_and_sink(&[(tool, "ask")]);
+        let capture = Arc::new(Capture::default());
+        gate.set_decision_sink(Some(capture.clone()));
+        let asking = {
+            let gate = Arc::clone(&gate);
+            let tool = tool.to_owned();
+            tokio::spawn(async move { gate.before_hook()(context("c1", &tool, args), None).await })
+        };
+        let prompt = prompts.recv().await.unwrap();
+        let _ = prompt
+            .response_tx
+            .send(crate::tool_approval::ApprovalDecision::Reject {
+                reason: Some("because QUERY-SECRET".into()),
+            });
+        assert!(asking.await.unwrap().unwrap().block);
+        capture.take()
+    }
+
+    #[tokio::test]
+    async fn on_every_path() {
+        let fetch = rejected(
+            "web_fetch",
+            json!({"url": "https://user:S3CRET@h.example/x?token=T0KEN"}),
+        )
+        .await;
+        assert_eq!(fetch[0].subject.host.as_deref(), Some("https://h.example"));
+        clean(&fetch);
+        clean(&rejected("web_search", json!({"query": "QUERY-SECRET"})).await);
+
+        let (g, capture) = super::gate(FullAccess, &[], vec![]);
+        let (_dir, registry) = super::super::tests::hooks(&[json!(
+            {"on": "tool_call", "action": {"block": true, "reason": "HOOK-SECRET in https://u:S3CRET@x"}}
+        )]);
+        g.set_hooks(registry);
+        assert!(
+            g.before_hook()(context("c2", "bash", json!({"command": "ls"})), None)
+                .await
+                .unwrap()
+                .block
+        );
+        clean(&capture.take());
+
+        let (g, capture) = super::gate(FullAccess, &[("bash(curl*)", "deny")], vec![]);
+        let command = "curl -H 'Authorization: CMD-SECRET' https://u:S3CRET@h/x?token=T0KEN";
+        assert!(g.check_user_command(command, None, None).await.is_err());
+        let records = capture.take();
+        assert_eq!(records[0].subject.programs, ["curl"]);
+        clean(&records);
+
+        let (g, capture) = super::gate(FullAccess, &[], vec![]);
+        let host = crate::agent_gate::GatedHost::new(
+            Arc::new(Nobody),
+            Arc::clone(&g),
+            "codex",
+            std::env::temp_dir(),
+        );
+        let mut call = loop_protocol::ToolCallUpdate::new(loop_protocol::ToolCallId("a1".into()));
+        call.title = Some("curl https://u:S3CRET@h?token=T0KEN".into());
+        call.kind = Some(ToolKind::Execute);
+        call.raw_input = Some(json!({"command": "curl CMD-SECRET"}));
+        let request = loop_protocol::InteractionRequest::Permission {
+            id: loop_protocol::InteractionId("i1".into()),
+            tool_call: Some(call),
+            options: vec![loop_protocol::PermissionOption {
+                native_id: "once".into(),
+                label: "once".into(),
+                kind_hint: loop_protocol::PermissionKind::AllowOnce,
+            }],
+        };
+        use loop_protocol::HostServices;
+        let _ = host.interact(request).await;
+        let records = capture.take();
+        assert_eq!(records[0].tool, "agent");
+        clean(&records);
+    }
+
+    struct Nobody;
+    #[async_trait::async_trait]
+    impl loop_protocol::HostServices for Nobody {
+        async fn interact(
+            &self,
+            _: loop_protocol::InteractionRequest,
+        ) -> loop_protocol::InteractionOutcome {
+            loop_protocol::InteractionOutcome::Cancelled
+        }
+    }
+}
+
+/// The block list refuses a typed command, and the record says so: the
+/// stored outcome is what happened.
+#[tokio::test]
+async fn the_block_list_refusal_is_the_recorded_outcome() {
+    let (g, capture) = gate(FullAccess, &[], vec![]);
+    let refused = g
+        .check_user_command("rm -rf /", None, None)
+        .await
+        .unwrap_err();
+    assert!(!refused.0.is_empty());
+    let record = capture.take().remove(0);
+    assert_eq!(
+        (record.outcome, record.by),
+        (DecisionOutcome::Deny, DecidedBy::Rule)
+    );
+    assert_eq!(record.rule.as_deref(), Some("bash block list"));
+    g.check_user_command("rm -rf ./build", None, None)
+        .await
+        .unwrap();
+    assert_eq!(capture.take()[0].outcome, DecisionOutcome::Allow);
 }

@@ -206,11 +206,8 @@ impl HostServices for GatedHost {
             )
         };
         let (answer, mut decided) = self.judge(call, options, &judged).await;
-        let tool = call
-            .name
-            .clone()
-            .or_else(|| call.title.clone())
-            .unwrap_or_else(|| "agent".to_owned());
+        // The name only: an agent's title often holds the whole command.
+        let tool = call.name.clone().unwrap_or_else(|| "agent".to_owned());
         let outcome = match answer {
             Some(outcome) => outcome,
             None => {

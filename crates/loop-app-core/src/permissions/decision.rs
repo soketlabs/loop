@@ -168,6 +168,45 @@ fn host_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| format!("{scheme}://{host}"))
 }
 
+/// The longest `reason` a record keeps, in bytes.
+pub const MAX_REASON_BYTES: usize = 512;
+/// The longest `tool` or `rule` a record keeps, in bytes.
+pub const MAX_NAME_BYTES: usize = 128;
+
+/// `text` made safe to keep in a record: every URL loses its user info,
+/// query and fragment (which can hold credentials and tokens), and the
+/// result is cut to `cap` bytes.
+pub fn scrub(text: &str, cap: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(cap));
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        out.push_str(&rest[..at + 3]);
+        let after = &rest[at + 3..];
+        let end = after
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>'))
+            .unwrap_or(after.len());
+        let url = &after[..end];
+        let url = url.split(['?', '#']).next().unwrap_or_default();
+        let (authority, path) = match url.find('/') {
+            Some(i) => url.split_at(i),
+            None => (url, ""),
+        };
+        let host = authority.rsplit('@').next().unwrap_or_default();
+        out.push_str(host);
+        out.push_str(path);
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    if out.len() > cap {
+        let mut end = cap;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+    }
+    out
+}
+
 /// A new record id, `pd-…`.
 pub fn record_id() -> String {
     format!("pd-{}", loop_ai::new_id())
@@ -279,6 +318,19 @@ mod tests {
         assert_eq!(s.host.as_deref(), Some("https://docs.rs"));
         let s = subject_of(ToolKind::Fetch, &json!({"query": "my secret"}));
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn scrub_keeps_no_url_credentials_or_queries() {
+        let text = scrub(
+            "User rejected fetch of https://user:S3CRET@h.example/x?token=T0KEN#f, see ftp://a@b",
+            MAX_REASON_BYTES,
+        );
+        assert_eq!(
+            text,
+            "User rejected fetch of https://h.example/x see ftp://b"
+        );
+        assert_eq!(scrub(&"x".repeat(1000), 10).len(), 10);
     }
 
     #[test]

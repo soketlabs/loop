@@ -213,6 +213,22 @@ pub(crate) struct Facts<'a> {
     pub(crate) session: Option<String>,
 }
 
+/// The rule name a record gives the `bash` block list.
+const BLOCK_LIST: &str = "bash block list";
+
+/// The `reason` a record keeps. An approver's or a hook's text can quote
+/// the call (a URL with a token, a search query, a command), so those get
+/// a fixed text; Loop's own reasons are scrubbed of URL credentials and
+/// capped ([`decision::scrub`]).
+fn record_reason(decided: &Decided) -> Option<String> {
+    let reason = decided.reason.as_deref()?;
+    Some(match decided.by {
+        DecidedBy::Approver => "the approver rejected it".to_owned(),
+        DecidedBy::Hook => "a tool_call hook blocked it".to_owned(),
+        _ => decision::scrub(reason, decision::MAX_REASON_BYTES),
+    })
+}
+
 /// Where a call reached the gate from, by its name and id: an MCP tool, a
 /// `/workflow` shell task (`wf-shell-…`), or the model's own tool.
 fn source_of(call: &ToolCall) -> DecisionSource {
@@ -735,7 +751,7 @@ impl ToolGate {
             turn: context.turn,
             call_id: facts.call_id.filter(|id| !id.is_empty()).map(str::to_owned),
             source: facts.source,
-            tool: facts.tool.to_owned(),
+            tool: decision::scrub(facts.tool, decision::MAX_NAME_BYTES),
             kind: facts.kind,
             capability: crate::permissions::Capability::of(&capability).id(),
             subject: decision::subject_of(facts.kind, facts.args),
@@ -744,14 +760,17 @@ impl ToolGate {
             answer: decided.answer,
             by: decided.by,
             layer: decided.layer.map(|layer| layer.id().to_owned()),
-            rule: decided.rule.clone(),
+            rule: decided
+                .rule
+                .as_deref()
+                .map(|rule| decision::scrub(rule, decision::MAX_NAME_BYTES)),
             mode: Some(self.mode().as_str().to_owned()),
             escalation: decided.escalation.clone(),
             answered_by: (decided.by == DecidedBy::Approver)
                 .then_some(context.answered_by)
                 .flatten()
                 .map(|caller| caller.principal().clone()),
-            reason: decided.reason.clone(),
+            reason: record_reason(decided),
         };
         sink.record(&record).await.map_err(|error| {
             tracing::warn!(%error, "Policy decision not recorded; the call is refused");
@@ -789,7 +808,8 @@ impl ToolGate {
     /// prompt, when the caller is this host's user or an in-process call. A
     /// caller from outside the host cannot approve, so an "ask" refuses it.
     /// Hooks are not run: they review the agent's tool calls, and a typed
-    /// command is the user's own action.
+    /// command is the user's own action. The `bash` block list refuses as it
+    /// does for the tool.
     ///
     /// The decision is recorded before `Ok` returns. `Err` is the refusal.
     pub async fn check_user_command(
@@ -800,7 +820,19 @@ impl ToolGate {
     ) -> Result<(), loop_agent::native_backend::CommandRefused> {
         use loop_agent::native_backend::CommandRefused;
         let args = serde_json::json!({ "command": command });
-        let verdict = self.verdict("bash", &args).await;
+        let mut verdict = self.verdict("bash", &args).await;
+        // The `bash` block list is part of the decision, so the record says
+        // what happened.
+        if !matches!(verdict.decision, Decision::Deny(_)) {
+            if let Err(reason) = loop_agent::harness::tools::check_command_policy(command, &[]) {
+                verdict = Verdict {
+                    decision: Decision::Deny(reason),
+                    by: DecidedBy::Rule,
+                    rule: Some(BLOCK_LIST.to_owned()),
+                    layer: None,
+                };
+            }
+        }
         let host = caller.as_ref().is_none_or(Caller::is_host_user);
         let (result, decided) = match &verdict.decision {
             Decision::Deny(reason) => (
