@@ -6,7 +6,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use loop_agent::harness::sandbox::{HostWorkspaceDriver, WorkspaceSpec};
+use loop_agent::harness::sandbox::{HostWorkspaceDriver, WorkspaceSource, WorkspaceSpec};
 use loop_agent::harness::types::ShellExecOptions;
 use loop_agent::harness::{SessionExecutionEnv, ToolEnvPolicy};
 use loop_workspace_testkit::{run_all, DriverFixture};
@@ -17,7 +17,7 @@ fn fixture(confine_reads: bool) -> DriverFixture {
     DriverFixture::new(
         Arc::new(HostWorkspaceDriver),
         WorkspaceSpec {
-            workdir: layout.project.clone(),
+            source: WorkspaceSource::HostFolder(layout.project.clone()),
             options: json!({ "confineReads": confine_reads }),
             ..Default::default()
         },

@@ -46,6 +46,21 @@ pub const OUTSIDE_SECRET: &str = "secret.txt";
 /// Content of [`OUTSIDE_SECRET`].
 pub const OUTSIDE_SECRET_TEXT: &str = "outside-sentinel";
 
+/// Name of the sentinel secret that [`run_all`] puts in the Runtime
+/// (test) process environment. No command in a Workspace may see it.
+pub const SECRET_ENV: &str = "LOOP_WS_KIT_SECRET";
+/// Value of [`SECRET_ENV`].
+pub const SECRET_VALUE: &str = "kit-secret-sentinel";
+
+/// Put the sentinel secret into this process's environment. Called once by
+/// [`run_all`]; call it yourself before running single checks.
+pub fn set_sentinel_secret() {
+    static SET: std::sync::Once = std::sync::Once::new();
+    // Set once, before the checks spawn commands. Edition 2021: `set_var`
+    // is safe; the kit sets the same value every time.
+    SET.call_once(|| std::env::set_var(SECRET_ENV, SECRET_VALUE));
+}
+
 /// A driver under test, the spec of a new Workspace, and what must live as
 /// long as the test.
 pub struct DriverFixture {
@@ -104,6 +119,7 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = DriverFixture>,
 {
+    set_sentinel_secret();
     capabilities_match_behaviour(&factory).await;
     lifecycle_is_idempotent(&factory).await;
     file_round_trips(&factory).await;

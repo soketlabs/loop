@@ -281,15 +281,18 @@ impl loop_workspace::Workspace for KrunSandbox {
         super::drivers::PODMAN_DRIVER_ID
     }
     fn capabilities(&self) -> loop_workspace::WorkspaceCapabilities {
-        super::drivers::podman_capabilities(&SandboxConfig {
-            workdir: self.workdir.clone(),
-            options: json!({
-                "isolation": self.isolation.as_str(),
-                "cpus": self.cpus,
-                "ram_mib": self.ram_mib,
-            }),
-            labels: Default::default(),
-        })
+        super::drivers::podman_capabilities(
+            &SandboxConfig {
+                workdir: self.workdir.clone(),
+                options: json!({
+                    "isolation": self.isolation.as_str(),
+                    "cpus": self.cpus,
+                    "ram_mib": self.ram_mib,
+                }),
+                labels: Default::default(),
+            }
+            .into(),
+        )
     }
 }
 

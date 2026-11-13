@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use loop_workspace::{
-    ExecutionEnv, ExecutionErrorCode, FileErrorCode, HostOs, ProcessEvent, ShellExecOptions,
-    ShellOutput, SpawnRequest, Workspace, WorkspacePath, WorkspaceStatus,
+    ExecutionEnv, ExecutionErrorCode, ExitState, FileErrorCode, HostOs, PathNamespace,
+    ProcessEventKind, ProcessId, ShellExecOptions, ShellOutput, SpawnRequest, StreamId, UploadId,
+    UploadRequest, Workspace, WorkspaceError, WorkspacePath, WorkspaceStatus,
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{DriverFixture, OUTSIDE_SECRET, OUTSIDE_SECRET_TEXT};
+use crate::{DriverFixture, OUTSIDE_SECRET, OUTSIDE_SECRET_TEXT, SECRET_ENV, SECRET_VALUE};
 
 /// Longest wait for one command in the checks.
 const COMMAND_LIMIT_MS: u64 = 20_000;
@@ -25,6 +26,15 @@ fn path(ws: &Arc<dyn Workspace>, rel: &str) -> PathBuf {
 
 fn quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+/// A call that the capabilities say is missing must return `Unsupported`.
+fn unsupported(id: &str, operation: &str, result: Result<(), WorkspaceError>) {
+    match result {
+        Err(e) if e.is_unsupported() => {}
+        Err(e) => panic!("`{id}`: {operation} without the capability must be Unsupported: {e}"),
+        Ok(()) => panic!("`{id}`: {operation} works but the capabilities deny it"),
+    }
 }
 
 async fn sh(env: &Arc<dyn ExecutionEnv>, command: &str) -> ShellOutput {
@@ -75,7 +85,7 @@ where
         "`{id}`: outlives_process differs"
     );
     assert_eq!(ws.workspace_status(), WorkspaceStatus::Ready, "`{id}`");
-    if !caps.remote {
+    if caps.path_namespace == PathNamespace::Host {
         assert_eq!(
             ws.root(),
             ws.env().cwd(),
@@ -83,6 +93,10 @@ where
         );
     }
 
+    assert!(
+        !caps.pty || caps.streaming_exec,
+        "`{id}`: pty without streaming_exec"
+    );
     let file = WorkspacePath::parse("kit-chunk.bin").expect("valid path");
     if caps.streaming_exec {
         let process = match ws
@@ -99,68 +113,125 @@ where
         };
         let mut out = Vec::new();
         let mut exit = None;
+        let mut last_seq = 0;
         while let Some(event) = process.next_event().await {
-            match event {
-                ProcessEvent::Stdout(bytes) => out.extend(bytes),
-                ProcessEvent::Stderr(_) => {}
-                ProcessEvent::Exited(e) => exit = Some(e),
+            assert!(event.seq > last_seq, "`{id}`: event seq must grow");
+            last_seq = event.seq;
+            match event.kind {
+                ProcessEventKind::Output(bytes) if event.stream == StreamId::Stdout => {
+                    out.extend(bytes)
+                }
+                ProcessEventKind::Exited(e) => exit = Some(e),
+                _ => {}
             }
         }
         assert_eq!(out, b"kit-stream", "`{id}`: spawn output");
-        assert_eq!(exit.and_then(|e| e.code), Some(0), "`{id}`: spawn exit");
-    } else if !caps.pty {
-        match ws.spawn(SpawnRequest::default()).await {
-            Err(e) => assert!(e.is_unsupported(), "`{id}`: spawn: {e}"),
-            Ok(_) => panic!("`{id}`: spawn works but the capabilities deny it"),
-        }
+        assert_eq!(
+            exit,
+            Some(ExitState::Exited { code: 0 }),
+            "`{id}`: spawn exit"
+        );
+    } else {
+        unsupported(
+            &id,
+            "spawn",
+            ws.spawn(SpawnRequest::default()).await.map(|_| ()),
+        );
+        unsupported(
+            &id,
+            "attach_process",
+            ws.attach_process(&ProcessId("none".into()), 0)
+                .await
+                .map(|_| ()),
+        );
+        unsupported(&id, "list_processes", ws.list_processes().await.map(|_| ()));
     }
     if caps.chunked_transfer {
-        ws.write_chunk(&file, 0, b"abc", false)
+        let upload = ws
+            .begin_upload(UploadRequest {
+                path: file.clone(),
+                size: 6,
+                sha256: None,
+                if_match: None,
+                mode: None,
+            })
             .await
-            .unwrap_or_else(|e| panic!("`{id}`: write_chunk: {e}"));
-        ws.write_chunk(&file, 3, b"def", true)
+            .unwrap_or_else(|e| panic!("`{id}`: begin_upload: {e}"));
+        ws.upload_write(&upload, 0, b"abc")
             .await
-            .unwrap_or_else(|e| panic!("`{id}`: write_chunk last: {e}"));
+            .expect("upload_write");
+        assert_eq!(
+            ws.upload_committed_offset(&upload).await.expect("offset"),
+            3
+        );
+        ws.upload_write(&upload, 3, b"def")
+            .await
+            .expect("upload_write");
+        let tag = ws.upload_commit(&upload).await.expect("upload_commit");
         let chunk = ws
-            .read_chunk(&file, 2, 3)
+            .read_chunk(&file, 2, 3, Some(&tag))
             .await
             .unwrap_or_else(|e| panic!("`{id}`: read_chunk: {e}"));
         assert_eq!(chunk.data, b"cde", "`{id}`: chunk data");
         assert_eq!(chunk.total_size, 6, "`{id}`: chunk total size");
-        assert!(!chunk.eof, "`{id}`: chunk eof");
+        assert_eq!(chunk.tag, tag, "`{id}`: chunk tag");
+        ws.env()
+            .write_file(&ws.resolve(&file), b"changed")
+            .await
+            .expect("rewrite");
+        let changed = ws.read_chunk(&file, 0, 3, Some(&tag)).await;
+        assert!(
+            matches!(changed, Err(WorkspaceError::Changed { .. })),
+            "`{id}`: a changed file must fail the download: {changed:?}"
+        );
     } else {
-        let read = ws.read_chunk(&file, 0, 16).await;
-        assert!(
-            read.as_ref().is_err_and(|e| e.is_unsupported()),
-            "`{id}`: read_chunk without the capability: {read:?}"
+        let upload = UploadId("none".into());
+        unsupported(
+            &id,
+            "read_chunk",
+            ws.read_chunk(&file, 0, 16, None).await.map(|_| ()),
         );
-        let write = ws.write_chunk(&file, 0, b"x", true).await;
-        assert!(
-            write.as_ref().is_err_and(|e| e.is_unsupported()),
-            "`{id}`: write_chunk without the capability: {write:?}"
+        unsupported(
+            &id,
+            "begin_upload",
+            ws.begin_upload(UploadRequest {
+                path: file.clone(),
+                size: 1,
+                sha256: None,
+                if_match: None,
+                mode: None,
+            })
+            .await
+            .map(|_| ()),
         );
+        unsupported(
+            &id,
+            "upload_write",
+            ws.upload_write(&upload, 0, b"x").await.map(|_| ()),
+        );
+        unsupported(
+            &id,
+            "upload_committed_offset",
+            ws.upload_committed_offset(&upload).await.map(|_| ()),
+        );
+        unsupported(
+            &id,
+            "upload_commit",
+            ws.upload_commit(&upload).await.map(|_| ()),
+        );
+        unsupported(&id, "upload_abort", ws.upload_abort(&upload).await);
     }
     if caps.snapshot {
         ws.snapshot()
             .await
             .unwrap_or_else(|e| panic!("`{id}`: snapshot: {e}"));
     } else {
-        for (name, result) in [
-            ("snapshot", ws.snapshot().await.map(|_| ())),
-            ("hibernate", ws.hibernate().await.map(|_| ())),
-            ("wake", ws.wake().await),
-        ] {
-            assert!(
-                result.as_ref().is_err_and(|e| e.is_unsupported()),
-                "`{id}`: {name} without the capability: {result:?}"
-            );
-        }
+        unsupported(&id, "snapshot", ws.snapshot().await.map(|_| ()));
+        unsupported(&id, "hibernate", ws.hibernate().await.map(|_| ()));
+        unsupported(&id, "wake", ws.wake(None).await);
     }
     if !caps.attach {
-        match f.driver.attach(ws.id()).await {
-            Err(e) => assert!(e.is_unsupported(), "`{id}`: attach: {e}"),
-            Ok(_) => panic!("`{id}`: attach works but the capabilities deny it"),
-        }
+        unsupported(&id, "attach", f.driver.attach(ws.id()).await.map(|_| ()));
     }
     ws.destroy()
         .await
@@ -341,21 +412,38 @@ where
     let env = ws.env();
     let secret = outside.join(OUTSIDE_SECRET);
 
-    let read = env.read_text_file(&secret).await;
-    if caps.confines_reads {
+    let root = ws.root();
+    // The absolute path, and the same file through `..` from the root when
+    // the outside folder is a sibling of the root.
+    let mut reads = vec![secret.clone()];
+    if let (Some(name), true) = (outside.file_name(), outside.parent() == root.parent()) {
+        reads.push(root.join("..").join(name).join(OUTSIDE_SECRET));
+    }
+    for target in &reads {
+        let read = env.read_text_file(target).await;
+        if caps.confines_reads {
+            assert!(
+                read.is_err(),
+                "`{id}`: read of {} outside the workspace: {read:?}",
+                target.display()
+            );
+        } else {
+            assert_eq!(
+                read.as_deref().ok(),
+                Some(OUTSIDE_SECRET_TEXT),
+                "`{id}`: reads are not confined, so {} must be readable",
+                target.display()
+            );
+        }
+    }
+    if caps.confines_reads && caps.confines_shell {
+        let shell = sh(&env, &format!("cat {}", quote(&secret))).await;
         assert!(
-            read.is_err(),
-            "`{id}`: read outside the workspace: {read:?}"
-        );
-    } else {
-        assert_eq!(
-            read.as_deref().ok(),
-            Some(OUTSIDE_SECRET_TEXT),
-            "`{id}`: reads are not confined, so the outside file must be readable"
+            !shell.stdout.contains(OUTSIDE_SECRET_TEXT),
+            "`{id}`: a shell command read the outside file"
         );
     }
 
-    let root = ws.root();
     let link = path(&ws, "kit-link");
     let linked = sh(&env, &format!("ln -s {} {}", quote(&secret), quote(&link))).await;
     if caps.confines_reads && linked.exit_code == 0 {
@@ -387,8 +475,10 @@ where
             assert!(through.is_err(), "`{id}`: write through a link to outside");
         }
         let shell_target = outside.join("kit-shell.txt");
-        let _ = sh(&env, &format!("echo escape > {}", quote(&shell_target))).await;
-        if !caps.remote {
+        if caps.confines_shell {
+            let _ = sh(&env, &format!("echo escape > {}", quote(&shell_target))).await;
+        }
+        if caps.path_namespace == PathNamespace::Host {
             for target in targets.iter().chain([&new_outside, &shell_target]) {
                 assert!(
                     !target.exists(),
@@ -467,11 +557,12 @@ where
     ws.destroy().await.expect("destroy");
 }
 
-/// Variables in `ShellExecOptions::env` reach the command (a driver with
-/// its own environment may drop names outside its allowlist), and without
-/// `inherit_env` a driver that uses the Runtime environment passes none of
-/// it. The Session layer relies on this to apply the tool env policy
-/// (`removed_tool_env_names`, `tools.passEnv`).
+/// The Runtime environment does not leak into commands: a secret set in
+/// the Runtime process is absent for both `inherit_env` values (a driver
+/// without its own environment gets the name in `remove_env`, as the
+/// Session layer sends it). An override arrives when the driver's
+/// allowlist permits its name. The Session layer relies on this to apply
+/// the tool env policy (`removed_tool_env_names`, `tools.passEnv`).
 pub async fn exec_env_is_explicit<F, Fut>(factory: &F)
 where
     F: Fn() -> Fut,
@@ -482,42 +573,72 @@ where
     let ws = f.start().await;
     let env = ws.env();
     let caps = ws.capabilities();
-    let vars = HashMap::from([("LOOP_WS_KIT_VAR".to_owned(), "kit-value".to_owned())]);
+    assert_eq!(
+        std::env::var(SECRET_ENV).as_deref(),
+        Ok(SECRET_VALUE),
+        "run the checks through run_all, which sets the sentinel"
+    );
 
     for inherit_env in [true, false] {
+        let remove_env = if caps.own_environment {
+            Vec::new()
+        } else {
+            vec![SECRET_ENV.to_owned()]
+        };
         let out = sh_with(
             &env,
-            "printf %s \"$LOOP_WS_KIT_VAR\"",
+            &format!("printf %s \"${{{SECRET_ENV}-absent}}\""),
             ShellExecOptions {
-                env: Some(vars.clone()),
                 inherit_env,
+                remove_env,
                 ..Default::default()
             },
         )
         .await;
-        if caps.own_environment {
-            // A driver with its own environment may keep only an allowlist of
-            // names (Seatbelt does). It must never put another value there.
-            assert!(
-                out.stdout == "kit-value" || out.stdout.is_empty(),
-                "`{id}`: env override (inherit_env={inherit_env}): {:?}",
-                out.stdout
-            );
-        } else {
+        assert_eq!(
+            out.stdout, "absent",
+            "`{id}`: the Runtime secret leaked (inherit_env={inherit_env})"
+        );
+    }
+
+    // A name the driver allows.
+    let name = match &caps.env_allowlist {
+        None => Some("LOOP_WS_KIT_VAR".to_owned()),
+        Some(list) => list
+            .iter()
+            .find(|n| n.as_str() == "TZ")
+            .or_else(|| {
+                list.iter()
+                    .find(|n| !n.ends_with('*') && !["PATH", "HOME"].contains(&n.as_str()))
+            })
+            .cloned(),
+    };
+    if let Some(name) = name {
+        for inherit_env in [true, false] {
+            let out = sh_with(
+                &env,
+                &format!("printf %s \"${{{name}-absent}}\""),
+                ShellExecOptions {
+                    env: Some(HashMap::from([(name.clone(), "kit-value".to_owned())])),
+                    inherit_env,
+                    ..Default::default()
+                },
+            )
+            .await;
             assert_eq!(
                 out.stdout, "kit-value",
-                "`{id}`: env override (inherit_env={inherit_env})"
+                "`{id}`: allowed override {name} (inherit_env={inherit_env})"
             );
         }
     }
 
-    // A variable of the Runtime process that every Unix process has.
+    // Without inherit_env, a driver that uses the Runtime environment
+    // passes none of it.
     if !caps.own_environment && std::env::var_os("HOME").is_some() {
         let out = sh_with(
             &env,
             "printf %s \"${HOME-unset}\"",
             ShellExecOptions {
-                env: Some(vars),
                 inherit_env: false,
                 ..Default::default()
             },
@@ -532,7 +653,8 @@ where
 }
 
 /// A timeout and a cancel stop a long command quickly with the typed codes,
-/// and the Workspace still runs commands after.
+/// the command really stops (a later step of it never runs), and the
+/// Workspace still runs commands after.
 pub async fn exec_timeout_and_cancel<F, Fut>(factory: &F)
 where
     F: Fn() -> Fut,
@@ -542,11 +664,13 @@ where
     let id = f.driver.id().to_owned();
     let ws = f.start().await;
     let env = ws.env();
+    let timeout_marker = path(&ws, "kit-after-timeout");
+    let cancel_marker = path(&ws, "kit-after-cancel");
 
     let started = Instant::now();
     let timed_out = env
         .exec(
-            "sleep 30",
+            &format!("sleep 2; touch {}", quote(&timeout_marker)),
             ShellExecOptions {
                 timeout_ms: Some(300),
                 ..Default::default()
@@ -572,7 +696,7 @@ where
     let started = Instant::now();
     let cancelled = env
         .exec(
-            "sleep 30",
+            &format!("sleep 2; touch {}", quote(&cancel_marker)),
             ShellExecOptions {
                 cancel: Some(cancel),
                 timeout_ms: Some(COMMAND_LIMIT_MS),
@@ -589,6 +713,16 @@ where
         "`{id}`: cancel took {:?}",
         started.elapsed()
     );
+
+    // Wait past the sleep: a command that kept running would now write.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for marker in [&timeout_marker, &cancel_marker] {
+        assert!(
+            !env.exists(marker).await.expect("exists"),
+            "`{id}`: the stopped command kept running and wrote {}",
+            marker.display()
+        );
+    }
 
     let after = sh(&env, "echo still-here").await;
     assert_eq!(after.stdout, "still-here\n", "`{id}`: usable after stop");

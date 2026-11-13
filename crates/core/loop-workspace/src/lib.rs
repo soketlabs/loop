@@ -21,25 +21,29 @@ mod sandbox;
 mod workspace;
 
 pub use adapter::{CapabilitiesFn, FactoryDriver, SandboxWorkspace};
-pub use capabilities::{Isolation, NetworkPolicy, ResourceLimits, WorkspaceCapabilities};
+pub use capabilities::{
+    Isolation, NetworkPolicy, PathNamespace, ResourceLimits, WorkspaceCapabilities,
+};
+pub use env::{
+    lexical, ExecutionEnv, ExecutionError, ExecutionErrorCode, FileError, FileErrorCode,
+    FileIdentity, FileInfo, FileSystem, PathKind, PathMetadata, PolicyPath, RetryClass, Shell,
+    ShellExecOptions, ShellOutput, ShellOutputCallback,
+};
 pub use error::WorkspaceError;
 pub use path::WorkspacePath;
 pub use platform::HostOs;
 pub use process::{
-    ProcessEvent, ProcessExit, ProcessSignal, PtySize, SpawnRequest, WorkspaceProcess,
+    ExitState, ProcessEvent, ProcessEventKind, ProcessId, ProcessInfo, ProcessSignal, PtySize,
+    SpawnRequest, StreamId, WorkspaceProcess,
 };
 pub use registry::{
-    register_workspace_driver, registered_workspace_drivers, SandboxRegistry,
-    WorkspaceDriverRegistry,
-};
-pub use workspace::{
-    FileChunk, SnapshotId, Workspace, WorkspaceDriver, WorkspaceSpec, WorkspaceStatus,
-};
-
-pub use env::{
-    ExecutionEnv, ExecutionError, ExecutionErrorCode, FileError, FileErrorCode, FileIdentity,
-    FileInfo, FileSystem, Shell, ShellExecOptions, ShellOutput, ShellOutputCallback,
+    register_workspace_driver, registered_workspace_drivers, replace_builtin_workspace_driver,
+    reset_registered_workspace_drivers, SandboxRegistry, WorkspaceDriverRegistry,
 };
 pub use sandbox::{
     Sandbox, SandboxConfig, SandboxError, SandboxFactory, SandboxInfo, SandboxStatus,
+};
+pub use workspace::{
+    Attached, FileChunk, FileTag, SnapshotId, UploadId, UploadRequest, Workspace, WorkspaceDriver,
+    WorkspaceSource, WorkspaceSpec, WorkspaceStatus,
 };

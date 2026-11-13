@@ -18,10 +18,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use loop_agent::harness::sandbox::{builtin_workspace_drivers, HostOs, Workspace};
-use loop_agent::harness::{
-    KrunIsolation, LocalSandboxRuntime, SandboxConfig, SandboxRegistry,
+use loop_agent::harness::sandbox::{
+    builtin_workspace_drivers, HostOs, NetworkPolicy, PathNamespace, Workspace, WorkspaceDriver,
 };
+use loop_agent::harness::{KrunIsolation, LocalSandboxRuntime, SandboxConfig, SandboxRegistry};
 use serde_json::json;
 
 use crate::config::settings::SandboxSettings;
@@ -125,11 +125,26 @@ pub fn parse_local_sandbox_flags(args: &[&str]) -> Result<LocalSandboxFlags, Str
     Ok(flags)
 }
 
+/// Whether the Session uses a path policy that reads the Runtime host disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PathPolicyUse {
+    /// Not stated: treated as present.
+    #[default]
+    Unknown,
+    /// No path rules and no tool lock.
+    None,
+    /// Path rules or the tool lock apply.
+    Present,
+}
+
 /// What the user asked for, before platform defaults are applied.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxRequest {
     /// Sandbox kind (`sandbox.mode`); `None` means [`LOCAL_SANDBOX_KIND`].
     pub kind: Option<String>,
+    /// Whether host-side path policy (path permission rules, the tool lock)
+    /// applies to the Session. `Unknown` counts as present.
+    pub path_policy: PathPolicyUse,
     /// Explicit isolation, if any.
     pub isolation: Option<KrunIsolation>,
     /// Explicit container runtime, if any.
@@ -181,6 +196,7 @@ impl SandboxRequest {
         };
         Ok(Self {
             kind: (settings.mode != "off").then(|| settings.mode.clone()),
+            path_policy: PathPolicyUse::Unknown,
             isolation,
             runtime,
             network: settings.network(),
@@ -202,6 +218,7 @@ impl SandboxRequest {
     pub fn for_flags(settings: &SandboxSettings, flags: LocalSandboxFlags) -> Self {
         Self {
             kind: None,
+            path_policy: PathPolicyUse::Unknown,
             isolation: flags.isolation,
             runtime: flags.runtime,
             network: settings.network(),
@@ -326,6 +343,16 @@ pub enum SandboxBuildError {
         /// Platform in use.
         platform: SandboxPlatform,
     },
+    /// The selected driver does not meet a setting or a rule. Selection
+    /// refuses instead of running with less protection.
+    Unmet {
+        /// Driver id.
+        driver: String,
+        /// The setting or rule.
+        setting: &'static str,
+        /// Why not.
+        reason: &'static str,
+    },
     /// The sandbox could not be created or started.
     Start(String),
 }
@@ -364,6 +391,14 @@ impl fmt::Display for SandboxBuildError {
                 }
                 Ok(())
             }
+            Self::Unmet {
+                driver,
+                setting,
+                reason,
+            } => write!(
+                f,
+                "the `{driver}` workspace driver does not meet {setting}: {reason}"
+            ),
             Self::Start(message) => f.write_str(message),
         }
     }
@@ -371,13 +406,73 @@ impl fmt::Display for SandboxBuildError {
 
 impl std::error::Error for SandboxBuildError {}
 
+/// Refuse a driver that would run with less protection than the request
+/// asks for. Capabilities only add restrictions or refuse; they never relax
+/// a setting.
+///
+/// - A driver whose paths are guest paths is refused unless the caller says
+///   that no host-side path policy (path permission rules, the tool lock)
+///   applies: that policy still reads the host disk (task C2b).
+/// - For kinds other than `local` (hosted and remote use), every
+///   restriction the user set must be enforced. `local` keeps today's
+///   behaviour (for example Linux does not enforce `sandbox.network` yet).
+fn check_driver(
+    driver: &dyn WorkspaceDriver,
+    kind: &str,
+    request: &SandboxRequest,
+    plan: &SandboxPlan,
+) -> Result<(), SandboxBuildError> {
+    let caps = driver.capabilities();
+    let unmet = |setting, reason| SandboxBuildError::Unmet {
+        driver: driver.id().to_owned(),
+        setting,
+        reason,
+    };
+    if caps.path_namespace == PathNamespace::Guest && request.path_policy != PathPolicyUse::None {
+        return Err(unmet(
+            "path permission rules or the tool lock",
+            "they still check paths on the Runtime host, and this driver's paths are not host paths",
+        ));
+    }
+    if kind == LOCAL_SANDBOX_KIND {
+        return Ok(());
+    }
+    if !plan.network
+        && !matches!(
+            caps.network,
+            NetworkPolicy::Denied | NetworkPolicy::Allowlist(_)
+        )
+    {
+        return Err(unmet("sandbox.network", "it does not deny network access"));
+    }
+    if !plan.allow_write.is_empty() && !caps.honours_allow_write {
+        return Err(unmet(
+            "sandbox.allowWrite",
+            "it does not enforce writable paths",
+        ));
+    }
+    if plan.deny_home_reads && !caps.confines_reads {
+        return Err(unmet("sandbox.denyHomeReads", "it does not confine reads"));
+    }
+    if !caps.confines_writes {
+        return Err(unmet("sandbox.mode", "it does not confine writes"));
+    }
+    if !caps.protected_paths_enforced {
+        return Err(unmet(
+            "protected paths",
+            "it does not protect .loop and git paths",
+        ));
+    }
+    Ok(())
+}
+
 /// Registry with every built-in Workspace driver, then the drivers other
 /// crates registered with `register_workspace_driver`. Each driver states
 /// the platforms it supports; [`SandboxBuilder::start`] checks that at run time.
 pub fn platform_registry() -> SandboxRegistry {
     let registry = SandboxRegistry::new();
     for driver in builtin_workspace_drivers() {
-        registry.register_driver(driver);
+        registry.register_builtin(driver);
     }
     registry.with_registered_drivers()
 }
@@ -454,8 +549,9 @@ impl SandboxBuilder {
             .map_err(|_| SandboxBuildError::Unavailable {
                 platform: self.platform,
             })?;
+        check_driver(driver.as_ref(), kind, request, &plan)?;
         let workspace = driver
-            .create(plan.config_for_agent(workdir, &self.agent_dir))
+            .create(plan.config_for_agent(workdir, &self.agent_dir).into())
             .await
             .map_err(|e| SandboxBuildError::Start(e.to_string()))?;
         let sandbox = workspace;
@@ -544,6 +640,127 @@ mod tests {
             registry.register(factory);
         }
         SandboxBuilder::new(platform, registry)
+    }
+
+    /// A driver with chosen capabilities over the fake factory.
+    fn caps_builder(
+        kind: &str,
+        caps: loop_agent::harness::sandbox::WorkspaceCapabilities,
+    ) -> SandboxBuilder {
+        struct CapsFactory(String);
+        #[async_trait]
+        impl SandboxFactory for CapsFactory {
+            fn kind(&self) -> &str {
+                &self.0
+            }
+            async fn create(
+                &self,
+                config: SandboxConfig,
+            ) -> Result<Arc<dyn Sandbox>, SandboxError> {
+                FakeFactory::default().create(config).await
+            }
+        }
+        static CAPS: Mutex<Option<loop_agent::harness::sandbox::WorkspaceCapabilities>> =
+            Mutex::new(None);
+        *CAPS.lock() = Some(caps);
+        let registry = SandboxRegistry::new();
+        registry.register_builtin(Arc::new(
+            loop_agent::harness::sandbox::FactoryDriver::new(Arc::new(CapsFactory(kind.into())))
+                .with_id("fake")
+                .with_capabilities(|_| CAPS.lock().clone().unwrap_or_default()),
+        ));
+        SandboxBuilder::new(SandboxPlatform::Linux, registry)
+    }
+
+    fn guest_caps() -> loop_agent::harness::sandbox::WorkspaceCapabilities {
+        loop_agent::harness::sandbox::WorkspaceCapabilities {
+            path_namespace: PathNamespace::Guest,
+            network: NetworkPolicy::Denied,
+            confines_reads: true,
+            confines_writes: true,
+            protected_paths_enforced: true,
+            honours_allow_write: true,
+            ..Default::default()
+        }
+    }
+
+    // One test owns the static capabilities above, so they do not race.
+    #[tokio::test]
+    async fn selection_refuses_drivers_that_relax_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = |builder: SandboxBuilder, request: SandboxRequest| {
+            let path = dir.path().to_path_buf();
+            async move { builder.start(&path, &request).await.map(|_| ()) }
+        };
+
+        // A guest-namespace driver with host path policy (unknown counts).
+        let err = start(
+            caps_builder("local", guest_caps()),
+            SandboxRequest::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, SandboxBuildError::Unmet { setting, .. } if setting.contains("tool lock")),
+            "{err}"
+        );
+        let no_policy = SandboxRequest {
+            path_policy: PathPolicyUse::None,
+            ..Default::default()
+        };
+        start(caps_builder("local", guest_caps()), no_policy.clone())
+            .await
+            .unwrap();
+
+        // Remote kind: every restriction must hold.
+        let remote = |r: SandboxRequest| SandboxRequest {
+            kind: Some("remote".into()),
+            ..r
+        };
+        start(
+            caps_builder("remote", guest_caps()),
+            remote(no_policy.clone()),
+        )
+        .await
+        .unwrap();
+        let open_net = loop_agent::harness::sandbox::WorkspaceCapabilities {
+            network: NetworkPolicy::NotEnforced,
+            ..guest_caps()
+        };
+        let err = start(
+            caps_builder("remote", open_net.clone()),
+            remote(no_policy.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the `fake` workspace driver does not meet sandbox.network: it does not deny network access"
+        );
+        let no_allow_write = loop_agent::harness::sandbox::WorkspaceCapabilities {
+            honours_allow_write: false,
+            ..guest_caps()
+        };
+        let with_allow_write = SandboxRequest {
+            allow_write: vec!["x".into()],
+            ..remote(no_policy.clone())
+        };
+        assert!(matches!(
+            start(caps_builder("remote", no_allow_write), with_allow_write).await,
+            Err(SandboxBuildError::Unmet {
+                setting: "sandbox.allowWrite",
+                ..
+            })
+        ));
+
+        // Local kind with host paths keeps today's behaviour: no refusal.
+        let host_open = loop_agent::harness::sandbox::WorkspaceCapabilities {
+            path_namespace: PathNamespace::Host,
+            ..open_net
+        };
+        start(caps_builder("local", host_open), SandboxRequest::default())
+            .await
+            .unwrap();
     }
 
     fn flags(args: &[&str]) -> SandboxRequest {

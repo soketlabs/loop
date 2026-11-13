@@ -54,8 +54,12 @@ impl Sandbox for SandboxWorkspace {
     fn status(&self) -> SandboxStatus {
         self.inner.status()
     }
+    /// The backend's card plus one new last row, `Driver`, with the driver
+    /// id. Existing rows do not change.
     fn info(&self) -> SandboxInfo {
-        self.inner.info()
+        let mut info = self.inner.info();
+        info.fields.push(("Driver".into(), self.driver.clone()));
+        info
     }
     fn env(&self) -> Arc<dyn ExecutionEnv> {
         self.inner.env()
@@ -147,7 +151,7 @@ impl WorkspaceDriver for FactoryDriver {
     }
     async fn create(&self, spec: WorkspaceSpec) -> Result<Arc<dyn Workspace>, WorkspaceError> {
         let capabilities = (self.capabilities)(&spec);
-        let sandbox = self.factory.create(spec).await?;
+        let sandbox = self.factory.create(spec.sandbox_config()).await?;
         Ok(Arc::new(SandboxWorkspace::new(
             sandbox,
             self.id.clone(),

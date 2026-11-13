@@ -7,16 +7,18 @@
 //! namespace with [`WorkspacePath::to_native`].
 
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::env::lexical;
 use crate::error::WorkspaceError;
 
 /// A normalised path inside a Workspace, relative to the Workspace root.
 ///
 /// Rules: `/`-separated; no leading `/`; no `.` or empty segments; no `..`
-/// segment; no NUL byte. The empty path is the root. Lexical only: a
+/// segment; no NUL byte; no backslash and no drive prefix such as `C:` in a
+/// segment (refused on every host, so a path means the same on each). The empty path is the root. Lexical only: a
 /// symbolic link inside the Workspace can still point outside it, so the
 /// driver must check the opened file (see the design note).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -40,6 +42,9 @@ impl WorkspacePath {
         if raw.contains('\0') {
             return Err(invalid("contains a NUL byte"));
         }
+        if raw.contains('\\') {
+            return Err(invalid("contains a backslash; use `/`"));
+        }
         if raw.starts_with('/') {
             return Err(invalid(
                 "is absolute; use a path relative to the workspace root",
@@ -54,7 +59,13 @@ impl WorkspacePath {
                         return Err(invalid("leaves the workspace root"));
                     }
                 }
-                other => parts.push(other),
+                other => {
+                    let bytes = other.as_bytes();
+                    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+                        return Err(invalid("has a drive prefix"));
+                    }
+                    parts.push(other)
+                }
             }
         }
         Ok(Self(parts.join("/")))
@@ -132,20 +143,6 @@ impl WorkspacePath {
     }
 }
 
-fn lexical(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
 impl fmt::Display for WorkspacePath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_root() {
@@ -183,7 +180,17 @@ mod tests {
 
     #[test]
     fn parse_rejects_escapes() {
-        for bad in ["/etc/passwd", "..", "a/../../b", "a\0b"] {
+        for bad in [
+            "/etc/passwd",
+            "..",
+            "a/../../b",
+            "a\0b",
+            "a\\b",
+            "..\\x",
+            "C:",
+            "c:/x",
+            "a/D:file",
+        ] {
             assert!(
                 matches!(
                     WorkspacePath::parse(bad),

@@ -27,7 +27,8 @@ pub fn get_or_throw<T, E: std::fmt::Display>(result: Result<T, E>) -> Result<T, 
 // crate. These re-exports keep the old paths working.
 pub use loop_workspace::{
     ExecutionEnv, ExecutionError, ExecutionErrorCode, FileError, FileErrorCode, FileIdentity,
-    FileInfo, FileSystem, Shell, ShellExecOptions, ShellOutput, ShellOutputCallback,
+    FileInfo, FileSystem, PathKind, PathMetadata, PolicyPath, RetryClass, Shell, ShellExecOptions,
+    ShellOutput, ShellOutputCallback,
 };
 
 /// Tool context carrying an execution environment.

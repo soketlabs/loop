@@ -7,7 +7,7 @@
 
 mod common;
 
-use loop_agent::harness::sandbox::{podman_driver, HostOs, WorkspaceSpec};
+use loop_agent::harness::sandbox::{podman_driver, HostOs, WorkspaceSource, WorkspaceSpec};
 use loop_workspace_testkit::{run_all, DriverFixture};
 use serde_json::json;
 
@@ -23,7 +23,7 @@ fn fixture() -> DriverFixture {
     DriverFixture::new(
         podman_driver(),
         WorkspaceSpec {
-            workdir: layout.project.clone(),
+            source: WorkspaceSource::HostFolder(layout.project.clone()),
             options: json!({ "runtime": runtime, "isolation": isolation }),
             ..Default::default()
         },
@@ -33,10 +33,11 @@ fn fixture() -> DriverFixture {
 }
 
 #[tokio::test]
+#[ignore = "needs Linux with Podman: LOOP_WORKSPACE_KIT_PODMAN=1 cargo test --test podman -- --ignored"]
 async fn podman_driver_conforms() {
-    if !enabled() {
-        eprintln!("skipped: set LOOP_WORKSPACE_KIT_PODMAN=1 on Linux with Podman to run");
-        return;
-    }
+    assert!(
+        enabled(),
+        "set LOOP_WORKSPACE_KIT_PODMAN=1 on Linux with Podman to run this test"
+    );
     run_all(|| async { fixture() }).await;
 }

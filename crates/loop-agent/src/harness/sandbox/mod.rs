@@ -31,11 +31,13 @@ pub use traits::{
 };
 // The Workspace driver contract (see `docs/design/workspace-driver.md`).
 pub use loop_workspace::{
-    register_workspace_driver, registered_workspace_drivers, FactoryDriver, FileChunk, HostOs,
-    Isolation, NetworkPolicy, ProcessEvent, ProcessExit, ProcessSignal, PtySize, ResourceLimits,
-    SandboxWorkspace, SnapshotId, SpawnRequest, Workspace, WorkspaceCapabilities, WorkspaceDriver,
-    WorkspaceDriverRegistry, WorkspaceError, WorkspacePath, WorkspaceProcess, WorkspaceSpec,
-    WorkspaceStatus,
+    register_workspace_driver, registered_workspace_drivers, replace_builtin_workspace_driver,
+    reset_registered_workspace_drivers, Attached, ExitState, FactoryDriver, FileChunk, FileTag,
+    HostOs, Isolation, NetworkPolicy, PathNamespace, ProcessEvent, ProcessEventKind, ProcessId,
+    ProcessInfo, ProcessSignal, PtySize, ResourceLimits, SandboxWorkspace, SnapshotId,
+    SpawnRequest, StreamId, UploadId, UploadRequest, Workspace, WorkspaceCapabilities,
+    WorkspaceDriver, WorkspaceDriverRegistry, WorkspaceError, WorkspacePath, WorkspaceProcess,
+    WorkspaceSource, WorkspaceSpec, WorkspaceStatus,
 };
 
 /// Whether `sandbox` and `workspace` are the same object (address only).

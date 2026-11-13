@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use loop_workspace::{
-    FactoryDriver, HostOs, Isolation, NetworkPolicy, ResourceLimits, Workspace,
+    FactoryDriver, HostOs, Isolation, NetworkPolicy, PathNamespace, ResourceLimits, Workspace,
     WorkspaceCapabilities, WorkspaceDriver, WorkspaceError, WorkspaceSpec,
 };
 use parking_lot::Mutex;
@@ -52,6 +52,16 @@ fn option_u64(spec: &WorkspaceSpec, key: &str) -> Option<u64> {
     })
 }
 
+/// A CPU count (`2`, `"1.5"`, `0.5`) in thousandths of a CPU.
+fn option_cpu_millis(spec: &WorkspaceSpec, key: &str) -> Option<u32> {
+    let cpus = spec.options.get(key).and_then(|v| {
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+    })?;
+    (cpus.is_finite() && cpus > 0.0)
+        .then(|| (cpus * 1000.0).round().min(f64::from(u32::MAX)) as u32)
+}
+
 fn option_bool(spec: &WorkspaceSpec, key: &str) -> bool {
     spec.options
         .get(key)
@@ -72,17 +82,18 @@ pub fn podman_capabilities(spec: &WorkspaceSpec) -> WorkspaceCapabilities {
         outlives_process: true,
         confines_reads: true,
         confines_writes: true,
+        confines_shell: true,
         own_environment: true,
+        // `exec` passes no variable from the caller into the container.
+        env_allowlist: Some(Vec::new()),
+        path_namespace: PathNamespace::Host,
+        protected_paths_enforced: true,
         // `sandbox.network` and `sandbox.allowWrite` are not enforced on
         // Linux yet (docs/configuration.md).
+        honours_allow_write: false,
         network: NetworkPolicy::NotEnforced,
         limits: ResourceLimits {
-            cpu_millis: Some(
-                option_u64(spec, "cpus")
-                    .unwrap_or(2)
-                    .saturating_mul(1000)
-                    .min(u64::from(u32::MAX)) as u32,
-            ),
+            cpu_millis: Some(option_cpu_millis(spec, "cpus").unwrap_or(2000)),
             memory_mib: Some(option_u64(spec, "ram_mib").unwrap_or(2048)),
             ..ResourceLimits::default()
         },
@@ -100,7 +111,17 @@ pub fn seatbelt_capabilities(spec: &WorkspaceSpec) -> WorkspaceCapabilities {
         // Workspace.
         confines_reads: false,
         confines_writes: true,
+        confines_shell: true,
         own_environment: true,
+        env_allowlist: Some(
+            super::seatbelt::SEATBELT_ENV_ALLOWLIST
+                .iter()
+                .map(|n| (*n).to_owned())
+                .collect(),
+        ),
+        path_namespace: PathNamespace::Host,
+        protected_paths_enforced: true,
+        honours_allow_write: true,
         network: if option_bool(spec, "network") {
             NetworkPolicy::Allowed
         } else {
@@ -122,6 +143,9 @@ pub fn host_capabilities(spec: &WorkspaceSpec) -> WorkspaceCapabilities {
         confines_reads: option_bool(spec, "confineReads"),
         confines_writes: false,
         own_environment: false,
+        path_namespace: PathNamespace::Host,
+        protected_paths_enforced: false,
+        honours_allow_write: false,
         network: NetworkPolicy::NotEnforced,
         limits: ResourceLimits {
             max_output_bytes: Some(HOST_OUTPUT_CAP),
@@ -182,12 +206,17 @@ impl WorkspaceDriver for HostWorkspaceDriver {
     }
     async fn create(&self, spec: WorkspaceSpec) -> Result<Arc<dyn Workspace>, WorkspaceError> {
         let capabilities = host_capabilities(&spec);
-        let workdir = if spec.workdir.as_os_str().is_empty() {
+        let folder = spec.host_folder().ok_or(WorkspaceError::Unmet {
+            driver: HOST_DRIVER_ID.into(),
+            setting: "workspace source",
+            reason: "the host driver uses a host folder in place",
+        })?;
+        let workdir = if folder.as_os_str().is_empty() {
             std::env::current_dir().map_err(|e| {
                 WorkspaceError::Sandbox(SandboxError::StartFailed(format!("current_dir: {e}")))
             })?
         } else {
-            spec.workdir.clone()
+            folder.to_path_buf()
         };
         let mut env = HostExecutionEnv::new(workdir.clone());
         if capabilities.confines_reads {
@@ -276,7 +305,7 @@ mod tests {
     fn local_kind_selects_by_platform() {
         let reg = WorkspaceDriverRegistry::new();
         for d in builtin_workspace_drivers() {
-            reg.register_driver(d);
+            reg.register_builtin(d);
         }
         assert_eq!(
             reg.select("local", HostOs::Linux).unwrap().id(),
@@ -303,6 +332,20 @@ mod tests {
         let partial = podman_capabilities(&spec(json!({"isolation": "partial", "cpus": 4})));
         assert_eq!(partial.isolation, Isolation::Partial);
         assert_eq!(partial.limits.cpu_millis, Some(4000));
+        for (cpus, millis) in [(json!("1.5"), 1500), (json!(0.25), 250), (json!("2"), 2000)] {
+            assert_eq!(
+                podman_capabilities(&spec(json!({ "cpus": cpus })))
+                    .limits
+                    .cpu_millis,
+                Some(millis)
+            );
+        }
+        assert_eq!(
+            podman_capabilities(&spec(json!({"cpus": "x"})))
+                .limits
+                .cpu_millis,
+            Some(2000)
+        );
         assert_eq!(
             podman_capabilities(&spec(json!({}))).isolation,
             Isolation::Full
@@ -312,5 +355,40 @@ mod tests {
             NetworkPolicy::Allowed
         );
         assert!(host_capabilities(&spec(json!({"confineReads": true}))).confines_reads);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_env_reports_links_owner_and_link_count() {
+        use crate::harness::types::{FileSystem, PathKind};
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("f"), "x").unwrap();
+        std::os::unix::fs::symlink(root.join("f"), root.join("l")).unwrap();
+        std::fs::hard_link(root.join("f"), root.join("h")).unwrap();
+        let env = HostExecutionEnv::new(&root);
+
+        let link = env.symlink_metadata(&root.join("l")).await.unwrap();
+        assert_eq!(link.kind, PathKind::Symlink);
+        assert_eq!(
+            env.read_link(&root.join("l")).await.unwrap(),
+            root.join("f")
+        );
+
+        let through = env.resolve_for_policy(&root.join("l")).await.unwrap();
+        assert!(through.exists && through.has_link);
+        assert_eq!(through.resolved, root.join("f"));
+        assert_eq!(through.nlink, Some(2));
+        // SAFETY: geteuid has no arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(through.uid, Some(uid));
+
+        let plain = env.resolve_for_policy(&root.join("f")).await.unwrap();
+        assert!(!plain.has_link);
+        let missing = env
+            .resolve_for_policy(&root.join("l/../none"))
+            .await
+            .unwrap();
+        assert!(!missing.exists);
     }
 }

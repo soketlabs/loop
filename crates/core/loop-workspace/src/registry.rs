@@ -14,11 +14,18 @@ use crate::workspace::WorkspaceDriver;
 /// Ordered set of drivers, keyed by driver id.
 ///
 /// Selection by kind takes the first driver, in registration order, that
-/// serves the kind and supports the platform. Registering an id that exists
-/// replaces that driver in its place.
+/// serves the kind and supports the platform. Built-in drivers are added
+/// with [`register_builtin`](Self::register_builtin); another driver cannot
+/// take a built-in id except through
+/// [`replace_builtin`](Self::replace_builtin), which logs the replacement.
 #[derive(Default)]
 pub struct WorkspaceDriverRegistry {
-    drivers: RwLock<Vec<Arc<dyn WorkspaceDriver>>>,
+    drivers: RwLock<Vec<Entry>>,
+}
+
+struct Entry {
+    driver: Arc<dyn WorkspaceDriver>,
+    builtin: bool,
 }
 
 /// The old name. `SandboxRegistry::register` and `create` keep their
@@ -31,13 +38,47 @@ impl WorkspaceDriverRegistry {
         Self::default()
     }
 
-    /// Register `driver`, replacing a driver with the same id in its place.
-    pub fn register_driver(&self, driver: Arc<dyn WorkspaceDriver>) {
+    fn put(&self, driver: Arc<dyn WorkspaceDriver>, builtin: bool) {
         let mut drivers = self.drivers.write();
-        match drivers.iter().position(|d| d.id() == driver.id()) {
-            Some(at) => drivers[at] = driver,
-            None => drivers.push(driver),
+        let entry = Entry { driver, builtin };
+        match drivers
+            .iter()
+            .position(|e| e.driver.id() == entry.driver.id())
+        {
+            Some(at) => drivers[at] = entry,
+            None => drivers.push(entry),
         }
+    }
+
+    /// Register a built-in driver (replaces a driver with the same id).
+    pub fn register_builtin(&self, driver: Arc<dyn WorkspaceDriver>) {
+        self.put(driver, true);
+    }
+
+    /// Register `driver`. A driver with the same id that is not built in is
+    /// replaced in its place. Taking a built-in id is refused.
+    pub fn register_driver(&self, driver: Arc<dyn WorkspaceDriver>) -> Result<(), WorkspaceError> {
+        if self.is_builtin(driver.id()) {
+            return Err(WorkspaceError::BuiltinId(driver.id().to_owned()));
+        }
+        self.put(driver, false);
+        Ok(())
+    }
+
+    /// Replace the built-in driver with the same id, on purpose. Logged.
+    pub fn replace_builtin(&self, driver: Arc<dyn WorkspaceDriver>) {
+        tracing::warn!(
+            driver = driver.id(),
+            "workspace driver replaces a built-in driver"
+        );
+        self.put(driver, false);
+    }
+
+    fn is_builtin(&self, id: &str) -> bool {
+        self.drivers
+            .read()
+            .iter()
+            .any(|e| e.builtin && e.driver.id() == id)
     }
 
     /// Register an old-style factory (replaces every driver of its kind, as
@@ -46,23 +87,41 @@ impl WorkspaceDriverRegistry {
     pub fn register(&self, factory: Arc<dyn SandboxFactory>) {
         let driver: Arc<dyn WorkspaceDriver> = Arc::new(FactoryDriver::new(factory));
         let mut drivers = self.drivers.write();
-        let at = drivers.iter().position(|d| d.kind() == driver.kind());
-        drivers.retain(|d| d.kind() != driver.kind());
+        let at = drivers
+            .iter()
+            .position(|e| e.driver.kind() == driver.kind());
+        drivers.retain(|e| e.driver.kind() != driver.kind());
         let at = at.unwrap_or(drivers.len()).min(drivers.len());
-        drivers.insert(at, driver);
+        drivers.insert(
+            at,
+            Entry {
+                driver,
+                builtin: false,
+            },
+        );
     }
 
-    /// Add every driver registered with [`register_workspace_driver`].
+    /// Add every driver registered with [`register_workspace_driver`] and
+    /// [`replace_builtin_workspace_driver`]. A plain registration that takes
+    /// a built-in id is refused and logged.
     pub fn with_registered_drivers(self) -> Self {
-        for driver in registered_workspace_drivers() {
-            self.register_driver(driver);
+        for (driver, replace) in global().read().iter() {
+            if *replace {
+                self.replace_builtin(driver.clone());
+            } else if let Err(error) = self.register_driver(driver.clone()) {
+                tracing::error!(%error, "workspace driver not registered");
+            }
         }
         self
     }
 
     /// The driver with id `id`.
     pub fn driver(&self, id: &str) -> Option<Arc<dyn WorkspaceDriver>> {
-        self.drivers.read().iter().find(|d| d.id() == id).cloned()
+        self.drivers
+            .read()
+            .iter()
+            .find(|e| e.driver.id() == id)
+            .map(|e| e.driver.clone())
     }
 
     /// Driver ids in registration order.
@@ -70,15 +129,26 @@ impl WorkspaceDriverRegistry {
         self.drivers
             .read()
             .iter()
-            .map(|d| d.id().to_owned())
+            .map(|e| e.driver.id().to_owned())
             .collect()
     }
 
-    /// Kinds served by at least one driver, in registration order.
+    /// Kinds that at least one driver serves on this platform, in
+    /// registration order (the old meaning: kinds that can be created here).
     pub fn kinds(&self) -> Vec<String> {
+        self.kinds_where(|d| d.supports(HostOs::current()))
+    }
+
+    /// Kinds served by any registered driver, on any platform.
+    pub fn all_kinds(&self) -> Vec<String> {
+        self.kinds_where(|_| true)
+    }
+
+    fn kinds_where(&self, keep: impl Fn(&dyn WorkspaceDriver) -> bool) -> Vec<String> {
         let mut kinds: Vec<String> = Vec::new();
-        for driver in self.drivers.read().iter() {
-            if !kinds.iter().any(|k| k == driver.kind()) {
+        for entry in self.drivers.read().iter() {
+            let driver = entry.driver.as_ref();
+            if keep(driver) && !kinds.iter().any(|k| k == driver.kind()) {
                 kinds.push(driver.kind().to_owned());
             }
         }
@@ -93,7 +163,11 @@ impl WorkspaceDriverRegistry {
         os: HostOs,
     ) -> Result<Arc<dyn WorkspaceDriver>, WorkspaceError> {
         let drivers = self.drivers.read();
-        let mut of_kind = drivers.iter().filter(|d| d.kind() == kind).peekable();
+        let mut of_kind = drivers
+            .iter()
+            .map(|e| &e.driver)
+            .filter(|d| d.kind() == kind)
+            .peekable();
         let first = of_kind
             .peek()
             .map(|d| d.id().to_owned())
@@ -117,31 +191,49 @@ impl WorkspaceDriverRegistry {
         let driver = self
             .select(kind, HostOs::current())
             .map_err(|_| SandboxError::Other(format!("unknown sandbox kind: {kind}")))?;
-        let workspace = driver.create(config).await?;
+        let workspace = driver.create(config.into()).await?;
         Ok(workspace)
     }
 }
 
-fn global() -> &'static RwLock<Vec<Arc<dyn WorkspaceDriver>>> {
-    static GLOBAL: OnceLock<RwLock<Vec<Arc<dyn WorkspaceDriver>>>> = OnceLock::new();
+type Global = RwLock<Vec<(Arc<dyn WorkspaceDriver>, bool)>>;
+
+fn global() -> &'static Global {
+    static GLOBAL: OnceLock<Global> = OnceLock::new();
     GLOBAL.get_or_init(Default::default)
+}
+
+fn put_global(driver: Arc<dyn WorkspaceDriver>, replace: bool) {
+    let mut drivers = global().write();
+    match drivers.iter().position(|(d, _)| d.id() == driver.id()) {
+        Some(at) => drivers[at] = (driver, replace),
+        None => drivers.push((driver, replace)),
+    }
 }
 
 /// Register a driver for this process. A driver crate outside this
 /// repository calls this at startup, before the Runtime builds its first
 /// Workspace. The platform registry of the app adds these drivers after the
-/// built-in ones; an id that exists replaces the built-in driver.
+/// built-in ones. A driver that takes a built-in id is refused there (and
+/// logged); use [`replace_builtin_workspace_driver`] for that.
 pub fn register_workspace_driver(driver: Arc<dyn WorkspaceDriver>) {
-    let mut drivers = global().write();
-    match drivers.iter().position(|d| d.id() == driver.id()) {
-        Some(at) => drivers[at] = driver,
-        None => drivers.push(driver),
-    }
+    put_global(driver, false);
 }
 
-/// Drivers registered with [`register_workspace_driver`], in order.
+/// Register a driver that replaces the built-in driver with the same id.
+pub fn replace_builtin_workspace_driver(driver: Arc<dyn WorkspaceDriver>) {
+    put_global(driver, true);
+}
+
+/// Drivers registered with [`register_workspace_driver`] or
+/// [`replace_builtin_workspace_driver`], in order.
 pub fn registered_workspace_drivers() -> Vec<Arc<dyn WorkspaceDriver>> {
-    global().read().clone()
+    global().read().iter().map(|(d, _)| d.clone()).collect()
+}
+
+/// Remove every process-wide registration. For tests.
+pub fn reset_registered_workspace_drivers() {
+    global().write().clear();
 }
 
 #[cfg(test)]
@@ -186,8 +278,8 @@ mod tests {
     #[test]
     fn select_checks_kind_then_platform() {
         let reg = WorkspaceDriverRegistry::new();
-        reg.register_driver(named("podman", "local", Some(HostOs::Linux)));
-        reg.register_driver(named("seatbelt", "local", Some(HostOs::MacOs)));
+        reg.register_builtin(named("podman", "local", Some(HostOs::Linux)));
+        reg.register_builtin(named("seatbelt", "local", Some(HostOs::MacOs)));
         assert_eq!(reg.select("local", HostOs::Linux).unwrap().id(), "podman");
         assert_eq!(reg.select("local", HostOs::MacOs).unwrap().id(), "seatbelt");
         assert!(matches!(
@@ -198,16 +290,16 @@ mod tests {
             reg.select("remote", HostOs::Linux),
             Err(WorkspaceError::UnknownKind(_))
         ));
-        assert_eq!(reg.kinds(), vec!["local".to_owned()]);
+        assert_eq!(reg.all_kinds(), vec!["local".to_owned()]);
         assert_eq!(reg.driver_ids(), vec!["podman", "seatbelt"]);
     }
 
     #[test]
     fn same_id_replaces_in_place() {
         let reg = WorkspaceDriverRegistry::new();
-        reg.register_driver(named("a", "local", None));
-        reg.register_driver(named("b", "local", None));
-        reg.register_driver(named("a", "remote", None));
+        reg.register_driver(named("a", "local", None)).unwrap();
+        reg.register_driver(named("b", "local", None)).unwrap();
+        reg.register_driver(named("a", "remote", None)).unwrap();
         assert_eq!(reg.driver_ids(), vec!["a", "b"]);
         assert_eq!(reg.driver("a").unwrap().kind(), "remote");
     }
@@ -223,13 +315,62 @@ mod tests {
     }
 
     #[test]
+    fn builtin_ids_need_an_explicit_replace() {
+        let reg = WorkspaceDriverRegistry::new();
+        reg.register_builtin(named("podman", "local", None));
+        assert!(matches!(
+            reg.register_driver(named("podman", "remote", None)),
+            Err(WorkspaceError::BuiltinId(_))
+        ));
+        assert_eq!(reg.driver("podman").unwrap().kind(), "local");
+        reg.replace_builtin(named("podman", "remote", None));
+        assert_eq!(reg.driver("podman").unwrap().kind(), "remote");
+    }
+
+    #[test]
+    fn kinds_are_those_usable_here() {
+        let reg = WorkspaceDriverRegistry::new();
+        let elsewhere = if HostOs::current() == HostOs::Linux {
+            HostOs::MacOs
+        } else {
+            HostOs::Linux
+        };
+        reg.register_builtin(named("x", "far", Some(elsewhere)));
+        reg.register_builtin(named("y", "near", None));
+        assert_eq!(reg.kinds(), vec!["near".to_owned()]);
+        assert_eq!(reg.all_kinds(), vec!["far".to_owned(), "near".to_owned()]);
+    }
+
+    // One test owns the process-wide list, so tests do not race on it.
+    #[test]
     fn global_registration_is_seen_by_new_registries() {
+        reset_registered_workspace_drivers();
         register_workspace_driver(named("registry-test-external", "remote", None));
-        let reg = WorkspaceDriverRegistry::new().with_registered_drivers();
+        register_workspace_driver(named("podman", "remote", None));
+        let reg = WorkspaceDriverRegistry::new();
+        reg.register_builtin(named("podman", "local", None));
+        let reg = reg.with_registered_drivers();
         assert!(reg.driver("registry-test-external").is_some());
+        assert_eq!(
+            reg.driver("podman").unwrap().kind(),
+            "local",
+            "built-in kept"
+        );
         assert_eq!(
             reg.select("remote", HostOs::current()).unwrap().id(),
             "registry-test-external"
         );
+        reset_registered_workspace_drivers();
+        replace_builtin_workspace_driver(named("podman", "remote", None));
+        let reg = WorkspaceDriverRegistry::new();
+        reg.register_builtin(named("podman", "local", None));
+        let reg = reg.with_registered_drivers();
+        assert_eq!(
+            reg.driver("podman").unwrap().kind(),
+            "remote",
+            "explicit replace"
+        );
+        reset_registered_workspace_drivers();
+        assert!(registered_workspace_drivers().is_empty());
     }
 }
