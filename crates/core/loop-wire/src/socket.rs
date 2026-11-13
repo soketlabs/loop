@@ -82,29 +82,151 @@ pub fn unix(stream: tokio::net::UnixStream) -> Transport {
     crate::transport::lines(read, write)
 }
 
+/// Handshake headers by which an Edge Gateway asserts the end user it
+/// connects for ([`websocket_accept_edge`]). An ordinary WebSocket that
+/// sends any of them is refused.
+pub mod edge_headers {
+    /// `person` or `service`.
+    pub const PRINCIPAL_KIND: &str = "loop-principal-kind";
+    /// Who vouches for the id, such as an OIDC issuer URL. Never `local`.
+    pub const PRINCIPAL_ISSUER: &str = "loop-principal-issuer";
+    /// The id within the issuer, such as an OIDC `sub`.
+    pub const PRINCIPAL_ID: &str = "loop-principal-id";
+    /// The tenant. Never `local` or `system`.
+    pub const TENANT: &str = "loop-tenant";
+    /// All of them.
+    pub const ALL: [&str; 4] = [PRINCIPAL_KIND, PRINCIPAL_ISSUER, PRINCIPAL_ID, TENANT];
+}
+
+fn refusal(status: StatusCode, reason: &str) -> ErrorResponse {
+    let mut refused = ErrorResponse::new(Some(reason.into()));
+    *refused.status_mut() = status;
+    refused
+}
+
+/// `Authorization: Bearer <token>`. The scheme name is case-insensitive
+/// (RFC 7235 §2.1, so `bearer` and `BEARER` match too), followed by one
+/// space and the token, compared in constant time.
+fn bearer_matches(request: &Request, token: &str) -> bool {
+    const SCHEME: &[u8] = b"bearer ";
+    let given = request
+        .headers()
+        .get("authorization")
+        .map(HeaderValue::as_bytes)
+        .unwrap_or_default();
+    let scheme_ok =
+        given.len() >= SCHEME.len() && given[..SCHEME.len()].eq_ignore_ascii_case(SCHEME);
+    let presented = given.get(SCHEME.len()..).unwrap_or_default();
+    // Both compared always, so a wrong scheme takes as long as a wrong token.
+    let token_ok = constant_time_eq(presented, token.as_bytes());
+    !token.is_empty() && scheme_ok & token_ok
+}
+
+/// The caller an edge handshake asserts. Each header must be present once.
+fn asserted_caller(request: &Request) -> Result<loop_protocol::Caller, String> {
+    use loop_protocol::{Caller, Principal, PrincipalKind, Tenant};
+    // No cap of its own: each value is checked against its own limit (all
+    // four together are at most 581 valid bytes), a repeated header is
+    // refused, and the WebSocket library bounds the header block.
+    let headers = request.headers();
+    let one = |name: &'static str| -> Result<&str, String> {
+        let mut values = headers.get_all(name).iter();
+        match (values.next(), values.next()) {
+            (Some(value), None) => value
+                .to_str()
+                .map_err(|_| format!("{name} is not visible ASCII")),
+            (None, _) => Err(format!("{name} is required")),
+            (Some(_), Some(_)) => Err(format!("{name} is given more than once")),
+        }
+    };
+    // An unknown kind is refused by `Caller::asserted`.
+    let kind =
+        PrincipalKind::parse(one(edge_headers::PRINCIPAL_KIND)?).map_err(|e| e.to_string())?;
+    let principal = Principal::new(
+        kind,
+        one(edge_headers::PRINCIPAL_ISSUER)?,
+        one(edge_headers::PRINCIPAL_ID)?,
+    )
+    .map_err(|e| e.to_string())?;
+    let tenant = Tenant::new(one(edge_headers::TENANT)?).map_err(|e| e.to_string())?;
+    Caller::asserted(principal, tenant).map_err(|e| e.to_string())
+}
+
 /// Accept a WebSocket on `stream`, which must present
-/// `Authorization: Bearer <token>`. Anything else is refused with 401.
+/// `Authorization: Bearer <token>`. Anything else is refused with 401. A
+/// handshake that carries an [`edge_headers`] identity is refused with 400:
+/// only an edge connection can assert one.
 pub async fn websocket_accept<S>(stream: S, token: &str) -> io::Result<Transport>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let expected = format!("Bearer {token}");
     // The handshake callback's type is tungstenite's; its error is large by design.
     #[allow(clippy::result_large_err)]
     let check = |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
-        let given = request
-            .headers()
-            .get("authorization")
-            .map(HeaderValue::as_bytes)
-            .unwrap_or_default();
-        if !token.is_empty() && constant_time_eq(given, expected.as_bytes()) {
-            Ok(response)
-        } else {
-            let mut refused = ErrorResponse::new(Some("a bearer token is required".into()));
-            *refused.status_mut() = StatusCode::UNAUTHORIZED;
-            Err(refused)
+        if !bearer_matches(request, token) {
+            return Err(refusal(
+                StatusCode::UNAUTHORIZED,
+                "a bearer token is required",
+            ));
+        }
+        if edge_headers::ALL
+            .iter()
+            .any(|name| request.headers().contains_key(*name))
+        {
+            return Err(refusal(
+                StatusCode::BAD_REQUEST,
+                "this connection cannot assert an identity",
+            ));
+        }
+        Ok(response)
+    };
+    handshake(stream, check).await
+}
+
+/// Accept an Edge Gateway connection on `stream`. It must present
+/// `Authorization: Bearer <edge_token>` (401 otherwise) and assert one end
+/// user with every [`edge_headers`] header, once each (400 otherwise). The
+/// returned caller is fixed for the connection's life: it is never read
+/// again, and no request can change it. Serve the transport with
+/// [`crate::serve_with_caller`] and remote authority.
+pub async fn websocket_accept_edge<S>(
+    stream: S,
+    edge_token: &str,
+) -> io::Result<(Transport, loop_protocol::Caller)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut asserted = None;
+    // The handshake callback's type is tungstenite's; its error is large by design.
+    #[allow(clippy::result_large_err)]
+    let check = |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
+        if !bearer_matches(request, edge_token) {
+            return Err(refusal(
+                StatusCode::UNAUTHORIZED,
+                "an edge bearer token is required",
+            ));
+        }
+        match asserted_caller(request) {
+            Ok(caller) => {
+                asserted = Some(caller);
+                Ok(response)
+            }
+            Err(reason) => {
+                tracing::warn!(%reason, "edge identity assertion refused");
+                Err(refusal(StatusCode::BAD_REQUEST, &reason))
+            }
         }
     };
+    let transport = handshake(stream, check).await?;
+    let caller = asserted.ok_or_else(|| io::Error::other("edge handshake gave no identity"))?;
+    Ok((transport, caller))
+}
+
+async fn handshake<S, C>(stream: S, check: C) -> io::Result<Transport>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    C: tokio_tungstenite::tungstenite::handshake::server::Callback + Unpin,
+{
     let ws = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tokio_tungstenite::accept_hdr_async_with_config(stream, check, Some(ws_config())),
@@ -118,6 +240,36 @@ where
 /// Connect to a WebSocket at `url` (`ws://host:port/path`) with a bearer
 /// token.
 pub async fn websocket_connect(url: &str, token: &str) -> io::Result<Transport> {
+    connect(url, token, &[]).await
+}
+
+/// Connect to a Runtime's edge listener as an Edge Gateway, for the end user
+/// `caller` names. The identity goes in the handshake ([`edge_headers`]),
+/// once, and holds for the connection's life. A caller the Runtime would
+/// refuse (unknown kind, `local` issuer, reserved tenant) is refused here.
+pub async fn websocket_connect_edge(
+    url: &str,
+    edge_token: &str,
+    caller: &loop_protocol::Caller,
+) -> io::Result<Transport> {
+    let invalid = |e: loop_protocol::IdentityError| io::Error::new(io::ErrorKind::InvalidInput, e);
+    // Checks the same rules the Runtime applies.
+    let principal = caller.principal();
+    loop_protocol::Caller::asserted(principal.clone(), caller.tenant().clone()).map_err(invalid)?;
+    let headers = [
+        (edge_headers::PRINCIPAL_KIND, principal.kind().as_str()),
+        (edge_headers::PRINCIPAL_ISSUER, principal.issuer()),
+        (edge_headers::PRINCIPAL_ID, principal.id()),
+        (edge_headers::TENANT, caller.tenant().as_str()),
+    ];
+    connect(url, edge_token, &headers).await
+}
+
+async fn connect(
+    url: &str,
+    token: &str,
+    headers: &[(&'static str, &str)],
+) -> io::Result<Transport> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut request = url.into_client_request().map_err(io::Error::other)?;
     let uri = request.uri();
@@ -135,6 +287,15 @@ pub async fn websocket_connect(url: &str, token: &str) -> io::Result<Transport> 
         )
     })?;
     request.headers_mut().insert("authorization", value);
+    for (name, value) in headers {
+        let value = HeaderValue::from_str(value).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an identity value is not a valid header",
+            )
+        })?;
+        request.headers_mut().insert(*name, value);
+    }
     let (ws, _) = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tokio_tungstenite::connect_async_with_config(request, Some(ws_config()), false),
@@ -217,9 +378,16 @@ where
     }
 }
 
-/// Compare without leaking how many leading bytes matched.
+/// Compare without leaking how many leading bytes matched, and without an
+/// early exit when the lengths differ: every byte of the longer input is
+/// read either way.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    let longest = a.len().max(b.len());
+    let mut diff = u8::from(a.len() != b.len());
+    for i in 0..longest {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    }
+    diff == 0
 }
 
 #[cfg(test)]
@@ -232,6 +400,9 @@ mod tests {
         assert!(!constant_time_eq(b"Bearer abd", b"Bearer abc"));
         assert!(!constant_time_eq(b"Bearer ab", b"Bearer abc"));
         assert!(!constant_time_eq(b"", b"Bearer abc"));
+        assert!(!constant_time_eq(b"Bearer abc\0", b"Bearer abc"));
+        assert!(!constant_time_eq(b"Bearer abc", b"Bearer abc\0"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     #[cfg(unix)]

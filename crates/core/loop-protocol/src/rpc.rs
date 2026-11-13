@@ -216,6 +216,46 @@ pub struct InitializeResult {
     pub instance: BackendInstanceId,
     /// What the backend supports.
     pub capabilities: Capabilities,
+    /// Who this connection acts for (ADR-0009), fixed when the connection
+    /// was accepted. Absent from an older server, or from a connection that
+    /// has no identity. A request field never changes it.
+    ///
+    /// The server builds these three from validated values. A client reads
+    /// them leniently: a value from a newer server that today's rules
+    /// refuse reads as absent, so `initialize` still succeeds.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient"
+    )]
+    pub principal: Option<crate::Principal>,
+    /// The tenant this connection's data belongs to. Present with
+    /// `principal`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient"
+    )]
+    pub tenant: Option<crate::Tenant>,
+    /// How the principal reached the Runtime (`token`, `edge`); absent on a
+    /// host-local connection.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient"
+    )]
+    pub via: Option<crate::Via>,
+}
+
+/// An optional value that reads as `None` when it is present but invalid,
+/// instead of failing the whole message.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// Params naming one session.
@@ -763,6 +803,8 @@ pub fn json_schema() -> Value {
     let reference = |schema: schemars::Schema| serde_json::to_value(schema).unwrap_or_default();
     let initialize_params = reference(generator.subschema_for::<InitializeParams>());
     let initialize_result = reference(generator.subschema_for::<InitializeResult>());
+    // The stored and audit form of a connection's identity (ADR-0009).
+    let _caller = generator.subschema_for::<crate::Caller>();
     let spec = reference(generator.subschema_for::<SessionSpec>());
     let session = reference(generator.subschema_for::<SessionRef>());
     let load = reference(generator.subschema_for::<LoadParams>());
