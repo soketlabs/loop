@@ -735,3 +735,153 @@ async fn a_decision_the_runtime_cannot_record_refuses_the_call() {
     .await
     .unwrap();
 }
+
+/// The cost of decision records, before (no sink) and after, on both paths.
+/// Run on demand:
+///
+/// ```text
+/// cargo test -p loop-runtime --lib cost_of_decision_records -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measures time; run on demand"]
+async fn cost_of_decision_records() {
+    const CALLS: usize = 200;
+    const BATCH: usize = 20;
+    /// A model that reads `a.txt` `CALLS` times, `per` calls per response.
+    fn reader(per: usize) -> Arc<loop_ai::Models> {
+        let models = Arc::new(loop_ai::Models::create(Default::default()));
+        models.set_provider(faux_provider_fn(Arc::new(move |context: &Context| {
+            let done = context
+                .messages
+                .iter()
+                .filter(|m| matches!(m, Message::ToolResult(_)))
+                .count();
+            let response = if done < CALLS {
+                FauxResponse::ToolCalls(
+                    (0..per)
+                        .map(|i| ToolCall {
+                            id: format!("r{done}-{i}"),
+                            name: "read".into(),
+                            arguments: json!({"path": "a.txt"}),
+                            thought_signature: None,
+                        })
+                        .collect(),
+                )
+            } else {
+                FauxResponse::Text("read".into())
+            };
+            Box::pin(std::future::ready(response))
+        })));
+        models
+    }
+    fn stats(mut samples: Vec<Duration>) -> (f64, f64) {
+        samples.sort();
+        let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize].as_secs_f64() * 1e3;
+        (at(0.5), at(0.95))
+    }
+    /// p50 and p95 of one gate check with its record, sequential and in
+    /// parallel batches.
+    async fn gate_calls(gate: &Arc<loop_app_core::tool_gate::ToolGate>) -> [(f64, f64); 2] {
+        let call = |i: usize| {
+            let args = json!({"path": "a.txt"});
+            loop_agent::BeforeToolCallContext::standalone(
+                ToolCall {
+                    id: format!("g{i}"),
+                    name: "read".into(),
+                    arguments: args.clone(),
+                    thought_signature: None,
+                },
+                args,
+            )
+        };
+        let before = gate.before_hook();
+        let mut sequential = Vec::new();
+        for i in 0..CALLS {
+            let start = std::time::Instant::now();
+            assert!(before(call(i), None).await.is_none());
+            sequential.push(start.elapsed());
+        }
+        let mut parallel = Vec::new();
+        for batch in 0..CALLS / BATCH {
+            let runs = (0..BATCH).map(|i| {
+                let before = before.clone();
+                let ctx = call(batch * BATCH + i);
+                async move {
+                    let start = std::time::Instant::now();
+                    assert!(before(ctx, None).await.is_none());
+                    start.elapsed()
+                }
+            });
+            parallel.extend(futures::future::join_all(runs).await);
+        }
+        [stats(sequential), stats(parallel)]
+    }
+    let mut rows = Vec::new();
+    for record in [false, true] {
+        // Embedded: the factory's Session with its JSONL sink.
+        for per in [1, BATCH] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+            let (_, opts) = setup(dir.path(), "full-access", "true", false);
+            let globals =
+                GlobalResources::with_models(dir.path().join("agent"), reader(per)).unwrap();
+            let factory = loop_app_core::runtime::SessionFactory::new(Arc::new(globals));
+            let workspace = factory.workspace(&opts).await.unwrap();
+            let opened = factory.open(workspace, &opts).await.unwrap();
+            if !record {
+                opened.tool_gate.set_decision_sink(None);
+            }
+            let start = std::time::Instant::now();
+            opened.harness.prompt("go").await.unwrap();
+            let turn = start.elapsed();
+            let [seq, par] = gate_calls(&opened.tool_gate).await;
+            rows.push(("embedded", record, per, turn, seq, par));
+        }
+        // Runtime: the Event Log sink (barrier and one commit per record).
+        for per in [1, BATCH] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+            let (_, opts) = setup(dir.path(), "full-access", "true", false);
+            let globals =
+                GlobalResources::with_models(dir.path().join("agent"), reader(per)).unwrap();
+            let log = Arc::new(
+                crate::log::SqliteEventLog::open(&dir.path().join("agent"))
+                    .await
+                    .unwrap(),
+            );
+            let rt = {
+                let store = globals.open_runtime_session_store().unwrap();
+                Runtime::new(globals, opts, log, store, RuntimeLimits::default())
+            }
+            .await
+            .unwrap()
+            .into_shared();
+            let session = rt.new_session(SessionSpec::default()).await.unwrap();
+            let gate = rt.route(&session).unwrap().opened.tool_gate.clone();
+            if !record {
+                gate.set_decision_sink(None);
+            }
+            let start = std::time::Instant::now();
+            let turn = rt
+                .prompt(&session, vec![ContentBlock::text("go")])
+                .await
+                .unwrap();
+            assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+            let turn = start.elapsed();
+            let [seq, par] = gate_calls(&gate).await;
+            rows.push(("runtime", record, per, turn, seq, par));
+            rt.shutdown().await;
+        }
+    }
+    println!("COST|path|records|calls per response|turn ms (200 reads)|gate p50/p95 ms sequential|gate p50/p95 ms parallel x{BATCH}");
+    for (path, record, per, turn, seq, par) in rows {
+        println!(
+            "COST|{path}|{record}|{per}|{:.0}|{:.3}/{:.3}|{:.3}/{:.3}",
+            turn.as_secs_f64() * 1e3,
+            seq.0,
+            seq.1,
+            par.0,
+            par.1
+        );
+    }
+}

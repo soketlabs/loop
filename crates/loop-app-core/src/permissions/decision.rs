@@ -271,9 +271,10 @@ impl JsonlDecisionSink {
     }
 }
 
-/// Whether a record may wait for the next sync: an allowed read of files,
-/// which has no effect to protect.
-fn may_defer_sync(record: &PolicyDecisionRecord) -> bool {
+/// Whether a record's call has no effect to protect: an allowed read of
+/// files. Its record may wait for the next sync (embedded), and need not
+/// wait for the call's `tool_call` to commit first (Runtime).
+pub fn has_no_effect(record: &PolicyDecisionRecord) -> bool {
     record.outcome == DecisionOutcome::Allow && record.capability == "read_files"
 }
 
@@ -294,7 +295,7 @@ impl DecisionSink for JsonlDecisionSink {
     async fn record(&self, record: &PolicyDecisionRecord) -> Result<(), DecisionError> {
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
-        let sync = !may_defer_sync(record);
+        let sync = !has_no_effect(record);
         let (path, file, max, kept) = (
             self.path.clone(),
             Arc::clone(&self.file),

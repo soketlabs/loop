@@ -3,7 +3,8 @@
 //! §1.2).
 //!
 //! Ordering (ADR-0007 §3.1): the gate awaits [`DecisionSink::record`]
-//! before the call runs. The sink first runs the Session's pump barrier,
+//! before the call runs. For a call with an effect (everything but an
+//! allowed read of files) the sink first runs the Session's pump barrier,
 //! which commits every update the backend sent before it, the call's
 //! `tool_call` included, and then appends the decision and waits for the
 //! commit. So `tool_call` commits first, then the decision, both before the
@@ -73,8 +74,15 @@ impl DecisionSink for LogDecisions {
     }
 
     async fn record(&self, record: &PolicyDecisionRecord) -> Result<(), DecisionError> {
-        // `tool_call` first: commit what the backend already sent.
-        if let Some(live) = self.live.get().and_then(std::sync::Weak::upgrade) {
+        // `tool_call` first: commit what the backend already sent. An
+        // allowed read has no effect to order, so it skips the barrier.
+        let barrier_first = !loop_app_core::permissions::decision::has_no_effect(record);
+        if let Some(live) = self
+            .live
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .filter(|_| barrier_first)
+        {
             barrier(&live)
                 .await
                 .map_err(|e| DecisionError::Write(e.to_string()))?;
