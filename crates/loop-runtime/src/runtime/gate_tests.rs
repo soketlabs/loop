@@ -563,3 +563,98 @@ async fn an_embedded_session_records_its_decisions_in_the_agent_directory() {
     .await
     .unwrap();
 }
+
+/// The parallel tool path (several tool calls in one model response): the
+/// agent loop decides every call first, then runs them at once. Each call's
+/// `tool_call` commits before its decision, and every decision commits
+/// before any of the calls runs (before the first tool result).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_tool_calls_commit_each_decision_before_any_tool_runs() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, opts) = setup(dir.path(), "full-access", "true", false);
+        let models = Arc::new(loop_ai::Models::create(Default::default()));
+        models.set_provider(faux_provider_fn(Arc::new(|context: &Context| {
+            let asked = matches!(context.messages.last(), Some(Message::User(_)));
+            let response = if asked {
+                FauxResponse::ToolCalls(
+                    (0..3)
+                        .map(|i| ToolCall {
+                            id: format!("par-{i}"),
+                            name: "bash".into(),
+                            arguments: json!({ "command": format!("printf {i} > made-{i}") }),
+                            thought_signature: None,
+                        })
+                        .collect(),
+                )
+            } else {
+                FauxResponse::Text("finished".into())
+            };
+            Box::pin(std::future::ready(response))
+        })));
+        let globals = GlobalResources::with_models(dir.path().join("agent"), models).unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = {
+            let store = globals.open_runtime_session_store().unwrap();
+            Runtime::new(globals, opts, log.clone(), store, RuntimeLimits::default())
+        }
+        .await
+        .unwrap()
+        .with_close_grace(Duration::from_millis(500))
+        .into_shared();
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let turn = rt
+            .prompt(&session, vec![ContentBlock::text("go")])
+            .await
+            .unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        for i in 0..3 {
+            let made = std::fs::read_to_string(dir.path().join(format!("made-{i}"))).unwrap();
+            assert_eq!(made, i.to_string(), "control: call {i} ran");
+        }
+        let all = log.read_runtime_after(0).await.unwrap();
+        let seq_of = |find: &dyn Fn(&LoggedEvent) -> bool| {
+            all.iter().find(|r| find(r)).map(|r| r.global_seq)
+        };
+        let found = decisions(&log).await;
+        let mut decided = Vec::new();
+        let mut ended = Vec::new();
+        for i in 0..3 {
+            let id = format!("par-{i}");
+            let call = seq_of(&|r| {
+                matches!(&r.event.kind, EventKind::Update(e)
+                    if matches!(&e.update, SessionUpdate::ToolCall(c) if c.id.0 == id))
+            })
+            .expect("tool_call committed");
+            let end = seq_of(&|r| {
+                matches!(&r.event.kind, EventKind::Update(e)
+                    if matches!(&e.update, SessionUpdate::ToolCallUpdate(u)
+                        if u.id.0 == id
+                            && matches!(u.status, Some(loop_protocol::ToolCallStatus::Completed))))
+            })
+            .expect("tool result committed");
+            let mine: Vec<_> = found
+                .iter()
+                .filter(|(_, d)| d.call_id.as_deref() == Some(id.as_str()))
+                .collect();
+            assert_eq!(mine.len(), 1, "one record for {id}");
+            let decision = mine[0].0.global_seq;
+            assert!(
+                call < decision,
+                "{id}: tool_call {call} < decision {decision}"
+            );
+            assert!(decision < end, "{id}: decision {decision} < result {end}");
+            decided.push(decision);
+            ended.push(end);
+        }
+        let last_decision = decided.iter().max().unwrap();
+        let first_result = ended.iter().min().unwrap();
+        assert!(
+            last_decision < first_result,
+            "every decision {decided:?} commits before the first tool result {ended:?}"
+        );
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
