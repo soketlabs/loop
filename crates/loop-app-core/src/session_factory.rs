@@ -121,8 +121,16 @@ impl GlobalResources {
 /// Store construction at the edge: the Runtime opens no database itself.
 impl GlobalResources {
     /// Inject a model catalog and the Session store of the shared repository,
-    /// with no SQLite store opened. `sessions_db` still names the default
-    /// path, for standalone Surfaces only; nothing is created there.
+    /// with no SQLite store opened.
+    ///
+    /// The injected store and `sessions_db` can differ: `sessions_db` still
+    /// names the default path, and nothing is created there. The Runtime
+    /// never reads `sessions_db` (it uses its injected store). Code that
+    /// still reads it: the standalone Surface path of
+    /// [`SessionFactory::open`] (`create_sqlite_session_store_for_resume`),
+    /// [`Self::open_runtime_session_store`], and `loop_app_core::Runtime`,
+    /// which copies it for the Surfaces to show. So do not use these
+    /// resources for a standalone Surface.
     pub fn with_models_and_store(
         agent_dir: PathBuf,
         models: Arc<Models>,

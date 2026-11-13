@@ -371,7 +371,9 @@ impl Runtime {
     /// since the newest generation whose recovery committed.
     ///
     /// With `lock` (the lock of this Runtime's own Session database), leases of
-    /// an earlier Runtime are reclaimed and released.
+    /// an earlier Runtime are reclaimed and released. The lock must name the
+    /// store's `database_path`; with a store that has no database path,
+    /// `recover(Some(lock))` fails.
     ///
     /// Precondition: call before serving any Session; turns of this generation
     /// are never ended here.

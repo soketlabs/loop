@@ -70,7 +70,7 @@ pub trait LeaseEnvironment: Send + Sync {
 }
 
 /// The system clock and the conservative process-liveness probe.
-pub struct SystemLeaseEnvironment;
+pub(crate) struct SystemLeaseEnvironment;
 impl LeaseEnvironment for SystemLeaseEnvironment {
     fn now_ms(&self) -> i64 {
         loop_ai::now_ms()
@@ -281,6 +281,12 @@ pub struct SessionControlState {
 pub trait SessionLeases: Send + Sync {
     /// The database file whose Runtime lock (`SessionDatabaseLock`) proves
     /// ownership of this store's leases, or `None` when the store has none.
+    ///
+    /// This is a SQLite-specific proof. `Runtime::recover(Some(lock))`
+    /// compares the lock's path with it, and `sweep_stale_leases` gets the
+    /// lock's path; so `recover` with a lock fails for a store that returns
+    /// `None`. ADR-0007 steps B4 and D1 replace it with a proof on the store
+    /// side: `LeaseStore::sweep_stale(&SystemScope)` and the `Fence` epoch.
     fn database_path(&self) -> Option<&Path>;
 
     /// A writer bound to this identity. Each append and delete through it
@@ -400,9 +406,10 @@ pub struct DestinationCreation {
     armed: bool,
 }
 impl DestinationCreation {
-    /// For store implementations. `armed` is true for a destination that
-    /// this call created, false for one found by its receipt.
-    pub fn new(
+    /// For the stores of this crate. `armed` is true for a destination that
+    /// this call created, false for one found by its receipt. An armed value
+    /// deletes the Session when it is dropped before `admitted`.
+    pub(crate) fn new(
         id: String,
         receipt: String,
         store: Arc<dyn RuntimeSessionStore>,

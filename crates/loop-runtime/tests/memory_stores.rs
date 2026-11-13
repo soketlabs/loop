@@ -10,7 +10,7 @@
 
 use loop_agent::harness::session::{
     InMemoryRuntimeStore, LeaseEnvironment, LeaseIdentity, PidLiveness, RuntimeSessionStore,
-    SessionStore, SystemLeaseEnvironment, LEASE_STALE_AFTER_MS,
+    SessionStore, LEASE_STALE_AFTER_MS,
 };
 use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
 use loop_protocol::{
@@ -35,20 +35,20 @@ const LIMIT: Duration = Duration::from_secs(60);
 /// A pid that the environment below reports as dead.
 const DEAD_PID: u32 = 2_000_000_001;
 
-/// The system clock and pid probe, except that the clock can be moved back
-/// and `DEAD_PID` is always dead.
+/// The system clock, which the test can move back. `DEAD_PID` is dead and
+/// every other pid is alive.
 struct Environment {
     offset_ms: AtomicI64,
 }
 impl LeaseEnvironment for Environment {
     fn now_ms(&self) -> i64 {
-        SystemLeaseEnvironment.now_ms() + self.offset_ms.load(Ordering::SeqCst)
+        loop_ai::now_ms() + self.offset_ms.load(Ordering::SeqCst)
     }
     fn pid_liveness(&self, pid: u32) -> PidLiveness {
         if pid == DEAD_PID {
             PidLiveness::Dead
         } else {
-            SystemLeaseEnvironment.pid_liveness(pid)
+            PidLiveness::Alive
         }
     }
 }

@@ -61,6 +61,50 @@ macro_rules! conformance {
                 suite::control_markers(&$factory).await;
             }
             #[tokio::test]
+            async fn takeover_stale_boundary() {
+                suite::takeover_stale_boundary(&$factory).await;
+            }
+            #[tokio::test]
+            async fn sweep_stale_boundary() {
+                suite::sweep_stale_boundary(&$factory).await;
+            }
+            #[tokio::test]
+            async fn claimant_pid_too_large() {
+                suite::claimant_pid_too_large(&$factory).await;
+            }
+            #[tokio::test]
+            async fn reclaim_same_pid_new_generation() {
+                suite::reclaim_same_pid_new_generation(&$factory).await;
+            }
+            #[tokio::test]
+            async fn takeover_missing_session() {
+                suite::takeover_missing_session(&$factory).await;
+            }
+            #[tokio::test]
+            async fn destinations() {
+                suite::destinations(&$factory).await;
+            }
+            #[tokio::test]
+            async fn delete_removes_control_and_receipt() {
+                suite::delete_removes_control_and_receipt(&$factory).await;
+            }
+            #[tokio::test]
+            async fn old_writer_fenced_after_takeover() {
+                suite::old_writer_fenced_after_takeover(&$factory).await;
+            }
+            #[tokio::test]
+            async fn check_resume_refuses_stale_lease() {
+                suite::check_resume_refuses_stale_lease(&$factory).await;
+            }
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn concurrent_acquires() {
+                suite::concurrent_acquires(&$factory).await;
+            }
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn renew_races_takeover() {
+                suite::renew_races_takeover(&$factory).await;
+            }
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             async fn run_all() {
                 suite::run_all($factory).await;
             }

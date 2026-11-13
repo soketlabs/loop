@@ -22,8 +22,8 @@ pub use fork::{
 pub use jsonl_store::create_jsonl_session_store;
 pub use lease::{
     DestinationCreation, LeaseEnvironment, LeaseIdentity, PidLiveness, RuntimeSessionStore,
-    SessionControl, SessionControlState, SessionLease, SessionLeases, SystemLeaseEnvironment,
-    LEASE_RENEW_INTERVAL_MS, LEASE_STALE_AFTER_MS,
+    SessionControl, SessionControlState, SessionLease, SessionLeases, LEASE_RENEW_INTERVAL_MS,
+    LEASE_STALE_AFTER_MS,
 };
 pub use memory_store::{
     create_in_memory_runtime_store, create_in_memory_session_store, InMemoryRuntimeStore,
