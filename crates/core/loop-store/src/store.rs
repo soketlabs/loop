@@ -1,34 +1,170 @@
 //! The store traits after ADR-0007 (§8).
 //!
-//! Defined for later steps. No type implements them yet, and nothing calls
-//! them. Steps B1 to B7 add the implementations; each method notes its step.
+//! The traits are defined for later steps. No type implements them yet, and
+//! nothing calls them. Steps B1 to B7 add the implementations; each method
+//! notes its step.
+//!
+//! Live from step B2: [`SessionSummary`] and its fold ([`SummaryDelta`],
+//! [`summarize`]). The SQLite and memory Event Logs keep the summary in the
+//! transaction of each append, and `EventLog::session_summary` reads it.
+
+use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use loop_protocol::SessionKey;
+use loop_protocol::{SessionKey, SessionUpdate, TurnId, UpdateEnvelope};
 
 use crate::append::Append;
 use crate::error::Result;
-use crate::event::Committed;
+use crate::event::{Committed, EventKind, LoggedEvent};
 use crate::identity::{SystemScope, Tenant};
 use crate::lease::{Fence, Generation, OwnerInfo};
-use crate::page::Page;
+use crate::page::{Page, PageLimit};
 use crate::tree::{SessionMetadata, SessionTreeEntry};
 
 /// Small per-Session summary that the projection keeps (step B2).
+///
+/// Every field is a fold over the Session's records in `global_seq` order
+/// ([`SessionSummary::apply`]). A store keeps it in the transaction of the
+/// append, so a read after an append sees the append in the summary too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
     /// The Session.
     pub session: SessionKey,
-    /// The last revision of `config_changed` or `branch_reset`.
+    /// The last `session_seq` (Updates only), or 0.
+    pub last_seq: u64,
+    /// The revision of the last `config_changed` or `branch_reset` Update,
+    /// in log order (not the largest), or 0.
     pub last_revision: u64,
-    /// Newest record timestamp (unix ms).
+    /// Newest timestamp (unix ms) of any record of the Session.
     pub last_activity_ms: i64,
-    /// Prompts sent to the Session.
+    /// `prompt_sent` records of the Session.
     pub prompts_sent: u64,
-    /// Distinct turns of its updates.
+    /// Distinct turn ids of the Session's records (all kinds, not only
+    /// Updates).
     pub turn_count: u64,
-    /// The parent Session of a Subagent.
+    /// The parent of a Subagent: set by the first `session_opened` whose
+    /// `parent` is not null, and never cleared. A parent that is not a
+    /// string is kept as its JSON text.
     pub parent: Option<SessionKey>,
+}
+
+/// What one record changes in its Session's summary. Records without a
+/// Session change nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryDelta {
+    /// The record's Session.
+    pub session: SessionKey,
+    /// Its `session_seq` (Updates).
+    pub seq: Option<u64>,
+    /// Its timestamp.
+    pub ts_ms: i64,
+    /// The revision of a `config_changed` or `branch_reset` Update.
+    pub revision: Option<u64>,
+    /// It is a `prompt_sent`.
+    pub prompt: bool,
+    /// Its turn.
+    pub turn: Option<TurnId>,
+    /// The parent of a `session_opened` with a parent.
+    pub parent: Option<SessionKey>,
+}
+
+impl SummaryDelta {
+    /// The change of one committed record, or `None` without a Session.
+    pub fn of(record: &LoggedEvent) -> Option<Self> {
+        let event = &record.event;
+        let session = event.session_key.clone()?;
+        let revision = match &event.kind {
+            EventKind::Update(UpdateEnvelope {
+                update: SessionUpdate::ConfigChanged(changed),
+                ..
+            }) => Some(changed.revision),
+            EventKind::Update(UpdateEnvelope {
+                update: SessionUpdate::BranchReset { revision, .. },
+                ..
+            }) => Some(*revision),
+            _ => None,
+        };
+        let parent = match &event.kind {
+            EventKind::SessionOpened(payload) => match payload.get("parent") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(key)) => Some(SessionKey::from(key.as_str())),
+                Some(other) => Some(SessionKey::from(other.to_string())),
+            },
+            _ => None,
+        };
+        Some(Self {
+            session,
+            seq: record.session_seq,
+            ts_ms: event.ts_ms,
+            revision,
+            prompt: matches!(event.kind, EventKind::PromptSent(_)),
+            turn: event.turn.clone(),
+            parent,
+        })
+    }
+}
+
+impl SessionSummary {
+    /// The summary of a Session with no records.
+    pub fn empty(session: SessionKey) -> Self {
+        Self {
+            session,
+            last_seq: 0,
+            last_revision: 0,
+            last_activity_ms: i64::MIN,
+            prompts_sent: 0,
+            turn_count: 0,
+            parent: None,
+        }
+    }
+
+    /// Apply the next record of the Session. `new_turn` is true when the
+    /// delta's turn was not seen before in this Session; the caller keeps
+    /// the set of turns.
+    pub fn apply(&mut self, delta: &SummaryDelta, new_turn: bool) {
+        if let Some(seq) = delta.seq {
+            self.last_seq = self.last_seq.max(seq);
+        }
+        self.last_activity_ms = self.last_activity_ms.max(delta.ts_ms);
+        if let Some(revision) = delta.revision {
+            self.last_revision = revision;
+        }
+        if delta.prompt {
+            self.prompts_sent += 1;
+        }
+        if new_turn && delta.turn.is_some() {
+            self.turn_count += 1;
+        }
+        if self.parent.is_none() {
+            self.parent.clone_from(&delta.parent);
+        }
+    }
+}
+
+/// The summary of each Session and its turn ids (first-seen order), folded
+/// from records in `global_seq` order. It is the reference that a store's
+/// projection must equal.
+pub fn summarize<'a>(
+    records: impl IntoIterator<Item = &'a LoggedEvent>,
+) -> BTreeMap<SessionKey, (SessionSummary, Vec<TurnId>)> {
+    let mut sessions: BTreeMap<SessionKey, (SessionSummary, Vec<TurnId>)> = BTreeMap::new();
+    for record in records {
+        let Some(delta) = SummaryDelta::of(record) else {
+            continue;
+        };
+        let (summary, turns) = sessions
+            .entry(delta.session.clone())
+            .or_insert_with(|| (SessionSummary::empty(delta.session.clone()), Vec::new()));
+        let new_turn = match &delta.turn {
+            Some(turn) if !turns.contains(turn) => {
+                turns.push(turn.clone());
+                true
+            }
+            _ => false,
+        };
+        summary.apply(&delta, new_turn);
+    }
+    sessions
 }
 
 /// What a projection rebuild did (step B6).
@@ -125,20 +261,20 @@ pub trait EventReader: Send + Sync {
         s: &SessionKey,
         after_seq: u64,
         through_seq: Option<u64>,
-        limit: u32,
+        limit: PageLimit,
     ) -> Result<Page<Committed>>;
     /// Last committed `session_seq`, or 0. Reads the `events_session_seq` index.
     async fn latest_seq(&self, t: &Tenant, s: &SessionKey) -> Result<u64>;
     /// Small per-Session summary that the projection keeps:
     /// last revision, last activity, prompts sent, turn count, parent.
     async fn session_summary(&self, t: &Tenant, s: &SessionKey) -> Result<Option<SessionSummary>>;
-    /// Summaries of a tenant's Sessions, in key order, paged.
+    /// Summaries of a tenant's Sessions, in key order, paged by key.
     async fn summaries(
         &self,
         t: &Tenant,
         after: Option<SessionKey>,
         limit: u32,
-    ) -> Result<Page<SessionSummary>>;
+    ) -> Result<Page<SessionSummary, SessionKey>>;
     /// Session-scoped recovery (§2.5): records of earlier lease epochs
     /// after the Session's recovery mark.
     async fn session_recovery_records(
@@ -147,7 +283,7 @@ pub trait EventReader: Send + Sync {
         s: &SessionKey,
         below_epoch: u64,
         after_global: u64,
-        limit: u32,
+        limit: PageLimit,
     ) -> Result<Page<Committed>>;
     /// The Session's recovery mark (a `global_seq`), or 0.
     async fn recovered_through(&self, t: &Tenant, s: &SessionKey) -> Result<u64>;
@@ -156,7 +292,7 @@ pub trait EventReader: Send + Sync {
         &self,
         scope: &SystemScope,
         after_global: u64,
-        limit: u32,
+        limit: PageLimit,
     ) -> Result<Page<Committed>>;
     /// Runtime-level recovery: generations with owner = 'runtime' only.
     async fn recovery_records(
@@ -164,7 +300,7 @@ pub trait EventReader: Send + Sync {
         scope: &SystemScope,
         from: Generation,
         after_global: u64,
-        limit: u32,
+        limit: PageLimit,
     ) -> Result<Page<Committed>>;
     /// Newest generation whose Runtime-level recovery committed.
     async fn last_recovered_generation(&self, scope: &SystemScope) -> Result<Generation>;
@@ -182,7 +318,7 @@ pub trait TreeReader: Send + Sync {
         cwd: Option<&str>,
         after: Option<&str>,
         limit: u32,
-    ) -> Result<Page<SessionMetadata>>;
+    ) -> Result<Page<SessionMetadata, String>>;
     /// The head entry id.
     async fn head(&self, t: &Tenant, id: &str) -> Result<Option<String>>;
     /// One entry.
