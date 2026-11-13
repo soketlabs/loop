@@ -7,6 +7,8 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 3. **The permission mode** allows the call or asks.
 4. **Asking**: the TUI and desktop app show a prompt. With nobody to ask (`--print`, `--serve-mcp`), the call is refused, and the model is told which flag or rule would allow it.
 
+Loop records every decision of this check before the call runs: see [Decision records](#decision-records). A command you type yourself (`!command` in the TUI, `session/shell`) passes the same check: see [Commands you type](#commands-you-type).
+
 ## Modes
 
 | Mode | read, search, web | write / edit | bash | MCP tools |
@@ -111,6 +113,50 @@ The agent's permission requests are checked in this order:
 6. **Otherwise**, you are asked.
 
 Codex runs some commands without asking: read-only commands in `read-only` mode, and sandboxed commands in `workspace-write`. Loop sees those only as tool-call updates, after they run.
+
+## Commands you type
+
+A command you type in a client (`!command` in the TUI, or the `session/shell` method) runs in the Session's tool environment, as the `bash` tool does. It is not a model tool call, but it passes the same check, as a `bash` call of that Session, with these rules:
+
+| Session state | Your command |
+|---|---|
+| The Runtime's tool lock (`--tool-lock`) | refused (`ToolLocked`), before the check |
+| You connect through an Edge Gateway | refused (`Forbidden`), before the check |
+| A Policy layer turns the shell off, or Locks it off | refused |
+| A `bash` deny rule: plain (`"bash": "deny"`) or a pattern that matches (`"bash(rm *)": "deny"`) | refused, in every mode |
+| `read-only` or `plan` mode | read-only commands run (the same list as for `bash`); other commands are refused |
+| `ask` or `accept-edits` mode, a pattern `ask`, or a layer's "ask" | runs. You typed the command, so you are its approver: Loop does not show you a prompt for your own command |
+| `full-access` | runs |
+
+- **Only the host's user approves by typing.** A caller from outside the host (an Edge Gateway user) cannot approve, so where `bash` would ask, the command is refused. Today the Runtime refuses `session/shell` from those callers anyway.
+- **Hooks do not run** for a command you type. `tool_call` hooks review the agent's tool calls; a typed command is your own action.
+- **The `bash` block list applies** (below).
+- **Command patterns are advisory**, for your commands as for the agent's: a `bash` deny pattern reads the command as text, and a wrapper (`env touch x`, `sh -c '…'`, a script) can get past it. To keep the shell out of reach, turn it off with a Policy layer or use the tool lock.
+- **Protected files.** The shell can write any file your OS user can. The sandbox (`sandbox.mode: local`) protects the agent directory, project `.loop` and git metadata from commands, yours and the agent's alike.
+
+## Decision records
+
+Every decision of the check is one **decision record**: allow, ask and deny, on every path (the agent, a Subagent, a `/workflow` task, a subscription agent's permission request, an MCP tool, `--serve-mcp` and the commands you type). Loop writes the record **before** the call runs. If Loop cannot write the record, it refuses the call.
+
+| Field | What |
+|---|---|
+| `id`, `ts_ms` | A unique id (`pd-…`) and the time, in Unix milliseconds |
+| `principal`, `tenant`, `via` | Who acted: the caller that sent the prompt or the command. A Subagent, a workflow task and a subscription agent act for the person who started the parent Session. Decisions with no caller (in-process calls) have the Runtime's own principal `{service, local, runtime}` |
+| `session`, `turn`, `call_id` | Where the call came from |
+| `source` | `native` (the model), `mcp:<server>`, `agent:<id>`, `workflow`, `mcp_serve` or `user_shell` |
+| `tool`, `kind`, `capability` | The tool, its kind, and the Capability it needs (`shell`, `write_files`, `mcp:github`, …) |
+| `subject` | A short summary that holds no secrets: the program of each part of a command (not its arguments), the path a file tool names, the host of a URL (not its path or query) |
+| `args_sha256` | A hash of the arguments. The record never holds the arguments or file contents |
+| `outcome`, `answer` | `allow`, `deny` or `ask`. For `ask`, `answer` is `allow` or `deny` when you answered before the call ran. A file edit is reviewed after the write, so its answer is in the Escalation's answer record |
+| `by`, `layer`, `rule` | The step that decided: `off`, `rule`, `layer_ask`, `hook`, `grant`, `preset`, `approver`, `no_approver` or `user` (you typed the command); and the Policy layer or the `toolPermissions` key, when one decided |
+| `mode` | The permission mode |
+| `escalation`, `answered_by` | For an answered ask: the Escalation id and who answered it, which can be a different person than `principal` |
+| `reason` | The refusal reason |
+
+**Where records go:**
+
+- **In the Runtime**, each record is a `policy_decision` row in the Event Log (`events.db`). It is audit-only: it has no Session sequence, so attach and replay do not show it. See [the Runtime docs](runtime.md#decision-records).
+- **Without the Runtime** (`--print` without the Runtime, the TUI's fallback, `--serve-mcp`), there is no Event Log. Records are JSON lines in `audit/decisions.jsonl` in the agent directory (mode 0600, folder 0700). Surfaces and replay do not see this file.
 
 ## Upgrading from 0.4
 

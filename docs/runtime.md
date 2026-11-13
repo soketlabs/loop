@@ -396,7 +396,12 @@ loop runtime start --tool-lock chat --tool-lock-root /srv/loop-users \
   - The Runtime always refuses `session/shell` from an edge connection with
     `Forbidden`, also under a tool lock.
   - `loop runtime start` refuses a `--tool-lock-root` that contains the agent
-    directory, the Session database or the edge token file.
+    directory, the Session database or the edge token file. It also refuses
+    a root that contains your home directory (a project folder below it is
+    fine), and a root that overlaps a path the macOS sandbox keeps from
+    commands: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.netrc`,
+    `~/.docker/config.json`, `~/.kube/config`, shell histories, other
+    agents' folders such as `~/.codex` and `~/.claude`, and the keychains.
 - The edge listener is separate from `--listen`. The Runtime token does not
   open an edge connection, and the edge token does not open an ordinary one.
 - The token file must be a 0600 file that you own, in a 0700 directory, with a
@@ -436,7 +441,26 @@ loop runtime start --tool-lock chat --tool-lock-root /srv/loop-users \
   turns off the shell, file changes, Subagents, workflows, MCP servers and
   hooks.
 - read the workspace settings that the tool lock lets a chat client read. The
-  Runtime refuses changes under the lock.
+  Runtime refuses changes under the lock. The reads return no secrets:
+  - `workspace/settings`: the thinking level, the sandbox settings (mode and
+    paths), the permission mode, the `toolPermissions` rules, the diff editor
+    command, the response timeout, the enabled model names and resource
+    counts. Never provider settings, API keys or MCP server definitions.
+  - `workspace/mcp` (list): each server's name, whether it is on and
+    connected, and its tool count. Never its command, arguments, `env` or
+    headers.
+  - `workspace/web_search` (read): on or off, the provider id and a status
+    line. Never the key.
+  - `workspace/skills`: each skill's name, description and state.
+  - `workspace/templates`: each prompt template's name and description, and
+    with `name`, the template's text. A template is text you wrote for chat
+    clients: do not put a secret in one.
+- answer an Escalation (an approval or a question) **only for a turn that
+  user started**. The Runtime sends an edge user's connection only the
+  Escalations of its own turns, so it never sees or answers the host user's
+  approvals, or another edge user's. The host user's connections get every
+  Escalation, as before. The answer record names who answered
+  (`answered_by`).
 
 An edge user cannot run `session/shell`, call a host-only method, or change
 the tool lock. Do not turn this option on for users who must not see each
@@ -534,6 +558,10 @@ The Runtime is full: all 16 loaded Sessions are busy or watched (limit 16). Clos
 
 An approval is an Escalation: a tool that needs your decision before it runs.
 
+- An edge user's connection gets only the Escalations of the turns that user
+  started ([above](#identity-who-acts-and-for-which-tenant)). The rest of this
+  section is about the host user's connections.
+
 - Every attached Surface sees the request as numbered choices.
 - A Subagent's request also goes to every Surface attached to its parent, or
   to any Session above it, so watching the parent is enough. `loop session attach`
@@ -553,6 +581,50 @@ An approval is an Escalation: a tool that needs your decision before it runs.
 - Cancelling the turn withdraws its pending approvals.
 - An "allow for this Session" grant lasts only while the Runtime runs. It is
   never restored after a restart.
+
+## Commands you type (`session/shell`)
+
+`!command` in the TUI (the `session/shell` method) runs a command in the
+Session's tool environment while the Session is idle. Before it runs:
+
+1. The tool lock refuses it (`ToolLocked`), and the Runtime refuses it from an
+   Edge Gateway connection (`Forbidden`).
+2. The Session's permission check judges it as a `bash` call: a Policy layer
+   that turns the shell off, a `bash` deny rule, and `read-only` or `plan`
+   mode (except read-only commands) refuse it. Where `bash` would ask, you are
+   the approver, because you typed it, so it runs with no prompt. A caller
+   from outside the host cannot approve, so for that caller the command is
+   refused. The rules are in [permissions](permissions.md#commands-you-type).
+3. The decision record is written (below). Then the `bash` block list
+   applies, and the command runs.
+
+A refusal is an error with the reason, for example
+`the command is refused: Tool `bash` is denied by settings.toolPermissions`.
+
+## Decision records
+
+Every permission decision of a Session is a `policy_decision` row in the
+Event Log: each tool call of the agent and its Subagents, each `/workflow`
+shell task, each permission request of a subscription agent, and each
+command you type. The fields are in [permissions](permissions.md#decision-records).
+
+- **Order.** For a tool call, the Runtime first commits the call's
+  `tool_call` update, then the decision, and only then runs the tool. A crash
+  after the decision leaves the record. If the record cannot be written, the
+  call is refused.
+- **Audit only.** The row has no Session sequence. Attach, replay and
+  `session_seq` never include it, and recovery does not read it. An older
+  Loop reads such a row as an unknown record and keeps it.
+- **Who.** The record names the caller that sent the prompt or the command.
+  An answered approval also names who answered (`answered_by`); the
+  `escalation_answered` row holds the same value.
+- **Read them** with SQLite:
+
+  ```sh
+  sqlite3 ~/.loop/agent/events.db \
+    "SELECT json_extract(payload,'$.event.payload') FROM events
+     WHERE kind='policy_decision' ORDER BY global_seq DESC LIMIT 20"
+  ```
 
 ## Sessions held by the Runtime
 
@@ -652,7 +724,8 @@ when that is set.
 | `run/runtime.lock` | File lock held while the Runtime runs. Holding it proves no other Runtime is alive |
 | `run/runtime.pid` | The Runtime's pid, for diagnostics only |
 | `logs/runtime.log` | Runtime log |
-| `events.db` | The Event Log: every update, prompt, approval and Session start and stop, used for replay and audit |
+| `events.db` | The Event Log: every update, prompt, approval, permission decision (`policy_decision`) and Session start and stop, used for replay and audit |
+| `audit/decisions.jsonl` | Permission decisions of Sessions that run without the Runtime (`--print` alone, the TUI's fallback, `--serve-mcp`). Mode 0600 |
 | `sessions.db` | Sessions, with a `runtime.lock` beside it. `LOOP_CODING_AGENT_SESSION_DIR` moves this file, but not `events.db` |
 
 The wire protocol that Surfaces speak is described in
