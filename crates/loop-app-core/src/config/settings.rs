@@ -1146,9 +1146,16 @@ mod tests {
             assert!(policy.removes(name), "{name}");
         }
         assert!(!policy.removes("GITHUB_TOKEN"));
+        // `webSearch.apiKeyEnv` names are removed too.
+        let settings: Settings =
+            serde_json::from_str(r#"{"webSearch":{"apiKeyEnv":["MY_SEARCH_KEY"]}}"#).unwrap();
+        let policy = crate::config::tool_env::tool_env_policy(dir.path(), &settings);
+        assert!(policy.removes("MY_SEARCH_KEY") && policy.removes("TAVILY_API_KEY"));
         // No file, or a broken one, adds nothing and does not fail.
         std::fs::write(dir.path().join("models.json"), "{not json").unwrap();
-        assert!(crate::config::tool_env::custom_key_envs(dir.path()).is_empty());
+        assert!(
+            crate::config::tool_env::custom_key_envs(dir.path(), &Settings::default()).is_empty()
+        );
     }
 
     #[test]

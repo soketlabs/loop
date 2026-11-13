@@ -86,6 +86,11 @@ Loop removes these variables from the environment of the `bash` tool and of
   `LOOP_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
   `GEMINI_API_KEY` and `GOOGLE_API_KEY`;
 - every name in `apiKeyEnv` of the custom providers in `models.json`;
+- the default key variables of the built-in web search backends
+  (`TAVILY_API_KEY`, `BRAVE_API_KEY`, `TINYFISH_API_KEY`; the Soket backend uses
+  the Soket names above) and every name in `webSearch.apiKeyEnv`;
+- the other secrets that Loop reads: `LOOP_PDF_OCR_API_KEY`,
+  `LANGFUSE_SECRET_KEY` and `LANGFUSE_PUBLIC_KEY`;
 - the Runtime token variable `LOOP_RUNTIME_TOKEN`.
 
 The list is exact names, not a pattern. `GITHUB_TOKEN`, `NPM_TOKEN`, `AWS_*` and
@@ -113,7 +118,7 @@ no note.
 Scope: this applies to `bash` and `!shell` only. [Hooks](hooks.md) and MCP
 servers are not changed. An MCP server gets the `env` values set in its
 configuration as written. Loop reads the `apiKeyEnv` names when a Session
-starts, so a change to `models.json` applies to new Sessions. With the sandbox
+starts, so a change to `models.json` or `webSearch` applies to new Sessions. With the sandbox
 off, this removal reduces accidental leaks. It is not a security boundary: see
 [the Runtime](runtime.md#tool-environment-and-the-sandbox).
 

@@ -10,4 +10,7 @@ pub(crate) use host::exec_command;
 mod process_tree;
 
 mod session;
-pub use session::{removed_tool_env_names, SessionExecutionEnv, ToolEnvPolicy, RUNTIME_TOKEN_ENVS};
+pub use session::{
+    removed_tool_env_names, SessionExecutionEnv, ToolEnvPolicy, LOOP_SECRET_ENVS,
+    RUNTIME_TOKEN_ENVS,
+};

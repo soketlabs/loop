@@ -10,16 +10,33 @@ use std::{
 /// Runtime token variables. No other variable carries a Runtime token.
 pub const RUNTIME_TOKEN_ENVS: &[&str] = &["LOOP_RUNTIME_TOKEN"];
 
+/// Other secret variables that Loop itself reads: the PDF OCR key and the
+/// Langfuse tracing keys.
+pub const LOOP_SECRET_ENVS: &[&str] = &[
+    "LOOP_PDF_OCR_API_KEY",
+    "LANGFUSE_SECRET_KEY",
+    "LANGFUSE_PUBLIC_KEY",
+];
+
 /// The exact variable names Loop removes from tool environments: every
-/// built-in provider key variable, the Runtime token variables, and the
-/// `apiKeyEnv` names of configured providers (`custom_key_envs`). This is a
-/// list of names, not a pattern, so `GITHUB_TOKEN`, `NPM_TOKEN`, `AWS_*` and
-/// the like stay. The Runtime and a standalone Surface both call this function.
+/// built-in provider key variable, the default key variables of the built-in
+/// web search backends, the Runtime token variables, [`LOOP_SECRET_ENVS`], and
+/// the configured key names (`custom_key_envs`: `apiKeyEnv` of `models.json`
+/// providers and of `webSearch`). This is a list of names, not a pattern, so
+/// `GITHUB_TOKEN`, `NPM_TOKEN`, `AWS_*` and the like stay. The Runtime and a
+/// standalone Surface both call this function.
 pub fn removed_tool_env_names(custom_key_envs: &[String]) -> BTreeSet<String> {
     loop_ai::providers::PROVIDER_PRESETS
         .iter()
         .flat_map(|preset| preset.api_key_envs.iter().map(|name| (*name).to_owned()))
+        .chain(
+            crate::harness::tools::web::WEB_SEARCH_BACKENDS
+                .iter()
+                .flat_map(|backend| backend.default_api_key_envs.iter())
+                .map(|name| (*name).to_owned()),
+        )
         .chain(RUNTIME_TOKEN_ENVS.iter().map(|name| (*name).to_owned()))
+        .chain(LOOP_SECRET_ENVS.iter().map(|name| (*name).to_owned()))
         .chain(custom_key_envs.iter().cloned())
         .collect()
 }
@@ -273,15 +290,21 @@ mod tests {
             names,
             [
                 "ANTHROPIC_API_KEY",
+                "BRAVE_API_KEY",
                 "CUSTOM_ONE",
                 "GEMINI_API_KEY",
                 "GOOGLE_API_KEY",
+                "LANGFUSE_PUBLIC_KEY",
+                "LANGFUSE_SECRET_KEY",
                 "LOOP_API_KEY",
+                "LOOP_PDF_OCR_API_KEY",
                 "LOOP_RUNTIME_TOKEN",
                 "OPENAI_API_KEY",
                 "OPENROUTER_API_KEY",
                 "SOKET_API_KEY",
+                "TAVILY_API_KEY",
                 "TENSORSTUDIO_API_KEY",
+                "TINYFISH_API_KEY",
             ]
         );
         for kept in [
