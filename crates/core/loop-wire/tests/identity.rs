@@ -15,7 +15,9 @@ use loop_protocol::{
     UpdateEnvelope,
 };
 use loop_wire::server::{serve_with_caller, serve_with_control, ServeOptions};
-use loop_wire::socket::{edge_headers, websocket_accept, websocket_accept_edge};
+use loop_wire::socket::{
+    edge_headers, websocket_accept, websocket_accept_edge, websocket_connect_edge,
+};
 use loop_wire::transport::memory;
 use loop_wire::{Attachment, Authority, Connection, Incoming, RuntimeControl, Transport};
 use serde_json::{json, Value};
@@ -30,12 +32,13 @@ fn info() -> PeerInfo {
     }
 }
 
-/// A backend that answers `session/new` and `session/list` with the caller
-/// it sees in scope, so a test can tell which connection's identity reached
-/// the backend.
+/// A backend that answers each method with the caller it sees in scope, so
+/// a test can tell which connection's identity reached the backend. A
+/// `session/cancel` notification has no answer, so it is recorded.
 struct Echo {
     instance: BackendInstanceId,
     updates: broadcast::Sender<UpdateEnvelope>,
+    cancels: std::sync::Mutex<Vec<String>>,
 }
 
 fn seen() -> String {
@@ -68,12 +71,14 @@ impl AgentBackend for Echo {
         })
     }
     async fn load_session(&self, _: &SessionRef, _: SessionSpec) -> BackendResult<SessionRef> {
-        Err(BackendError::Unsupported("load".into()))
+        Err(BackendError::Unsupported(seen()))
     }
     async fn prompt(&self, _: &SessionRef, _: Vec<ContentBlock>) -> BackendResult<TurnHandle> {
-        Err(BackendError::Unsupported("prompt".into()))
+        Err(BackendError::Unsupported(seen()))
     }
-    fn cancel(&self, _: &SessionRef) {}
+    fn cancel(&self, _: &SessionRef) {
+        self.cancels.lock().unwrap().push(seen());
+    }
     fn is_busy(&self, _: &SessionRef) -> bool {
         false
     }
@@ -89,7 +94,7 @@ impl RuntimeControl for Echo {
         Ok(())
     }
     async fn attach(&self, _: &SessionRef, _: u64) -> BackendResult<Attachment> {
-        Err(BackendError::Unsupported("attach".into()))
+        Err(BackendError::Unsupported(seen()))
     }
 }
 
@@ -97,6 +102,7 @@ fn echo() -> Arc<Echo> {
     Arc::new(Echo {
         instance: "echo".into(),
         updates: broadcast::channel(4).0,
+        cancels: std::sync::Mutex::new(Vec::new()),
     })
 }
 
@@ -241,15 +247,46 @@ async fn each_connection_s_requests_see_only_its_own_caller() {
                 let expected = expected.clone();
                 calls.push(tokio::spawn(async move {
                     assert_eq!(new_session_sees(&conn).await, expected);
-                    // RuntimeControl calls are in scope too.
-                    let listed = conn.request(methods::SESSION_LIST, json!({})).await;
-                    let text = format!("{listed:?}");
-                    assert!(text.contains(&expected), "{text}");
+                    // Every backend and RuntimeControl entry is in scope.
+                    let session = json!({"instance": "echo", "key": "s", "native_id": "n"});
+                    for (method, params) in [
+                        (methods::SESSION_LIST, json!({})),
+                        (
+                            methods::SESSION_LOAD,
+                            json!({"session": session, "spec": {}}),
+                        ),
+                        (
+                            methods::SESSION_PROMPT,
+                            json!({"session": session, "content": []}),
+                        ),
+                        (
+                            methods::SESSION_ATTACH,
+                            json!({"session": session, "after_seq": 0}),
+                        ),
+                    ] {
+                        let answer = conn.request(method, params).await;
+                        let text = format!("{answer:?}");
+                        assert!(text.contains(&expected), "{method}: {text}");
+                    }
+                    conn.notify(methods::SESSION_CANCEL, json!({"session": session}))
+                        .unwrap();
                 }));
             }
         }
         for call in calls {
             call.await.unwrap();
+        }
+        // Each cancel ran with its own connection's caller.
+        loop {
+            let cancels = backend.cancels.lock().unwrap().clone();
+            if cancels.len() == 40 {
+                for (_, expected) in &conns {
+                    assert_eq!(cancels.iter().filter(|c| *c == expected).count(), 20);
+                }
+                break;
+            }
+            drop(cancels);
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -355,24 +392,31 @@ async fn handshake(
 #[tokio::test]
 async fn an_edge_connection_s_asserted_identity_is_what_initialize_reports() {
     tokio::time::timeout(Duration::from_secs(20), async {
-        let (server_end, caller) = handshake(Listener::Edge, EDGE_TOKEN, &good_headers())
+        // The Runtime side: the edge listener, served as `runtime_cmd` does.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backend = echo();
+        let server_backend = backend.clone();
+        let accepted = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (transport, caller) = websocket_accept_edge(stream, EDGE_TOKEN).await.unwrap();
+            let _ = serve_with_caller(
+                server_backend.clone(),
+                Some(server_backend),
+                transport,
+                info(),
+                options(Authority::Remote),
+                caller.clone(),
+            );
+            caller
+        });
+        // The gateway side, over the real WebSocket.
+        let caller = edge_caller("110169484474386276334", "acme");
+        let transport = websocket_connect_edge(&format!("ws://{addr}/"), EDGE_TOKEN, &caller)
             .await
             .unwrap();
-        let caller = caller.unwrap();
-        assert_eq!(caller, edge_caller("110169484474386276334", "acme"));
-        // Serve it as the Runtime does, and speak to it in memory.
-        let backend = echo();
-        let (server, client_end) = memory();
-        let _ = serve_with_caller(
-            backend.clone(),
-            Some(backend),
-            server,
-            info(),
-            options(Authority::Remote),
-            caller.clone(),
-        );
-        drop(server_end);
-        let conn = client(client_end);
+        assert_eq!(accepted.await.unwrap(), caller);
+        let conn = client(transport);
         let (_, result) = initialize(&conn, forged()).await;
         assert_eq!(result.principal.as_ref(), Some(caller.principal()));
         assert_eq!(result.tenant.as_ref(), Some(caller.tenant()));
@@ -380,10 +424,26 @@ async fn an_edge_connection_s_asserted_identity_is_what_initialize_reports() {
         // A second initialize with forged fields changes nothing.
         let (_, again) = initialize(&conn, forged()).await;
         assert_eq!(again.principal.as_ref(), Some(caller.principal()));
+        assert_eq!(again.tenant.as_ref(), Some(caller.tenant()));
         assert_eq!(new_session_sees(&conn).await, "110169484474386276334|acme");
+        // An edge connection has remote authority.
+        assert!(conn
+            .request(methods::RUNTIME_STOP, json!({}))
+            .await
+            .is_err());
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn the_gateway_client_refuses_a_reserved_identity() {
+    let principal = Principal::local_uid(0);
+    let local = Caller::host(principal);
+    let error = websocket_connect_edge("ws://127.0.0.1:9/", EDGE_TOKEN, &local)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
 
 #[tokio::test]

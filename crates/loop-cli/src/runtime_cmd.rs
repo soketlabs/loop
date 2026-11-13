@@ -350,12 +350,11 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
             },
             accepted = async {
                 match &edge {
-                    Some((listener, _)) => listener.accept().await,
+                    Some((listener, token)) => listener.accept().await.map(|(stream, _)| (stream, token.clone())),
                     None => std::future::pending().await,
                 }
             } => match accepted {
-                Ok((stream, _)) => {
-                    let token = edge.as_ref().expect("edge listener").1.clone();
+                Ok((stream, token)) => {
                     let backend: Arc<dyn AgentBackend> = runtime.clone();
                     let control = control.clone();
                     let info = info.clone();

@@ -243,6 +243,42 @@ where
 /// Connect to a WebSocket at `url` (`ws://host:port/path`) with a bearer
 /// token.
 pub async fn websocket_connect(url: &str, token: &str) -> io::Result<Transport> {
+    connect(url, token, &[]).await
+}
+
+/// Connect to a Runtime's edge listener as an Edge Gateway, for the end user
+/// `caller` names. The identity goes in the handshake ([`edge_headers`]),
+/// once, and holds for the connection's life. A caller the Runtime would
+/// refuse (unknown kind, `local` issuer, reserved tenant) is refused here.
+pub async fn websocket_connect_edge(
+    url: &str,
+    edge_token: &str,
+    caller: &loop_protocol::Caller,
+) -> io::Result<Transport> {
+    use loop_protocol::PrincipalKind;
+    let invalid = |e: loop_protocol::IdentityError| io::Error::new(io::ErrorKind::InvalidInput, e);
+    // Checks the same rules the Runtime applies.
+    let principal = caller.principal();
+    loop_protocol::Caller::asserted(principal.clone(), caller.tenant().clone()).map_err(invalid)?;
+    let kind = match principal.kind() {
+        PrincipalKind::Person => "person",
+        PrincipalKind::Service => "service",
+        PrincipalKind::Unknown => return Err(invalid(loop_protocol::IdentityError::UnknownKind)),
+    };
+    let headers = [
+        (edge_headers::PRINCIPAL_KIND, kind),
+        (edge_headers::PRINCIPAL_ISSUER, principal.issuer()),
+        (edge_headers::PRINCIPAL_ID, principal.id()),
+        (edge_headers::TENANT, caller.tenant().as_str()),
+    ];
+    connect(url, edge_token, &headers).await
+}
+
+async fn connect(
+    url: &str,
+    token: &str,
+    headers: &[(&'static str, &str)],
+) -> io::Result<Transport> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut request = url.into_client_request().map_err(io::Error::other)?;
     let uri = request.uri();
@@ -260,6 +296,15 @@ pub async fn websocket_connect(url: &str, token: &str) -> io::Result<Transport> 
         )
     })?;
     request.headers_mut().insert("authorization", value);
+    for (name, value) in headers {
+        let value = HeaderValue::from_str(value).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an identity value is not a valid header",
+            )
+        })?;
+        request.headers_mut().insert(*name, value);
+    }
     let (ws, _) = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tokio_tungstenite::connect_async_with_config(request, Some(ws_config()), false),
