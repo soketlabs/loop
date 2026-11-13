@@ -81,6 +81,8 @@ pub async fn summarize(
 /// context order (as `default_context_from_entries` builds them).
 pub fn context_entry_ids(entries: &[SessionTreeEntry]) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
+    // `ids[0]` is a compaction's summary.
+    let mut summary_first = false;
     for entry in entries {
         match entry {
             SessionTreeEntry::Message { .. } | SessionTreeEntry::BranchSummary { .. } => {
@@ -92,26 +94,19 @@ pub fn context_entry_ids(entries: &[SessionTreeEntry]) -> Vec<String> {
             } => {
                 if first_kept_entry_id.is_none() {
                     ids.clear();
+                    summary_first = false;
                 }
                 // A later summary replaces an earlier one at the front.
-                if ids
-                    .first()
-                    .is_some_and(|first| is_compaction(entries, first))
-                {
+                if summary_first {
                     ids.remove(0);
                 }
                 ids.insert(0, entry.id().to_string());
+                summary_first = true;
             }
             _ => {}
         }
     }
     ids
-}
-
-fn is_compaction(entries: &[SessionTreeEntry], id: &str) -> bool {
-    entries
-        .iter()
-        .any(|e| e.id() == id && matches!(e, SessionTreeEntry::Compaction { .. }))
 }
 
 /// Index of the first context message whose response usage is current:

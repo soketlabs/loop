@@ -763,3 +763,49 @@ async fn manual_compaction_uses_the_model_and_counts_usage() {
     let stats = f.harness.session_stats().await.unwrap();
     assert!(stats.breakdown.iter().any(|b| b.key == "Tools/summaries"));
 }
+
+/// A compaction whose kept part reaches back past an earlier compaction:
+/// the context holds only the newer summary, and the entry map agrees.
+#[tokio::test]
+async fn a_later_compaction_replaces_an_earlier_summary() {
+    use loop_agent::harness::compaction::context_entry_ids;
+    use loop_agent::harness::session::types::{default_context_from_entries, PendingSessionWrite};
+    let store = create_in_memory_session_store();
+    let repo = create_session_repository(Arc::clone(&store), None);
+    let session = repo.create(None, None).await.unwrap();
+    let sid = session.metadata().id.clone();
+    let append = |w: PendingSessionWrite| {
+        let store = Arc::clone(&store);
+        let sid = sid.clone();
+        async move { store.append_entry(&sid, w).await.unwrap() }
+    };
+    let message = |m: AgentMessage| PendingSessionWrite::Message { message: m };
+    let a = append(message(AgentMessage::user_text("A"))).await;
+    append(message(AgentMessage::user_text("B"))).await;
+    let compaction = |summary: &str, kept: &str| PendingSessionWrite::Compaction {
+        summary: summary.into(),
+        first_kept_entry_id: Some(kept.into()),
+        details: None,
+    };
+    append(compaction("s1", a.id())).await;
+    append(message(AgentMessage::user_text("D"))).await;
+    let c2 = append(compaction("s2", a.id())).await;
+    let branch = session.read_branch().await.unwrap();
+    let ctx = default_context_from_entries(&branch);
+    let summaries: Vec<_> = ctx
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::Custom(CustomAgentMessage::CompactionSummary { summary, .. }) => {
+                Some(summary.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(summaries, ["s2"]);
+    assert_eq!(ctx.messages.len(), 4);
+    let ids = context_entry_ids(&branch);
+    assert_eq!(ids.len(), ctx.messages.len());
+    assert_eq!(ids[0], c2.id());
+    assert_eq!(ids[1], a.id());
+}
