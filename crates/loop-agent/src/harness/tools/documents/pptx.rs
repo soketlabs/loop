@@ -91,6 +91,18 @@ fn missing_slide(number: usize) -> String {
     format!("[slide {number} is missing from the file]")
 }
 
+/// Whether `block` is a paragraph that is exactly a [`missing_slide`] note.
+fn is_missing_note(block: &Block) -> bool {
+    let Block::Paragraph(spans) = block else {
+        return false;
+    };
+    let text = markdown::plain(spans);
+    text.trim()
+        .strip_prefix("[slide ")
+        .and_then(|t| t.strip_suffix(" is missing from the file]"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 #[derive(Default)]
 struct Paragraph {
     level: usize,
@@ -258,7 +270,14 @@ struct Slide<'a> {
 }
 
 pub(super) fn write(blocks: &[Block]) -> Result<Vec<u8>, String> {
-    let slides = split(blocks);
+    // The note `read` gives for a missing slide is not slide text: a deck
+    // written back from what `read` gave must not show it.
+    let blocks: Vec<Block> = blocks
+        .iter()
+        .filter(|b| !is_missing_note(b))
+        .cloned()
+        .collect();
+    let slides = split(&blocks);
     let mut parts: Vec<(String, String)> = Vec::new();
     let mut ids = String::new();
     let mut rels = String::from(
@@ -735,10 +754,19 @@ mod tests {
     fn a_deck_with_a_missing_slide_can_be_written_back_from_its_text() {
         let deck = write(&markdown::parse("# A\n\nx\n\n# B\n\ny\n\n# C\n\nz")).unwrap();
         let text = read(&without_part(&deck, "ppt/slides/slide2.xml")).unwrap();
+        assert_eq!(
+            text,
+            "# A\n\nx\n\n[slide 2 is missing from the file]\n\n# C\n\nz"
+        );
         let rebuilt = write(&markdown::parse(&text)).unwrap();
-        let again = read(&rebuilt).unwrap();
-        assert!(again.contains("# A") && again.contains("# C"), "{again}");
-        assert!(!again.contains("# B"), "{again}");
+        // The note is not written as slide text.
+        assert_eq!(read(&rebuilt).unwrap(), "# A\n\nx\n\n# C\n\nz");
+        // Text that only mentions it stays.
+        let kept = write(&markdown::parse(
+            "# A\n\nsee [slide 2 is missing from the file] here",
+        ))
+        .unwrap();
+        assert!(read(&kept).unwrap().contains("missing from the file"));
     }
 
     /// `write` diffs against this text: a missing slide makes the deck
