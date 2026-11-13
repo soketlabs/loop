@@ -610,9 +610,8 @@ Include `kill -9` then restart; never infer crash safety from clean shutdown.
 Retain Lane B parity and the schema freshness test.
 
 The plan requires each implementation commit to pass formatting, workspace
-clippy excluding desktop (also with agent/app-core/CLI telemetry enabled),
-and workspace tests excluding desktop. App-core public API changes also
-require `cargo +nightly check -p loop-desktop`. S2.0 changes docs only.
+workspace clippy (also with agent/app-core/CLI telemetry enabled), and
+workspace tests. S2.0 changes docs only.
 The later live check uses GLM in Herdr: two Sessions, detach/reattach mid-turn,
 a parked approval and two parallel Subagents. These checks have not been
 run for this design document.
