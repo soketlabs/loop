@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::harness::types::SessionError;
-use crate::types::{AgentMessage, AgentThinkingLevel};
+use crate::types::{AgentMessage, AgentThinkingLevel, CustomAgentMessage};
 
 /// Session metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,6 +495,16 @@ pub fn default_context_from_entries(entries: &[SessionTreeEntry]) -> SessionCont
             } => {
                 if first_kept_entry_id.is_none() {
                     ctx.messages.clear();
+                }
+                // A compaction whose kept part reaches back past an earlier
+                // compaction summarized that earlier summary too.
+                if matches!(
+                    ctx.messages.first(),
+                    Some(AgentMessage::Custom(
+                        CustomAgentMessage::CompactionSummary { .. }
+                    ))
+                ) {
+                    ctx.messages.remove(0);
                 }
                 ctx.messages.insert(
                     0,

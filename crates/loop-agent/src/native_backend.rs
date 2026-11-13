@@ -1049,11 +1049,28 @@ impl AgentBackend for NativeBackend {
         let hold = TurnHold::start(instance.clone(), Arc::clone(&stream), Arc::clone(&config));
         tokio::spawn(async move {
             let on_written = Arc::clone(&hold);
+            let (counted, count_instance, count_stream, count_config) = (
+                Arc::clone(&harness),
+                instance.clone(),
+                Arc::clone(&stream),
+                Arc::clone(&config),
+            );
             let written: TurnWritten = Box::new(move |failure| {
                 // The same text `harness_error` gives the returned error.
                 let info = failure
                     .map(|e| ErrorInfo::new(ErrorCategory::Internal, format!("session: {e}")));
                 on_written.written(info.as_ref());
+                // The tree counts each automatic compaction in the Session
+                // revision, as it counts `session/compact`.
+                let compactions = counted.take_turn_compactions();
+                if compactions > 0 {
+                    let update = {
+                        let mut state = count_config.lock();
+                        state.revision += compactions;
+                        state.update()
+                    };
+                    announce(&count_instance, &count_stream, update);
+                }
             });
             let result = harness.prompt_then_written(input, written).await;
             let rejected_busy = matches!(result, Err(AgentHarnessError::Busy));

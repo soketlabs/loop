@@ -69,13 +69,42 @@ Common settings in `settings.json`:
 | `sandbox.allowWrite` | empty | Extra paths macOS sandboxed commands and file tools may write, such as `~/.cargo`. Secret paths remain denied under broad grants. The Linux sandbox does not enforce this setting yet (global only) |
 | `sandbox.denyHomeReads` | `false` | macOS: deny reading files under the home directory, except the project, `allowWrite`, `allowRead` and git/Rust toolchain settings. Credential files stay denied either way. A project may turn it on but not off |
 | `sandbox.allowRead` | empty | macOS, with `denyHomeReads`: paths under the home directory sandboxed commands and file tools may still read, such as `~/.npm` (global only) |
-| `compaction` | enabled | `reserveTokens`, `keepRecentTokens` for `/compact` |
+| `compaction` | enabled | `enabled`, `reserveTokens` (`16384`), `keepRecentTokens` (`20000`). See [Context compaction](#context-compaction) |
 | `skills`, `disabledSkills` | empty | Extra skill paths, and skills to hide |
 | `mcpServers`, `disabledMcpServers` | empty | MCP servers (stdio `command` or remote `url`) |
 | `providers` | empty | Custom providers added with `/login custom` |
 | `runtime.maxSessions`, `runtime.maxActiveTurns` | `16`, `8` | Limits of `loop runtime start`; see [the Runtime](runtime.md#start-the-runtime). Each must be a whole number of at least 1. A command-line flag overrides it (global only) |
 | `runtime.idleShutdownMinutes` | `10` | Minutes an auto-started Runtime waits with nothing attached or running before it exits. `0` disables it. An owner from `loop runtime start` never idles out (global only) |
 | `runtime.forwardEnv` | empty | Extra environment variable names a Surface forwards to a Runtime over WebSocket, on top of the built-in allowlist. Unix sockets forward the full environment. Values are never logged (global only) |
+
+## Context compaction
+
+Compaction replaces the older part of a Session's context with a summary that
+the Session's model writes. The model call counts in the Session's usage
+(`/session` shows it under `Tools/summaries`). `/compact` runs it on request.
+With `compaction.enabled` (the default), Loop also compacts automatically
+during a turn:
+
+- **Before a model request**, when the context plus `reserveTokens` reaches
+  the model's context window. Loop checks this before each request, also
+  between the tool rounds of one long turn. It uses the token usage of the
+  last response and estimates only the messages after it; without usage
+  numbers, it estimates the whole context.
+- **After a context-length error**, Loop compacts once and sends the request
+  once more. If that compaction fails, or the request is still too long, the
+  turn ends with an error that says so. Loop does not try again.
+
+Compaction keeps about `keepRecentTokens` of the newest messages, the system
+prompt and the user's current request. It cuts at the start of a user turn,
+or at the start of a tool round inside one long turn, never between a tool
+call and its result. When the cut removes the current request, the summary
+quotes it. The Session tree records an automatic compaction as the same entry
+`/compact` writes, so resume, fork and the transcript work the same way. A
+cancelled turn records nothing. A `session_before_compact` hook (see
+[hooks](hooks.md)) can block a compaction or give the summary.
+
+Set `"compaction": {"enabled": false}` to turn automatic compaction off; a
+request that is too long then fails with the provider's error.
 
 ## Tool environment
 
