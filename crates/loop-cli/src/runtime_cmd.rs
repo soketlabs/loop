@@ -447,6 +447,13 @@ impl loop_wire::RuntimeAdmin for Control {
     }
     #[cfg(feature = "usage")]
     async fn usage(&self, p: admin::UsageParams) -> BackendResult<admin::UsageResult> {
+        // The host's usage log covers every Session; not under a tool lock.
+        if let Some(lock) = self.tool_lock {
+            return Err(loop_protocol::BackendError::ToolLocked {
+                what: "runtime/usage".into(),
+                lock,
+            });
+        }
         let dir = loop_app_core::config::paths::usage_dir(&self.agent_dir);
         tokio::task::spawn_blocking(move || usage_page(&dir, &p))
             .await

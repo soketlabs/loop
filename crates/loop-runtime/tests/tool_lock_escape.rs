@@ -445,6 +445,23 @@ async fn admin_writes_trust_and_the_sandbox_are_refused() {
     .unwrap_err();
     assert!(is_locked(&web), "{web:?}");
     assert!(!w.agent.join("workspace-settings.json").exists());
+    // Review N4: in-process callers are refused too, not only the wire.
+    let settings_before = std::fs::read(w.agent.join("settings.json")).ok();
+    let defaults = rt
+        .update_defaults(loop_protocol::admin::DefaultsParams {
+            patch: Some(loop_protocol::admin::DefaultsPatch {
+                effort: Some("high".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(is_locked(&defaults), "{defaults:?}");
+    assert_eq!(
+        std::fs::read(w.agent.join("settings.json")).ok(),
+        settings_before
+    );
 
     // Reads and reloads still work.
     RuntimeAdmin::settings(

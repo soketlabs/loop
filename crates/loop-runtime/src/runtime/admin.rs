@@ -545,6 +545,10 @@ impl Runtime {
     /// read-modify-write and the reloads run under the admin lock, so they
     /// never interleave with each other or with a workspace change.
     pub async fn update_defaults(&self, params: DefaultsParams) -> BackendResult<DefaultsResult> {
+        // A change writes the global settings; reading them is fine.
+        if params.patch.is_some() {
+            self.refuse_if_locked("runtime/defaults")?;
+        }
         let _admin = self.admin.lock().await;
         let path = paths::settings_path(&self.factory.globals.agent_dir);
         let mut settings = Settings::load_file(&path).map_err(failed)?;

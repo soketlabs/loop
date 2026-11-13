@@ -156,9 +156,11 @@ Session of the Runtime:
 - **opens only inside the root.** Its folder, with symlinks resolved, must
   be the root or a folder in it. `session/new`, `session/load` (also of a
   Session recorded before the lock), a fork, an import and a Subagent with
-  a folder outside are refused with `ToolLocked`. The root bounds the
-  Runtime, not the users in it: give each user a Runtime with their own
-  root.
+  a folder outside are refused with `ToolLocked`.
+- **keeps the folder it opened in.** The folder and the root are stored as
+  they resolved when the Session opened, and every check compares against
+  them. If the folder or the root is later replaced by a link, every call
+  of the Session is refused ("moved or replaced"); open a new Session.
 - **is offered only `read`, `grep`, `glob`, `ls`** (documents included,
   through `read`), `web_fetch` and `web_search`. Every other tool is not
   sent to the model: `bash`, `write`, `edit`, `subagent`, `todo`,
@@ -226,14 +228,34 @@ it names. Clients see it in `initialize`: `capabilities.tool_lock` is
 so a client can hide those controls. `runtime/status` has `"tool_lock":
 "chat"`, and `loop runtime status` shows `tool lock: chat`.
 
+**One Runtime and one root per user.** The root bounds the Runtime, not the
+users in it. A Session may open in the root itself, so a root shared by
+several users gives each of them the other users' files. Give each user a
+Runtime of their own, with their own folder as its root, and do not let one
+user's client reach another user's Runtime socket.
+
+**For the program that writes uploads into the folder.** The lock's
+guarantees assume that this writer:
+
+- writes each upload as a regular file, atomically: write a temporary file
+  in the folder, then rename it into place;
+- never creates a hard link or a symlink in the folder;
+- never replaces a folder (the Session's folder or one in it) with a link.
+
+Under the lock a file with more than one hard link is refused and hidden,
+and a link that leads out is refused, so a writer that breaks these rules
+makes files unreadable rather than leaking them, as far as Loop can see.
+
 Limits:
 
 - The lock does not isolate the process. The Runtime runs as one
   operating-system user; use one container per user for that.
-- A `read` checks the path and then opens it. If something in the folder
-  changes a path into a symlink to a file outside between the check and the
-  open, the read can follow it. Only a process that can change files in
-  the folder while the turn runs can do this.
+- File contents are checked on the file that was opened (its real path, a
+  regular file, one link), so a path changed into a link between the
+  check and the open is refused. This needs macOS or Linux; elsewhere a
+  locked read always fails. Folder listings (`ls`, the names that `grep`
+  and `glob` walk) are checked by path only: a folder swapped during one
+  call can show the names, not the contents, of what it links to.
 - Any client of the Runtime's socket can use every Session in it. The lock
   limits what Sessions can do, not who can use them.
 
