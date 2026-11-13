@@ -290,12 +290,15 @@ fn append_group(
     }
 }
 
+/// Last Update sequence of one Session. `session_seq IS NOT NULL` changes no
+/// result (`MAX` skips NULL), but it lets the planner use the partial index
+/// `events_session_seq`. Without it each call scans the whole table, once per
+/// appended Update.
+const LATEST_SEQ_SQL: &str =
+    "SELECT COALESCE(MAX(session_seq),0) FROM events WHERE session_key=?1 AND session_seq IS NOT NULL";
+
 fn latest(conn: &Connection, session: &SessionKey) -> Result<u64> {
-    Ok(conn.query_row(
-        "SELECT COALESCE(MAX(session_seq),0) FROM events WHERE session_key=?1",
-        [session.as_str()],
-        |row| row.get(0),
-    )?)
+    Ok(conn.query_row(LATEST_SEQ_SQL, [session.as_str()], |row| row.get(0))?)
 }
 
 fn subagents(conn: &Connection) -> Result<std::collections::HashSet<SessionKey>> {
@@ -436,4 +439,95 @@ fn allocate(conn: &mut Connection, owner: &str, pid: u32, started: i64) -> Resul
     )?;
     tx.commit()?;
     Ok(generation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(conn: &Connection, sql: &str) -> Vec<String> {
+        let mut statement = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare plan");
+        statement
+            .query_map(["s"], |row| row.get::<_, String>(3))
+            .expect("query plan")
+            .collect::<rusqlite::Result<_>>()
+            .expect("plan rows")
+    }
+
+    /// The per-append sequence query must read the partial index, not scan.
+    /// The old text (no `IS NOT NULL`) shows why: the planner cannot prove
+    /// the index predicate, so it scans `events`.
+    #[test]
+    fn latest_seq_uses_the_session_seq_index() {
+        let mut conn = Connection::open_in_memory().expect("open");
+        migrate(&mut conn).expect("migrate");
+        let old = "SELECT COALESCE(MAX(session_seq),0) FROM events WHERE session_key=?1";
+        let before = plan(&conn, old);
+        let after = plan(&conn, LATEST_SEQ_SQL);
+        println!("old plan: {before:?}");
+        println!("new plan: {after:?}");
+        assert!(
+            !before.iter().any(|row| row.contains("events_session_seq")),
+            "old query should not use the partial index: {before:?}"
+        );
+        assert!(
+            after.iter().any(|row| row.contains("events_session_seq")),
+            "latest() must use events_session_seq: {after:?}"
+        );
+    }
+
+    /// Time of one `latest()` query, old and new text, on 51,200 rows
+    /// (200 Sessions x 256 Updates). Ignored: it only prints numbers.
+    #[test]
+    #[ignore]
+    fn latest_seq_cost() {
+        let mut conn = Connection::open_in_memory().expect("open");
+        migrate(&mut conn).expect("migrate");
+        let tx = conn.transaction().expect("tx");
+        for global in 1..=51_200_i64 {
+            let session = format!("s{}", global % 200);
+            tx.execute(
+                "INSERT INTO events (global_seq,generation,session_key,session_seq,kind,ts_ms,payload) VALUES (?1,1,?2,?3,'update',0,'{}')",
+                params![global, session, global / 200 + 1],
+            )
+            .expect("insert");
+        }
+        tx.commit().expect("commit");
+        let old = "SELECT COALESCE(MAX(session_seq),0) FROM events WHERE session_key=?1";
+        for (name, sql) in [("old", old), ("new", LATEST_SEQ_SQL)] {
+            let start = std::time::Instant::now();
+            let calls = 200;
+            for i in 0..calls {
+                let _: u64 = conn
+                    .query_row(sql, [format!("s{i}")], |row| row.get(0))
+                    .expect("query");
+            }
+            let per_call = start.elapsed().as_secs_f64() * 1000.0 / f64::from(calls);
+            println!("{name}: {per_call:.4} ms per call");
+        }
+    }
+
+    /// Plans of the other per-Session queries, for review. Only the replay
+    /// read is asserted: `session_seq>?2` already implies the index predicate.
+    #[test]
+    fn other_session_query_plans() {
+        let mut conn = Connection::open_in_memory().expect("open");
+        migrate(&mut conn).expect("migrate");
+        let read_sql = format!(
+            "SELECT {COLUMNS} FROM events WHERE session_key=?1 AND session_seq>0 ORDER BY session_seq"
+        );
+        let read_plan = plan(&conn, &read_sql);
+        println!("read_after plan: {read_plan:?}");
+        assert!(read_plan
+            .iter()
+            .any(|row| row.contains("events_session_seq")));
+        for sql in [
+            "SELECT DISTINCT turn FROM events WHERE session_key=?1 AND turn IS NOT NULL",
+            "SELECT COUNT(*) FROM events WHERE session_key=?1 AND kind='prompt_sent'",
+        ] {
+            println!("{sql}: {:?}", plan(&conn, sql));
+        }
+    }
 }
