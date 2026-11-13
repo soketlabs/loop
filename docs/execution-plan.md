@@ -38,6 +38,10 @@ Delivery evidence: one maintainer with coding agents built S2 in about 1.5 days 
   - parity list;
   - these documents.
 
+## Status on 2026-11-13: Loop web
+
+Loop web has a two-stage plan now: a beta on 20 November from the tested web app code (a chat pool and an on-demand agent pool), and then the shared cells of Phase 2. The design, the changes in the core, the cost estimate and the workstreams are in `docs/design/loop-web.md`. The S4 design lists 11 open questions (not 13).
+
 ## Principles of the plan
 
 - **Measure first, but cheaply.** Each step has a gate with numbers. A failed gate stops the step.
