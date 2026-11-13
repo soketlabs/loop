@@ -297,9 +297,14 @@ impl Walk {
         filter: Option<SearchFilter>,
     ) -> Result<Self, String> {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let root = env
+        // Without `.` and doubled separators (`.` is the default path): the
+        // env may return the entries of a folder in that plain form, and
+        // the ignore rules, the filter and the display compare by prefix.
+        let root: PathBuf = env
             .absolute_path(Path::new(path))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .components()
+            .collect();
         if !env.exists(&root).await.map_err(|e| e.to_string())? {
             return Err(format!("no such file or directory: {path}"));
         }

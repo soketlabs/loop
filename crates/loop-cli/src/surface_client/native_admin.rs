@@ -478,8 +478,16 @@ impl RuntimeAdmin for NativeAdmin<'_> {
                 provider_id: None,
             })
             .await;
-        r.resources =
-            crate::resources::load_resources(&r.agent_dir, &r.cwd, r.project_trusted, &r.settings);
+        // The loader of a fresh open: project folders through the workspace env.
+        let env = loop_agent::harness::HostExecutionEnv::new(&r.cwd);
+        r.resources = crate::resources::load_resources_in(
+            &env,
+            &r.agent_dir,
+            &r.cwd,
+            r.project_trusted,
+            &r.settings,
+        )
+        .await;
         r.sync_harness_resources().await;
         Ok(ReloadResult::default())
     }
@@ -590,8 +598,15 @@ impl RuntimeAdmin for NativeAdmin<'_> {
         if let Some(trusted) = p.trusted {
             r.trust.set(&r.cwd, trusted).map_err(failed)?;
             r.project_trusted = trusted;
-            r.resources =
-                crate::resources::load_resources(&r.agent_dir, &r.cwd, trusted, &r.settings);
+            let env = loop_agent::harness::HostExecutionEnv::new(&r.cwd);
+            r.resources = crate::resources::load_resources_in(
+                &env,
+                &r.agent_dir,
+                &r.cwd,
+                trusted,
+                &r.settings,
+            )
+            .await;
             r.sync_harness_resources().await;
         }
         Ok(TrustResult {
