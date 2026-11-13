@@ -602,6 +602,8 @@ impl Runtime {
         live: &LiveSession,
         slot: Option<ViewSlot<'_>>,
     ) -> BackendResult<u64> {
+        // `latest_seq` below must count appends abandoned while queued.
+        self.log.sync().await.map_err(failed)?;
         let state = self
             .store
             .control_state(&live.reference.native_id)

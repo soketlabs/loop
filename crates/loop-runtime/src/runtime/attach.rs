@@ -174,23 +174,40 @@ impl Runtime {
     /// Committed updates after `after_seq` through the snapshot's `at_seq`.
     /// Plain Event Log replay stays read-only, including closed Sessions;
     /// callers may hold the lifecycle lock.
+    ///
+    /// The read pages through `(after_seq, at_seq]` on reader connections and
+    /// stops at `at_seq`; it never reads updates after the snapshot. The
+    /// replay is still collected here, because `Attachment::replay` is a
+    /// synchronous iterator.
     pub(super) async fn attachment(
         &self,
         session: &SessionRef,
         after_seq: u64,
         snapshot: SessionSnapshot,
     ) -> BackendResult<loop_wire::Attachment> {
-        let records = self
-            .log
-            .read_after(&session.key, after_seq)
-            .await
-            .map_err(failed)?;
-        let mut replay = Vec::with_capacity(records.len());
-        for record in records {
-            if let EventKind::Update(envelope) = record.event.kind {
-                if envelope.seq <= snapshot.at_seq {
-                    replay.push(envelope);
+        let mut replay = Vec::new();
+        let mut after = after_seq;
+        while after < snapshot.at_seq {
+            let page = self
+                .log
+                .read_session_page(
+                    &session.key,
+                    after,
+                    Some(snapshot.at_seq),
+                    loop_store::PageLimit::DEFAULT,
+                )
+                .await
+                .map_err(failed)?;
+            for record in page.items {
+                if let EventKind::Update(envelope) = record.event.kind {
+                    if envelope.seq <= snapshot.at_seq {
+                        replay.push(envelope);
+                    }
                 }
+            }
+            match page.next {
+                Some(loop_store::Cursor(next)) => after = next,
+                None => break,
             }
         }
         Ok(loop_wire::Attachment {

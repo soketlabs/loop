@@ -968,7 +968,7 @@ exec "$@"
             let dir = tempfile::tempdir().unwrap();
             let (program, log) = fake_podman(dir.path());
             let client = RealPodmanClient::with_program(&program);
-            let mut opts = shell(command, (!cancel).then_some(1500));
+            let opts = shell(command, (!cancel).then_some(1500));
             if cancel {
                 let token = opts.cancel.clone().unwrap();
                 tokio::spawn(async move {

@@ -5,7 +5,7 @@
 use crate::log::{EventKind, LoggedEvent};
 use loop_protocol::{SessionKey, SessionUpdate, TurnId};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Reason recorded on recovery records; matches the wire stop reason.
 pub(crate) const REASON: &str = "runtime_restarted";
@@ -52,48 +52,77 @@ pub(crate) fn unstarted_turn_id(global_seq: u64) -> TurnId {
 /// A Session runs one prompt at a time, so a `turn_started` after a
 /// `prompt_sent` belongs to it. The last prompt of a Session with no turn
 /// start after it is unfinished too, unless its generation stopped cleanly.
+#[cfg(test)]
 pub(crate) fn unfinished(
     records: &[LoggedEvent],
     current: u64,
 ) -> (Vec<OpenTurn>, Vec<OpenEscalation>) {
-    let mut turns: HashMap<(SessionKey, TurnId), (u64, bool, bool)> = HashMap::new();
-    // Per Session: the last prompt with no turn start yet (seq, generation).
-    let mut prompts: HashMap<SessionKey, (u64, u64)> = HashMap::new();
-    let stopped: std::collections::HashSet<u64> = records
-        .iter()
-        .filter(|r| matches!(r.event.kind, EventKind::RuntimeStopped(_)))
-        .map(|r| r.event.generation)
-        .collect();
-    let mut escalations: HashMap<(SessionKey, u64, String), (u64, Option<Value>)> = HashMap::new();
+    let mut open = Unfinished::new(current);
     for record in records {
+        open.feed(record);
+    }
+    open.finish()
+}
+
+/// The fold behind [`unfinished`], fed one page of recovery records at a
+/// time in `global_seq` order. It keeps only open work, not the records.
+#[derive(Debug)]
+pub(crate) struct Unfinished {
+    current: u64,
+    turns: HashMap<(SessionKey, TurnId), (u64, bool, bool)>,
+    /// Per Session: the last prompt with no turn start yet (seq, generation).
+    prompts: HashMap<SessionKey, (u64, u64)>,
+    /// Generations with a clean stop.
+    stopped: HashSet<u64>,
+    escalations: HashMap<(SessionKey, u64, String), (u64, Option<Value>)>,
+}
+
+impl Unfinished {
+    pub(crate) fn new(current: u64) -> Self {
+        Self {
+            current,
+            turns: HashMap::new(),
+            prompts: HashMap::new(),
+            stopped: HashSet::new(),
+            escalations: HashMap::new(),
+        }
+    }
+
+    /// Fold the next record.
+    pub(crate) fn feed(&mut self, record: &LoggedEvent) {
+        let current = self.current;
         let event = &record.event;
+        if matches!(event.kind, EventKind::RuntimeStopped(_)) {
+            self.stopped.insert(event.generation);
+        }
         let Some(session) = &event.session_key else {
-            continue;
+            return;
         };
         match &event.kind {
             // The prompt never started a turn.
             EventKind::PromptSettled(_) => {
-                prompts.remove(session);
+                self.prompts.remove(session);
             }
             EventKind::PromptSent(_) => {
                 if event.generation < current {
-                    prompts.insert(session.clone(), (record.global_seq, event.generation));
+                    self.prompts
+                        .insert(session.clone(), (record.global_seq, event.generation));
                 } else {
-                    prompts.remove(session);
+                    self.prompts.remove(session);
                 }
             }
             EventKind::Update(envelope) => match &envelope.update {
                 // A turn that started in this generation is live, not recoverable.
                 SessionUpdate::TurnStarted { turn_id } if event.generation < current => {
-                    prompts.remove(session);
-                    turns.insert(
+                    self.prompts.remove(session);
+                    self.turns.insert(
                         (session.clone(), turn_id.clone()),
                         (record.global_seq, true, false),
                     );
                 }
                 // Recovery's own start for an unstarted prompt settles it.
                 SessionUpdate::TurnStarted { .. } => {
-                    prompts.remove(session);
+                    self.prompts.remove(session);
                 }
                 // Ids are process-local counters. A live turn of this generation
                 // must not close an old one; only recovery's own end may.
@@ -101,7 +130,7 @@ pub(crate) fn unfinished(
                     if event.generation >= current
                         && *stop != loop_protocol::StopReason::RuntimeRestarted => {}
                 SessionUpdate::TurnEnded { turn_id, .. } => {
-                    if let Some(open) = turns.get_mut(&(session.clone(), turn_id.clone())) {
+                    if let Some(open) = self.turns.get_mut(&(session.clone(), turn_id.clone())) {
                         open.1 = false;
                     }
                 }
@@ -109,7 +138,7 @@ pub(crate) fn unfinished(
             },
             EventKind::EscalationRaised(payload) if event.generation < current => {
                 let id = payload.get("id").cloned().unwrap_or(Value::Null);
-                escalations.insert(
+                self.escalations.insert(
                     (session.clone(), event.generation, id.to_string()),
                     (record.global_seq, Some(id)),
                 );
@@ -122,7 +151,8 @@ pub(crate) fn unfinished(
                     .unwrap_or(event.generation);
                 let id = payload.get("id").cloned().unwrap_or(Value::Null);
                 if let Some(open) =
-                    escalations.get_mut(&(session.clone(), generation, id.to_string()))
+                    self.escalations
+                        .get_mut(&(session.clone(), generation, id.to_string()))
                 {
                     open.1 = None;
                 }
@@ -130,46 +160,57 @@ pub(crate) fn unfinished(
             _ => {}
         }
     }
-    for (session, (seq, generation)) in prompts {
-        if !stopped.contains(&generation) {
-            turns.insert((session, unstarted_turn_id(seq)), (seq, true, true));
+
+    /// The open turns and Escalations, in first-seen order.
+    pub(crate) fn finish(self) -> (Vec<OpenTurn>, Vec<OpenEscalation>) {
+        let Self {
+            mut turns,
+            prompts,
+            stopped,
+            escalations,
+            ..
+        } = self;
+        for (session, (seq, generation)) in prompts {
+            if !stopped.contains(&generation) {
+                turns.insert((session, unstarted_turn_id(seq)), (seq, true, true));
+            }
         }
-    }
-    let mut turns: Vec<_> = turns
-        .into_iter()
-        .filter(|(_, (_, open, _))| *open)
-        .map(|((session, turn_id), (seq, _, unstarted))| {
-            (
-                seq,
-                OpenTurn {
-                    session,
-                    turn_id,
-                    unstarted,
-                },
-            )
-        })
-        .collect();
-    turns.sort_by_key(|(seq, _)| *seq);
-    let mut escalations: Vec<_> = escalations
-        .into_iter()
-        .filter_map(|((session, generation, _), (seq, id))| {
-            id.map(|id| {
+        let mut turns: Vec<_> = turns
+            .into_iter()
+            .filter(|(_, (_, open, _))| *open)
+            .map(|((session, turn_id), (seq, _, unstarted))| {
                 (
                     seq,
-                    OpenEscalation {
+                    OpenTurn {
                         session,
-                        generation,
-                        id,
+                        turn_id,
+                        unstarted,
                     },
                 )
             })
-        })
-        .collect();
-    escalations.sort_by_key(|(seq, _)| *seq);
-    (
-        turns.into_iter().map(|(_, turn)| turn).collect(),
-        escalations.into_iter().map(|(_, open)| open).collect(),
-    )
+            .collect();
+        turns.sort_by_key(|(seq, _)| *seq);
+        let mut escalations: Vec<_> = escalations
+            .into_iter()
+            .filter_map(|((session, generation, _), (seq, id))| {
+                id.map(|id| {
+                    (
+                        seq,
+                        OpenEscalation {
+                            session,
+                            generation,
+                            id,
+                        },
+                    )
+                })
+            })
+            .collect();
+        escalations.sort_by_key(|(seq, _)| *seq);
+        (
+            turns.into_iter().map(|(_, turn)| turn).collect(),
+            escalations.into_iter().map(|(_, open)| open).collect(),
+        )
+    }
 }
 
 #[cfg(test)]

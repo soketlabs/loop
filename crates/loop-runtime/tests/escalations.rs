@@ -575,6 +575,36 @@ impl EventLog for DelayedDecision {
     ) -> loop_runtime::log::Result<()> {
         self.0.finish_generation(generation, stopped).await
     }
+    async fn sync(&self) -> loop_runtime::log::Result<()> {
+        self.0.sync().await
+    }
+    async fn read_session_page(
+        &self,
+        session: &loop_protocol::SessionKey,
+        after_seq: u64,
+        through_seq: Option<u64>,
+        limit: loop_runtime::log::PageLimit,
+    ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
+        self.0
+            .read_session_page(session, after_seq, through_seq, limit)
+            .await
+    }
+    async fn session_summary(
+        &self,
+        session: &loop_protocol::SessionKey,
+    ) -> loop_runtime::log::Result<Option<loop_runtime::log::SessionSummary>> {
+        self.0.session_summary(session).await
+    }
+    async fn recovery_page(
+        &self,
+        from_generation: u64,
+        after_global: u64,
+        limit: loop_runtime::log::PageLimit,
+    ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
+        self.0
+            .recovery_page(from_generation, after_global, limit)
+            .await
+    }
 }
 #[tokio::test]
 async fn cancellation_during_raised_commit_still_logs_withdrawal() {

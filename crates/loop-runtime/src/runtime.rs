@@ -391,7 +391,7 @@ impl Runtime {
         &self,
         lock: Option<&loop_app_core::runtime_instance::SessionDatabaseLock>,
     ) -> BackendResult<crate::Recovery> {
-        use crate::recovery::{unfinished, REASON};
+        use crate::recovery::{Unfinished, REASON};
         if let Some(lock) = lock {
             let ours = std::path::absolute(self.store.database_path().ok_or_else(|| {
                 failed(format!(
@@ -409,8 +409,24 @@ impl Runtime {
             }
         }
         let from = self.log.last_recovered_generation().await.map_err(failed)?;
-        let records = self.log.recovery_records(from).await.map_err(failed)?;
-        let (turns, escalations) = unfinished(&records, self.generation);
+        // Page through the records; the fold keeps only the open work.
+        let mut open = Unfinished::new(self.generation);
+        let mut after = 0;
+        loop {
+            let page = self
+                .log
+                .recovery_page(from, after, loop_store::PageLimit::DEFAULT)
+                .await
+                .map_err(failed)?;
+            for record in &page.items {
+                open.feed(record);
+            }
+            match page.next {
+                Some(loop_store::Cursor(next)) => after = next,
+                None => break,
+            }
+        }
+        let (turns, escalations) = open.finish();
         let ts_ms = now();
         let mut events = Vec::with_capacity(2 * turns.len() + escalations.len());
         for turn in &turns {
@@ -1073,6 +1089,8 @@ impl Runtime {
         let (at_seq, changed) = match committed {
             Some(committed) => committed,
             None => {
+                // An append abandoned while queued must count before `at_seq`.
+                self.log.sync().await.map_err(failed)?;
                 let at_seq = self.log.latest_seq(&session.key).await.map_err(failed)?;
                 (at_seq, self.recorded_config(session).await?)
             }
@@ -1178,24 +1196,12 @@ impl Runtime {
             agent: d.agent.clone(),
         }
     }
-    /// The newest Session revision the Event Log announced for `key`.
+    /// The newest Session revision the Event Log announced for `key`: the
+    /// revision of its last `config_changed` or `branch_reset`, from the
+    /// Session summary (no read of the Session's history).
     async fn logged_revision(&self, key: &SessionKey) -> BackendResult<u64> {
-        let records = self.log.read_after(key, 0).await.map_err(failed)?;
-        Ok(records
-            .iter()
-            .rev()
-            .find_map(|record| match &record.event.kind {
-                EventKind::Update(UpdateEnvelope {
-                    update: SessionUpdate::ConfigChanged(changed),
-                    ..
-                }) => Some(changed.revision),
-                EventKind::Update(UpdateEnvelope {
-                    update: SessionUpdate::BranchReset { revision, .. },
-                    ..
-                }) => Some(*revision),
-                _ => None,
-            })
-            .unwrap_or(0))
+        let summary = self.log.session_summary(key).await.map_err(failed)?;
+        Ok(summary.map_or(0, |summary| summary.last_revision))
     }
     /// The loaded Session, loading it again when it was unloaded to make room.
     async fn loaded(&self, session: &SessionRef) -> BackendResult<Arc<LiveSession>> {
