@@ -44,6 +44,24 @@ pub(super) fn read(bytes: &[u8]) -> Result<String, String> {
             ));
         }
     }
+    // A listed slide without a relationship may still be in the file as a
+    // part that nothing names. Its text cannot be shown, and a `write` from
+    // this text would drop it, so the read fails (`write` then treats the
+    // deck as unreadable). With no such part, the slide has no content.
+    if parts.iter().any(Option::is_none) {
+        let unread: Vec<String> = package
+            .names()
+            .into_iter()
+            .filter(|n| n.starts_with("ppt/slides/") && n.ends_with(".xml"))
+            .filter(|n| !seen.contains(n))
+            .collect();
+        if let Some(part) = unread.first() {
+            return Err(format!(
+                "the deck lists a slide without saying which part holds it, and {part} is \
+                 not listed: the file is damaged"
+            ));
+        }
+    }
     let mut md = Markdown::default();
     // Slides are numbered by their place in the deck's list, so a missing
     // slide does not renumber the ones after it.
@@ -56,8 +74,8 @@ pub(super) fn read(bytes: &[u8]) -> Result<String, String> {
         match (part, slide) {
             (Some(part), Some(slide)) => read_slide(&mut md, number, part, &slide)?,
             // Said in the text, so the read is not silently partial. The
-            // slide has no content to lose, so `write` may still rebuild
-            // the deck from this text.
+            // file holds no part for the slide (checked above), so `write`
+            // may still rebuild the deck from this text.
             _ => md.block(&missing_slide(number)),
         }
         if md.full() {
@@ -701,6 +719,11 @@ mod tests {
         let start = rels.find("<Relationship Id=\"rId10\"").unwrap();
         let end = start + rels[start..].find("/>").unwrap() + 2;
         rels.replace_range(start..end, "");
+        // The slide part is still in the file, but nothing names it: its
+        // text is unseen, so the read fails.
+        let err = read(&repack(&parts)).unwrap_err();
+        assert!(err.contains("ppt/slides/slide1.xml"), "{err}");
+        parts.retain(|(n, _)| n != "ppt/slides/slide1.xml");
         let bytes = repack(&parts);
         assert_eq!(
             read(&bytes).unwrap(),
