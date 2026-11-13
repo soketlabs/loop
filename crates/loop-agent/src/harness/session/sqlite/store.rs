@@ -999,7 +999,11 @@ impl SessionStore for SqliteSessionStore {
             tx.execute("INSERT INTO session_sequences(session_id, next_seq) VALUES (?1, 1)", [&new_id])
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
             insert_empty_materialized(&tx, &new_id)?;
+            // Copies get new ids: references to entries (a compaction's kept
+            // entry and shortened outputs, a leaf move) are mapped to them.
+            let mut remap = std::collections::HashMap::new();
             for entry in selected {
+            let old_id = entry.id().to_owned();
             let pending = match entry {
                 SessionTreeEntry::Message { message, .. } => {
                     PendingSessionWrite::Message { message }
@@ -1020,20 +1024,27 @@ impl SessionStore for SqliteSessionStore {
                     ..
                 } => PendingSessionWrite::Compaction {
                     summary,
-                    first_kept_entry_id,
-                    details,
+                    first_kept_entry_id: first_kept_entry_id
+                        .and_then(|id| remap.get(&id).cloned()),
+                    details: crate::harness::compaction::remap_details(details, |old| {
+                        remap.get(old).cloned()
+                    }),
                 },
                 SessionTreeEntry::Label { label, .. } => PendingSessionWrite::Label { label },
                 SessionTreeEntry::SessionInfo { name, .. } => {
                     PendingSessionWrite::SessionInfo { name }
                 }
-                SessionTreeEntry::Leaf { target_id, .. } => PendingSessionWrite::Leaf { target_id },
+                SessionTreeEntry::Leaf { target_id, .. } => PendingSessionWrite::Leaf {
+                    // A target off the copied path keeps its id, as before.
+                    target_id: target_id.map(|id| remap.get(&id).cloned().unwrap_or(id)),
+                },
                 SessionTreeEntry::BranchSummary { summary, .. } => {
                     PendingSessionWrite::BranchSummary { summary }
                 }
                 SessionTreeEntry::Custom { .. } => continue,
             };
-                append_entry_tx(&tx, &new_id, pending)?;
+                let written = append_entry_tx(&tx, &new_id, pending)?;
+                remap.insert(old_id, written.id().to_owned());
             }
             if let Some(guard) = &guard { guard.claim_created(&tx, &new_id)?; }
             tx.commit().map_err(|e| SessionError::Storage(e.to_string()))?;
@@ -1482,8 +1493,13 @@ impl SqliteSessionStore {
                         if label.starts_with(super::super::TOOL_APPROVAL_LABEL_NAMESPACE) => continue,
                     SessionTreeEntry::Label { label, .. } => PendingSessionWrite::Label { label },
                     SessionTreeEntry::SessionInfo { .. } => continue,
-                    SessionTreeEntry::Compaction { summary, first_kept_entry_id, .. } => PendingSessionWrite::Compaction {
-                        summary, first_kept_entry_id: first_kept_entry_id.and_then(|id| remap.get(&id).cloned()), details: None,
+                    SessionTreeEntry::Compaction { summary, first_kept_entry_id, details, .. } => PendingSessionWrite::Compaction {
+                        summary, first_kept_entry_id: first_kept_entry_id.and_then(|id| remap.get(&id).cloned()),
+                        // Only the shortened tool outputs (by new entry id), so the copy builds the same context.
+                        details: crate::harness::compaction::remap_details(
+                            details.map(|d| serde_json::json!({"shortened": d.get("shortened").cloned().unwrap_or_default()})),
+                            |old| remap.get(old).cloned(),
+                        ),
                     },
                     SessionTreeEntry::BranchSummary { summary, .. } => PendingSessionWrite::BranchSummary { summary },
                     // Imported paths, custom data and grants never confer authority.

@@ -451,3 +451,38 @@ async fn runtime_admits_seatbelt_and_protects_its_actual_agent_directory() {
     .await
     .expect("sandbox admission timed out");
 }
+
+/// B1: the `compaction` settings reach the Session's harness through the
+/// factory, and a workspace reload applies changed values.
+#[tokio::test]
+async fn compaction_settings_reach_the_harness_and_follow_a_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir(&agent_dir).unwrap();
+    let write = |enabled: bool, reserve: u64, keep: u64| {
+        std::fs::write(
+            settings_path(&agent_dir),
+            format!(
+                r#"{{"compaction":{{"enabled":{enabled},"reserveTokens":{reserve},"keepRecentTokens":{keep}}}}}"#
+            ),
+        )
+        .unwrap();
+    };
+    write(false, 1_234, 567);
+    let factory = factory(&agent_dir);
+    let options = opts(dir.path());
+    let workspace = factory.workspace(&options).await.unwrap();
+    let opened = factory.open(workspace, &options).await.unwrap();
+    let settings = opened.harness.compaction_settings().await;
+    assert!(!settings.enabled);
+    assert_eq!(settings.reserve_tokens, 1_234);
+    assert_eq!(settings.keep_recent_tokens, 567);
+
+    write(true, 2_000, 3_000);
+    let (fresh, _old) = factory.reload_workspace(&options).await.unwrap();
+    opened.apply_workspace(&fresh, &[]).await.unwrap();
+    let settings = opened.harness.compaction_settings().await;
+    assert!(settings.enabled);
+    assert_eq!(settings.reserve_tokens, 2_000);
+    assert_eq!(settings.keep_recent_tokens, 3_000);
+}

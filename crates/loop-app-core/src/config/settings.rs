@@ -34,6 +34,19 @@ fn default_keep() -> u64 {
     20_000
 }
 
+impl CompactionSettingsJson {
+    /// The harness settings these give: automatic compaction runs when
+    /// `enabled`, `reserve_tokens` before the window, and keeps about
+    /// `keep_recent_tokens` (also for `/compact`).
+    pub fn harness_settings(&self) -> loop_agent::harness::compaction::CompactionSettings {
+        loop_agent::harness::compaction::CompactionSettings {
+            enabled: self.enabled,
+            reserve_tokens: self.reserve_tokens,
+            keep_recent_tokens: self.keep_recent_tokens,
+        }
+    }
+}
+
 impl Default for CompactionSettingsJson {
     fn default() -> Self {
         Self {

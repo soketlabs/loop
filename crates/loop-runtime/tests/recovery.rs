@@ -462,7 +462,7 @@ impl EventLog for CrashBetweenChunks {
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
         use std::sync::atomic::Ordering;
         if self.armed.load(Ordering::Acquire) && self.appends.fetch_add(1, Ordering::AcqRel) == 1 {
-            return Err(loop_runtime::log::EventLogError::WriterStopped);
+            return Err(loop_runtime::log::EventLogError::Stopped);
         }
         self.inner.append_batch(events).await
     }
