@@ -491,8 +491,11 @@ pub fn default_context_from_entries(entries: &[SessionTreeEntry]) -> SessionCont
             SessionTreeEntry::Compaction {
                 summary,
                 first_kept_entry_id,
+                details,
                 ..
             } => {
+                // Tool outputs the compaction shortened stay shortened.
+                crate::harness::compaction::apply_shortened(&mut ctx.messages, details.as_ref());
                 if first_kept_entry_id.is_none() {
                     ctx.messages.clear();
                 }

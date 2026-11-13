@@ -222,6 +222,26 @@ pub enum AutoCompactionError {
     /// The model did not write a summary.
     #[error("the summary request failed: {0}")]
     Summary(String),
+    /// The compacted context would still be above the threshold, so the
+    /// compaction is not worth its summary request.
+    #[error("compaction cannot bring the context under the threshold (~{after} tokens, limit ~{limit})")]
+    StillTooLarge {
+        /// Estimated tokens after.
+        after: u64,
+        /// Most tokens the context may hold.
+        limit: u64,
+    },
+    /// The model's window is not larger than the reserve and the fixed part
+    /// of each request (system prompt, tool definitions).
+    #[error("the model's context window ({window} tokens) leaves no room after the reserve ({reserve}) and the system prompt and tools (~{overhead})")]
+    WindowTooSmall {
+        /// Context window.
+        window: u64,
+        /// Reserve tokens.
+        reserve: u64,
+        /// Fixed tokens of each request.
+        overhead: u64,
+    },
     /// A `session_before_compact` hook refused the compaction.
     #[error("a hook cancelled the compaction")]
     HookCancelled,
@@ -345,26 +365,34 @@ pub fn find_auto_cut_point(
     (1..reach.min(n)).rev().find(|&i| boundary(i)).unwrap_or(0)
 }
 
-/// The text of the newest user message in `messages`, for a summary that
-/// replaces it.
-pub fn latest_user_text(messages: &[AgentMessage]) -> Option<String> {
-    messages.iter().rev().find_map(|m| match m {
-        AgentMessage::Llm(Message::User(user)) => {
-            let text = match &user.content {
-                loop_ai::UserMessageContent::Text(t) => t.clone(),
-                loop_ai::UserMessageContent::Blocks(blocks) => blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        loop_ai::UserContent::Text(t) => Some(t.text.as_str()),
-                        loop_ai::UserContent::Image(_) => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            };
-            Some(text)
+/// The user's request in `prompts` (the messages that started a turn), for a
+/// summary that has to quote it: their text, and a note for images it
+/// cannot carry.
+pub fn request_text(prompts: &[AgentMessage]) -> Option<String> {
+    let mut parts = Vec::new();
+    let mut images = 0usize;
+    for prompt in prompts {
+        if let AgentMessage::Llm(Message::User(user)) = prompt {
+            match &user.content {
+                loop_ai::UserMessageContent::Text(t) => parts.push(t.clone()),
+                loop_ai::UserMessageContent::Blocks(blocks) => {
+                    for block in blocks {
+                        match block {
+                            loop_ai::UserContent::Text(t) => parts.push(t.text.clone()),
+                            loop_ai::UserContent::Image(_) => images += 1,
+                        }
+                    }
+                }
+            }
         }
-        _ => None,
-    })
+    }
+    if images > 0 {
+        parts.push(format!(
+            "[{images} image(s) were attached to this request; they are no longer in the context]"
+        ));
+    }
+    let text = parts.join("\n\n");
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// Whether `messages` hold a user message (not a summary or other custom
@@ -410,4 +438,90 @@ pub fn usage_from_details(details: Option<&serde_json::Value>) -> Option<loop_ai
     details
         .and_then(|d| d.get("usage"))
         .and_then(|u| serde_json::from_value(u.clone()).ok())
+}
+
+/// Characters an automatically shortened tool output keeps.
+pub const SHORTENED_OUTPUT_CHARS: usize = 600;
+
+/// Note at the end of a shortened tool output.
+const SHORTENED_NOTE: &str = "[output shortened by automatic compaction:";
+
+/// Shorten the text of a tool result to `keep_chars` characters and say so
+/// at its end. Returns whether anything changed; an already short or
+/// shortened output stays as it is.
+pub fn shorten_tool_result(result: &mut loop_ai::ToolResultMessage, keep_chars: usize) -> bool {
+    let mut changed = false;
+    for content in &mut result.content {
+        if let loop_ai::ToolResultContent::Text(t) = content {
+            if t.text.contains(SHORTENED_NOTE) {
+                continue;
+            }
+            let total = t.text.chars().count();
+            if total <= keep_chars + 200 {
+                continue;
+            }
+            let kept: String = t.text.chars().take(keep_chars).collect();
+            t.text = format!(
+                "{kept}\n{SHORTENED_NOTE} {keep_chars} of {total} characters kept; run the tool again for the full output]"
+            );
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// The tool call ids a compaction entry shortened, from its `details`.
+pub fn shortened_from_details(details: Option<&serde_json::Value>) -> Vec<String> {
+    details
+        .and_then(|d| d.get("shortened"))
+        .and_then(|v| v.as_array())
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Shorten the tool results named in a compaction entry's `details`, as the
+/// compaction did when it ran.
+pub fn apply_shortened(messages: &mut [AgentMessage], details: Option<&serde_json::Value>) {
+    let ids = shortened_from_details(details);
+    if ids.is_empty() {
+        return;
+    }
+    for message in messages {
+        if let AgentMessage::Llm(Message::ToolResult(result)) = message {
+            if ids.iter().any(|id| *id == result.tool_call_id) {
+                shorten_tool_result(result, SHORTENED_OUTPUT_CHARS);
+            }
+        }
+    }
+}
+
+/// Fixed tokens of every request that compaction cannot remove: the system
+/// prompt and the tool definitions, estimated.
+pub fn fixed_overhead_estimate(system_prompt: &str, tools: &[loop_ai::Tool]) -> u64 {
+    let tools: u64 = tools
+        .iter()
+        .map(|t| {
+            text_tokens(&t.name)
+                + text_tokens(&t.description)
+                + text_tokens(&t.parameters.to_string())
+        })
+        .sum();
+    text_tokens(system_prompt).saturating_add(tools)
+}
+
+/// The fixed tokens of a request as the provider counted them: the newest
+/// usable usage less the estimate of the messages it covered. Never below
+/// `estimate`.
+pub fn fixed_overhead(messages: &[AgentMessage], usage_valid_from: usize, estimate: u64) -> u64 {
+    for index in (usage_valid_from.min(messages.len())..messages.len()).rev() {
+        if let Some(tokens) = messages[index].as_assistant().and_then(usable_usage) {
+            let covered = estimate_agent_messages_tokens(&messages[..=index]);
+            return tokens.saturating_sub(covered).max(estimate);
+        }
+    }
+    estimate
 }

@@ -646,6 +646,11 @@ pub struct CompactionRequest {
     pub model: Model,
     /// Cancellation of the turn.
     pub cancel: Option<CancellationToken>,
+    /// Tokens of each request that compaction cannot remove: the system
+    /// prompt and the tool definitions.
+    pub overhead_tokens: u64,
+    /// Progress notices while compacting.
+    pub emit: Option<AgentEventSink>,
 }
 
 /// A compacted context.

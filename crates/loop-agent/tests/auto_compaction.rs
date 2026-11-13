@@ -36,6 +36,13 @@ enum Reply {
     Tool,
     /// A context-length error, whatever the size.
     Overflow,
+    /// `n` tool calls to `big` in one response (run in parallel).
+    Tools(usize),
+    /// Text of about this many tokens cut at the output limit (the loop
+    /// asks it to continue).
+    Length(usize),
+    /// A tool call after signed thinking.
+    ThinkingTool,
 }
 
 /// What the provider answers to a summary request.
@@ -141,13 +148,23 @@ async fn fixture(settings: CompactionSettings) -> Fixture {
 }
 
 async fn fixture_on(store: Arc<dyn SessionStore>, settings: CompactionSettings) -> Fixture {
+    fixture_with(store, settings, WINDOW, "sys".into()).await
+}
+
+/// A fixture with its own window and system prompt.
+async fn fixture_with(
+    store: Arc<dyn SessionStore>,
+    settings: CompactionSettings,
+    window: u64,
+    system_prompt: String,
+) -> Fixture {
     let provider = Provider {
         replies: Default::default(),
         summaries: Default::default(),
         requests: Default::default(),
         usage: Arc::new(Mutex::new(true)),
         started: Default::default(),
-        limit: Arc::new(Mutex::new(WINDOW)),
+        limit: Arc::new(Mutex::new(window)),
     };
     let model_slot: Arc<Mutex<Option<Model>>> = Default::default();
     let (p, slot) = (provider.clone(), Arc::clone(&model_slot));
@@ -201,6 +218,47 @@ async fn fixture_on(store: Arc<dyn SessionStore>, settings: CompactionSettings) 
                         usage,
                     )
                 }
+                Reply::Tools(count) => {
+                    let n = p.requests.lock().len();
+                    let calls = (0..count)
+                        .map(|i| {
+                            AssistantContent::ToolCall(ToolCall {
+                                id: format!("call-{n}-{i}"),
+                                name: "big".into(),
+                                arguments: json!({}),
+                                thought_signature: None,
+                            })
+                        })
+                        .collect();
+                    answer(&model, calls, StopReason::ToolUse, usage)
+                }
+                Reply::Length(tokens) => answer(
+                    &model,
+                    vec![text(&"partial ".repeat(tokens / 2))],
+                    StopReason::Length,
+                    usage,
+                ),
+                Reply::ThinkingTool => {
+                    let n = p.requests.lock().len();
+                    answer(
+                        &model,
+                        vec![
+                            AssistantContent::Thinking(loop_ai::ThinkingContent {
+                                thinking: "thinking it over".into(),
+                                thinking_signature: Some("SIGNATURE-123".into()),
+                                redacted: None,
+                            }),
+                            AssistantContent::ToolCall(ToolCall {
+                                id: format!("call-{n}"),
+                                name: "big".into(),
+                                arguments: json!({}),
+                                thought_signature: Some("TOOL-SIGNATURE".into()),
+                            }),
+                        ],
+                        StopReason::ToolUse,
+                        usage,
+                    )
+                }
                 Reply::Overflow => unreachable!(),
             }
         })
@@ -208,7 +266,7 @@ async fn fixture_on(store: Arc<dyn SessionStore>, settings: CompactionSettings) 
     let models = Arc::new(Models::new());
     models.set_provider(faux);
     let mut model = models.get_model("faux", "faux-model").unwrap();
-    model.context_window = WINDOW;
+    model.context_window = window;
     *model_slot.lock() = Some(model.clone());
 
     let repo = create_session_repository(Arc::clone(&store), None);
@@ -226,7 +284,7 @@ async fn fixture_on(store: Arc<dyn SessionStore>, settings: CompactionSettings) 
         session,
         host_env: Arc::new(HostExecutionEnv::new(std::env::temp_dir())),
         tools: vec![big],
-        system_prompt: "sys".into(),
+        system_prompt,
         sandbox: SandboxMode::Disabled,
         resources: Default::default(),
     }));
@@ -515,19 +573,21 @@ async fn tool_rounds_compact_between_rounds_without_splitting_pairs() {
     let answer = f.harness.prompt("please run big many times").await.unwrap();
     assert_eq!(answer.as_assistant().unwrap().stop_reason, StopReason::Stop);
     // Twice: the second compaction keeps messages queued after the first.
-    assert!(
-        f.provider.summary_requests() >= 2,
-        "{} compactions",
-        f.provider.summary_requests()
-    );
+    // A turn with no earlier turns has nothing to summarize: the threshold
+    // path shortens the turn's older tool outputs, with no model call.
+    let found = compactions(&f.harness.read_session_entries().await.unwrap()).len();
+    assert!(found >= 2, "{found} compactions");
+    assert_eq!(f.provider.summary_requests(), 0);
     let main = f.provider.main_requests();
     assert_eq!(main.len(), 25, "every round ran once");
     for r in &main {
         assert!(r.tokens <= WINDOW, "a request of {} tokens", r.tokens);
         assert_pairs(&r.messages);
-        // The request is always in the context, verbatim or quoted.
+        // The threshold path never cuts the current request.
         assert!(
-            format!("{:?}", r.messages).contains("please run big many times"),
+            r.messages.iter().any(|m| matches!(m, Message::User(u)
+                if format!("{u:?}").contains("please run big many times")
+                    && !format!("{u:?}").contains("<compaction-summary>"))),
             "a request lost the user's message"
         );
     }
@@ -821,7 +881,7 @@ async fn a_keep_budget_above_the_window_still_compacts() {
     f.provider.push([Reply::Text("all done")]);
     let answer = f.harness.prompt("run big").await.unwrap();
     assert_eq!(answer.as_assistant().unwrap().stop_reason, StopReason::Stop);
-    assert!(f.provider.summary_requests() >= 1);
+    assert!(!compactions(&f.harness.read_session_entries().await.unwrap()).is_empty());
     for r in f.provider.main_requests() {
         assert!(r.tokens <= WINDOW, "a request of {} tokens", r.tokens);
         assert_pairs(&r.messages);
@@ -857,4 +917,225 @@ async fn abort_stops_a_manual_compaction() {
         before
     );
     f.harness.prompt("still works").await.unwrap();
+}
+
+/// The reviewer's scenarios: default settings, a first long prompt, then
+/// three prompts of six tool rounds each. Returns the summary requests per
+/// prompt.
+async fn summary_requests_per_prompt(window: u64, system_chars: usize) -> Vec<usize> {
+    let f = fixture_with(
+        create_in_memory_session_store(),
+        CompactionSettings::default(),
+        window,
+        "s".repeat(system_chars),
+    )
+    .await;
+    f.harness.prompt(long("first", 2_000)).await.unwrap();
+    let mut counts = Vec::new();
+    for p in 0..3 {
+        let before = f.provider.summary_requests();
+        f.provider.push(std::iter::repeat_n(Reply::Tool, 6));
+        f.provider.push([Reply::Text("all done")]);
+        f.harness
+            .prompt(format!("prompt {p}: please run big many times"))
+            .await
+            .unwrap();
+        counts.push(f.provider.summary_requests() - before);
+    }
+    for e in compactions(&f.harness.read_session_entries().await.unwrap()) {
+        if let SessionTreeEntry::Compaction { details, .. } = e {
+            eprintln!("  compaction {details:?}");
+        }
+    }
+    eprintln!("window {window}, system {system_chars} chars: summaries per prompt {counts:?}");
+    counts
+}
+
+/// A 32k window with a 12k-token system prompt: the system prompt is a fixed
+/// cost that compaction cannot remove, so the kept budget must leave room
+/// for it. At most one summary per prompt, none wasted.
+#[tokio::test]
+async fn a_large_system_prompt_does_not_compact_before_every_request() {
+    let counts = summary_requests_per_prompt(32_000, 48_000).await;
+    assert!(counts.iter().all(|&c| c <= 1), "{counts:?}");
+}
+
+/// A 16k window below the 16384 reserve: automatic compaction cannot help
+/// and must not run (one notice, no summary requests).
+#[tokio::test]
+async fn a_window_below_the_reserve_never_compacts_automatically() {
+    let counts = summary_requests_per_prompt(16_000, 12).await;
+    assert_eq!(counts, [0, 0, 0]);
+}
+
+/// The summary text of the newest compaction summary in a request.
+fn summary_text(messages: &[Message]) -> Option<String> {
+    messages.iter().find_map(|m| match m {
+        Message::User(u) if format!("{u:?}").contains("<compaction-summary>") => {
+            Some(format!("{u:?}"))
+        }
+        _ => None,
+    })
+}
+
+/// Earlier turns that the threshold can summarize.
+async fn with_history(f: &Fixture, turns: usize, tokens: usize) {
+    for i in 0..turns {
+        f.harness
+            .prompt(long(&format!("turn {i}"), tokens))
+            .await
+            .unwrap();
+    }
+}
+
+/// M3: at the threshold, a steering message in the turn does not move the
+/// cut past the turn's request: the request stays verbatim in every request.
+#[tokio::test]
+async fn threshold_keeps_the_request_verbatim_with_a_steering_message() {
+    let f = fixture(settings()).await;
+    with_history(&f, 3, 1_000).await;
+    f.harness.steer(AgentMessage::user_text("STEERING NOTE"));
+    f.provider.push(std::iter::repeat_n(Reply::Tool, 8));
+    f.provider.push([Reply::Text("done")]);
+    f.harness.prompt("THE REAL REQUEST").await.unwrap();
+    let entries = f.harness.read_session_entries().await.unwrap();
+    assert!(!compactions(&entries).is_empty());
+    for r in f.provider.main_requests().iter().rev().take(5) {
+        assert!(r.messages.iter().any(|m| matches!(m, Message::User(u)
+            if format!("{u:?}").contains("THE REAL REQUEST")
+                && !format!("{u:?}").contains("<compaction-summary>"))));
+    }
+    // The request stays a fork point.
+    let points = f.harness.fork_points().await.unwrap();
+    assert!(points.iter().any(|p| p.text == "THE REAL REQUEST"));
+}
+
+/// M3: an overflow recovery that cuts into the turn quotes the request
+/// captured when the turn started, not the newest user message (a steering
+/// message).
+#[tokio::test]
+async fn overflow_quotes_the_turn_request_not_a_steering_message() {
+    let f = fixture(settings()).await;
+    f.harness.steer(AgentMessage::user_text("STEERING NOTE"));
+    f.provider.push(std::iter::repeat_n(Reply::Tool, 4));
+    f.provider.push([Reply::Overflow, Reply::Text("done")]);
+    let answer = f.harness.prompt(long("THE REAL REQUEST", 400)).await.unwrap();
+    assert_eq!(
+        answer.as_assistant().unwrap().stop_reason,
+        StopReason::Stop,
+        "{:?}",
+        answer.as_assistant().unwrap().error_message
+    );
+    let retry = f.provider.main_requests().last().unwrap().clone();
+    let summary = summary_text(&retry.messages).expect("a summary");
+    assert!(summary.contains("THE REAL REQUEST"), "{summary}");
+    assert!(!summary.contains("<request>\\nSTEERING NOTE"), "{summary}");
+    assert_pairs(&retry.messages);
+}
+
+/// M3: after a length stop the loop adds a continue prompt; an overflow
+/// recovery still quotes the turn's request.
+#[tokio::test]
+async fn overflow_quotes_the_turn_request_not_the_continue_prompt() {
+    let f = fixture(settings()).await;
+    f.provider.push([Reply::Length(3_000), Reply::Overflow, Reply::Text("done")]);
+    let answer = f.harness.prompt("THE REAL REQUEST").await.unwrap();
+    assert_eq!(
+        answer.as_assistant().unwrap().stop_reason,
+        StopReason::Stop,
+        "{:?}",
+        answer.as_assistant().unwrap().error_message
+    );
+    let retry = f.provider.main_requests().last().unwrap().clone();
+    let summary = summary_text(&retry.messages).expect("a summary");
+    assert!(summary.contains("<request>"), "{summary}");
+    assert!(summary.contains("THE REAL REQUEST"), "{summary}");
+    assert!(!summary.contains("output token limit"), "{summary}");
+}
+
+/// Parallel tool calls: a cut never separates any of the results of one
+/// response from it.
+#[tokio::test]
+async fn parallel_tool_calls_survive_a_mid_turn_cut() {
+    let f = fixture(settings()).await;
+    f.provider.push(std::iter::repeat_n(Reply::Tools(3), 5));
+    f.provider.push([Reply::Overflow]);
+    f.provider.push(std::iter::repeat_n(Reply::Tools(3), 2));
+    f.provider.push([Reply::Text("done")]);
+    let answer = f.harness.prompt("parallel please").await.unwrap();
+    assert_eq!(answer.as_assistant().unwrap().stop_reason, StopReason::Stop);
+    assert!(!compactions(&f.harness.read_session_entries().await.unwrap()).is_empty());
+    for r in f.provider.main_requests() {
+        assert_pairs(&r.messages);
+    }
+    let ctx = f.harness.session_context().await.unwrap();
+    assert_pairs(&convert_to_llm(&ctx.messages));
+}
+
+/// Images in the request and signed thinking in the kept part reach the
+/// next request unchanged.
+#[tokio::test]
+async fn images_and_thinking_signatures_are_kept() {
+    let f = fixture(settings()).await;
+    with_history(&f, 3, 1_000).await;
+    f.provider.push([Reply::ThinkingTool]);
+    f.provider.push(std::iter::repeat_n(Reply::Tool, 6));
+    f.provider.push([Reply::Text("done")]);
+    f.harness
+        .prompt_with_images(
+            "look at this",
+            vec![loop_ai::ImageContent {
+                data: "aW1hZ2U=".into(),
+                mime_type: "image/png".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    let entries = f.harness.read_session_entries().await.unwrap();
+    assert!(!compactions(&entries).is_empty());
+    let last = f.provider.main_requests().last().unwrap().clone();
+    let text = format!("{:?}", last.messages);
+    assert!(text.contains("aW1hZ2U="), "the image is gone");
+    assert!(text.contains("SIGNATURE-123"), "the thinking signature is gone");
+    assert!(text.contains("TOOL-SIGNATURE"), "the tool call signature is gone");
+}
+
+/// A nested compaction on the SQLite store builds the same context as the
+/// loop sent, and survives a reopen.
+#[tokio::test]
+async fn nested_compaction_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        loop_agent::harness::create_sqlite_session_store(dir.path().join("s.db")).unwrap();
+    let f = fixture_on(Arc::clone(&store), settings()).await;
+    with_history(&f, 8, 1_500).await;
+    f.provider.push(std::iter::repeat_n(Reply::Tool, 20));
+    f.provider.push([Reply::Text("done")]);
+    f.harness.prompt("many rounds").await.unwrap();
+    let entries = f.harness.read_session_entries().await.unwrap();
+    assert!(compactions(&entries).len() >= 2);
+    let ctx = f.harness.session_context().await.unwrap();
+    let llm = convert_to_llm(&ctx.messages);
+    let last = f.provider.main_requests().last().unwrap().clone();
+    assert_eq!(same_llm(&llm[..llm.len() - 1]), same_llm(&last.messages));
+    let id = f.harness.session_id().await;
+    drop(f);
+    let again = fixture_on(Arc::clone(&store), settings()).await;
+    again.harness.switch_session(&id).await.unwrap();
+    let reopened = again.harness.session_context().await.unwrap();
+    assert_eq!(same_agent(&reopened.messages), same_agent(&ctx.messages));
+}
+
+/// M5: "nothing to compact" does not turn automatic compaction off for the
+/// rest of the turn: a later round compacts.
+#[tokio::test]
+async fn nothing_to_compact_does_not_stop_later_compaction() {
+    // One huge request with no earlier turns and no tool output yet:
+    // nothing to cut at first; the tool rounds later can be shortened.
+    let f = fixture(settings()).await;
+    f.provider.push(std::iter::repeat_n(Reply::Tool, 14));
+    f.provider.push([Reply::Text("done")]);
+    let answer = f.harness.prompt(long("start", 300)).await.unwrap();
+    assert_eq!(answer.as_assistant().unwrap().stop_reason, StopReason::Stop);
+    assert!(!compactions(&f.harness.read_session_entries().await.unwrap()).is_empty());
 }

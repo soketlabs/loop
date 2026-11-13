@@ -87,7 +87,7 @@ pub async fn request_summary(
 }
 
 /// The conversation as plain text for the summary request, at most about
-/// `max_tokens` (4 bytes per token). When it is longer, its start (an older
+/// `max_tokens` (2 bytes per token, safe for any script). When it is longer, its start (an older
 /// summary, the first request) and its end are kept.
 fn transcript_text(messages: &[AgentMessage], max_tokens: u64) -> String {
     let mut out = String::new();
@@ -99,7 +99,9 @@ fn transcript_text(messages: &[AgentMessage], max_tokens: u64) -> String {
         out.push_str(&clip(&body, MAX_ITEM_CHARS));
         out.push_str("\n\n");
     }
-    let limit = usize::try_from(max_tokens.saturating_mul(4)).unwrap_or(usize::MAX);
+    // Two bytes per token: text in scripts such as CJK takes about one
+    // token for three bytes, so four bytes per token would overrun.
+    let limit = usize::try_from(max_tokens.saturating_mul(2)).unwrap_or(usize::MAX);
     if out.len() <= limit {
         return out;
     }
@@ -212,7 +214,7 @@ mod tests {
             .map(|i| AgentMessage::user_text(format!("message {i} {}", "é".repeat(300))))
             .collect();
         let text = transcript_text(&messages, 2_000);
-        assert!(text.len() <= 8_000 + 100, "{}", text.len());
+        assert!(text.len() <= 4_000 + 100, "{}", text.len());
         assert!(text.contains("message 0 "));
         assert!(text.contains("message 199 "));
         assert!(text.contains("older messages left out"));

@@ -1654,6 +1654,7 @@ impl AgentHarness {
                 Arc::clone(&self.pending_writes),
                 &branch,
                 snapshot.messages.len(),
+                &prompts,
             ));
             config.compaction = Some(LoopCompaction {
                 usage_valid_from: usage_valid_from(&branch, snapshot.messages.len()),
