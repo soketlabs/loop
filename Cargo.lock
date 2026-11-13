@@ -4865,6 +4865,7 @@ dependencies = [
  "loop-app-core",
  "loop-orchestration",
  "loop-protocol",
+ "loop-store-testkit",
  "loop-wire",
  "rusqlite",
  "serde",
@@ -4874,6 +4875,18 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "loop-store-testkit"
+version = "0.6.0"
+dependencies = [
+ "loop-agent",
+ "loop-protocol",
+ "loop-runtime",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
