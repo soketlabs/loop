@@ -110,6 +110,7 @@ running after you close the terminal, use your usual tool, such as `nohup`,
 | `--permission-mode MODE` | from settings | `read-only`, `ask`, `accept-edits`, `full-access` or `plan` |
 | `--cwd DIR` | current folder | Folder for Sessions that name none |
 | `--tool-lock LOCK` | `LOOP_TOOL_LOCK`, else off | `chat`: lock the tools of every Session for the life of the Runtime. See [Tool lock](#tool-lock) |
+| `--tool-lock-root DIR` | `LOOP_TOOL_LOCK_ROOT` | Required with a lock: every Session folder must be in it |
 
 The two limits can also be set in the global `~/.loop/agent/settings.json`
 (a project's settings cannot change them, since one Runtime serves many
@@ -134,49 +135,107 @@ Session database is shared.
 
 ### Tool lock
 
-`--tool-lock chat` (or `LOOP_TOOL_LOCK=chat` in the Runtime's environment)
-is for a host that runs Runtimes of many users side by side and must not let
-any of them run commands or change files. The flag wins over the variable.
-An empty variable means no lock. Any other value stops
-`loop runtime start` with ``unknown tool lock `…` ``, so a typo never starts a
-Runtime without its lock.
+```bash
+loop runtime start --tool-lock chat --tool-lock-root /srv/users/alice
+```
 
-With the `chat` lock, every Session of the Runtime:
+The tool lock is for a host that runs a Runtime for a user who may only
+chat: the Runtime must not run commands, change files or read past one
+folder. `LOOP_TOOL_LOCK=chat` and `LOOP_TOOL_LOCK_ROOT=DIR` in the
+Runtime's environment do the same; a flag wins over its variable. These
+stop `loop runtime start` with an error, so a mistake never starts a
+Runtime without the lock it asked for:
 
-- is offered only `read`, `grep`, `glob`, `ls` (documents included, through
-  `read`), `web_fetch` and `web_search`. Every other tool is not sent to the
-  model at all: `bash`, `write`, `edit`, `subagent`, `todo`, `exit_plan`, the
-  workflow tools and every MCP tool. A tool that a later version adds is off
-  too, unless the lock names it. If a call to a removed tool arrives anyway,
-  the gate refuses it.
-- reads only inside its own folder (its cwd, not the git root above it).
-  A path that leads out, also through a symlink or `..`, is refused, and
-  `read` must name a path.
-- starts no MCP server (stdio or remote), loads no hooks and no Rhai
-  extensions, and has no skill whose folder holds anything but text files
-  (`.md`, `.markdown`, `.txt`). Prompt templates are text and stay.
-- can't fetch or search private addresses, even if `allowPrivateAddresses`
-  is set.
-- refuses `session/shell` and `session/workflow` with the typed error
+- an unknown or empty lock name (``unknown tool lock `…` ``, ``… is empty``);
+- a lock without a root, or a root without a lock;
+- a root that is not an existing folder, or is `/`.
+
+The lock is fixed until the Runtime stops. With the `chat` lock, every
+Session of the Runtime:
+
+- **opens only inside the root.** Its folder, with symlinks resolved, must
+  be the root or a folder in it. `session/new`, `session/load` (also of a
+  Session recorded before the lock), a fork, an import and a Subagent with
+  a folder outside are refused with `ToolLocked`. The root bounds the
+  Runtime, not the users in it: give each user a Runtime with their own
+  root.
+- **is offered only `read`, `grep`, `glob`, `ls`** (documents included,
+  through `read`), `web_fetch` and `web_search`. Every other tool is not
+  sent to the model: `bash`, `write`, `edit`, `subagent`, `todo`,
+  `exit_plan`, the workflow tools and every MCP tool. A tool that a later
+  version adds is off too, unless the lock names it. A call to a removed
+  tool that arrives anyway is refused.
+- **reads only inside its own folder** (its cwd, not the git root above
+  it). A path that leads out through `..` or a symlink is refused, and
+  `read` must name a path. `grep`, `glob` and `ls` skip every entry that
+  leads out of the folder, so a walk never enters a linked folder outside.
+  A file with more than one hard link is refused and skipped, because a
+  hard link to a file outside the folder looks like a file inside it.
+- **treats its folder as untrusted**, whatever the trust store says. So
+  nothing from the folder loads: no project `.loop/settings.json` (and so
+  no project `skills`, `prompts`, `extensions` or `themes` paths), no
+  context files (`AGENTS.md` and the like, in the folder or above it), no
+  project skills or prompt templates, and no system prompt files. The
+  global settings and resources in the agent directory, which the host
+  controls, still load.
+- **starts no process for the folder:** no MCP server (stdio or remote), no
+  hooks, no Rhai extensions and no sandbox (`sandbox.mode` is forced off).
+  A skill from the agent directory whose folder holds anything but text
+  files (`.md`, `.markdown`, `.txt`) is off. The one process the Runtime
+  still starts is its own document reader, for `read`.
+- **can't fetch or search private addresses,** even if
+  `allowPrivateAddresses` is set.
+- **refuses `session/shell` and `session/workflow`** with the typed error
   `ToolLocked` (JSON-RPC code `-32007`, data
   `{"what": "session/shell", "lock": "chat"}`).
+
+Admin calls under the lock. Over the wire, only the methods in this table
+are served. Any other admin method, also one a later version adds, is
+refused with `ToolLocked` before it runs.
+
+| Call | Decision |
+|---|---|
+| `workspace/settings` | Served: it only reads |
+| `workspace/templates` | Served: it only lists and renders (the folder's own templates do not load) |
+| `workspace/reload` | Served: a reload loads the folder under the same rules |
+| `workspace/mcp` | List and reload served; enable and disable refused |
+| `workspace/skills` | List served; enable and disable refused |
+| `workspace/web_search` | Read served; a change refused |
+| `workspace/trust` | Read served (always "not trusted"); a change refused |
+| `session/sandbox` | Read served (always off); a change refused |
+| `session/permission_mode` | Served: no mode widens the lock, and the result names the lock |
+| `runtime/sessions` | Served |
+| `runtime/defaults` | Refused (it writes the global settings) |
+| `runtime/providers`, `runtime/mcp_auth` | Refused (they write credentials) |
+| `runtime/tracing` | Refused (a host-only setting) |
+| `runtime/usage` | Refused (it reads the host's usage log) |
+
+Every workspace setting change goes through one write step, which the
+Runtime refuses under the lock, so a later setter is refused too.
 
 Nothing widens the lock: not the global or a project's `settings.json`
 (`permissionMode`, `toolPermissions` allow rules, `mcpServers`, hooks,
 `tools.passEnv`), not Session options, not `session/permission_mode` (also
 `full-access` and `plan`), not the `workspace/*` setters or
-`workspace/reload`, and not a skill. It holds until the Runtime stops.
+`workspace/reload`, and not a skill.
 
 The lock is the top Policy layer (see [permissions](permissions.md)): it
 turns off the shell, file writes and other tools, and offers only the tools
-it names. Clients see it in `initialize`: `capabilities.tool_lock` is `"chat"`,
-and `local_shell` and `workflow` are false, so a client can hide those
-controls. `loop runtime status` shows `tool lock: chat` (`"tool_lock"` with
-`--json`).
+it names. Clients see it in `initialize`: `capabilities.tool_lock` is
+`"chat"`, and `local_shell`, `workflow` and the host-only flags are false,
+so a client can hide those controls. `runtime/status` has `"tool_lock":
+"chat"`, and `loop runtime status` shows `tool lock: chat`.
 
-The lock does not isolate the process. The Runtime still reads documents in
-its own child process, and it still runs as one operating-system user: use
-the sandbox, or one container per user, for that.
+Limits:
+
+- The lock does not isolate the process. The Runtime runs as one
+  operating-system user; use one container per user for that.
+- A `read` checks the path and then opens it. If something in the folder
+  changes a path into a symlink to a file outside between the check and the
+  open, the read can follow it. Only a process that can change files in
+  the folder while the turn runs can do this.
+- Any client of the Runtime's socket can use every Session in it. The lock
+  limits what Sessions can do, not who can use them.
 
 ### Check and stop it
 
