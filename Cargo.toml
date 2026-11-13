@@ -13,6 +13,7 @@ members = [
     "crates/ops/loop-update",
     "crates/core/loop-protocol",
     "crates/core/loop-wire",
+    "crates/core/loop-store-testkit",
     "crates/extend/loop-acp",
     "crates/extend/loop-dashboard",
 ]
@@ -30,6 +31,7 @@ default-members = [
     "crates/ops/loop-update",
     "crates/core/loop-protocol",
     "crates/core/loop-wire",
+    "crates/core/loop-store-testkit",
     "crates/extend/loop-acp",
     "crates/extend/loop-dashboard",
 ]
