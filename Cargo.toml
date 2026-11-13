@@ -16,6 +16,7 @@ members = [
     "crates/core/loop-store",
     "crates/core/loop-store-testkit",
     "crates/core/loop-workspace",
+    "crates/core/loop-workspace-testkit",
     "crates/extend/loop-acp",
     "crates/extend/loop-dashboard",
 ]
@@ -36,6 +37,7 @@ default-members = [
     "crates/core/loop-store",
     "crates/core/loop-store-testkit",
     "crates/core/loop-workspace",
+    "crates/core/loop-workspace-testkit",
     "crates/extend/loop-acp",
     "crates/extend/loop-dashboard",
 ]

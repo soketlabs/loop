@@ -2613,6 +2613,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "loop-workspace-testkit"
+version = "0.6.0"
+dependencies = [
+ "loop-agent",
+ "loop-workspace",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "lopdf"
 version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
