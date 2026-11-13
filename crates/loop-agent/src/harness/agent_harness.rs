@@ -990,16 +990,10 @@ impl AgentHarness {
     ) -> Result<CompactResult, AgentHarnessError> {
         self.acquire_idle_phase(AgentHarnessPhase::Compaction)
             .await?;
-
-        let result = self
-            .compact_inner(settings, custom_instructions)
-            .await
-            .inspect_err(|_e| {
-                self.release_to_idle();
-            });
-
-        self.release_to_idle();
-        result
+        // Back to idle however this ends, also when the caller drops it
+        // during the summary request.
+        let _idle = IdleOnDrop(self);
+        self.compact_inner(settings, custom_instructions).await
     }
 
     /// Aggregate session / token / cost statistics for `/session`.
@@ -1074,11 +1068,9 @@ impl AgentHarness {
         let settings = self.compaction_settings.read().await.clone();
         self.acquire_idle_phase(AgentHarnessPhase::Compaction)
             .await?;
-        let result = self
-            .prepare_compaction_inner(&settings, custom_instructions)
-            .await;
-        self.release_to_idle();
-        result
+        let _idle = IdleOnDrop(self);
+        self.prepare_compaction_inner(&settings, custom_instructions)
+            .await
     }
 
     async fn prepare_compaction_inner(
@@ -2012,6 +2004,15 @@ impl AgentHarness {
             _ = cancel.cancelled() => return Err(AgentHarnessError::Other("workflow cancelled".into())),
         };
         self.run_workflow_inner(graph, config, progress_tx).await
+    }
+}
+
+/// Returns the harness to idle when dropped: an idle-only operation ends
+/// cleanly also when its future is dropped.
+struct IdleOnDrop<'a>(&'a AgentHarness);
+impl Drop for IdleOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.release_to_idle();
     }
 }
 

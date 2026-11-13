@@ -1159,3 +1159,30 @@ async fn an_unknown_window_still_recovers_from_an_overflow() {
     assert_eq!(answer.as_assistant().unwrap().stop_reason, StopReason::Stop);
     assert_eq!(f.provider.summary_requests(), 1);
 }
+
+/// M2: dropping a manual compaction during its summary request leaves the
+/// harness idle; the next prompt runs.
+#[tokio::test]
+async fn dropping_a_manual_compaction_leaves_the_harness_idle() {
+    let f = fixture(settings()).await;
+    with_history(&f, 3, 600).await;
+    f.provider.summaries.lock().push_back(SummaryReply::Hang);
+    let started = Arc::clone(&f.provider.started);
+    let harness = Arc::clone(&f.harness);
+    let compact = tokio::spawn(async move { harness.prepare_compaction(None).await });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("the summary request started");
+    compact.abort();
+    let _ = compact.await;
+    assert_eq!(
+        f.harness.phase(),
+        loop_agent::harness::AgentHarnessPhase::Idle
+    );
+    f.provider.push([Reply::Text("works")]);
+    let answer = tokio::time::timeout(Duration::from_secs(5), f.harness.prompt("again"))
+        .await
+        .expect("not stuck")
+        .unwrap();
+    assert_eq!(answer.as_assistant().unwrap().stop_reason, StopReason::Stop);
+}
