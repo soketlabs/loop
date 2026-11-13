@@ -658,3 +658,80 @@ async fn parallel_tool_calls_commit_each_decision_before_any_tool_runs() {
     .await
     .unwrap();
 }
+
+/// An Event Log that refuses every `policy_decision` row.
+struct NoDecisions(MemoryEventLog);
+
+#[async_trait]
+impl EventLog for NoDecisions {
+    async fn append_batch(&self, events: Vec<Event>) -> crate::log::Result<Vec<LoggedEvent>> {
+        if events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::PolicyDecision(_)))
+        {
+            return Err(crate::log::EventLogError::Storage(
+                "the disk is full".into(),
+            ));
+        }
+        self.0.append_batch(events).await
+    }
+    async fn read_after(
+        &self,
+        session: &SessionKey,
+        after_seq: u64,
+    ) -> crate::log::Result<Vec<LoggedEvent>> {
+        self.0.read_after(session, after_seq).await
+    }
+    async fn read_runtime_after(&self, global_seq: u64) -> crate::log::Result<Vec<LoggedEvent>> {
+        self.0.read_runtime_after(global_seq).await
+    }
+    async fn latest_seq(&self, session: &SessionKey) -> crate::log::Result<u64> {
+        self.0.latest_seq(session).await
+    }
+    async fn allocate_generation(
+        &self,
+        owner: &str,
+        pid: u32,
+        started_ms: i64,
+    ) -> crate::log::Result<u64> {
+        self.0.allocate_generation(owner, pid, started_ms).await
+    }
+    async fn finish_generation(&self, generation: u64, stopped_ms: i64) -> crate::log::Result<()> {
+        self.0.finish_generation(generation, stopped_ms).await
+    }
+}
+
+/// When the Event Log cannot take the decision, the Runtime refuses the
+/// call: the tool does not run, and neither does a typed command.
+#[tokio::test]
+async fn a_decision_the_runtime_cannot_record_refuses_the_call() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (globals, opts) = setup(dir.path(), "full-access", "printf ran > made", false);
+        let log = Arc::new(NoDecisions(MemoryEventLog::new()));
+        let rt = {
+            let store = globals.open_runtime_session_store().unwrap();
+            Runtime::new(globals, opts, log.clone(), store, RuntimeLimits::default())
+        }
+        .await
+        .unwrap()
+        .with_close_grace(Duration::from_millis(500))
+        .into_shared();
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let turn = rt
+            .prompt(&session, vec![ContentBlock::text("go")])
+            .await
+            .unwrap();
+        let _ = turn.outcome().await;
+        assert!(!dir.path().join("made").exists(), "the tool ran unrecorded");
+        let refused = shell(&rt, &session, "printf x > typed").await.unwrap_err();
+        assert!(
+            refused.to_string().contains("the disk is full"),
+            "{refused}"
+        );
+        assert!(!dir.path().join("typed").exists());
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

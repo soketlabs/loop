@@ -1359,3 +1359,60 @@ async fn a_subagent_s_decisions_are_recorded_for_the_parent_s_caller() {
     .await
     .unwrap();
 }
+
+/// A child Session's commands pass the child's own gate: the tightening
+/// it got from its parent turns a writing command off and keeps a
+/// read-only one. This is the gate `session/shell` uses for the child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_session_s_commands_obey_its_tightening_layer() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let (b1, b2) = (started.clone(), release.clone());
+        let script: Script = Arc::new(move |turn: Turn| {
+            let (b1, b2) = (b1.clone(), b2.clone());
+            match (turn.task.as_str(), turn.call) {
+                ("root", 1) => ready(calls(vec![spawn("child")])),
+                ("child", 1) => Box::pin(async move {
+                    b1.wait().await;
+                    b2.wait().await;
+                    text("child done")
+                }),
+                _ => ready(text("done")),
+            }
+        });
+        let (rt, _log, _) =
+            runtime(dir.path(), "full-access", RuntimeLimits::default(), script).await;
+        let root = rt.new_session(SessionSpec::default()).await.unwrap();
+        // The parent's Policy turns the shell off except read-only commands;
+        // the child gets it with its own Session layer.
+        let (policy, _) = rt.route(&root).unwrap().opened.tool_gate.policy().with(
+            Layer::new(LayerSource::Session).set(
+                Capability::Shell,
+                PermissionMode::ReadOnly.setting(&Capability::Shell),
+            ),
+        );
+        rt.route(&root).unwrap().opened.tool_gate.set_policy(policy);
+        let turn = rt
+            .prompt(&root, vec![ContentBlock::text("root")])
+            .await
+            .unwrap();
+        started.wait().await;
+        let child = children(&rt.list().await.unwrap(), &root).remove(0);
+        let live = rt.route(&child.r#ref).unwrap();
+        let native = &live.opened.native;
+        let refused = native
+            .run_as(&child.r#ref, "touch made", None, None)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("refused"), "{refused}");
+        assert!(!dir.path().join("made").exists());
+        native.run_as(&child.r#ref, "ls", None, None).await.unwrap();
+        release.wait().await;
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

@@ -949,3 +949,40 @@ async fn an_edge_user_cannot_answer_an_escalation_of_a_turn_it_did_not_start() {
     .await
     .unwrap();
 }
+
+/// The same outside identity on a new connection (a reconnect) still
+/// answers the Escalation of the turn it started.
+#[tokio::test]
+async fn a_reconnected_edge_user_answers_its_own_turn() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let log = Arc::new(MemoryEventLog::new());
+        let session = SessionRef {
+            instance: "loop".into(),
+            key: "s".into(),
+            native_id: "s".into(),
+        };
+        let host = EscalationHost::new(session, log.clone(), 1);
+        let (first, mut first_rx) = connection(Some(edge("alice")));
+        host.attach(2, first).await;
+        host.set_turn_caller(Some(edge("alice")));
+        let asking = tokio::spawn({
+            let host = host.clone();
+            async move { host.interact(request()).await }
+        });
+        let _ = first_rx.recv().await.unwrap();
+        // The connection drops; Alice comes back on a new one.
+        host.detach(2).await;
+        let (again, mut again_rx) = connection(Some(edge("alice")));
+        host.attach(4, again).await;
+        let (_, answer) = again_rx.recv().await.unwrap();
+        answer.send(selected("accept")).unwrap();
+        assert_eq!(asking.await.unwrap(), selected("accept"));
+        let events = log.read_runtime_after(0).await.unwrap();
+        let EventKind::EscalationAnswered(payload) = &events.last().unwrap().event.kind else {
+            panic!("missing answer")
+        };
+        assert_eq!(payload["answered_by"]["principal"]["id"], "alice");
+    })
+    .await
+    .unwrap();
+}
