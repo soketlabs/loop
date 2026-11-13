@@ -62,11 +62,14 @@ async fn runtime_with(
         agent: None,
     };
     let log = Arc::new(MemoryEventLog::new());
-    let rt = Runtime::new(globals, opts, log.clone(), limits)
-        .await
-        .unwrap()
-        .with_close_grace(Duration::from_millis(500))
-        .into_shared();
+    let rt = {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(globals, opts, log.clone(), store, limits)
+    }
+    .await
+    .unwrap()
+    .with_close_grace(Duration::from_millis(500))
+    .into_shared();
     (rt, log)
 }
 

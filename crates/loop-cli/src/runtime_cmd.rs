@@ -114,6 +114,10 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
             .await
             .context("could not open the Event Log")?,
     );
+    // The Runtime opened this store itself before; keep its error text.
+    let store = globals
+        .open_runtime_session_store()
+        .map_err(|e| anyhow::anyhow!("could not start the Runtime: {e}"))?;
     let defaults = BootstrapOpts {
         cwd: args.cwd.clone(),
         provider: None,
@@ -132,6 +136,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         globals,
         defaults,
         log,
+        store,
         RuntimeLimits {
             max_sessions: limits.max_sessions.0,
             max_active_turns: limits.max_active_turns.0,

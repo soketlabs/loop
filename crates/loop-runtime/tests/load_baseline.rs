@@ -508,12 +508,16 @@ async fn load_baseline() {
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(faux_provider_fn(streaming_responder(chunks, chunk_bytes)));
     let globals = GlobalResources::with_models(dir.path().join("agent"), models).unwrap();
-    let rt = Runtime::new(
-        globals,
-        make_opts(&dir.path().join("work")),
-        log.clone(),
-        limits,
-    )
+    let rt = {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(
+            globals,
+            make_opts(&dir.path().join("work")),
+            log.clone(),
+            store,
+            limits,
+        )
+    }
     .await
     .unwrap()
     .into_shared();

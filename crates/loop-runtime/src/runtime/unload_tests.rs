@@ -92,15 +92,19 @@ async fn runtime(
         agent: None,
     };
     let log = Arc::new(MemoryEventLog::new());
-    let rt = Runtime::new(
-        globals,
-        opts,
-        log.clone(),
-        RuntimeLimits {
-            max_sessions,
-            max_active_turns: 8,
-        },
-    )
+    let rt = {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(
+            globals,
+            opts,
+            log.clone(),
+            store,
+            RuntimeLimits {
+                max_sessions,
+                max_active_turns: 8,
+            },
+        )
+    }
     .await
     .unwrap()
     .with_close_grace(Duration::from_millis(500))

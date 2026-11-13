@@ -86,7 +86,7 @@ pub(super) async fn pump(
     log: Arc<dyn EventLog>,
     generation: u64,
     updates: broadcast::Sender<UpdateEnvelope>,
-    store: Arc<SqliteSessionStore>,
+    store: Arc<dyn RuntimeSessionStore>,
     identity: LeaseIdentity,
 ) {
     // Lease maintenance must not wait behind Event Log backpressure.

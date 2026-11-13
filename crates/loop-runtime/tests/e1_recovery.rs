@@ -505,10 +505,13 @@ async fn daemon_main() {
         permission_mode: Some("full-access".into()),
         agent: None,
     };
-    let rt = Runtime::new(globals, opts, log, RuntimeLimits::default())
-        .await
-        .unwrap()
-        .into_shared();
+    let rt = {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(globals, opts, log, store, RuntimeLimits::default())
+    }
+    .await
+    .unwrap()
+    .into_shared();
     let r = rt.recover(Some(&sessions_lock)).await.unwrap();
     say(format!(
         "READY|{}|{}|{}|{}|{}",

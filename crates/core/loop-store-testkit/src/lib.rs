@@ -18,13 +18,15 @@
 //! ```
 //!
 //! Features: `event-log` (the Event Log suite) and `session-store` (the
-//! Session store suite). Both are on by default.
+//! Session store suite and the Session lease suite). Both are on by default.
 
 use std::any::Any;
 use std::sync::Arc;
 
 #[cfg(feature = "event-log")]
 pub mod event_log;
+#[cfg(feature = "session-store")]
+pub mod session_leases;
 #[cfg(feature = "session-store")]
 pub mod session_store;
 

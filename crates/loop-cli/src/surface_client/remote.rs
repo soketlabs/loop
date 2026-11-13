@@ -524,12 +524,16 @@ mod tests {
             .save_file(&crate::config::paths::settings_path(&agent))
             .unwrap();
         let globals = loop_app_core::runtime::GlobalResources::with_models(agent, models).unwrap();
-        loop_runtime::Runtime::new(
-            globals,
-            opts(dir),
-            Arc::new(loop_runtime::log::MemoryEventLog::new()),
-            Default::default(),
-        )
+        {
+            let store = globals.open_runtime_session_store().unwrap();
+            loop_runtime::Runtime::new(
+                globals,
+                opts(dir),
+                Arc::new(loop_runtime::log::MemoryEventLog::new()),
+                store,
+                Default::default(),
+            )
+        }
         .await
         .unwrap()
         .into_shared()
