@@ -1,10 +1,14 @@
 //! One place that turns sandbox settings or `/sandbox local` flags into a running sandbox.
 //!
 //! Both `/sandbox local` and the Session factory go through [`SandboxBuilder`]. The
-//! builder picks the platform's sandbox from a [`SandboxRegistry`]: on Linux that is
-//! the Podman sandbox ([`KrunSandboxFactory`]); macOS uses Seatbelt. A new platform
-//! sandbox only needs a factory registered in [`platform_registry`] under
-//! [`LOCAL_SANDBOX_KIND`].
+//! builder selects a Workspace driver by data, not by `#[cfg]`: the sandbox kind
+//! (`sandbox.mode`, [`LOCAL_SANDBOX_KIND`]) and the platform go to
+//! [`SandboxRegistry::select`], which returns the first registered driver that
+//! serves the kind and supports the platform. The built-in drivers are `podman`
+//! (Linux, [`KrunSandboxFactory`](loop_agent::harness::KrunSandboxFactory)) and
+//! `seatbelt` (macOS). A driver from another crate registers itself with
+//! [`register_workspace_driver`](loop_agent::harness::sandbox::register_workspace_driver);
+//! [`platform_registry`] adds it after the built-in drivers.
 //!
 //! Isolation and runtime are optional. A value the user set (a flag, or a key in
 //! `settings.json`) is explicit; a missing value inherits the platform default. An
@@ -14,9 +18,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use loop_agent::harness::{
-    KrunIsolation, LocalSandboxRuntime, Sandbox, SandboxConfig, SandboxRegistry,
+use loop_agent::harness::sandbox::{
+    builtin_workspace_drivers, HostOs, NetworkPolicy, PathNamespace, Workspace, WorkspaceDriver,
 };
+use loop_agent::harness::{KrunIsolation, LocalSandboxRuntime, SandboxConfig, SandboxRegistry};
 use serde_json::json;
 
 use crate::config::settings::SandboxSettings;
@@ -38,12 +43,19 @@ pub enum SandboxPlatform {
 impl SandboxPlatform {
     /// The platform this binary was built for.
     pub fn current() -> Self {
-        if cfg!(target_os = "linux") {
-            Self::Linux
-        } else if cfg!(target_os = "macos") {
-            Self::MacOs
-        } else {
-            Self::Other
+        match HostOs::current() {
+            HostOs::Linux => Self::Linux,
+            HostOs::MacOs => Self::MacOs,
+            HostOs::Other => Self::Other,
+        }
+    }
+
+    /// The platform as driver selection data.
+    pub fn os(self) -> HostOs {
+        match self {
+            Self::Linux => HostOs::Linux,
+            Self::MacOs => HostOs::MacOs,
+            Self::Other => HostOs::Other,
         }
     }
 
@@ -65,11 +77,7 @@ impl SandboxPlatform {
     }
 
     fn name(self) -> &'static str {
-        match self {
-            Self::Linux => "Linux",
-            Self::MacOs => "macOS",
-            Self::Other => "this platform",
-        }
+        self.os().name()
     }
 }
 
@@ -117,9 +125,26 @@ pub fn parse_local_sandbox_flags(args: &[&str]) -> Result<LocalSandboxFlags, Str
     Ok(flags)
 }
 
+/// Whether the Session uses a path policy that reads the Runtime host disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PathPolicyUse {
+    /// Not stated: treated as present.
+    #[default]
+    Unknown,
+    /// No path rules and no tool lock.
+    None,
+    /// Path rules or the tool lock apply.
+    Present,
+}
+
 /// What the user asked for, before platform defaults are applied.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxRequest {
+    /// Sandbox kind (`sandbox.mode`); `None` means [`LOCAL_SANDBOX_KIND`].
+    pub kind: Option<String>,
+    /// Whether host-side path policy (path permission rules, the tool lock)
+    /// applies to the Session. `Unknown` counts as present.
+    pub path_policy: PathPolicyUse,
     /// Explicit isolation, if any.
     pub isolation: Option<KrunIsolation>,
     /// Explicit container runtime, if any.
@@ -170,6 +195,8 @@ impl SandboxRequest {
             (isolation, runtime)
         };
         Ok(Self {
+            kind: (settings.mode != "off").then(|| settings.mode.clone()),
+            path_policy: PathPolicyUse::Unknown,
             isolation,
             runtime,
             network: settings.network(),
@@ -190,6 +217,8 @@ impl SandboxRequest {
     /// command that replaces it.
     pub fn for_flags(settings: &SandboxSettings, flags: LocalSandboxFlags) -> Self {
         Self {
+            kind: None,
+            path_policy: PathPolicyUse::Unknown,
             isolation: flags.isolation,
             runtime: flags.runtime,
             network: settings.network(),
@@ -314,6 +343,16 @@ pub enum SandboxBuildError {
         /// Platform in use.
         platform: SandboxPlatform,
     },
+    /// The selected driver does not meet a setting or a rule. Selection
+    /// refuses instead of running with less protection.
+    Unmet {
+        /// Driver id.
+        driver: String,
+        /// The setting or rule.
+        setting: &'static str,
+        /// Why not.
+        reason: &'static str,
+    },
     /// The sandbox could not be created or started.
     Start(String),
 }
@@ -352,6 +391,14 @@ impl fmt::Display for SandboxBuildError {
                 }
                 Ok(())
             }
+            Self::Unmet {
+                driver,
+                setting,
+                reason,
+            } => write!(
+                f,
+                "the `{driver}` workspace driver does not meet {setting}: {reason}"
+            ),
             Self::Start(message) => f.write_str(message),
         }
     }
@@ -359,16 +406,75 @@ impl fmt::Display for SandboxBuildError {
 
 impl std::error::Error for SandboxBuildError {}
 
-/// Registry with the sandbox factories this platform supports.
+/// Refuse a driver that would run with less protection than the request
+/// asks for. Capabilities only add restrictions or refuse; they never relax
+/// a setting.
+///
+/// - A driver whose paths are guest paths is refused unless the caller says
+///   that no host-side path policy (path permission rules, the tool lock)
+///   applies: that policy still reads the host disk (task C2b).
+/// - For kinds other than `local` (hosted and remote use), every
+///   restriction the user set must be enforced. `local` keeps today's
+///   behaviour (for example Linux does not enforce `sandbox.network` yet).
+fn check_driver(
+    driver: &dyn WorkspaceDriver,
+    kind: &str,
+    request: &SandboxRequest,
+    plan: &SandboxPlan,
+) -> Result<(), SandboxBuildError> {
+    let caps = driver.capabilities();
+    let unmet = |setting, reason| SandboxBuildError::Unmet {
+        driver: driver.id().to_owned(),
+        setting,
+        reason,
+    };
+    if caps.path_namespace == PathNamespace::Guest && request.path_policy != PathPolicyUse::None {
+        return Err(unmet(
+            "path permission rules or the tool lock",
+            "they still check paths on the Runtime host, and this driver's paths are not host paths",
+        ));
+    }
+    if kind == LOCAL_SANDBOX_KIND {
+        return Ok(());
+    }
+    if !plan.network
+        && !matches!(
+            caps.network,
+            NetworkPolicy::Denied | NetworkPolicy::Allowlist(_)
+        )
+    {
+        return Err(unmet("sandbox.network", "it does not deny network access"));
+    }
+    if !plan.allow_write.is_empty() && !caps.honours_allow_write {
+        return Err(unmet(
+            "sandbox.allowWrite",
+            "it does not enforce writable paths",
+        ));
+    }
+    if plan.deny_home_reads && !caps.confines_reads {
+        return Err(unmet("sandbox.denyHomeReads", "it does not confine reads"));
+    }
+    if !caps.confines_writes {
+        return Err(unmet("sandbox.mode", "it does not confine writes"));
+    }
+    if !caps.protected_paths_enforced {
+        return Err(unmet(
+            "protected paths",
+            "it does not protect .loop and git paths",
+        ));
+    }
+    Ok(())
+}
+
+/// Registry with every built-in Workspace driver, then the drivers other
+/// crates registered with `register_workspace_driver`. Each driver states
+/// the platforms it supports; [`SandboxBuilder::start`] checks that at run time.
 pub fn platform_registry() -> SandboxRegistry {
     let registry = SandboxRegistry::new();
-    #[cfg(target_os = "linux")]
-    registry.register(Arc::new(loop_agent::harness::KrunSandboxFactory));
-    #[cfg(target_os = "macos")]
-    registry.register(Arc::new(
-        loop_agent::harness::sandbox::seatbelt::SeatbeltSandboxFactory,
-    ));
-    registry
+    for driver in builtin_workspace_drivers() {
+        registry.register_builtin(driver);
+    }
+    registry.with_registered_drivers()
 }
 
 /// Builds the platform's local sandbox from a [`SandboxRequest`].
@@ -432,26 +538,23 @@ impl SandboxBuilder {
         &self,
         workdir: &Path,
         request: &SandboxRequest,
-    ) -> Result<(Arc<dyn Sandbox>, SandboxPlan), SandboxBuildError> {
+    ) -> Result<(Arc<dyn Workspace>, SandboxPlan), SandboxBuildError> {
         let plan = self.resolve(request)?;
-        if !self
+        // Settings -> registry lookup -> platform check. A kind with no driver
+        // for this platform is "not available", as before.
+        let kind = request.kind.as_deref().unwrap_or(LOCAL_SANDBOX_KIND);
+        let driver = self
             .registry
-            .kinds()
-            .iter()
-            .any(|kind| kind == LOCAL_SANDBOX_KIND)
-        {
-            return Err(SandboxBuildError::Unavailable {
+            .select(kind, self.platform.os())
+            .map_err(|_| SandboxBuildError::Unavailable {
                 platform: self.platform,
-            });
-        }
-        let sandbox = self
-            .registry
-            .create(
-                LOCAL_SANDBOX_KIND,
-                plan.config_for_agent(workdir, &self.agent_dir),
-            )
+            })?;
+        check_driver(driver.as_ref(), kind, request, &plan)?;
+        let workspace = driver
+            .create(plan.config_for_agent(workdir, &self.agent_dir).into())
             .await
             .map_err(|e| SandboxBuildError::Start(e.to_string()))?;
+        let sandbox = workspace;
         if let Err(e) = sandbox.start().await {
             let _ = sandbox.destroy().await;
             return Err(SandboxBuildError::Start(e.to_string()));
@@ -465,7 +568,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use loop_agent::harness::{
-        ExecutionEnv, HostExecutionEnv, SandboxError, SandboxFactory, SandboxInfo, SandboxStatus,
+        ExecutionEnv, HostExecutionEnv, Sandbox, SandboxError, SandboxFactory, SandboxInfo,
+        SandboxStatus,
     };
     use parking_lot::Mutex;
 
@@ -536,6 +640,127 @@ mod tests {
             registry.register(factory);
         }
         SandboxBuilder::new(platform, registry)
+    }
+
+    /// A driver with chosen capabilities over the fake factory.
+    fn caps_builder(
+        kind: &str,
+        caps: loop_agent::harness::sandbox::WorkspaceCapabilities,
+    ) -> SandboxBuilder {
+        struct CapsFactory(String);
+        #[async_trait]
+        impl SandboxFactory for CapsFactory {
+            fn kind(&self) -> &str {
+                &self.0
+            }
+            async fn create(
+                &self,
+                config: SandboxConfig,
+            ) -> Result<Arc<dyn Sandbox>, SandboxError> {
+                FakeFactory::default().create(config).await
+            }
+        }
+        static CAPS: Mutex<Option<loop_agent::harness::sandbox::WorkspaceCapabilities>> =
+            Mutex::new(None);
+        *CAPS.lock() = Some(caps);
+        let registry = SandboxRegistry::new();
+        registry.register_builtin(Arc::new(
+            loop_agent::harness::sandbox::FactoryDriver::new(Arc::new(CapsFactory(kind.into())))
+                .with_id("fake")
+                .with_capabilities(|_| CAPS.lock().clone().unwrap_or_default()),
+        ));
+        SandboxBuilder::new(SandboxPlatform::Linux, registry)
+    }
+
+    fn guest_caps() -> loop_agent::harness::sandbox::WorkspaceCapabilities {
+        loop_agent::harness::sandbox::WorkspaceCapabilities {
+            path_namespace: PathNamespace::Guest,
+            network: NetworkPolicy::Denied,
+            confines_reads: true,
+            confines_writes: true,
+            protected_paths_enforced: true,
+            honours_allow_write: true,
+            ..Default::default()
+        }
+    }
+
+    // One test owns the static capabilities above, so they do not race.
+    #[tokio::test]
+    async fn selection_refuses_drivers_that_relax_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = |builder: SandboxBuilder, request: SandboxRequest| {
+            let path = dir.path().to_path_buf();
+            async move { builder.start(&path, &request).await.map(|_| ()) }
+        };
+
+        // A guest-namespace driver with host path policy (unknown counts).
+        let err = start(
+            caps_builder("local", guest_caps()),
+            SandboxRequest::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, SandboxBuildError::Unmet { setting, .. } if setting.contains("tool lock")),
+            "{err}"
+        );
+        let no_policy = SandboxRequest {
+            path_policy: PathPolicyUse::None,
+            ..Default::default()
+        };
+        start(caps_builder("local", guest_caps()), no_policy.clone())
+            .await
+            .unwrap();
+
+        // Remote kind: every restriction must hold.
+        let remote = |r: SandboxRequest| SandboxRequest {
+            kind: Some("remote".into()),
+            ..r
+        };
+        start(
+            caps_builder("remote", guest_caps()),
+            remote(no_policy.clone()),
+        )
+        .await
+        .unwrap();
+        let open_net = loop_agent::harness::sandbox::WorkspaceCapabilities {
+            network: NetworkPolicy::NotEnforced,
+            ..guest_caps()
+        };
+        let err = start(
+            caps_builder("remote", open_net.clone()),
+            remote(no_policy.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the `fake` workspace driver does not meet sandbox.network: it does not deny network access"
+        );
+        let no_allow_write = loop_agent::harness::sandbox::WorkspaceCapabilities {
+            honours_allow_write: false,
+            ..guest_caps()
+        };
+        let with_allow_write = SandboxRequest {
+            allow_write: vec!["x".into()],
+            ..remote(no_policy.clone())
+        };
+        assert!(matches!(
+            start(caps_builder("remote", no_allow_write), with_allow_write).await,
+            Err(SandboxBuildError::Unmet {
+                setting: "sandbox.allowWrite",
+                ..
+            })
+        ));
+
+        // Local kind with host paths keeps today's behaviour: no refusal.
+        let host_open = loop_agent::harness::sandbox::WorkspaceCapabilities {
+            path_namespace: PathNamespace::Host,
+            ..open_net
+        };
+        start(caps_builder("local", host_open), SandboxRequest::default())
+            .await
+            .unwrap();
     }
 
     fn flags(args: &[&str]) -> SandboxRequest {
@@ -864,12 +1089,56 @@ mod tests {
 
     #[test]
     fn platform_registry_matches_the_build_target() {
-        let kinds = platform_registry().kinds();
-        let has_local = kinds.iter().any(|k| k == LOCAL_SANDBOX_KIND);
+        let registry = platform_registry();
+        let local = registry.select(LOCAL_SANDBOX_KIND, HostOs::current());
         assert_eq!(
-            has_local,
+            local.is_ok(),
             cfg!(any(target_os = "linux", target_os = "macos")),
-            "{kinds:?}"
+            "{:?}",
+            registry.driver_ids()
+        );
+        let expected = if cfg!(target_os = "linux") {
+            Some("podman")
+        } else if cfg!(target_os = "macos") {
+            Some("seatbelt")
+        } else {
+            None
+        };
+        assert_eq!(local.ok().map(|d| d.id().to_owned()).as_deref(), expected);
+    }
+
+    #[test]
+    fn platform_registry_selects_by_data_on_every_platform() {
+        let registry = platform_registry();
+        let pick = |os| {
+            registry
+                .select(LOCAL_SANDBOX_KIND, os)
+                .ok()
+                .map(|d| d.id().to_owned())
+        };
+        assert_eq!(pick(HostOs::Linux).as_deref(), Some("podman"));
+        #[cfg(unix)]
+        assert_eq!(pick(HostOs::MacOs).as_deref(), Some("seatbelt"));
+        assert_eq!(pick(HostOs::Other), None);
+    }
+
+    #[tokio::test]
+    async fn other_platform_with_the_full_registry_says_not_available() {
+        let builder = SandboxBuilder::new(SandboxPlatform::Other, platform_registry());
+        let dir = tempfile::tempdir().unwrap();
+        let err = match builder.start(dir.path(), &SandboxRequest::default()).await {
+            Err(e) => e,
+            Ok(_) => panic!("started a sandbox on an unsupported platform"),
+        };
+        assert_eq!(
+            err,
+            SandboxBuildError::Unavailable {
+                platform: SandboxPlatform::Other
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "the local sandbox is not available on this platform yet; tools run on the host (/sandbox off)."
         );
     }
 }

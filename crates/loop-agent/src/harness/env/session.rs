@@ -199,6 +199,17 @@ impl Shell for SessionExecutionEnv {
         if let Some(overrides) = options.env.take() {
             env.extend(overrides);
         }
+        // Also tell the inner env, so a driver with its own base
+        // environment drops these names too. An explicit override of the
+        // caller still applies, as before.
+        options.remove_env.extend(
+            self.policy
+                .0
+                .removed
+                .iter()
+                .filter(|name| !env.contains_key(*name))
+                .cloned(),
+        );
         options.env = Some(env);
         options.inherit_env = false;
         self.inner.exec(command, options).await
@@ -253,6 +264,15 @@ impl FileSystem for SessionExecutionEnv {
         path: &Path,
     ) -> Result<Option<crate::harness::types::FileIdentity>, FileError> {
         self.inner.file_identity(path).await
+    }
+    async fn symlink_metadata(&self, path: &Path) -> Result<PathMetadata, FileError> {
+        self.inner.symlink_metadata(path).await
+    }
+    async fn read_link(&self, path: &Path) -> Result<PathBuf, FileError> {
+        self.inner.read_link(path).await
+    }
+    async fn resolve_for_policy(&self, path: &Path) -> Result<PolicyPath, FileError> {
+        self.inner.resolve_for_policy(path).await
     }
 }
 

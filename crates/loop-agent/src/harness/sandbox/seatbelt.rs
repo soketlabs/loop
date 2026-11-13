@@ -767,26 +767,34 @@ impl SeatbeltPolicy {
     }
 }
 
+/// The only variable names Seatbelt commands get (`LC_*` is a prefix).
+pub const SEATBELT_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "TERM",
+    "COLORTERM",
+    "TMPDIR",
+    "TZ",
+    "NO_COLOR",
+    "CLICOLOR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "DEVELOPER_DIR",
+    "SDKROOT",
+    "LC_*",
+];
+
 fn safe_env_key(key: &str) -> bool {
-    matches!(
-        key,
-        "PATH"
-            | "HOME"
-            | "USER"
-            | "LOGNAME"
-            | "SHELL"
-            | "LANG"
-            | "TERM"
-            | "COLORTERM"
-            | "TMPDIR"
-            | "TZ"
-            | "NO_COLOR"
-            | "CLICOLOR"
-            | "CARGO_HOME"
-            | "RUSTUP_HOME"
-            | "DEVELOPER_DIR"
-            | "SDKROOT"
-    ) || key.starts_with("LC_")
+    SEATBELT_ENV_ALLOWLIST
+        .iter()
+        .any(|name| match name.strip_suffix('*') {
+            Some(prefix) => key.starts_with(prefix),
+            None => key == *name,
+        })
 }
 
 /// Host filesystem access with canonical policy checks and no-follow opens.
@@ -1061,6 +1069,7 @@ impl Shell for JailedHostFs {
                     .map(|(k, v)| (k.clone(), v.clone())),
             );
         }
+        env.retain(|name, _| !options.remove_env.contains(name));
         let (mut cmd, marker) = self.policy.command("/bin/sh", &["-c", command])?;
         cmd.current_dir(cwd).env_clear().envs(env);
         let marker_path = std::fs::canonicalize(marker.dir.path())
