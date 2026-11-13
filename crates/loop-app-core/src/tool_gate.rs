@@ -801,7 +801,8 @@ mod tests {
             "mcp__fs__write",
             "brand_new_tool",
         ];
-        let widen: [(&str, Box<dyn Fn(&ToolGate)>); 5] = [
+        type Change = Box<dyn Fn(&ToolGate)>;
+        let widen: [(&str, Change); 5] = [
             (
                 "full-access",
                 Box::new(|g| g.set_mode(PermissionMode::FullAccess)),
