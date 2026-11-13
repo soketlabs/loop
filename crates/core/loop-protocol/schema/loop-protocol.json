@@ -2422,6 +2422,17 @@
         "socket": {
           "description": "The socket this connection reached.",
           "type": "string"
+        },
+        "tool_lock": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolLock"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The Runtime's tool lock (`--tool-lock`), when it has one."
         }
       },
       "required": [
