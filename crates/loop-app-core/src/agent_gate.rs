@@ -11,7 +11,8 @@
 //!   kind rejects it, and so does a mode that turns it off (`read-only`
 //!   rejects edits and commands), all before hooks run. A layer's "ask"
 //!   always reaches the user. Then `full-access` allows once; otherwise the
-//!   user is asked.
+//!   user is asked. Each request's decision is recorded before Loop answers
+//!   the agent ([`crate::permissions::decision`]).
 //! - **tool-call updates**, which [`AgentToolObserver`] turns into
 //!   `tool_result` events once a call finishes. These are observe-only: the
 //!   agent already ran the tool.
@@ -28,8 +29,9 @@ use loop_protocol::{
     ToolCallUpdate, ToolContent, ToolKind,
 };
 
+use crate::permissions::decision::{DecidedBy, DecisionAnswer, DecisionSource};
 use crate::permissions::{Call, Capability, Ceiling, PermissionMode, State};
-use crate::tool_gate::ToolGate;
+use crate::tool_gate::{Decided, Facts, ToolGate};
 
 /// A host that runs the gate's hooks on an agent's permission requests
 /// before handing them to `inner`.
@@ -71,90 +73,169 @@ impl GatedHost {
     }
 }
 
+impl GatedHost {
+    /// The gate's decision on an agent's permission request: `Some` answers
+    /// it without asking the user; `None` asks. The [`Decided`] is what to
+    /// record; for an ask, the answer is added once it comes.
+    async fn judge(
+        &self,
+        call: &ToolCallUpdate,
+        options: &[PermissionOption],
+        judged: &Call,
+    ) -> (Option<InteractionOutcome>, Decided) {
+        let reject = |reason: String| reject_with(options, reason);
+        let allow_once = || {
+            pick(options, &[PermissionKind::AllowOnce]).map(|native_id| {
+                InteractionOutcome::Selected {
+                    native_id,
+                    note: None,
+                }
+            })
+        };
+        let ceiling = self.gate.policy().ceiling(judged);
+        if let Some(Ceiling {
+            state: State::Off,
+            source,
+        }) = ceiling
+        {
+            let reason = format!(
+                "{} turns off {}",
+                source.label(),
+                Capability::of(judged).label()
+            );
+            let mut decided = Decided::deny(DecidedBy::Off, reason.clone());
+            decided.layer = Some(source);
+            return (Some(reject(reason)), decided);
+        }
+        // Deny rules and the mode's "off" come before hooks: a hook's
+        // allow can't lift either (docs/hooks.md).
+        if let Some((reason, rule)) =
+            self.gate
+                .agent_call_denied_by(judged.kind, &judged.args, &self.cwd)
+        {
+            let mut decided = Decided::deny(DecidedBy::Rule, reason.clone());
+            decided.rule = rule;
+            return (Some(reject(reason)), decided);
+        }
+        let mode = self.gate.mode();
+        if mode.setting(&Capability::of(judged)).state_for(judged) == State::Off {
+            let reason = format!(
+                "Loop is in {} mode; the user can switch with /permissions",
+                mode.as_str()
+            );
+            return (
+                Some(reject(reason.clone())),
+                Decided::deny(DecidedBy::Off, reason),
+            );
+        }
+        // A Policy layer's "ask" goes to the user, whatever the mode or a
+        // hook says.
+        let must_ask = ceiling.is_some_and(|c| c.state == State::Ask);
+        // The approver decides; a layer's "ask" names the layer.
+        let mut asked = Decided::answered(false, None);
+        if must_ask {
+            asked.layer = ceiling.map(|c| c.source);
+        }
+        match self.gate.review_agent_call(self.info(call)).await {
+            Some(ToolDecision::Block { reason }) => {
+                let decided = Decided::deny(DecidedBy::Hook, reason.clone());
+                return (Some(reject(reason)), decided);
+            }
+            Some(ToolDecision::Allow) if !must_ask => {
+                if let Some(outcome) = allow_once() {
+                    return (Some(outcome), Decided::allow(DecidedBy::Hook));
+                }
+            }
+            _ => {}
+        }
+        if mode == PermissionMode::FullAccess && !must_ask {
+            if let Some(outcome) = allow_once() {
+                return (Some(outcome), Decided::allow(DecidedBy::Preset));
+            }
+        }
+        (None, asked)
+    }
+}
+
+/// Reject an agent's request with its own "reject" option, or plainly.
+fn reject_with(options: &[PermissionOption], reason: String) -> InteractionOutcome {
+    let option = pick(options, &[PermissionKind::RejectOnce])
+        .or_else(|| pick(options, &[PermissionKind::RejectAlways]));
+    match option {
+        Some(native_id) => InteractionOutcome::Selected {
+            native_id,
+            note: Some(reason),
+        },
+        None => InteractionOutcome::Rejected { reason },
+    }
+}
+
+/// Whether the user's answer lets the agent run the call.
+fn approved(options: &[PermissionOption], outcome: &InteractionOutcome) -> bool {
+    match outcome {
+        InteractionOutcome::Selected { native_id, .. } => options.iter().any(|o| {
+            &o.native_id == native_id
+                && matches!(
+                    o.kind_hint,
+                    PermissionKind::AllowOnce | PermissionKind::AllowAlways
+                )
+        }),
+        _ => false,
+    }
+}
+
 #[async_trait]
 impl HostServices for GatedHost {
     async fn interact(&self, request: InteractionRequest) -> InteractionOutcome {
-        if let InteractionRequest::Permission {
+        let InteractionRequest::Permission {
             tool_call: Some(call),
             options,
             ..
         } = &request
-        {
-            let reject = |reason: String| {
-                let option = pick(options, &[PermissionKind::RejectOnce])
-                    .or_else(|| pick(options, &[PermissionKind::RejectAlways]));
-                match option {
-                    Some(native_id) => InteractionOutcome::Selected {
-                        native_id,
-                        note: Some(reason),
-                    },
-                    None => InteractionOutcome::Rejected { reason },
-                }
-            };
-            let allow_once = || {
-                pick(options, &[PermissionKind::AllowOnce]).map(|native_id| {
-                    InteractionOutcome::Selected {
-                        native_id,
-                        note: None,
-                    }
-                })
-            };
-            // An agent's tool names aren't Loop's, so its call is judged by
-            // kind; one with no kind may run anything.
-            let judged = Call {
-                kind: call.kind.unwrap_or(ToolKind::Execute),
-                ..Call::new(
-                    "agent",
-                    call.raw_input.clone().unwrap_or_default(),
-                    self.cwd.clone(),
-                )
-            };
-            let ceiling = self.gate.policy().ceiling(&judged);
-            if let Some(Ceiling {
-                state: State::Off,
-                source,
-            }) = ceiling
-            {
-                return reject(format!(
-                    "{} turns off {}",
-                    source.label(),
-                    Capability::of(&judged).label()
-                ));
+        else {
+            return self.inner.interact(request).await;
+        };
+        // An agent's tool names aren't Loop's, so its call is judged by
+        // kind; one with no kind may run anything.
+        let judged = Call {
+            kind: call.kind.unwrap_or(ToolKind::Execute),
+            ..Call::new(
+                "agent",
+                call.raw_input.clone().unwrap_or_default(),
+                self.cwd.clone(),
+            )
+        };
+        let (answer, mut decided) = self.judge(call, options, &judged).await;
+        // The name only: an agent's title often holds the whole command.
+        let tool = call.name.clone().unwrap_or_else(|| "agent".to_owned());
+        let outcome = match answer {
+            Some(outcome) => outcome,
+            None => {
+                let outcome = self.inner.interact(request.clone()).await;
+                decided.answer = Some(if approved(options, &outcome) {
+                    DecisionAnswer::Allow
+                } else {
+                    DecisionAnswer::Deny
+                });
+                decided.escalation = Some(request.id().to_string());
+                outcome
             }
-            // Deny rules and the mode's "off" come before hooks: a hook's
-            // allow can't lift either (docs/hooks.md).
-            if let Some(reason) = self
-                .gate
-                .agent_call_denied(judged.kind, &judged.args, &self.cwd)
-            {
-                return reject(reason);
-            }
-            let mode = self.gate.mode();
-            if mode.setting(&Capability::of(&judged)).state_for(&judged) == State::Off {
-                return reject(format!(
-                    "Loop is in {} mode; the user can switch with /permissions",
-                    mode.as_str()
-                ));
-            }
-            // A Policy layer's "ask" goes to the user, whatever the mode or
-            // a hook says.
-            let must_ask = ceiling.is_some_and(|c| c.state == State::Ask);
-            match self.gate.review_agent_call(self.info(call)).await {
-                Some(ToolDecision::Block { reason }) => return reject(reason),
-                Some(ToolDecision::Allow) if !must_ask => {
-                    if let Some(outcome) = allow_once() {
-                        return outcome;
-                    }
-                }
-                _ => {}
-            }
-            if mode == PermissionMode::FullAccess && !must_ask {
-                if let Some(outcome) = allow_once() {
-                    return outcome;
-                }
-            }
+        };
+        let facts = Facts {
+            source: DecisionSource::Agent(self.agent.clone()),
+            tool: &tool,
+            kind: judged.kind,
+            call_id: Some(&call.id.0),
+            args: &judged.args,
+            caller: None,
+            session: None,
+        };
+        // The agent runs the call once Loop answers: record first, and
+        // refuse when the record cannot be written.
+        match self.gate.record(facts, &decided).await {
+            Ok(()) => outcome,
+            Err(reason) => reject_with(options, reason),
         }
-        self.inner.interact(request).await
     }
 
     fn file_system(&self) -> Option<&dyn HostFileSystem> {
@@ -539,5 +620,94 @@ mod tests {
         gate.set_mode(PermissionMode::AcceptEdits);
         let (_, asked) = ask(gate, exec_request("ls")).await;
         assert!(asked, "accept-edits asks the user about commands");
+    }
+
+    /// Keeps every decision record it is given.
+    #[derive(Default)]
+    struct Records(parking_lot::Mutex<Vec<crate::permissions::decision::PolicyDecisionRecord>>);
+
+    #[async_trait]
+    impl crate::permissions::decision::DecisionSink for Records {
+        fn context(
+            &self,
+            escalation: Option<&str>,
+        ) -> crate::permissions::decision::DecisionContext {
+            let me = loop_protocol::Caller::host(loop_protocol::Principal::local_uid(501));
+            crate::permissions::decision::DecisionContext {
+                session: Some("s1".into()),
+                turn: None,
+                answered_by: escalation.map(|_| me.clone()),
+                caller: me,
+            }
+        }
+        async fn record(
+            &self,
+            record: &crate::permissions::decision::PolicyDecisionRecord,
+        ) -> Result<(), crate::permissions::decision::DecisionError> {
+            self.0.lock().push(record.clone());
+            Ok(())
+        }
+    }
+
+    /// Each permission request of an ACP agent is one decision record,
+    /// written before Loop answers the agent: a deny rule, `full-access`,
+    /// and an ask with the user's answer and who gave it.
+    #[tokio::test]
+    async fn every_agent_request_is_recorded_with_its_source() {
+        use crate::permissions::decision::{DecidedBy, DecisionOutcome};
+        let records = Arc::new(Records::default());
+        let gate = ToolGate::new(crate::tool_approval::permissions_from_settings(
+            &[("bash(rm *)".to_owned(), "deny".to_owned())].into(),
+        ));
+        gate.set_decision_sink(Some(records.clone()));
+        let (denied, asked) = ask(Arc::clone(&gate), exec_request("rm -rf x")).await;
+        assert!(!asked);
+        assert!(
+            matches!(denied, InteractionOutcome::Selected { ref native_id, .. } if native_id == "no")
+        );
+        let (_, asked) = ask(Arc::clone(&gate), exec_request("ls")).await;
+        assert!(asked, "ask mode asks the user");
+        gate.set_mode(PermissionMode::FullAccess);
+        let (allowed, _) = ask(Arc::clone(&gate), exec_request("ls")).await;
+        assert!(
+            matches!(allowed, InteractionOutcome::Selected { ref native_id, .. } if native_id == "once")
+        );
+        let records = std::mem::take(&mut *records.0.lock());
+        let got: Vec<_> = records
+            .iter()
+            .map(|r| (r.source.to_string(), r.outcome, r.answer, r.by))
+            .collect();
+        use crate::permissions::decision::DecisionAnswer;
+        assert_eq!(
+            got,
+            [
+                (
+                    "agent:chatgpt".to_owned(),
+                    DecisionOutcome::Deny,
+                    None,
+                    DecidedBy::Rule
+                ),
+                (
+                    "agent:chatgpt".to_owned(),
+                    DecisionOutcome::Ask,
+                    Some(DecisionAnswer::Deny),
+                    DecidedBy::Approver
+                ),
+                (
+                    "agent:chatgpt".to_owned(),
+                    DecisionOutcome::Allow,
+                    None,
+                    DecidedBy::Preset
+                ),
+            ]
+        );
+        assert_eq!(records[0].rule.as_deref(), Some("bash(rm *)"));
+        assert_eq!(records[0].call_id.as_deref(), Some("t1"));
+        assert_eq!(records[1].escalation.as_deref(), Some("i1"));
+        assert_eq!(
+            records[1].answered_by,
+            Some(loop_protocol::Principal::local_uid(501))
+        );
+        assert_eq!(records[2].capability, "shell");
     }
 }

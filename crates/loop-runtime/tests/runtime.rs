@@ -165,6 +165,10 @@ async fn session_capacity_is_separate_from_queued_turn_admission() {
 struct Watching;
 #[async_trait::async_trait]
 impl loop_wire::control::EscalationRecipient for Watching {
+    fn caller(&self) -> Option<loop_protocol::Caller> {
+        None
+    }
+
     fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
     async fn interact(
         &self,

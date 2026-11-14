@@ -21,17 +21,20 @@
 //! - [`page`]: `Cursor`, `Page`, `PageLimit` (B2).
 //! - [`store`]: `SessionSummary`, `SummaryDelta`, `summarize` (B2).
 //! - [`error`]: `StoreError` (was `EventLogError`) and `Result`.
+//! - [`records`]: the typed `policy_decision` record (S4 §12), which the
+//!   Runtime writes as `EventKind::PolicyDecision`.
+//! - [`identity`]: `Tenant`, `Principal`, `PrincipalKind` and `Via`, the
+//!   protocol's own types re-exported, so there is one definition of each.
 //!
 //! `loop_runtime::log` re-exports all of these at their old paths.
 //!
 //! # Defined for later steps, not used yet
 //!
-//! - [`identity`]: `Tenant`, `Principal`, `PrincipalKind`, `Identity`,
-//!   `SystemScope` (B3).
+//! - [`identity`]: `Identity`, `SystemScope` (B3).
 //! - [`lease`]: `Generation`, `OwnerInfo`, `Fence` (B4, chain D).
 //! - [`append`]: `Append` (B4, B5).
-//! - [`records`]: payloads of `policy_decision`, `tree`, `session_deleted`,
-//!   and the `session_opened` origin (A5, B5).
+//! - [`records`]: payloads of `tree`, `session_deleted`, and the
+//!   `session_opened` origin (B5).
 //! - [`tree`]: `SessionTreeEntry`, `SessionMetadata` (B5).
 //! - [`delta`]: `Delta` and the new `message_ended` fields (chain A; these
 //!   move to `loop-protocol`).
@@ -59,10 +62,14 @@ pub use event::{
     is_recovery_record, stamp, validate_batch, Committed, Event, EventKind, LoggedEvent,
     MAX_BATCH_EVENTS, WRITER_QUEUE_CAPACITY,
 };
-pub use identity::{Identity, Principal, PrincipalKind, SystemScope, Tenant};
+pub use identity::{Identity, Principal, PrincipalKind, SystemScope, Tenant, Via};
 pub use lease::{Fence, Generation, OwnerInfo};
 pub use log::{record_bytes, EventLog};
 pub use page::{Cursor, Page, PageLimit};
+pub use records::{
+    DecidedBy, DecisionAnswer, DecisionOutcome, DecisionSource, DecisionSubject,
+    PolicyDecisionRecord,
+};
 pub use store::{
     summarize, EventReader, EventWriter, LeaseStore, ProjectionAdmin, RebuildReport,
     SessionSummary, Store, StoreCapabilities, SummaryDelta, TreeReader, VerifyReport,

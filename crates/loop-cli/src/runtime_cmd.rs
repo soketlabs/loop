@@ -78,9 +78,17 @@ fn edge_options(
 /// inside the agent directory (such as its `run/` folder) is refused too.
 /// A path that does not exist yet is resolved through its nearest existing
 /// parent, so a symbolic link cannot hide it.
+///
+/// The user's own secrets count too: a root that contains `home` (the
+/// home directory itself or a folder above it) is refused, and so is a root
+/// that overlaps any path the Seatbelt profile denies to sandboxed commands,
+/// or a credential store or browser profile folder (`~/.ssh`, `~/.aws`, `~/.config/gh`, shell histories and the like;
+/// [`loop_agent::harness::sandbox::seatbelt::sensitive_home_paths`]). A
+/// root below the home directory, such as `~/projects`, is allowed.
 fn edge_reach(
     lock_root: &std::path::Path,
     secrets: &[(&str, &std::path::Path)],
+    homes: &[PathBuf],
 ) -> anyhow::Result<()> {
     fn resolve(path: &std::path::Path) -> PathBuf {
         let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
@@ -109,7 +117,79 @@ fn edge_reach(
             );
         }
     }
+    if homes.is_empty() {
+        anyhow::bail!(
+            "--unstable-edge-listen: Loop cannot find your home directory, so it cannot check that the --tool-lock-root {} keeps your secrets out of reach",
+            root.display()
+        );
+    }
+    for home in homes {
+        // The configured and the resolved home: either name can be the
+        // one above the root.
+        for home_form in [
+            std::path::absolute(home).unwrap_or_else(|_| home.clone()),
+            resolve(home),
+        ] {
+            if home_form.starts_with(&root) {
+                anyhow::bail!(
+                    "--unstable-edge-listen: the --tool-lock-root {} contains your home directory {}; an Edge Gateway user could read your files. Use a folder below it, such as one project folder",
+                    root.display(),
+                    home_form.display()
+                );
+            }
+        }
+        for path in loop_agent::harness::sandbox::seatbelt::sensitive_home_paths_extended(home) {
+            let secret = resolve(&path);
+            if secret.starts_with(&root) || root.starts_with(&secret) {
+                anyhow::bail!(
+                    "--unstable-edge-listen: the --tool-lock-root {} overlaps {}, which holds credentials or history; an Edge Gateway user could read it. Use a root outside it",
+                    root.display(),
+                    path.display()
+                );
+            }
+        }
+    }
     Ok(())
+}
+
+/// The user's home directories: `HOME` (as `dirs` reads it) and the one
+/// the password database names for this user, when they differ. A changed
+/// `HOME` must not hide the real one from [`edge_reach`].
+fn user_homes() -> Vec<PathBuf> {
+    let mut homes: Vec<PathBuf> = dirs::home_dir().into_iter().collect();
+    if let Some(home) = passwd_home() {
+        if !homes.contains(&home) {
+            homes.push(home);
+        }
+    }
+    homes
+}
+
+/// This user's home directory in the password database.
+fn passwd_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: zeroed is a valid `passwd`; getpwuid_r writes only into it
+    // and `buffer`, whose length it is given, and `found` points into it
+    // or is null.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if status != 0 || found.is_null() || entry.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: pw_dir is a NUL-terminated string inside `buffer`.
+    let dir = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+    let dir = std::ffi::OsStr::from_bytes(dir.to_bytes());
+    (!dir.is_empty()).then(|| PathBuf::from(dir))
 }
 
 /// Read the edge token from `path`, after the Runtime token was made. It
@@ -253,6 +333,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
                 ("Session database", sessions_db.as_path()),
                 ("edge token file", token_file.as_path()),
             ],
+            &user_homes(),
         )?;
     }
     let sessions_lock = loop_app_core::runtime_instance::SessionDatabaseLock::acquire(&sessions_db)
@@ -1138,14 +1219,19 @@ mod tests {
             ("Session database", db.as_path()),
             ("edge token file", token.as_path()),
         ];
-        assert!(super::edge_reach(&users, &secrets).is_ok());
+        let home = dir.path().join("home");
+        assert!(super::edge_reach(&users, &secrets, std::slice::from_ref(&home)).is_ok());
         // A secret that does not exist yet, behind a symbolic link into the
         // root, is found through its nearest existing parent.
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&users, &link).unwrap();
         let hidden = link.join("later/sessions.db");
-        let refused =
-            super::edge_reach(&users, &[("Session database", hidden.as_path())]).unwrap_err();
+        let refused = super::edge_reach(
+            &users,
+            &[("Session database", hidden.as_path())],
+            std::slice::from_ref(&home),
+        )
+        .unwrap_err();
         assert!(
             refused.to_string().contains("Session database"),
             "{refused}"
@@ -1159,9 +1245,84 @@ mod tests {
             (agent.join("run"), "agent directory"),
             (agent.join("sessions"), "agent directory"),
         ] {
-            let refused = super::edge_reach(&root, &secrets).unwrap_err();
+            let refused =
+                super::edge_reach(&root, &secrets, std::slice::from_ref(&home)).unwrap_err();
             assert!(refused.to_string().contains(what), "{refused}");
         }
+    }
+
+    /// With the edge listener on, a root that holds the home directory, or
+    /// that overlaps a path the Seatbelt profile denies, is refused; a
+    /// project folder below the home directory is not.
+    #[test]
+    fn a_lock_root_that_reaches_the_users_secrets_is_refused_for_edge_users() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("Users/me");
+        let agent = dir.path().join("agent");
+        let project = home.join("projects/site");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(&agent).unwrap();
+        let secrets = [("agent directory", agent.as_path())];
+        assert!(super::edge_reach(&project, &secrets, std::slice::from_ref(&home)).is_ok());
+        assert!(super::edge_reach(
+            &home.join("projects"),
+            &secrets,
+            std::slice::from_ref(&home)
+        )
+        .is_ok());
+        for root in [home.clone(), dir.path().join("Users")] {
+            let refused =
+                super::edge_reach(&root, &secrets, std::slice::from_ref(&home)).unwrap_err();
+            assert!(
+                refused.to_string().contains("contains your home directory"),
+                "{refused}"
+            );
+        }
+        // The shared list, not a copy: every entry is refused, both ways.
+        for path in loop_agent::harness::sandbox::seatbelt::sensitive_home_paths_extended(&home)
+            .into_iter()
+            .filter(|p| p.starts_with(&home))
+        {
+            let inside = path.join("sub");
+            let refused =
+                super::edge_reach(&inside, &secrets, std::slice::from_ref(&home)).unwrap_err();
+            assert!(
+                refused.to_string().contains("credentials or history"),
+                "{refused}"
+            );
+        }
+        let refused = super::edge_reach(&home.join(".ssh"), &secrets, std::slice::from_ref(&home))
+            .unwrap_err();
+        assert!(refused.to_string().contains(".ssh"), "{refused}");
+        let refused = super::edge_reach(
+            &home.join(".config/gh"),
+            &secrets,
+            std::slice::from_ref(&home),
+        )
+        .unwrap_err();
+        assert!(refused.to_string().contains(".config/gh"), "{refused}");
+        // The wider list: whole credential and browser folders.
+        for wider in [".docker", ".kube", ".password-store"] {
+            let refused =
+                super::edge_reach(&home.join(wider), &secrets, std::slice::from_ref(&home))
+                    .unwrap_err();
+            assert!(refused.to_string().contains(wider), "{refused}");
+        }
+        // A symbolic link to the home directory cannot hide it.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        assert!(super::edge_reach(&link, &secrets, std::slice::from_ref(&home)).is_err());
+        // Without a home directory to check against, it fails closed.
+        assert!(super::edge_reach(&project, &secrets, &[]).is_err());
+        // Every home counts: a second one (the password database's) above
+        // the root is refused too.
+        let other = dir.path().join("srv/me");
+        std::fs::create_dir_all(other.join("work")).unwrap();
+        let both = [home.clone(), other.clone()];
+        assert!(super::edge_reach(&other.join("work"), &secrets, &both).is_ok());
+        assert!(super::edge_reach(&dir.path().join("srv"), &secrets, &both).is_err());
+        assert!(!super::user_homes().is_empty());
     }
 
     #[test]

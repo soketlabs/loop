@@ -72,7 +72,10 @@ async fn native(responses: Vec<FauxResponse>, tools: Vec<AgentTool>) -> Arc<Nati
         sandbox: SandboxMode::Disabled,
         resources: Default::default(),
     }));
-    NativeBackend::new(harness).await
+    let backend = NativeBackend::new(harness).await;
+    // User commands pass a Policy gate; this one lets every one run.
+    backend.set_command_gate(Arc::new(|_| Box::pin(async { Ok(()) })));
+    backend
 }
 
 /// Answers every permission prompt with its first option.
@@ -103,6 +106,23 @@ enum Wire {
 /// `backend` served over an in-memory transport, and the client for it.
 async fn over_the_wire(backend: Arc<NativeBackend>) -> (Arc<RemoteBackend>, loop_wire::Served) {
     over(backend, Wire::Memory).await
+}
+
+/// `backend` served to the host's own user: a remote connection with no
+/// named caller may not run shell commands.
+fn serve_host(
+    backend: Arc<dyn loop_protocol::AgentBackend>,
+    transport: loop_wire::Transport,
+) -> loop_wire::Served {
+    loop_wire::server::serve_with_options(
+        backend,
+        transport,
+        info("server"),
+        loop_wire::server::ServeOptions {
+            authority: loop_wire::Authority::HostLocal,
+            ..Default::default()
+        },
+    )
 }
 
 /// `backend` served over `wire`, and the client for it.
@@ -139,7 +159,7 @@ async fn over(backend: Arc<NativeBackend>, wire: Wire) -> (Arc<RemoteBackend>, l
             (accept.await.unwrap(), client)
         }
     };
-    let served = serve(backend, server_end, info("server"));
+    let served = serve_host(backend, server_end);
     let remote = RemoteBackend::connect(client_end, info("client"), Arc::new(FirstOption))
         .await
         .expect("initialize");
@@ -782,7 +802,7 @@ async fn modes_follow_the_capability_and_missing_ones_are_unsupported() {
             Err(BackendError::Unsupported(_))
         ));
         let (server_end, client_end) = memory();
-        let _served = serve(backend.clone(), server_end, info("server"));
+        let _served = serve_host(backend.clone(), server_end);
         let (conn, mut incoming) = Connection::new(client_end);
         tokio::spawn({
             let conn = conn.clone();
@@ -1006,7 +1026,7 @@ async fn compact_stats_and_shell_need_their_capabilities() {
         assert!(remote.local_shell().is_none());
         let session = backend.inner.current_session().await;
         let (server_end, client_end) = memory();
-        let _served = serve(backend.clone(), server_end, info("server"));
+        let _served = serve_host(backend.clone(), server_end);
         let (conn, mut incoming) = Connection::new(client_end);
         tokio::spawn({
             let conn = conn.clone();

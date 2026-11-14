@@ -404,6 +404,21 @@ async fn run(
                     respond(&conn, id, Err(refused));
                     continue;
                 }
+                // A remote connection that no acceptor named a caller for has
+                // no identity to check, so it never runs a shell command.
+                if method == methods::SESSION_SHELL
+                    && options.authority != Authority::HostLocal
+                    && host.caller.is_none()
+                {
+                    let mut body =
+                        RpcErrorBody::from(&loop_protocol::BackendError::Forbidden(method.clone()));
+                    body.message = format!(
+                        "{method} is refused: this connection has no identity, so it cannot \
+                         run shell commands"
+                    );
+                    respond(&conn, id, Err(body));
+                    continue;
+                }
                 // Refused before parsing or dispatch, whatever the params.
                 if options.authority != Authority::HostLocal && host_only(&method, &params) {
                     let body =
@@ -1469,6 +1484,10 @@ async fn register_recipient(
 
 #[async_trait]
 impl crate::control::EscalationRecipient for ClientHost {
+    fn caller(&self) -> Option<Caller> {
+        self.caller.clone()
+    }
+
     fn withdraw(&self, params: loop_protocol::rpc::InteractWithdrawnParams) {
         let _ = self
             .conn

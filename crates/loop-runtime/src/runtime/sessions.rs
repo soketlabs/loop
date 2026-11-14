@@ -279,6 +279,15 @@ impl Runtime {
                 .set_mode_recorder(Some(loop_app_core::tool_gate::mode_recorder(
                     &opened.native,
                 )));
+            // Every gate decision of this Session goes to the Event Log.
+            let decisions = decisions::LogDecisions::new(
+                self.log.clone(),
+                self.generation,
+                reference.key.clone(),
+                escalations.clone(),
+                &opened.native,
+            );
+            opened.tool_gate.set_decision_sink(Some(decisions.clone()));
             let (depth, workspace, child_state) = match &child {
                 Some(child) => (
                     child.parent.depth + 1,
@@ -371,6 +380,7 @@ impl Runtime {
                 pending_sandbox: Mutex::new(None),
                 loaded_by,
             });
+            decisions.bind(&live);
             if unannounced {
                 publish(
                     &live,

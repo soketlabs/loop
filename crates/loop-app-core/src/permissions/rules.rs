@@ -11,7 +11,8 @@ use super::policy::resolve;
 use super::Call;
 use crate::hooks_load::glob_match;
 pub use loop_agent::harness::tools::shell::split_command;
-use loop_agent::harness::tools::shell::split_words;
+pub use loop_agent::harness::tools::shell::unreadable;
+use loop_agent::harness::tools::shell::{parse, Simple};
 
 /// Per-tool default from `~/.loop/agent/settings.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,24 +168,45 @@ const READ_ONLY_GIT: &[&str] = &[
 /// [`READ_ONLY_COMMANDS`] or a read-only `git` subcommand, with no output
 /// redirect, command substitution or variable assignment.
 pub fn read_only_command(command: &str) -> bool {
-    split_command(command).is_some_and(|parts| {
-        parts
-            .iter()
-            .all(|part| words(part).is_some_and(|w| read_only_part(&w)))
-    })
+    // Only a command the reader models ([`parse`]); an unreadable one can
+    // run anything.
+    parse(command).is_ok_and(|commands| commands.iter().all(read_only_simple))
 }
 
-/// The words of one command part, with quotes removed. `None` when it
-/// redirects output (an unquoted `>`).
-fn words(part: &str) -> Option<Vec<String>> {
-    split_words(part, false)
+/// Programs whose options can write or run programs. An argument the shell
+/// can change (a variable or a glob) could become such an option, so with
+/// one they are not read-only.
+const OPTION_SENSITIVE: &[&str] = &["find", "sort", "file", "rg", "tree", "uniq", "git"];
+
+/// Whether one simple command only reads.
+fn read_only_simple(simple: &Simple) -> bool {
+    if simple.writes() {
+        return false;
+    }
+    let changes = simple.dynamic.iter().skip(1).any(|&d| d);
+    if changes && OPTION_SENSITIVE.contains(&simple.program()) {
+        return false;
+    }
+    read_only_part(&simple.words)
 }
 
-/// One command part as the shell runs it: quotes and escapes removed and
-/// words joined with single spaces, so `\rm`, `r\m` and `'rm'` read as
-/// `rm`. Deny and ask patterns match this as well as the part as written.
-fn normalise(part: &str) -> String {
-    split_words(part, true).unwrap_or_default().join(" ")
+/// One simple command as the shell runs it: quotes and escapes removed
+/// and words joined with single spaces, so `r\m` and `r'm'` read as `rm`.
+/// Deny and ask patterns match this as well as the part as written.
+fn normalise(simple: &Simple) -> String {
+    simple.words.join(" ")
+}
+
+/// [`normalise`] with the program reduced to its last path part and
+/// lower-cased: `/usr/bin/touch` and `TOUCH` read as `touch` (S4 §7). A
+/// disk that ignores case runs `TOUCH` as `touch`.
+fn normalise_program(simple: &Simple) -> String {
+    let mut words = simple.words.clone();
+    if let Some(program) = words.first_mut() {
+        let base = program.rsplit('/').next().unwrap_or(program);
+        *program = base.to_lowercase();
+    }
+    words.join(" ")
 }
 
 fn read_only_part(words: &[String]) -> bool {
@@ -204,7 +226,9 @@ fn read_only_part(words: &[String]) -> bool {
             let Some((sub, rest)) = args.split_first() else {
                 return false;
             };
-            if !READ_ONLY_GIT.contains(&sub.as_str()) || has(&["--output"]) {
+            // `--output` writes a file; `--ext-diff` runs a configured
+            // program.
+            if !READ_ONLY_GIT.contains(&sub.as_str()) || has(&["--output", "--ext-diff"]) {
                 return false;
             }
             // `git branch NAME` creates a branch; only listing is a read.
@@ -244,7 +268,10 @@ fn read_only_part(words: &[String]) -> bool {
         // `file -C` compiles a magic file.
         "file" => !has(&["-C", "--compile"]),
         "rg" => !has(&["--pre", "--hostname-bin"]),
-        "tree" => !has(&["-o"]),
+        // `-o FILE` writes FILE, also inside a cluster such as `-ao`.
+        "tree" => !args.iter().any(|a| {
+            a.starts_with("--o") || (a.starts_with('-') && !a.starts_with("--") && a.contains('o'))
+        }),
         // `uniq IN OUT` writes OUT.
         "uniq" => positional() <= 1,
         program => READ_ONLY_COMMANDS.contains(&program),
@@ -578,15 +605,34 @@ pub fn rule_for(rules: &BTreeMap<String, ToolPermission>, call: &Call) -> Rule {
     rule_with(rules, call, &OnceCell::new())
 }
 
+/// [`rule_for`], and the `toolPermissions` key that decided it (`bash`,
+/// `bash(touch*)`), when a key did; for decision records.
+pub fn rule_and_key(
+    rules: &BTreeMap<String, ToolPermission>,
+    call: &Call,
+) -> (Rule, Option<String>) {
+    rule_with_key(rules, call, &OnceCell::new())
+}
+
 /// [`rule_for`] with the call path's [`PathForms`] worked out at most once.
 fn rule_with(
     rules: &BTreeMap<String, ToolPermission>,
     call: &Call,
     forms: &OnceCell<PathForms>,
 ) -> Rule {
+    rule_with_key(rules, call, forms).0
+}
+
+/// [`rule_with`] and the deciding key.
+fn rule_with_key(
+    rules: &BTreeMap<String, ToolPermission>,
+    call: &Call,
+    forms: &OnceCell<PathForms>,
+) -> (Rule, Option<String>) {
     let tool = call.tool.as_str();
     let subject = subject(tool, &call.args);
     let mut specific: Option<ToolPermission> = None;
+    let mut specific_key: Option<&str> = None;
     let mut bash_allows = Vec::new();
     for (key, permission) in rules {
         let (tool_pattern, Some(pattern)) = split_key(key) else {
@@ -605,14 +651,20 @@ fn rule_with(
             } else {
                 // Deny and ask also match the part with quotes and escapes
                 // removed; allow (above) matches only the part as written.
-                let matches =
-                    |part: &str| glob_match(pattern, part) || glob_match(pattern, &normalise(part));
-                match split_command(subject) {
-                    Some(parts) => parts.iter().any(|part| matches(part)),
-                    None => {
-                        matches(subject)
+                let matches = |simple: &Simple| {
+                    glob_match(pattern, &simple.raw)
+                        || glob_match(pattern, &normalise(simple))
+                        || glob_match(pattern, &normalise_program(simple))
+                };
+                match parse(subject) {
+                    Ok(commands) => commands.iter().any(matches),
+                    // An unreadable command cannot be shown not to match a
+                    // deny pattern, so the pattern applies (fail closed,
+                    // S4 §7). An ask pattern matches its text.
+                    Err(_) => {
+                        *permission == ToolPermission::Deny
+                            || glob_match(pattern, subject)
                             || subject.contains(pattern.trim_matches('*'))
-                            || normalise(subject).contains(pattern.trim_matches('*'))
                     }
                 }
             }
@@ -629,37 +681,45 @@ fn rule_with(
         };
         if hit && specific.is_none_or(|s| permission.strictness() > s.strictness()) {
             specific = Some(*permission);
+            specific_key = Some(key);
         }
     }
     if specific.is_none() && !bash_allows.is_empty() {
-        let all_allowed = subject
-            .as_deref()
-            .and_then(split_command)
-            .is_some_and(|parts| {
-                parts
-                    .iter()
-                    .all(|part| bash_allows.iter().any(|pattern| glob_match(pattern, part)))
-            });
+        // An allow pattern never matches an unreadable command.
+        let all_allowed = subject.as_deref().map(parse).is_some_and(|parsed| {
+            parsed.is_ok_and(|commands| {
+                commands.iter().all(|simple| {
+                    bash_allows
+                        .iter()
+                        .any(|pattern| glob_match(pattern, &simple.raw))
+                })
+            })
+        });
         if all_allowed {
             specific = Some(ToolPermission::Allow);
+            // Several allow patterns can share the command; name the tool.
+            specific_key = Some("bash(…)");
         }
     }
     if let Some(permission) = specific {
-        return Rule {
+        let rule = Rule {
             permission,
             specific: true,
         };
+        return (rule, specific_key.map(str::to_owned));
     }
     if let Some(permission) = rules.get(tool) {
-        return Rule::plain(*permission);
+        return (Rule::plain(*permission), Some(tool.to_owned()));
     }
     // Plain glob keys such as `mcp__github__*`; the strictest match wins.
     let plain = rules
         .iter()
         .filter(|(key, _)| split_key(key).1.is_none() && key.contains('*') && glob_match(key, tool))
-        .map(|(_, p)| *p)
-        .max_by_key(|p| p.strictness());
-    Rule::plain(plain.unwrap_or(ToolPermission::Allow))
+        .max_by_key(|(_, p)| p.strictness());
+    match plain {
+        Some((key, permission)) => (Rule::plain(*permission), Some(key.clone())),
+        None => (Rule::plain(ToolPermission::Allow), None),
+    }
 }
 
 #[cfg(test)]
@@ -793,7 +853,12 @@ mod tests {
         ] {
             assert_eq!(bash_rule(&r, cmd).permission, ToolPermission::Deny, "{cmd}");
         }
-        assert_eq!(bash_rule(&r, "c\\url x").permission, ToolPermission::Ask);
+        // A program word with an escape is unreadable: with a deny pattern
+        // set, it is refused (fail closed); with only an ask pattern, the
+        // mode decides.
+        assert_eq!(bash_rule(&r, "c\\url x").permission, ToolPermission::Deny);
+        let ask = rules(&[("bash(curl *)", "ask")]);
+        assert_eq!(bash_rule(&ask, "curl x").permission, ToolPermission::Ask);
         // Allow patterns are not widened by the normalisation.
         let allow = rules(&[("bash(git status)", "allow"), ("bash", "ask")]);
         assert_eq!(

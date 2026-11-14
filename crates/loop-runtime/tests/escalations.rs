@@ -18,6 +18,10 @@ struct Surface(
 );
 #[async_trait::async_trait]
 impl EscalationRecipient for Surface {
+    fn caller(&self) -> Option<loop_protocol::Caller> {
+        None
+    }
+
     fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
     async fn interact(
         &self,
@@ -853,6 +857,161 @@ async fn a_cancelled_reply_is_a_recipient_leaving_not_an_answer() {
             .unwrap();
         assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
         rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A connection with a fixed caller, as the wire server's recipient is.
+struct Connection {
+    caller: Option<loop_protocol::Caller>,
+    asked: mpsc::UnboundedSender<(InteractParams, oneshot::Sender<InteractionOutcome>)>,
+}
+#[async_trait::async_trait]
+impl EscalationRecipient for Connection {
+    fn caller(&self) -> Option<loop_protocol::Caller> {
+        self.caller.clone()
+    }
+    fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
+    async fn interact(
+        &self,
+        params: InteractParams,
+        _withdrawn: oneshot::Receiver<()>,
+    ) -> Result<InteractionOutcome, ()> {
+        let (tx, rx) = oneshot::channel();
+        self.asked.send((params, tx)).map_err(|_| ())?;
+        rx.await.map_err(|_| ())
+    }
+}
+fn connection(
+    caller: Option<loop_protocol::Caller>,
+) -> (
+    Arc<Connection>,
+    mpsc::UnboundedReceiver<(InteractParams, oneshot::Sender<InteractionOutcome>)>,
+) {
+    let (asked, rx) = mpsc::unbounded_channel();
+    (Arc::new(Connection { caller, asked }), rx)
+}
+fn edge(id: &str) -> loop_protocol::Caller {
+    let principal = loop_protocol::Principal::new(
+        loop_protocol::PrincipalKind::Person,
+        "https://idp.example",
+        id,
+    )
+    .unwrap();
+    loop_protocol::Caller::asserted(principal, loop_protocol::Tenant::new("acme").unwrap()).unwrap()
+}
+
+/// Two connections on one Session, the host user's and an edge user's: an
+/// edge user never receives, and so can never answer, an Escalation of a
+/// turn it did not start, whether it was attached before the request or
+/// after. The host user keeps today's behaviour: it gets every request. The
+/// answer record names who answered.
+#[tokio::test]
+async fn an_edge_user_cannot_answer_an_escalation_of_a_turn_it_did_not_start() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let log = Arc::new(MemoryEventLog::new());
+        let session = SessionRef {
+            instance: "loop".into(),
+            key: "s".into(),
+            native_id: "s".into(),
+        };
+        let host_user = loop_protocol::Caller::host(loop_protocol::Principal::local_uid(501));
+        let host = EscalationHost::new(session.clone(), log.clone(), 1);
+        let (mine, mut mine_rx) = connection(Some(host_user.clone()));
+        let (alice, mut alice_rx) = connection(Some(edge("alice")));
+        host.attach(1, mine).await;
+        host.attach(2, alice.clone()).await;
+
+        // The host user's turn: only the host user's connection is asked.
+        host.set_turn_caller(Some(host_user.clone()));
+        let asking = tokio::spawn({
+            let host = host.clone();
+            async move { host.interact(request()).await }
+        });
+        let (_, answer) = mine_rx.recv().await.unwrap();
+        // Attaching again after the request does not deliver it either.
+        host.detach(2).await;
+        host.attach(2, alice.clone()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(alice_rx.try_recv().is_err(), "the edge user was asked");
+        answer.send(selected("accept")).unwrap();
+        assert_eq!(asking.await.unwrap(), selected("accept"));
+        let events = log.read_runtime_after(0).await.unwrap();
+        let EventKind::EscalationAnswered(payload) = &events[1].event.kind else {
+            panic!("missing answer")
+        };
+        assert_eq!(payload["answered_by"]["principal"]["id"], "uid:501");
+        let id = payload["id"].as_str().unwrap();
+        assert_eq!(host.take_answered_by(id), Some(host_user.clone()));
+
+        // Alice's own turn: she is asked, and so is the host user.
+        host.set_turn_caller(Some(edge("alice")));
+        let asking = tokio::spawn({
+            let host = host.clone();
+            async move { host.interact(request()).await }
+        });
+        let (_, from_alice) = alice_rx.recv().await.unwrap();
+        let (_, _from_host) = mine_rx.recv().await.unwrap();
+        from_alice.send(selected("accept")).unwrap();
+        assert_eq!(asking.await.unwrap(), selected("accept"));
+        let events = log.read_runtime_after(0).await.unwrap();
+        let EventKind::EscalationAnswered(payload) = &events.last().unwrap().event.kind else {
+            panic!("missing answer")
+        };
+        assert_eq!(payload["answered_by"]["principal"]["id"], "alice");
+        assert_eq!(payload["answered_by"]["via"], "edge");
+
+        // Another edge user is not asked about Alice's turn.
+        let (bob, mut bob_rx) = connection(Some(edge("bob")));
+        host.attach(3, bob).await;
+        let asking = tokio::spawn({
+            let host = host.clone();
+            async move { host.interact(request()).await }
+        });
+        let (_, from_alice) = alice_rx.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(bob_rx.try_recv().is_err(), "another edge user was asked");
+        from_alice.send(selected("reject")).unwrap();
+        let _ = asking.await.unwrap();
+        let _ = mine_rx.try_recv();
+    })
+    .await
+    .unwrap();
+}
+
+/// The same outside identity on a new connection (a reconnect) still
+/// answers the Escalation of the turn it started.
+#[tokio::test]
+async fn a_reconnected_edge_user_answers_its_own_turn() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let log = Arc::new(MemoryEventLog::new());
+        let session = SessionRef {
+            instance: "loop".into(),
+            key: "s".into(),
+            native_id: "s".into(),
+        };
+        let host = EscalationHost::new(session, log.clone(), 1);
+        let (first, mut first_rx) = connection(Some(edge("alice")));
+        host.attach(2, first).await;
+        host.set_turn_caller(Some(edge("alice")));
+        let asking = tokio::spawn({
+            let host = host.clone();
+            async move { host.interact(request()).await }
+        });
+        let _ = first_rx.recv().await.unwrap();
+        // The connection drops; Alice comes back on a new one.
+        host.detach(2).await;
+        let (again, mut again_rx) = connection(Some(edge("alice")));
+        host.attach(4, again).await;
+        let (_, answer) = again_rx.recv().await.unwrap();
+        answer.send(selected("accept")).unwrap();
+        assert_eq!(asking.await.unwrap(), selected("accept"));
+        let events = log.read_runtime_after(0).await.unwrap();
+        let EventKind::EscalationAnswered(payload) = &events.last().unwrap().event.kind else {
+            panic!("missing answer")
+        };
+        assert_eq!(payload["answered_by"]["principal"]["id"], "alice");
     })
     .await
     .unwrap();

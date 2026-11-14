@@ -2,7 +2,10 @@
 
 use loop_protocol::{SessionUpdate, ToolCallStatus, ToolCallUpdate, UpdateEnvelope};
 use loop_store::class::{classify_update, Durability, UpdateCase, RECORD_CLASSES, UPDATE_CLASSES};
-use loop_store::{EventKind, Principal, PrincipalKind, StoreError, Tenant};
+use loop_store::{
+    DecidedBy, DecisionAnswer, DecisionOutcome, DecisionSource, DecisionSubject, Event, EventKind,
+    PolicyDecisionRecord, Principal, PrincipalKind, StoreError, Tenant,
+};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
@@ -122,6 +125,7 @@ fn record_kinds_match_event_kind() {
         EventKind::SubagentEnded(json!({})),
         EventKind::RuntimeStarted(json!({})),
         EventKind::RuntimeStopped(json!({})),
+        EventKind::PolicyDecision(json!({})),
     ];
     let names: Vec<String> = present
         .iter()
@@ -142,8 +146,8 @@ fn record_kinds_match_event_kind() {
     for class in RECORD_CLASSES {
         assert_eq!(class.session_seq, class.kind == "update", "{}", class.kind);
     }
-    // The kinds that ADR-0007 adds are not variants yet: they still read as
-    // Unknown, so defining them changed nothing.
+    // The kinds that ADR-0007 adds and nothing writes yet are not variants:
+    // they still read as Unknown, so defining them changed nothing.
     for class in RECORD_CLASSES.iter().filter(|c| !c.in_event_kind) {
         let raw = json!({"kind": class.kind, "payload": {}});
         let kind: EventKind = serde_json::from_value(raw.clone()).unwrap();
@@ -166,7 +170,7 @@ fn live_error_text_is_unchanged() {
 
 #[test]
 fn identity_serde_matches_the_s4_record() {
-    let principal = Principal::new(PrincipalKind::Person, "local", "uid:501");
+    let principal = Principal::new(PrincipalKind::Person, "local", "uid:501").unwrap();
     assert_eq!(
         serde_json::to_value(&principal).unwrap(),
         json!({"kind":"person","issuer":"local","id":"uid:501"})
@@ -175,4 +179,141 @@ fn identity_serde_matches_the_s4_record() {
         serde_json::to_value(Tenant::local()).unwrap(),
         json!("local")
     );
+}
+
+/// The store's identity types are the protocol's: one definition each.
+#[test]
+fn identity_types_are_the_protocol_types() {
+    fn same<T>(_: &T, _: &T) {}
+    let principal: loop_protocol::Principal = loop_protocol::Principal::local_uid(501);
+    same(&principal, &Principal::local_uid(501));
+    same(&loop_protocol::Tenant::local(), &Tenant::local());
+}
+
+fn decision() -> PolicyDecisionRecord {
+    PolicyDecisionRecord {
+        id: "pd-1".into(),
+        ts_ms: 1_762_862_400_000,
+        tenant: Tenant::local(),
+        principal: Principal::local_uid(501),
+        via: None,
+        session: Some("s1".into()),
+        turn: Some("turn-7".into()),
+        call_id: Some("c3".into()),
+        source: DecisionSource::Agent("chatgpt".into()),
+        tool: "bash".into(),
+        kind: loop_protocol::ToolKind::Execute,
+        capability: "shell".into(),
+        subject: DecisionSubject {
+            programs: vec!["touch".into()],
+            ..DecisionSubject::default()
+        },
+        args_sha256: Some("ab".into()),
+        outcome: DecisionOutcome::Deny,
+        answer: None,
+        by: DecidedBy::Rule,
+        layer: Some("project".into()),
+        rule: Some("bash(touch*)".into()),
+        mode: Some("full-access".into()),
+        escalation: None,
+        answered_by: None,
+        reason: Some("Tool `bash` is denied by settings.toolPermissions".into()),
+    }
+}
+
+/// The record's JSON follows S4 §12, and it reads back unchanged.
+#[test]
+fn a_decision_record_has_the_s4_shape() {
+    let record = decision();
+    let value = serde_json::to_value(&record).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "id": "pd-1", "ts_ms": 1_762_862_400_000_i64, "tenant": "local",
+            "principal": {"kind": "person", "issuer": "local", "id": "uid:501"},
+            "session": "s1", "turn": "turn-7", "call_id": "c3",
+            "source": "agent:chatgpt", "tool": "bash", "kind": "execute",
+            "capability": "shell", "subject": {"programs": ["touch"]},
+            "args_sha256": "ab", "outcome": "deny", "by": "rule",
+            "layer": "project", "rule": "bash(touch*)", "mode": "full-access",
+            "reason": "Tool `bash` is denied by settings.toolPermissions"
+        })
+    );
+    let back: PolicyDecisionRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(back, record);
+    for (source, text) in [
+        (DecisionSource::Native, "native"),
+        (DecisionSource::Mcp("github".into()), "mcp:github"),
+        (DecisionSource::Workflow, "workflow"),
+        (DecisionSource::McpServe, "mcp_serve"),
+        (DecisionSource::UserShell, "user_shell"),
+        (DecisionSource::Other("later".into()), "later"),
+    ] {
+        assert_eq!(serde_json::to_value(&source).unwrap(), json!(text));
+        assert_eq!(
+            serde_json::from_value::<DecisionSource>(json!(text)).unwrap(),
+            source
+        );
+    }
+    // An answered ask runs only when it was approved.
+    let mut asked = decision();
+    asked.outcome = DecisionOutcome::Ask;
+    assert!(asked.allowed());
+    asked.answer = Some(DecisionAnswer::Deny);
+    assert!(!asked.allowed());
+}
+
+/// The subject is capped at 4 KB of JSON.
+#[test]
+fn a_decision_subject_is_capped() {
+    let subject = DecisionSubject {
+        programs: (0..2000).map(|i| format!("p{i}")).collect(),
+        path: Some("x".repeat(10_000)),
+        host: None,
+    }
+    .capped();
+    assert!(serde_json::to_vec(&subject).unwrap().len() <= loop_store::records::MAX_SUBJECT_BYTES);
+}
+
+/// A `policy_decision` row reads as its own kind and passes the append
+/// rules; a reader from before this kind reads it as Unknown, and an
+/// unknown kind still reads as Unknown.
+#[test]
+fn a_policy_decision_row_stays_readable_by_old_and_new_readers() {
+    let payload = serde_json::to_value(decision()).unwrap();
+    let raw = json!({"kind": "policy_decision", "payload": payload});
+    let kind: EventKind = serde_json::from_value(raw.clone()).unwrap();
+    let EventKind::PolicyDecision(value) = &kind else {
+        panic!("policy_decision did not decode: {kind:?}");
+    };
+    assert_eq!(
+        serde_json::from_value::<PolicyDecisionRecord>(value.clone()).unwrap(),
+        decision()
+    );
+    assert_eq!(serde_json::to_value(&kind).unwrap(), raw);
+    let event = Event {
+        generation: 1,
+        session_key: Some("s1".into()),
+        turn: None,
+        ts_ms: 1,
+        kind,
+    };
+    loop_store::validate_batch(&[event]).unwrap();
+    assert!(!loop_store::is_recovery_record(&EventKind::PolicyDecision(
+        json!({})
+    )));
+
+    // The shape of `EventKind` before this kind existed.
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+    enum OldKind {
+        RuntimeStopped(Value),
+        #[serde(untagged)]
+        Unknown(Value),
+    }
+    let old: OldKind = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(old, OldKind::Unknown(raw));
+    let later = json!({"kind": "later_kind", "payload": {"x": 1}});
+    let kind: EventKind = serde_json::from_value(later.clone()).unwrap();
+    assert_eq!(kind, EventKind::Unknown(later));
 }

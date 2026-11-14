@@ -172,7 +172,7 @@ pub const RECORD_CLASSES: &[RecordClass] = &[
     record("subagent_ended", Some(true), true),
     record("runtime_started", Some(true), true),
     record("runtime_stopped", Some(true), true),
-    record(crate::records::POLICY_DECISION, Some(true), false),
+    record(crate::records::POLICY_DECISION, Some(true), true),
     // A turn's tree records commit in one atomic request that the harness
     // awaits (§5.3).
     record(crate::records::TREE, Some(true), false),

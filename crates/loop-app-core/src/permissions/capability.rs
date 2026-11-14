@@ -32,6 +32,21 @@ pub enum Capability {
 }
 
 impl Capability {
+    /// The id in decision records and the S4 `policy` block: `read_files`,
+    /// `write_files`, `shell`, `web_fetch`, `web_search`, `mcp:<server>` or
+    /// `other`.
+    pub fn id(&self) -> String {
+        match self {
+            Self::ReadFiles => "read_files".into(),
+            Self::WriteFiles => "write_files".into(),
+            Self::Shell => "shell".into(),
+            Self::WebFetch => "web_fetch".into(),
+            Self::WebSearch => "web_search".into(),
+            Self::Mcp(server) => format!("mcp:{server}"),
+            Self::Other => "other".into(),
+        }
+    }
+
     /// The name in notices and refusals.
     pub fn label(&self) -> String {
         match self {

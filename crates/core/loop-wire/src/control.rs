@@ -289,6 +289,12 @@ fn unsupported(method: &str) -> BackendError {
 /// An interactive connection that can receive a Session's Escalations.
 #[async_trait]
 pub trait EscalationRecipient: Send + Sync {
+    /// Who the connection acts for, fixed when it was accepted; `None` for
+    /// an in-process recipient. The Runtime sends a user from outside the
+    /// host ([`loop_protocol::Caller::is_host_user`] is false) only the
+    /// Escalations of turns that user started, and records the caller that
+    /// answered.
+    fn caller(&self) -> Option<loop_protocol::Caller>;
     /// Queue withdrawal synchronously in the connection's ordered output.
     /// The Runtime calls this before removing the recipient or redispatching.
     fn withdraw(&self, params: loop_protocol::rpc::InteractWithdrawnParams);

@@ -1072,6 +1072,10 @@ type Asked = (
 struct Watcher(tokio::sync::mpsc::UnboundedSender<Asked>);
 #[async_trait]
 impl EscalationRecipient for Watcher {
+    fn caller(&self) -> Option<loop_protocol::Caller> {
+        None
+    }
+
     fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
     async fn interact(
         &self,
@@ -1297,6 +1301,115 @@ async fn an_ancestors_surface_disconnecting_leaves_the_request_parked() {
             .unwrap();
         let (params, answer, _) = next_rx.recv().await.unwrap();
         answer.send(allow(&params)).unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A Subagent's tool calls pass its own gate, and each decision is recorded
+/// on the child Session, acting for the caller that prompted the parent
+/// (ADR-0009: agents act as the person who started the Session).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subagent_s_decisions_are_recorded_for_the_parent_s_caller() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let script: Script = Arc::new(|turn: Turn| match (turn.task.as_str(), turn.call) {
+            ("root", 1) => ready(calls(vec![spawn("child")])),
+            ("child", 1) => ready(calls(vec![("bash", json!({"command": "true"}))])),
+            _ => ready(text("done")),
+        });
+        let (rt, log, _) =
+            runtime(dir.path(), "full-access", RuntimeLimits::default(), script).await;
+        let root = rt.new_session(SessionSpec::default()).await.unwrap();
+        let person = loop_protocol::Caller::host(loop_protocol::Principal::local_uid(4242));
+        let turn = person
+            .scope(rt.prompt(&root, vec![ContentBlock::text("root")]))
+            .await
+            .unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        let records: Vec<(SessionKey, loop_store::PolicyDecisionRecord)> = log
+            .read_runtime_after(0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| match r.event.kind {
+                EventKind::PolicyDecision(value) => Some((
+                    r.event.session_key.unwrap(),
+                    serde_json::from_value(value).unwrap(),
+                )),
+                _ => None,
+            })
+            .collect();
+        let parent: Vec<_> = records.iter().filter(|(key, _)| *key == root.key).collect();
+        assert_eq!(parent.len(), 1, "{records:?}");
+        assert_eq!(parent[0].1.tool, "subagent");
+        let child: Vec<_> = records
+            .iter()
+            .filter(|(key, record)| *key != root.key && record.tool == "bash")
+            .collect();
+        assert_eq!(child.len(), 1, "{records:?}");
+        let (key, record) = child[0];
+        assert_eq!(record.session.as_deref(), Some(key.as_str()));
+        assert_eq!(record.principal, loop_protocol::Principal::local_uid(4242));
+        assert_eq!(record.outcome, loop_store::DecisionOutcome::Allow);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A child Session's commands pass the child's own gate: the tightening
+/// it got from its parent turns a writing command off and keeps a
+/// read-only one. This is the gate `session/shell` uses for the child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_session_s_commands_obey_its_tightening_layer() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let (b1, b2) = (started.clone(), release.clone());
+        let script: Script = Arc::new(move |turn: Turn| {
+            let (b1, b2) = (b1.clone(), b2.clone());
+            match (turn.task.as_str(), turn.call) {
+                ("root", 1) => ready(calls(vec![spawn("child")])),
+                ("child", 1) => Box::pin(async move {
+                    b1.wait().await;
+                    b2.wait().await;
+                    text("child done")
+                }),
+                _ => ready(text("done")),
+            }
+        });
+        let (rt, _log, _) =
+            runtime(dir.path(), "full-access", RuntimeLimits::default(), script).await;
+        let root = rt.new_session(SessionSpec::default()).await.unwrap();
+        // The parent's Policy turns the shell off except read-only commands;
+        // the child gets it with its own Session layer.
+        let (policy, _) = rt.route(&root).unwrap().opened.tool_gate.policy().with(
+            Layer::new(LayerSource::Session).set(
+                Capability::Shell,
+                PermissionMode::ReadOnly.setting(&Capability::Shell),
+            ),
+        );
+        rt.route(&root).unwrap().opened.tool_gate.set_policy(policy);
+        let turn = rt
+            .prompt(&root, vec![ContentBlock::text("root")])
+            .await
+            .unwrap();
+        started.wait().await;
+        let child = children(&rt.list().await.unwrap(), &root).remove(0);
+        let live = rt.route(&child.r#ref).unwrap();
+        let native = &live.opened.native;
+        let refused = native
+            .run_as(&child.r#ref, "touch made", None, None)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("refused"), "{refused}");
+        assert!(!dir.path().join("made").exists());
+        native.run_as(&child.r#ref, "ls", None, None).await.unwrap();
+        release.wait().await;
         assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
         rt.shutdown().await;
     })

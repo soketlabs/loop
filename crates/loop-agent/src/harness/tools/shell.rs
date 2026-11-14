@@ -1,55 +1,235 @@
-//! Shell command splitting shared by the bash safety block list and the
-//! permission rules: parts at `;`, `&&`, `||`, `|`, `&` and newlines, and
-//! words with quotes and escapes removed, as the shell reads them.
+//! Shell command reading shared by the bash safety block list and the
+//! permission rules.
+//!
+//! [`parse`] is the one reader. It accepts only a small grammar that it
+//! models exactly, and calls everything else **unreadable**:
+//!
+//! - commands are separated by `|`, `||`, `&&`, `;` and newlines;
+//! - a simple command is a program word, then argument words and
+//!   redirects;
+//! - a program word is plain text: `A-Z a-z 0-9 _ . / + -` only;
+//! - an argument word joins unquoted text from `A-Z a-z 0-9 _ . / + - = :
+//!   , @ %` and the glob characters `* ? [ ]`, a backslash before one
+//!   printable ASCII character, `'single quotes'` (no newline), `"double
+//!   quotes"` (no newline, backtick or `!`; a backslash before `$`,
+//!   backtick, `"` or `\` gives that character, before any other character
+//!   both stay), and `$NAME` or `${NAME}`;
+//! - redirects: `<`, `>`, `>>`, `>|`, `&>`, `&>>` with a target word, and
+//!   `>&N`, `<&N`, `>&-`, each with an optional one-digit file number;
+//! - anything else is unreadable: comments, `(`, `)`, `{`, `}`, backticks,
+//!   any other `$` form, `!`, `&` alone, here-documents, control
+//!   characters, non-ASCII text outside quotes, a newline inside quotes,
+//!   `~user`, `~+`, `~-` and a `~` after `=` or `:` (`~` and `~/…` at the
+//!   start of an argument are the home directory; inside a word, as in
+//!   `HEAD~1`, it is text),
+//!   unbalanced quotes, keywords (`if`, `for`, …), programs that run
+//!   another program or change how later programs are found (`env`, `sh`,
+//!   `eval`, `xargs`, `trap`, `hash`, `read`, …), an assignment before the
+//!   program, and interpreters with inline code.
 
-/// The parts of a shell command, split at `;`, `&&`, `||`, `|`, `&` and
-/// newlines outside quotes. `None` when it substitutes commands (`$(…)`,
-/// backticks, `<(…)`) or has unbalanced quotes.
-pub fn split_command(command: &str) -> Option<Vec<String>> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let (mut single, mut double) = (false, false);
-    let mut chars = command.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            // An escaped character never opens a quote or ends a part, as
-            // in the shell (and in `words`).
-            '\\' if !single => {
-                current.push(c);
-                current.extend(chars.next());
-                continue;
-            }
-            '\'' if !double => single = !single,
-            '"' if !single => double = !double,
-            '`' if !single => return None,
-            '$' | '<' | '>' if !single && chars.peek() == Some(&'(') => return None,
-            ';' | '\n' | '&' | '|' if !single && !double => {
-                if matches!(chars.peek(), Some('&' | '|')) {
-                    chars.next();
-                }
-                parts.push(std::mem::take(&mut current));
-                continue;
-            }
-            _ => {}
-        }
-        current.push(c);
-    }
-    if single || double {
-        return None;
-    }
-    parts.push(current);
-    let parts: Vec<String> = parts
-        .into_iter()
-        .map(|p| p.trim().to_owned())
-        .filter(|p| !p.is_empty())
-        .collect();
-    (!parts.is_empty()).then_some(parts)
+/// One simple command of a readable command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Simple {
+    /// The text of this command as written, trimmed.
+    pub raw: String,
+    /// The program and its arguments, quotes and escapes removed. `$NAME`
+    /// and `${NAME}` stay as written.
+    pub words: Vec<String>,
+    /// For each word, whether the shell can change it: a variable or an
+    /// unquoted glob character.
+    pub dynamic: Vec<bool>,
+    /// Its redirects.
+    pub redirects: Vec<Redirect>,
 }
 
-/// The words of one command part, with quotes and escapes removed. `None`
-/// when it redirects output (an unquoted `>`), unless `redirects` is true:
-/// then `>` is kept as a character.
+impl Simple {
+    /// The program word.
+    pub fn program(&self) -> &str {
+        self.words.first().map_or("", String::as_str)
+    }
+
+    /// Whether it opens a file for writing through a redirect (`>`, `>>`,
+    /// `&>`, …). A file number copy such as `2>&1` writes nothing.
+    pub fn writes(&self) -> bool {
+        self.redirects
+            .iter()
+            .any(|r| r.output && r.target.is_some())
+    }
+}
+
+/// One redirect of a simple command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redirect {
+    /// `>`-like (opens for writing) rather than `<`.
+    pub output: bool,
+    /// The file it opens; `None` for a file number copy (`2>&1`, `>&-`).
+    pub target: Option<String>,
+}
+
+/// Why a command is unreadable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    /// What Loop could not read.
+    pub reason: &'static str,
+    /// The program involved, when the reason is about one.
+    pub program: Option<String>,
+}
+
+impl Unreadable {
+    fn new(reason: &'static str) -> Self {
+        Self {
+            reason,
+            program: None,
+        }
+    }
+}
+
+/// Programs that run the program named in their arguments, or run code
+/// or shell escapes from their arguments or their input.
+pub const WRAPPERS: &[&str] = &[
+    "env", "command", "builtin", "exec", "eval", "source", ".", "time", "nohup", "nice", "timeout",
+    "stdbuf", "xargs", "sudo", "su", "doas", "sh", "bash", "zsh", "dash", "ksh", "fish", "csh",
+    "tcsh", "busybox", "parallel", "watch", "script", "awk", "gawk", "mawk", "nawk", "sed", "less",
+    "more",
+];
+
+/// Programs whose options can make them run another program. An argument
+/// the shell can change (a variable or a glob) could become such an
+/// option, so with one their command is unreadable.
+const RUNS_THROUGH_OPTIONS: &[&str] = &[
+    "find", "git", "rg", "sort", "tar", "ssh", "scp", "sftp", "man",
+];
+
+/// Shell keywords: they change how the following words are read.
+const KEYWORDS: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "case", "esac", "for", "select", "while", "until", "do",
+    "done", "function", "in", "coproc",
+];
+
+/// Built-in commands that change how later programs are found or run, or
+/// run text later.
+const SHELL_STATE: &[&str] = &[
+    "alias",
+    "unalias",
+    "hash",
+    "trap",
+    "enable",
+    "shopt",
+    "set",
+    "unset",
+    "bind",
+    "fc",
+    "read",
+    "mapfile",
+    "readarray",
+    "getopts",
+    "let",
+    "complete",
+];
+
+/// Built-ins that assign variables: unreadable when they set one of
+/// [`RISKY_VARIABLES`] or take an option.
+const ASSIGNERS: &[&str] = &["export", "declare", "typeset", "readonly", "local"];
+
+/// Variables that change which program a later command runs, or what the
+/// shell runs on its own.
+const RISKY_VARIABLES: &[&str] = &[
+    "PATH",
+    "ENV",
+    "BASH_ENV",
+    "IFS",
+    "CDPATH",
+    "PS4",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "GLOBIGNORE",
+    "PROMPT_COMMAND",
+    "FPATH",
+];
+
+/// Read `command` under the grammar of this module: its simple commands,
+/// or why it is unreadable.
+pub fn parse(command: &str) -> Result<Vec<Simple>, Unreadable> {
+    parse_with(command, WRAPPERS)
+}
+
+/// [`parse`] with another list of wrapper programs; for tests that check
+/// the checks.
+pub fn parse_with(command: &str, wrappers: &[&str]) -> Result<Vec<Simple>, Unreadable> {
+    let commands = Lexer::new(command).commands()?;
+    for simple in &commands {
+        check_program(simple, wrappers)?;
+    }
+    // An exported variable can change what a later command runs
+    // (`GIT_EXTERNAL_DIFF`, `BASH_FUNC_*`, …). Each tool call starts a new
+    // shell, so an export on its own changes nothing after it.
+    let last = commands.len().saturating_sub(1);
+    for simple in &commands[..last] {
+        if ASSIGNERS.contains(&base_name(simple.program()).as_str()) {
+            return Err(Unreadable {
+                reason: REASON_EXPORT,
+                program: Some(simple.program().to_owned()),
+            });
+        }
+    }
+    Ok(commands)
+}
+
+/// A program's last path part, lower-cased.
+fn base_name(program: &str) -> String {
+    program
+        .rsplit('/')
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase()
+}
+
+/// Why `command` is unreadable, or `None` when [`parse`] reads it.
+pub fn unreadable(command: &str) -> Option<&'static str> {
+    parse(command).err().map(|e| e.reason)
+}
+
+/// The parts of a command as written, one per simple command. `None` when
+/// it is unreadable.
+pub fn split_command(command: &str) -> Option<Vec<String>> {
+    parse(command)
+        .ok()
+        .map(|commands| commands.into_iter().map(|c| c.raw).collect())
+}
+
+/// The words of one command part, quotes and escapes removed. A readable
+/// part gives the words [`parse`] reads; with `redirects`, its redirect
+/// operators and targets follow as words. `None` when it writes through a
+/// redirect and `redirects` is false.
+///
+/// For text [`parse`] cannot read (the block list cuts an unreadable
+/// command at every separator and checks each piece), this falls back to a
+/// loose cut at whitespace outside quotes, so the block list errs on the
+/// side of seeing a program.
 pub fn split_words(part: &str, redirects: bool) -> Option<Vec<String>> {
+    match parse(part) {
+        Ok(commands) if commands.len() == 1 => {
+            let simple = &commands[0];
+            if simple.writes() && !redirects {
+                return None;
+            }
+            let mut words = simple.words.clone();
+            if redirects {
+                for r in &simple.redirects {
+                    words.push(if r.output { ">" } else { "<" }.to_owned());
+                    words.extend(r.target.clone());
+                }
+            }
+            Some(words)
+        }
+        _ => Some(loose_words(part)),
+    }
+}
+
+/// Whitespace-separated words with quote characters and backslashes
+/// removed outside single quotes. Not a reader: only the block list's
+/// fallback for unreadable text.
+fn loose_words(part: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let (mut single, mut double, mut started) = (false, false, false);
@@ -65,7 +245,6 @@ pub fn split_words(part: &str, redirects: bool) -> Option<Vec<String>> {
                 started = true;
             }
             '\\' if !single => current.extend(chars.next()),
-            '>' if !single && !double && !redirects => return None,
             c if c.is_whitespace() && !single && !double => {
                 if started || !current.is_empty() {
                     words.push(std::mem::take(&mut current));
@@ -78,5 +257,629 @@ pub fn split_words(part: &str, redirects: bool) -> Option<Vec<String>> {
     if started || !current.is_empty() {
         words.push(current);
     }
-    Some(words)
+    words
+}
+
+/// How to run `command` so that Loop can read it, when it is unreadable.
+pub fn unreadable_advice(command: &str) -> Option<String> {
+    let why = parse(command).err()?;
+    let advice = match why.reason {
+        REASON_SUBSTITUTION => {
+            "run the inner command on its own first, then use its output as plain text".into()
+        }
+        REASON_PAREN => "run the commands without the parentheses, one part at a time".into(),
+        REASON_BRACE => "write each word out in full, without `{` and `}`".into(),
+        REASON_DOLLAR => "use `$NAME` or `${NAME}` only, or write the value out".into(),
+        REASON_HEREDOC => "put the text in a file and pass the file".into(),
+        REASON_QUOTES => "close every quote, and keep each quoted text on one line".into(),
+        REASON_COMMENT => "remove the comment".into(),
+        REASON_TILDE => "use `~/…` at the start of a word, or write the path out".into(),
+        REASON_CHARACTER => "put the text in single quotes".into(),
+        REASON_SEPARATOR => "use `;`, `&&`, `||` or `|` between whole commands".into(),
+        REASON_REDIRECT => "use `<`, `>`, `>>` or `2>&1` with a plain file name".into(),
+        REASON_ASSIGNMENT => "leave the assignment out".into(),
+        REASON_PROGRAM_TEXT => "write the program name out in plain text".into(),
+        REASON_INTERPRETER => {
+            "put the code in a script file and run the file, or run the command directly".into()
+        }
+        REASON_KEYWORD => "run each command on its own, without the shell keyword".into(),
+        REASON_EXPORT => "run the export and the command as two separate commands".into(),
+        REASON_OPTION => match &why.program {
+            Some(option) => format!("remove the option `{option}`, which runs another program"),
+            None => "remove the option that runs another program".into(),
+        },
+        REASON_DYNAMIC => "write the arguments out in full, without variables or globs".into(),
+        REASON_STATE => match &why.program {
+            Some(program) => format!("run the commands without `{program}`"),
+            None => "run the commands without it".into(),
+        },
+        _ => match &why.program {
+            Some(program) => format!("remove `{program}` and run the inner command directly"),
+            None => "write the command in plain form".into(),
+        },
+    };
+    Some(format!(
+        "the command has {}; to run it, {advice}",
+        why.reason
+    ))
+}
+
+const REASON_SUBSTITUTION: &str = "a command substitution (`$(…)`, `$[…]` or backticks)";
+const REASON_PAREN: &str = "a subshell, function or other `(…)`";
+const REASON_BRACE: &str = "a group, function body or brace expansion";
+const REASON_DOLLAR: &str = "a `$` form other than `$NAME` or `${NAME}`";
+const REASON_HEREDOC: &str = "a here-document or here-string";
+const REASON_QUOTES: &str = "unbalanced quotes or a quoted newline";
+const REASON_COMMENT: &str = "a comment (`#`)";
+const REASON_TILDE: &str = "a `~`";
+const REASON_CHARACTER: &str = "a character the shell reads specially";
+const REASON_SEPARATOR: &str = "a background `&` or an empty command";
+const REASON_REDIRECT: &str = "a redirect Loop does not read";
+const REASON_ASSIGNMENT: &str = "a variable assignment before the program";
+const REASON_PROGRAM_TEXT: &str = "a program name that is not plain text";
+const REASON_INTERPRETER: &str = "an interpreter with inline code";
+const REASON_KEYWORD: &str = "a shell keyword";
+const REASON_WRAPPER: &str = "a program that runs another program";
+const REASON_STATE: &str = "a built-in that changes how later commands run";
+const REASON_EXPORT: &str = "a variable export before another command";
+const REASON_OPTION: &str = "an option that makes the program run another program";
+const REASON_DYNAMIC: &str =
+    "a variable or glob passed to a program whose options can run another program";
+
+/// The checks on a simple command's program.
+fn check_program(simple: &Simple, wrappers: &[&str]) -> Result<(), Unreadable> {
+    let program = simple.program();
+    let named = |reason| Unreadable {
+        reason,
+        program: Some(program.to_owned()),
+    };
+    let plain = !program.is_empty()
+        && !simple.dynamic[0]
+        && simple.raw.starts_with(program)
+        && program
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '+' | '-'));
+    if !plain {
+        let assignment = program.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        return Err(Unreadable::new(if assignment {
+            REASON_ASSIGNMENT
+        } else {
+            REASON_PROGRAM_TEXT
+        }));
+    }
+    let base = base_name(program);
+    if KEYWORDS.contains(&base.as_str()) {
+        return Err(named(REASON_KEYWORD));
+    }
+    if wrappers.contains(&base.as_str()) {
+        return Err(named(REASON_WRAPPER));
+    }
+    if SHELL_STATE.contains(&base.as_str()) {
+        return Err(named(REASON_STATE));
+    }
+    let args = &simple.words[1..];
+    if ASSIGNERS.contains(&base.as_str()) {
+        let identifier = |name: &str| {
+            name.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        let risky = args.iter().any(|a| {
+            let name = a.split('=').next().unwrap_or(a);
+            a.starts_with('-')
+                || !identifier(name)
+                || RISKY_VARIABLES.contains(&name)
+                || name.starts_with("LD_")
+                || name.starts_with("DYLD_")
+        });
+        if risky {
+            return Err(named(REASON_STATE));
+        }
+    }
+    if base == "printf" && args.iter().any(|a| a.starts_with("-v")) {
+        return Err(named(REASON_STATE));
+    }
+    let inline = |flags: &[&str]| args.iter().any(|w| flags.contains(&w.as_str()));
+    let interpreter = (base.starts_with("python") && inline(&["-c"]))
+        || (base == "node" && inline(&["-e", "--eval", "-p", "--print"]))
+        || (matches!(base.as_str(), "perl" | "ruby") && inline(&["-e", "-E"]));
+    if interpreter {
+        return Err(named(REASON_INTERPRETER));
+    }
+    if let Some(option) = runs_through_option(&base, args) {
+        return Err(Unreadable {
+            reason: REASON_OPTION,
+            program: Some(option.to_owned()),
+        });
+    }
+    if RUNS_THROUGH_OPTIONS.contains(&base.as_str()) && simple.dynamic.iter().skip(1).any(|&d| d) {
+        return Err(named(REASON_DYNAMIC));
+    }
+    Ok(())
+}
+
+/// The option of `args` that makes `program` run another program, if any.
+fn runs_through_option<'a>(program: &str, args: &'a [String]) -> Option<&'a str> {
+    let starts = |a: &str, options: &[&str]| {
+        options
+            .iter()
+            .any(|o| a == *o || (o.starts_with("--") && a.starts_with(&format!("{o}="))))
+    };
+    let found = |options: &[&str]| args.iter().find(|a| starts(a, options)).map(String::as_str);
+    match program {
+        "find" => found(&["-exec", "-execdir", "-ok", "-okdir"]),
+        "git" => {
+            // Options before the subcommand; `git log -c` is a log option.
+            let global = args.iter().take_while(|a| a.starts_with('-'));
+            global
+                .clone()
+                .find(|a| {
+                    starts(a, &["-c", "-C", "--config-env", "--exec-path"]) || a.starts_with("-c")
+                })
+                .or_else(|| {
+                    args.iter()
+                        .find(|a| starts(a, &["--upload-pack", "--receive-pack", "--ext-diff"]))
+                })
+                .map(String::as_str)
+        }
+        "rg" => found(&["--pre", "--pre-glob", "--hostname-bin"]),
+        "sort" => found(&["--compress-program"]),
+        "tar" => found(&[
+            "--to-command",
+            "--use-compress-program",
+            "-I",
+            "--checkpoint-action",
+            "--info-script",
+            "--new-volume-script",
+            "-F",
+        ]),
+        "ssh" | "scp" | "sftp" => args
+            .iter()
+            .find(|a| a.starts_with("-o") || a.starts_with("-F"))
+            .map(String::as_str),
+        "man" => args
+            .iter()
+            .find(|a| starts(a, &["-P", "--pager", "-H", "--html"]) || a.starts_with("-P"))
+            .map(String::as_str),
+        _ => None,
+    }
+}
+
+/// Unquoted characters an argument word may hold.
+fn plain_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '_' | '.' | '/' | '+' | '-' | '=' | ':' | ',' | '@' | '%')
+}
+
+/// Unquoted glob characters: kept as text, but they mark the word as one
+/// the shell can change.
+fn glob_char(c: char) -> bool {
+    matches!(c, '*' | '?' | '[' | ']')
+}
+
+/// The reader behind [`parse`].
+struct Lexer<'a> {
+    text: &'a str,
+    chars: Vec<(usize, char)>,
+    at: usize,
+}
+
+/// A separator after a simple command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sep {
+    Start,
+    Pipe,
+    And,
+    Or,
+    Semi,
+    Newline,
+    End,
+}
+
+/// A simple command's words, which of them the shell can change, and its
+/// redirects.
+type Parts = (Vec<String>, Vec<bool>, Vec<Redirect>);
+
+impl<'a> Lexer<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            chars: text.char_indices().collect(),
+            at: 0,
+        }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.at).map(|&(_, c)| c)
+    }
+
+    fn peek_at(&self, n: usize) -> Option<char> {
+        self.chars.get(self.at + n).map(|&(_, c)| c)
+    }
+
+    fn offset(&self) -> usize {
+        self.chars.get(self.at).map_or(self.text.len(), |&(i, _)| i)
+    }
+
+    fn skip_blanks(&mut self) {
+        while matches!(self.peek(), Some(' ' | '\t')) {
+            self.at += 1;
+        }
+    }
+
+    /// Every simple command. An empty command is allowed only at the end
+    /// of a line, after `;` or a newline (`ls;` and blank lines).
+    fn commands(&mut self) -> Result<Vec<Simple>, Unreadable> {
+        let mut out = Vec::new();
+        let mut before = Sep::Start;
+        loop {
+            let start = self.offset();
+            let (words, dynamic, redirects) = self.simple()?;
+            let end = self.offset();
+            let after = self.separator()?;
+            let raw = self.text[start..end].trim().to_owned();
+            if words.is_empty() {
+                if !redirects.is_empty() {
+                    return Err(Unreadable::new(REASON_REDIRECT));
+                }
+                let open_before = matches!(before, Sep::Pipe | Sep::And | Sep::Or);
+                let closes = matches!(after, Sep::Newline | Sep::End);
+                if open_before || !closes {
+                    return Err(Unreadable::new(REASON_SEPARATOR));
+                }
+            } else {
+                out.push(Simple {
+                    raw,
+                    words,
+                    dynamic,
+                    redirects,
+                });
+            }
+            if after == Sep::End {
+                break;
+            }
+            before = after;
+        }
+        if out.is_empty() {
+            return Err(Unreadable::new(REASON_SEPARATOR));
+        }
+        Ok(out)
+    }
+
+    /// The separator at the cursor, consumed.
+    fn separator(&mut self) -> Result<Sep, Unreadable> {
+        let Some(c) = self.peek() else {
+            return Ok(Sep::End);
+        };
+        let (sep, len) = match (c, self.peek_at(1)) {
+            ('|', Some('|')) => (Sep::Or, 2),
+            ('|', Some('&')) => return Err(Unreadable::new(REASON_SEPARATOR)),
+            ('|', _) => (Sep::Pipe, 1),
+            ('&', Some('&')) => (Sep::And, 2),
+            ('&', _) => return Err(Unreadable::new(REASON_SEPARATOR)),
+            (';', _) => (Sep::Semi, 1),
+            ('\n', _) => (Sep::Newline, 1),
+            _ => return Err(Unreadable::new(REASON_CHARACTER)),
+        };
+        self.at += len;
+        Ok(sep)
+    }
+
+    /// One simple command up to a separator.
+    fn simple(&mut self) -> Result<Parts, Unreadable> {
+        let (mut words, mut dynamic, mut redirects) = (Vec::new(), Vec::new(), Vec::new());
+        loop {
+            self.skip_blanks();
+            match self.peek() {
+                None | Some('|' | ';' | '\n') => break,
+                Some('&') if self.peek_at(1) != Some('>') => break,
+                _ => {}
+            }
+            if let Some(redirect) = self.redirect()? {
+                redirects.push(redirect);
+                continue;
+            }
+            let (word, changes) = self.word()?;
+            // A one-digit file number right before `<` or `>` belongs to
+            // the redirect.
+            if matches!(self.peek(), Some('<' | '>')) {
+                let fd = word.len() == 1 && word.chars().all(|c| c.is_ascii_digit()) && !changes;
+                if !fd {
+                    words.push(word);
+                    dynamic.push(changes);
+                }
+                match self.redirect()? {
+                    Some(redirect) => redirects.push(redirect),
+                    None => return Err(Unreadable::new(REASON_REDIRECT)),
+                }
+                continue;
+            }
+            words.push(word);
+            dynamic.push(changes);
+        }
+        Ok((words, dynamic, redirects))
+    }
+
+    /// A redirect at the cursor, consumed; `None` when there is none.
+    fn redirect(&mut self) -> Result<Option<Redirect>, Unreadable> {
+        let c = self.peek();
+        let (output, len) = match (c, self.peek_at(1)) {
+            (Some('&'), Some('>')) => (true, if self.peek_at(2) == Some('>') { 3 } else { 2 }),
+            (Some('>'), Some('>' | '|')) => (true, 2),
+            (Some('>' | '<'), Some('&')) => {
+                self.at += 2;
+                // A file number copy or close: `>&2`, `<&0`, `>&-`.
+                let mut digits = 0;
+                while matches!(self.peek(), Some('0'..='9')) {
+                    self.at += 1;
+                    digits += 1;
+                }
+                let closed = digits == 0 && self.peek() == Some('-');
+                if closed {
+                    self.at += 1;
+                }
+                let ends = matches!(self.peek(), None | Some(' ' | '\t' | '\n' | ';' | '|'))
+                    || (self.peek() == Some('&') && self.peek_at(1) == Some('&'));
+                if (digits == 1 || closed) && ends {
+                    return Ok(Some(Redirect {
+                        output: c == Some('>'),
+                        target: None,
+                    }));
+                }
+                return Err(Unreadable::new(REASON_REDIRECT));
+            }
+            (Some('<'), Some('<')) => return Err(Unreadable::new(REASON_HEREDOC)),
+            (Some('<'), Some('>' | '(')) | (Some('>'), Some('(')) => {
+                return Err(Unreadable::new(REASON_REDIRECT))
+            }
+            (Some('>'), _) => (true, 1),
+            (Some('<'), _) => (false, 1),
+            _ => return Ok(None),
+        };
+        self.at += len;
+        self.skip_blanks();
+        if matches!(self.peek(), None | Some('|' | '&' | ';' | '\n' | '<' | '>')) {
+            return Err(Unreadable::new(REASON_REDIRECT));
+        }
+        let (target, _) = self.word()?;
+        Ok(Some(Redirect {
+            output,
+            target: Some(target),
+        }))
+    }
+
+    /// One word at the cursor: its text and whether the shell can change
+    /// it. It stops at a blank, a separator or a redirect.
+    fn word(&mut self) -> Result<(String, bool), Unreadable> {
+        let start = self.at;
+        let mut text = String::new();
+        let mut changes = false;
+        while let Some(c) = self.peek() {
+            match c {
+                ' ' | '\t' | '\n' | '|' | ';' | '&' | '<' | '>' => break,
+                '\'' => {
+                    self.at += 1;
+                    loop {
+                        match self.peek() {
+                            None | Some('\n' | '\r') => return Err(Unreadable::new(REASON_QUOTES)),
+                            Some('\'') => break,
+                            Some(c) => text.push(c),
+                        }
+                        self.at += 1;
+                    }
+                }
+                '"' => {
+                    self.at += 1;
+                    self.double_quoted(&mut text, &mut changes)?;
+                    continue;
+                }
+                '\\' => {
+                    match self.peek_at(1) {
+                        Some(c) if c.is_ascii_graphic() || c == ' ' => text.push(c),
+                        _ => return Err(Unreadable::new(REASON_CHARACTER)),
+                    }
+                    self.at += 1;
+                }
+                '$' => {
+                    self.at += 1;
+                    text.push_str(&self.parameter()?);
+                    changes = true;
+                    continue;
+                }
+                '#' => return Err(Unreadable::new(REASON_COMMENT)),
+                '(' | ')' => return Err(Unreadable::new(REASON_PAREN)),
+                '{' | '}' => return Err(Unreadable::new(REASON_BRACE)),
+                '`' => return Err(Unreadable::new(REASON_SUBSTITUTION)),
+                // A tilde expands at the start of a word and after `=` or
+                // `:`; elsewhere (`HEAD~1`) it is text.
+                '~' => {
+                    let previous = (self.at > start).then(|| self.chars[self.at - 1].1);
+                    match previous {
+                        // `~` or `~/…` at the start of a word: the home
+                        // directory, which the shell fills in.
+                        None if matches!(
+                            self.peek_at(1),
+                            None | Some('/' | ' ' | '\t' | '\n' | ';' | '|' | '&' | '<' | '>')
+                        ) =>
+                        {
+                            changes = true;
+                        }
+                        // `~user`, `~+`, `~-`, and after `=` or `:`.
+                        None | Some('=' | ':') => return Err(Unreadable::new(REASON_TILDE)),
+                        Some(_) => {}
+                    }
+                    text.push('~');
+                }
+                c if plain_char(c) => text.push(c),
+                c if glob_char(c) => {
+                    text.push(c);
+                    changes = true;
+                }
+                _ => return Err(Unreadable::new(REASON_CHARACTER)),
+            }
+            self.at += 1;
+        }
+        Ok((text, changes))
+    }
+
+    /// The rest of a double-quoted string, after its `"`.
+    fn double_quoted(&mut self, text: &mut String, changes: &mut bool) -> Result<(), Unreadable> {
+        loop {
+            match self.peek() {
+                None | Some('\n' | '\r') => return Err(Unreadable::new(REASON_QUOTES)),
+                Some('"') => {
+                    self.at += 1;
+                    return Ok(());
+                }
+                Some('`') => return Err(Unreadable::new(REASON_SUBSTITUTION)),
+                Some('!') => return Err(Unreadable::new(REASON_CHARACTER)),
+                Some('\\') => {
+                    match self.peek_at(1) {
+                        Some(c @ ('$' | '`' | '"' | '\\')) => text.push(c),
+                        Some(c) if !c.is_control() => {
+                            text.push('\\');
+                            text.push(c);
+                        }
+                        _ => return Err(Unreadable::new(REASON_QUOTES)),
+                    }
+                    self.at += 2;
+                }
+                Some('$') => {
+                    self.at += 1;
+                    text.push_str(&self.parameter()?);
+                    *changes = true;
+                }
+                Some(c) if c.is_control() && c != '\t' => {
+                    return Err(Unreadable::new(REASON_CHARACTER))
+                }
+                Some(c) => {
+                    text.push(c);
+                    self.at += 1;
+                }
+            }
+        }
+    }
+
+    /// `NAME` or `{NAME}` after a `$`, returned as written with the `$`.
+    fn parameter(&mut self) -> Result<String, Unreadable> {
+        let name_start = |c: char| c.is_ascii_alphabetic() || c == '_';
+        let name_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let braced = self.peek() == Some('{');
+        if braced {
+            self.at += 1;
+        }
+        match self.peek() {
+            Some(c) if name_start(c) => {}
+            Some('(' | '[') => return Err(Unreadable::new(REASON_SUBSTITUTION)),
+            _ => return Err(Unreadable::new(REASON_DOLLAR)),
+        }
+        let mut name = String::new();
+        while let Some(c) = self.peek().filter(|&c| name_char(c)) {
+            name.push(c);
+            self.at += 1;
+        }
+        if braced {
+            if self.peek() != Some('}') {
+                return Err(Unreadable::new(REASON_DOLLAR));
+            }
+            self.at += 1;
+            return Ok(format!("${{{name}}}"));
+        }
+        Ok(format!("${name}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn programs(command: &str) -> Vec<String> {
+        parse(command)
+            .unwrap()
+            .iter()
+            .map(|s| s.program().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn reads_the_grammar() {
+        assert_eq!(
+            programs("ls -la | grep x && wc -l; cat a\nhead b"),
+            ["ls", "grep", "wc", "cat", "head"]
+        );
+        let simple = &parse("grep -rn \"x y\" 'a b' c\\ d $HOME \"${HOME}/x\"").unwrap()[0];
+        assert_eq!(
+            simple.words,
+            ["grep", "-rn", "x y", "a b", "c d", "$HOME", "${HOME}/x"]
+        );
+        assert_eq!(
+            simple.dynamic,
+            [false, false, false, false, false, true, true]
+        );
+        let simple = &parse("cargo test 2>&1 >out <in").unwrap()[0];
+        assert_eq!(simple.words, ["cargo", "test"]);
+        assert!(simple.writes());
+        assert!(!parse("cargo test 2>&1").unwrap()[0].writes());
+        assert_eq!(parse("ls;\n").unwrap().len(), 1);
+        assert_eq!(parse("grep \"a\\.b\" f").unwrap()[0].words[1], "a\\.b");
+    }
+
+    #[test]
+    fn everything_else_is_unreadable() {
+        for command in [
+            "echo #'\ntouch x\n'",
+            "echo ${x:=a[\\$(touch x)]}; echo $[x]",
+            "echo ${s:1}",
+            "export y=ouch; t${y} x",
+            "echo $'a'",
+            "echo $\"a\"",
+            "echo $$",
+            "echo $?",
+            "echo $1",
+            "echo 'a\nb'",
+            "echo \"a\nb\"",
+            "echo \"`x`\"",
+            "echo \"$(x)\"",
+            "ls &",
+            "ls |& cat",
+            "ls ;; ls",
+            "ls | ",
+            "(ls)",
+            "{ ls; }",
+            "ls ~user",
+            "ls ~+",
+            "cp a x=~/b",
+            "~/bin/tool",
+            "echo a\r",
+            "cat <<EOF",
+            "cat <> f",
+            "echo a\\",
+            "for f in a; do touch $f; done",
+            "f() { touch x; }",
+            "X=1 ls",
+            "'ls' -la",
+            "\\ls",
+            "env ls",
+            "hash -p /bin/touch ls; ls x",
+            "read PATH < f; ls",
+            "export PATH=.; ls",
+            "printf -v PATH x; ls",
+            "trap 'touch x' EXIT",
+            "echo é",
+            "> out",
+            "[ -f x ]",
+        ] {
+            assert!(parse(command).is_err(), "readable: {command:?}");
+        }
+        // An export before another command: unreadable; alone: readable.
+        assert!(parse("export FOO=1; cargo test").is_err());
+        assert!(parse("export FOO=1").is_ok());
+        assert!(parse("export 'BASH_FUNC_ls%%=() { touch P; }'").is_err());
+        let home = &parse("cat ~/notes.txt ~").unwrap()[0];
+        assert_eq!(home.words, ["cat", "~/notes.txt", "~"]);
+        assert_eq!(home.dynamic, [false, true, true]);
+    }
 }

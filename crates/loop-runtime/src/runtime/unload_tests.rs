@@ -150,6 +150,10 @@ async fn parked(rt: &Runtime, session: &SessionRef) {
 struct Watching;
 #[async_trait]
 impl EscalationRecipient for Watching {
+    fn caller(&self) -> Option<loop_protocol::Caller> {
+        None
+    }
+
     fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
     async fn interact(
         &self,

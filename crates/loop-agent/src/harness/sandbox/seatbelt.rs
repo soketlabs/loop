@@ -330,6 +330,88 @@ pub struct SeatbeltPolicy {
     home_reads: Option<(Vec<PathBuf>, Vec<PathBuf>)>,
 }
 
+/// The secrets below the home directory (and the system keychains) that
+/// the Seatbelt profile denies to sandboxed commands, whatever the Policy:
+/// credential stores, shell histories and other agents' configuration. The
+/// edge listener's tool-lock root check reads the same list.
+pub fn sensitive_home_paths(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".git-credentials"),
+        home.join(".config/git/credentials"),
+        home.join(".cargo/credentials"),
+        home.join(".cargo/credentials.toml"),
+        home.join(".gem/credentials"),
+        home.join(".terraform.d/credentials.tfrc.json"),
+        home.join(".azure"),
+        home.join(".config/hub"),
+        home.join(".bash_history"),
+        home.join(".zsh_history"),
+        home.join(".zhistory"),
+        home.join(".sh_history"),
+        home.join(".history"),
+        home.join(".local/share/fish/fish_history"),
+        home.join(".python_history"),
+        home.join(".node_repl_history"),
+        home.join(".psql_history"),
+        home.join(".mysql_history"),
+        home.join(".sqlite_history"),
+        home.join(".lesshst"),
+        home.join(".netrc"),
+        home.join(".docker/config.json"),
+        home.join(".kube/config"),
+        home.join(".npmrc"),
+        home.join(".pypirc"),
+        home.join(".config/gcloud"),
+        home.join("Library/Cookies"),
+        home.join(".codex"),
+        home.join(".claude"),
+        home.join(".claude.json"),
+        home.join(".gemini"),
+        home.join(".qwen"),
+        home.join(".copilot"),
+        home.join(".config/github-copilot"),
+        home.join(".cursor"),
+        home.join(".continue"),
+        home.join(".aider.conf.yml"),
+        home.join(".config/opencode"),
+        home.join(".local/share/opencode"),
+        home.join(".config/goose"),
+        home.join(".config/amp"),
+        home.join(".local/share/amp"),
+        home.join(".ssh"),
+        home.join(".aws"),
+        home.join(".gnupg"),
+        home.join(".config/gh"),
+        home.join("Library/Keychains"),
+        PathBuf::from("/Library/Keychains"),
+    ]
+}
+
+/// [`sensitive_home_paths`] and more folders that hold credentials or
+/// personal data: whole credential stores and browser profiles. The Edge
+/// listener's tool-lock root check uses this wider list; the Seatbelt
+/// profile does not deny these, so tools such as `docker` and `kubectl`
+/// keep working inside the sandbox.
+pub fn sensitive_home_paths_extended(home: &Path) -> Vec<PathBuf> {
+    let mut paths = sensitive_home_paths(home);
+    paths.extend([
+        home.join(".password-store"),
+        home.join(".local/share/keyrings"),
+        home.join(".kube"),
+        home.join(".docker"),
+        home.join(".mozilla"),
+        home.join(".config/google-chrome"),
+        home.join(".config/chromium"),
+        home.join(".config/BraveSoftware"),
+        home.join("Library/Application Support/Google/Chrome"),
+        home.join("Library/Application Support/Firefox"),
+        home.join("Library/Application Support/BraveSoftware"),
+        home.join("Library/Application Support/Microsoft Edge"),
+        home.join("Library/Safari"),
+    ]);
+    paths
+}
+
 impl SeatbeltPolicy {
     /// Build a policy with explicit home, agent directory and Runtime endpoints.
     pub fn new(
@@ -349,66 +431,20 @@ impl SeatbeltPolicy {
         // write its git directory outside the project.
         writes.extend(project_git_writes(&project)?);
         let mut denied_paths = vec![];
-        for path in [
-            home.join(".git-credentials"),
-            home.join(".config/git/credentials"),
-            home.join(".cargo/credentials"),
-            home.join(".cargo/credentials.toml"),
-            home.join(".gem/credentials"),
-            home.join(".terraform.d/credentials.tfrc.json"),
-            home.join(".azure"),
-            home.join(".config/hub"),
-            home.join(".bash_history"),
-            home.join(".zsh_history"),
-            home.join(".zhistory"),
-            home.join(".sh_history"),
-            home.join(".history"),
-            home.join(".local/share/fish/fish_history"),
-            home.join(".python_history"),
-            home.join(".node_repl_history"),
-            home.join(".psql_history"),
-            home.join(".mysql_history"),
-            home.join(".sqlite_history"),
-            home.join(".lesshst"),
-            home.join(".netrc"),
-            home.join(".docker/config.json"),
-            home.join(".kube/config"),
-            home.join(".npmrc"),
-            home.join(".pypirc"),
-            home.join(".config/gcloud"),
-            home.join("Library/Cookies"),
-            home.join(".codex"),
-            home.join(".claude"),
-            home.join(".claude.json"),
-            home.join(".gemini"),
-            home.join(".qwen"),
-            home.join(".copilot"),
-            home.join(".config/github-copilot"),
-            home.join(".cursor"),
-            home.join(".continue"),
-            home.join(".aider.conf.yml"),
-            home.join(".config/opencode"),
-            home.join(".local/share/opencode"),
-            home.join(".config/goose"),
-            home.join(".config/amp"),
-            home.join(".local/share/amp"),
-            home.join(".ssh"),
-            home.join(".aws"),
-            home.join(".gnupg"),
-            home.join(".config/gh"),
-            home.join("Library/Keychains"),
-            PathBuf::from("/Library/Keychains"),
-            agent.join("auth.json"),
-            agent.join("run"),
-            agent.join("mcp-auth"),
-            agent.join("agents"),
-            agent.join("history.json"),
-            agent.join("history"),
-            agent.join("logs"),
-            agent.join("usage"),
-        ]
-        .into_iter()
-        .chain(runtime_paths.iter().cloned())
+        for path in sensitive_home_paths(home)
+            .into_iter()
+            .chain([
+                agent.join("auth.json"),
+                agent.join("audit"),
+                agent.join("run"),
+                agent.join("mcp-auth"),
+                agent.join("agents"),
+                agent.join("history.json"),
+                agent.join("history"),
+                agent.join("logs"),
+                agent.join("usage"),
+            ])
+            .chain(runtime_paths.iter().cloned())
         {
             // Protect both the configured name and its resolved target.
             denied_paths.push(std::path::absolute(&path).map_err(io_error)?);
@@ -1463,6 +1499,75 @@ fn shell_quote(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The paths the Seatbelt profile denies below the home directory. A
+    /// change here changes what sandboxed commands can read, so it must be
+    /// deliberate: the Edge listener's wider list is
+    /// [`sensitive_home_paths_extended`].
+    #[test]
+    fn the_seatbelt_sensitive_list_is_pinned() {
+        let home = Path::new("/h");
+        let expected: Vec<PathBuf> = [
+            ".git-credentials",
+            ".config/git/credentials",
+            ".cargo/credentials",
+            ".cargo/credentials.toml",
+            ".gem/credentials",
+            ".terraform.d/credentials.tfrc.json",
+            ".azure",
+            ".config/hub",
+            ".bash_history",
+            ".zsh_history",
+            ".zhistory",
+            ".sh_history",
+            ".history",
+            ".local/share/fish/fish_history",
+            ".python_history",
+            ".node_repl_history",
+            ".psql_history",
+            ".mysql_history",
+            ".sqlite_history",
+            ".lesshst",
+            ".netrc",
+            ".docker/config.json",
+            ".kube/config",
+            ".npmrc",
+            ".pypirc",
+            ".config/gcloud",
+            "Library/Cookies",
+            ".codex",
+            ".claude",
+            ".claude.json",
+            ".gemini",
+            ".qwen",
+            ".copilot",
+            ".config/github-copilot",
+            ".cursor",
+            ".continue",
+            ".aider.conf.yml",
+            ".config/opencode",
+            ".local/share/opencode",
+            ".config/goose",
+            ".config/amp",
+            ".local/share/amp",
+            ".ssh",
+            ".aws",
+            ".gnupg",
+            ".config/gh",
+            "Library/Keychains",
+        ]
+        .iter()
+        .map(|p| home.join(p))
+        .chain([PathBuf::from("/Library/Keychains")])
+        .collect();
+        assert_eq!(sensitive_home_paths(home), expected);
+        let extended = sensitive_home_paths_extended(home);
+        assert!(extended.starts_with(&expected));
+        for wider in [".docker", ".kube", ".password-store", ".mozilla"] {
+            assert!(!expected.contains(&home.join(wider)), "{wider}");
+            assert!(extended.contains(&home.join(wider)), "{wider}");
+        }
+    }
 
     #[test]
     fn paths_are_parameters_not_profile_source() {

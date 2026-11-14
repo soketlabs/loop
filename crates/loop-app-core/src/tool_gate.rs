@@ -13,6 +13,13 @@
 //! After the call, the approver's file review runs (unless step 2 or 3
 //! allowed the call), then `tool_result` hooks, which may add context for
 //! the model.
+//!
+//! Every decision is written as a decision record to the gate's
+//! [`DecisionSink`] before the call runs ([`crate::permissions::decision`]).
+//! A record that cannot be written refuses the call.
+//!
+//! A command the user typed (`session/shell`) passes the same Policy
+//! layers, rules and mode as a `bash` call ([`ToolGate::check_user_command`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -31,8 +38,13 @@ use tokio_util::sync::CancellationToken;
 
 use loop_protocol::ToolKind;
 
-use crate::permissions::{Call, Decision, PermissionMode, Policy};
-use crate::tool_approval::{PlanReview, ToolApprovalBridge, ToolPermission};
+use crate::permissions::decision::{
+    self, DecidedBy, DecisionAnswer, DecisionOutcome, DecisionSink, DecisionSource,
+    PolicyDecisionRecord,
+};
+use crate::permissions::{Call, Decision, LayerSource, PermissionMode, Policy, Verdict};
+use crate::tool_approval::{PlanReview, Review, ToolApprovalBridge, ToolPermission};
+use loop_protocol::Caller;
 
 /// Why a call that needs approval is refused when nobody can approve it,
 /// naming a mode that would allow it.
@@ -94,6 +106,148 @@ pub struct ToolGate {
     /// Under a tool lock: the Session's folder and root as they resolved
     /// when it opened. Set once; every path check compares against it.
     confinement: std::sync::OnceLock<Arc<crate::permissions::tool_lock::Confinement>>,
+    /// Where the decision records go. `None` records nothing (a bare gate in
+    /// tests); every Session the factory opens has one.
+    decisions: Mutex<Option<Arc<dyn DecisionSink>>>,
+}
+
+/// What the gate decided about one call, before it is recorded.
+#[derive(Debug, Clone)]
+pub(crate) struct Decided {
+    pub(crate) outcome: DecisionOutcome,
+    pub(crate) answer: Option<DecisionAnswer>,
+    pub(crate) by: DecidedBy,
+    pub(crate) layer: Option<LayerSource>,
+    pub(crate) rule: Option<String>,
+    pub(crate) reason: Option<String>,
+    pub(crate) escalation: Option<String>,
+}
+
+impl Decided {
+    /// The mode's and the Policy's verdict as it stands.
+    pub(crate) fn from_verdict(verdict: &Verdict) -> Self {
+        let (outcome, reason) = match &verdict.decision {
+            Decision::Allow => (DecisionOutcome::Allow, None),
+            Decision::Ask => (DecisionOutcome::Ask, None),
+            Decision::Deny(reason) => (DecisionOutcome::Deny, Some(reason.clone())),
+        };
+        Self {
+            outcome,
+            answer: None,
+            by: verdict.by,
+            layer: verdict.layer,
+            rule: verdict.rule.clone(),
+            reason,
+            escalation: None,
+        }
+    }
+
+    /// A refusal by `by`.
+    pub(crate) fn deny(by: DecidedBy, reason: impl Into<String>) -> Self {
+        Self {
+            outcome: DecisionOutcome::Deny,
+            answer: None,
+            by,
+            layer: None,
+            rule: None,
+            reason: Some(reason.into()),
+            escalation: None,
+        }
+    }
+
+    /// An allow by `by`.
+    pub(crate) fn allow(by: DecidedBy) -> Self {
+        Self {
+            outcome: DecisionOutcome::Allow,
+            answer: None,
+            by,
+            layer: None,
+            rule: None,
+            reason: None,
+            escalation: None,
+        }
+    }
+
+    /// An "ask" the approver answered (`allowed`), through `escalation`.
+    pub(crate) fn answered(allowed: bool, escalation: Option<String>) -> Self {
+        Self {
+            outcome: DecisionOutcome::Ask,
+            answer: Some(if allowed {
+                DecisionAnswer::Allow
+            } else {
+                DecisionAnswer::Deny
+            }),
+            by: DecidedBy::Approver,
+            layer: None,
+            rule: None,
+            reason: None,
+            escalation,
+        }
+    }
+
+    /// Keep the layer and the rule of `verdict`, which led here.
+    pub(crate) fn after(mut self, verdict: &Verdict) -> Self {
+        self.layer = self.layer.or(verdict.layer);
+        self.rule = self.rule.or_else(|| verdict.rule.clone());
+        self
+    }
+
+    /// With `reason`.
+    pub(crate) fn because(mut self, reason: Option<String>) -> Self {
+        self.reason = reason;
+        self
+    }
+}
+
+/// An effect of the approver's answer, made only once the decision is
+/// recorded.
+pub(crate) enum After {
+    /// Approving a plan changes the mode.
+    Mode(PermissionMode),
+    /// "Accept all" grants a group for the rest of the Session.
+    Grant(&'static str),
+}
+
+/// The call a decision is about.
+pub(crate) struct Facts<'a> {
+    pub(crate) source: DecisionSource,
+    pub(crate) tool: &'a str,
+    pub(crate) kind: ToolKind,
+    pub(crate) call_id: Option<&'a str>,
+    pub(crate) args: &'a serde_json::Value,
+    /// Who acts, when the caller is known here (a user command); else the
+    /// sink says.
+    pub(crate) caller: Option<Caller>,
+    /// The Session, when known here.
+    pub(crate) session: Option<String>,
+}
+
+/// The rule name a record gives the `bash` block list.
+const BLOCK_LIST: &str = "bash block list";
+
+/// The `reason` a record keeps. An approver's or a hook's text can quote
+/// the call (a URL with a token, a search query, a command), so those get
+/// a fixed text; Loop's own reasons are scrubbed of URL credentials and
+/// capped ([`decision::scrub`]).
+fn record_reason(decided: &Decided) -> Option<String> {
+    let reason = decided.reason.as_deref()?;
+    Some(match decided.by {
+        DecidedBy::Approver => "the approver rejected it".to_owned(),
+        DecidedBy::Hook => "a tool_call hook blocked it".to_owned(),
+        _ => decision::scrub(reason, decision::MAX_REASON_BYTES),
+    })
+}
+
+/// Where a call reached the gate from, by its name and id: an MCP tool, a
+/// `/workflow` shell task (`wf-shell-…`), or the model's own tool.
+fn source_of(call: &ToolCall) -> DecisionSource {
+    if call.id.starts_with("wf-shell-") {
+        return DecisionSource::Workflow;
+    }
+    match loop_agent::harness::mcp::bridge::parse_mcp_tool_name(&call.name) {
+        Some((server, _)) => DecisionSource::Mcp(server.to_owned()),
+        None => DecisionSource::Native,
+    }
 }
 
 /// See [`ToolGate::set_mode_recorder`].
@@ -305,19 +459,29 @@ impl ToolGate {
     /// What the mode and the Policy say about a call, before hooks and the
     /// approver.
     pub async fn decide(&self, tool: &str, args: &serde_json::Value) -> Decision {
+        self.verdict(tool, args).await.decision
+    }
+
+    /// [`Self::decide`], with the step and the layer that decided.
+    pub async fn verdict(&self, tool: &str, args: &serde_json::Value) -> Verdict {
         if let Some(confined) = self.confinement.get() {
             if confined.moved() {
-                return Decision::Deny(format!(
-                    "`{tool}` is refused: this Session's folder {} was moved or replaced \
-                     after the Session opened, so the tool lock refuses every call of this \
-                     Session. Open a new Session.",
-                    confined.folder().display()
-                ));
+                return Verdict {
+                    decision: Decision::Deny(format!(
+                        "`{tool}` is refused: this Session's folder {} was moved or replaced \
+                         after the Session opened, so the tool lock refuses every call of \
+                         this Session. Open a new Session.",
+                        confined.folder().display()
+                    )),
+                    by: DecidedBy::Off,
+                    rule: None,
+                    layer: Some(LayerSource::Runtime),
+                };
             }
         }
         let call = self.call(tool, args).await;
         self.effective_policy()
-            .decide(self.mode(), &self.rules(), &call)
+            .decide_why(self.mode(), &self.rules(), &call)
     }
 
     async fn call(&self, tool: &str, args: &serde_json::Value) -> Call {
@@ -356,6 +520,18 @@ impl ToolGate {
         args: &serde_json::Value,
         cwd: &std::path::Path,
     ) -> Option<String> {
+        self.agent_call_denied_by(kind, args, cwd)
+            .map(|(reason, _)| reason)
+    }
+
+    /// [`Self::agent_call_denied`], with the `toolPermissions` key that
+    /// denied it.
+    pub fn agent_call_denied_by(
+        &self,
+        kind: ToolKind,
+        args: &serde_json::Value,
+        cwd: &std::path::Path,
+    ) -> Option<(String, Option<String>)> {
         let tools: &[&str] = match kind {
             ToolKind::Execute => &["bash"],
             ToolKind::Edit | ToolKind::Delete | ToolKind::Move => &["write", "edit"],
@@ -371,9 +547,13 @@ impl ToolGate {
                 rule_bases: self.rule_bases.lock().clone(),
                 ..Call::resolve_in(tool, kind, args, &workspace, cwd)
             };
-            let rule = crate::permissions::rule_for(&rules, &call);
-            (rule.permission == ToolPermission::Deny)
-                .then(|| format!("Tool `{tool}` is denied by settings.toolPermissions"))
+            let (rule, key) = crate::permissions::rule_and_key(&rules, &call);
+            (rule.permission == ToolPermission::Deny).then(|| {
+                (
+                    format!("Tool `{tool}` is denied by settings.toolPermissions"),
+                    key,
+                )
+            })
         })
     }
 
@@ -500,7 +680,7 @@ impl ToolGate {
         &self,
         ctx: &BeforeToolCallContext,
         cancel: Option<CancellationToken>,
-    ) -> Option<BeforeToolCallResult> {
+    ) -> (Option<BeforeToolCallResult>, Decided, Option<After>) {
         let block = |reason: String| {
             Some(BeforeToolCallResult {
                 block: true,
@@ -508,10 +688,12 @@ impl ToolGate {
             })
         };
         let Some(approver) = self.approver() else {
-            return block(
-                "Plan mode ends when the user approves the plan, and nobody can approve it in \
-                 this run. Give the plan as your answer instead."
-                    .into(),
+            let reason = "Plan mode ends when the user approves the plan, and nobody can \
+                          approve it in this run. Give the plan as your answer instead.";
+            return (
+                block(reason.into()),
+                Decided::deny(DecidedBy::NoApprover, reason),
+                None,
             );
         };
         let plan = ctx
@@ -520,107 +702,367 @@ impl ToolGate {
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         let back = *self.plan_return.lock();
-        match approver.review_plan(plan, back.as_str(), cancel).await {
+        let (review, escalation) = approver.review_plan(plan, back.as_str(), cancel).await;
+        match review {
             PlanReview::Approved { accept_edits } => {
                 let mode = if accept_edits {
                     PermissionMode::AcceptEdits
                 } else {
                     back
                 };
-                self.set_mode(mode);
-                let recorder = self.mode_recorder.lock().clone();
-                if let Some(recorder) = recorder {
-                    recorder(mode).await;
-                }
-                None
+                // The mode changes once the decision is recorded.
+                (
+                    None,
+                    Decided::answered(true, escalation),
+                    Some(After::Mode(mode)),
+                )
             }
-            PlanReview::KeepPlanning(reason) => block(match reason {
-                Some(reason) => format!(
-                    "The user wants changes to the plan: {reason}. Stay in plan mode, revise the \
-                     plan and call {EXIT_PLAN_TOOL} again."
-                ),
-                None => format!(
-                    "The user did not approve the plan. Stay in plan mode: ask what to change, \
-                     or revise the plan and call {EXIT_PLAN_TOOL} again."
-                ),
-            }),
+            PlanReview::KeepPlanning(reason) => {
+                let reason = match reason {
+                    Some(reason) => format!(
+                        "The user wants changes to the plan: {reason}. Stay in plan mode, \
+                         revise the plan and call {EXIT_PLAN_TOOL} again."
+                    ),
+                    None => format!(
+                        "The user did not approve the plan. Stay in plan mode: ask what to \
+                         change, or revise the plan and call {EXIT_PLAN_TOOL} again."
+                    ),
+                };
+                let decided = Decided::answered(false, escalation).because(Some(reason.clone()));
+                (block(reason), decided, None)
+            }
         }
+    }
+
+    /// Write the decision record for `facts` and `decided` to the sink, and
+    /// wait for it. With no sink, nothing is written. `Err` is the refusal
+    /// to give when the record could not be written.
+    pub(crate) async fn record(&self, facts: Facts<'_>, decided: &Decided) -> Result<(), String> {
+        let Some(sink) = self.decisions.lock().clone() else {
+            return Ok(());
+        };
+        let context = sink.context(decided.escalation.as_deref());
+        let caller = facts.caller.unwrap_or(context.caller);
+        let session = match facts.session.or(context.session) {
+            Some(session) => Some(session),
+            None => self.harness_session().await,
+        };
+        let capability = Call {
+            kind: facts.kind,
+            ..Call::new(facts.tool, serde_json::Value::Null, PathBuf::new())
+        };
+        let record = PolicyDecisionRecord {
+            id: decision::record_id(),
+            ts_ms: decision::now_ms(),
+            tenant: caller.tenant().clone(),
+            principal: caller.principal().clone(),
+            via: caller.via().cloned(),
+            session,
+            turn: context.turn,
+            call_id: facts.call_id.filter(|id| !id.is_empty()).map(str::to_owned),
+            source: facts.source,
+            tool: decision::scrub(facts.tool, decision::MAX_NAME_BYTES),
+            kind: facts.kind,
+            capability: crate::permissions::Capability::of(&capability).id(),
+            subject: decision::subject_of(facts.kind, facts.args),
+            args_sha256: Some(decision::args_sha256(facts.args)),
+            outcome: decided.outcome,
+            answer: decided.answer,
+            by: decided.by,
+            layer: decided.layer.map(|layer| layer.id().to_owned()),
+            rule: decided
+                .rule
+                .as_deref()
+                .map(|rule| decision::scrub(rule, decision::MAX_NAME_BYTES)),
+            mode: Some(self.mode().as_str().to_owned()),
+            escalation: decided.escalation.clone(),
+            answered_by: (decided.by == DecidedBy::Approver)
+                .then_some(context.answered_by)
+                .flatten()
+                .map(|caller| caller.principal().clone()),
+            reason: record_reason(decided),
+        };
+        sink.record(&record).await.map_err(|error| {
+            tracing::warn!(%error, "Policy decision not recorded; the call is refused");
+            format!("`{}` is refused: {error}", facts.tool)
+        })
+    }
+
+    /// The Session id of the harness, when there is one.
+    async fn harness_session(&self) -> Option<String> {
+        let harness = self.harness.lock().upgrade()?;
+        let id = harness.session_id().await;
+        (!id.is_empty()).then_some(id)
+    }
+
+    /// Write every decision record to `sink` from now on (`None`: write
+    /// none).
+    pub fn set_decision_sink(&self, sink: Option<Arc<dyn DecisionSink>>) {
+        *self.decisions.lock() = sink;
+    }
+
+    /// The sink decision records go to, if any.
+    pub fn decision_sink(&self) -> Option<Arc<dyn DecisionSink>> {
+        self.decisions.lock().clone()
+    }
+
+    /// The Policy check for a command the user typed (`session/shell`,
+    /// `!command`), which runs in the Session's tool environment as `bash`
+    /// does. The tool lock and the outside-user refusal come before it.
+    ///
+    /// The command is judged as a `bash` call with the same Policy layers,
+    /// `toolPermissions` rules and mode: a layer that turns the shell off, a
+    /// deny rule (plain or pattern) and `read-only` or `plan` mode (except
+    /// read-only commands) refuse it. Where the `bash` tool would ask, the
+    /// user who typed the command is the approver, so it runs without a
+    /// prompt, when the caller is this host's user or an in-process call. A
+    /// caller from outside the host cannot approve, so an "ask" refuses it.
+    /// Hooks are not run: they review the agent's tool calls, and a typed
+    /// command is the user's own action. The `bash` block list refuses as it
+    /// does for the tool.
+    ///
+    /// The decision is recorded before `Ok` returns. `Err` is the refusal.
+    pub async fn check_user_command(
+        &self,
+        command: &str,
+        session: Option<String>,
+        caller: Option<Caller>,
+    ) -> Result<(), loop_agent::native_backend::CommandRefused> {
+        use loop_agent::native_backend::CommandRefused;
+        let args = serde_json::json!({ "command": command });
+        let mut verdict = self.verdict("bash", &args).await;
+        // The `bash` block list is part of the decision, so the record says
+        // what happened.
+        if !matches!(verdict.decision, Decision::Deny(_)) {
+            if let Err(reason) = loop_agent::harness::tools::check_command_policy(command, &[]) {
+                verdict = Verdict {
+                    decision: Decision::Deny(reason),
+                    by: DecidedBy::Rule,
+                    rule: Some(BLOCK_LIST.to_owned()),
+                    layer: None,
+                };
+            }
+        }
+        let host = caller.as_ref().is_none_or(Caller::is_host_user);
+        let (result, decided) = match &verdict.decision {
+            Decision::Deny(reason) => (
+                Err(CommandRefused(reason.clone())),
+                Decided::from_verdict(&verdict),
+            ),
+            Decision::Allow => (Ok(()), Decided::from_verdict(&verdict)),
+            Decision::Ask if host => (Ok(()), Decided::allow(DecidedBy::User).after(&verdict)),
+            Decision::Ask => {
+                let reason = format!(
+                    "this command needs approval in {} mode, and a user from outside this \
+                     host cannot approve it",
+                    self.mode().as_str()
+                );
+                let decided = Decided::deny(DecidedBy::NoApprover, reason.clone()).after(&verdict);
+                (Err(CommandRefused(reason)), decided)
+            }
+        };
+        let facts = Facts {
+            source: DecisionSource::UserShell,
+            tool: "bash",
+            kind: ToolKind::Execute,
+            call_id: None,
+            args: &args,
+            caller,
+            session,
+        };
+        self.record(facts, &decided).await.map_err(CommandRefused)?;
+        result
+    }
+
+    /// [`Self::check_user_command`] as the backend's check for user
+    /// commands. It holds the gate weakly: a dropped gate refuses.
+    pub fn command_gate(self: &Arc<Self>) -> loop_agent::native_backend::CommandGate {
+        let gate = Arc::downgrade(self);
+        Arc::new(move |command: loop_agent::native_backend::UserCommand| {
+            let gate = gate.upgrade();
+            Box::pin(async move {
+                let Some(gate) = gate else {
+                    return Err(loop_agent::native_backend::CommandRefused(
+                        "the Session's permission gate is gone".to_owned(),
+                    ));
+                };
+                gate.check_user_command(
+                    &command.command,
+                    Some(command.session.0.clone()),
+                    command.caller,
+                )
+                .await
+            })
+        })
     }
 
     /// The gate's before-call check, for callers outside the harness
     /// (`mcp serve`).
     pub fn before_hook(self: &Arc<Self>) -> BeforeToolCallFn {
+        self.before_hook_from(None)
+    }
+
+    /// [`Self::before_hook`] for calls that all come from `source` (such as
+    /// `loop mcp serve`'s clients); `None` tells the source by the call.
+    pub fn before_hook_from(self: &Arc<Self>, source: Option<DecisionSource>) -> BeforeToolCallFn {
         let gate = Arc::clone(self);
         Arc::new(move |ctx, cancel| {
             let gate = Arc::clone(&gate);
+            let source = source.clone();
             Box::pin(async move {
-                let block = |reason: String| {
-                    Some(BeforeToolCallResult {
+                let tool_call = ctx.tool_call.clone();
+                let args = ctx.args.clone();
+                let source = source.unwrap_or_else(|| source_of(&tool_call));
+                let kind = gate.kind(&tool_call.name).await;
+                let (result, decided, unasked, after) = gate.check(ctx, cancel).await;
+                let facts = Facts {
+                    source,
+                    tool: &tool_call.name,
+                    kind,
+                    call_id: Some(&tool_call.id),
+                    args: &args,
+                    caller: None,
+                    session: None,
+                };
+                if let Err(reason) = gate.record(facts, &decided).await {
+                    return Some(BeforeToolCallResult {
                         block: true,
                         reason: Some(reason),
-                    })
-                };
-                let decision = gate.decide(&ctx.tool_call.name, &ctx.args).await;
-                if let Decision::Deny(reason) = decision {
-                    return block(reason);
+                    });
                 }
-                // Only the user ends plan mode: hooks don't decide this one.
-                if ctx.tool_call.name == EXIT_PLAN_TOOL {
-                    return gate.review_plan(&ctx, cancel).await;
+                if unasked {
+                    gate.mark_allowed(&tool_call, &args);
                 }
-                if let Some(hooks) = gate.hooks() {
-                    let info = gate.call_info(&ctx.tool_call, &ctx.args).await;
-                    let emit = hooks.emit(HarnessHookEvent::ToolCall(info));
-                    // Cancelling the turn drops the emit, which kills any
-                    // command hook still running.
-                    let outcome = match &cancel {
-                        Some(cancel) => tokio::select! {
-                            outcome = emit => outcome,
-                            () = cancel.cancelled() => return block("Operation aborted".into()),
-                        },
-                        None => emit.await,
-                    };
-                    match outcome.decision {
-                        Some(ToolDecision::Block { reason }) => return block(reason),
-                        Some(ToolDecision::Allow) => {
-                            // A Policy layer's "ask" holds even against a hook.
-                            let call = gate.call(&ctx.tool_call.name, &ctx.args).await;
-                            if !gate.effective_policy().requires_ask(&call) {
-                                gate.mark_allowed(&ctx.tool_call, &ctx.args);
-                                return None;
-                            }
+                // Effects of the answer come only after it is recorded.
+                match after {
+                    Some(After::Mode(mode)) => {
+                        gate.set_mode(mode);
+                        let recorder = gate.mode_recorder.lock().clone();
+                        if let Some(recorder) = recorder {
+                            recorder(mode).await;
                         }
-                        None => {}
                     }
-                }
-                if decision == Decision::Allow {
-                    gate.mark_allowed(&ctx.tool_call, &ctx.args);
-                    return None;
-                }
-                match gate.approver() {
-                    // Only some tools have an approval prompt; asking about
-                    // the others would silently run them, so refuse instead.
-                    Some(_)
-                        if !crate::tool_approval::interactive_tools()
-                            .contains(&ctx.tool_call.name.as_str()) =>
-                    {
-                        block(format!(
-                            "`{}` needs approval, but Loop has no approval prompt for it yet. \
-                             Set it to allow or deny in settings.toolPermissions.",
-                            ctx.tool_call.name
-                        ))
+                    Some(After::Grant(group)) => {
+                        if let Some(approver) = gate.approver() {
+                            approver.grant_and_persist(group).await;
+                        }
                     }
-                    Some(approver) => {
-                        let call = gate.call(&ctx.tool_call.name, &ctx.args).await;
-                        let ignore_grants = gate.effective_policy().requires_ask(&call);
-                        approver
-                            .review_before_tool(ctx, cancel, ignore_grants)
-                            .await
-                    }
-                    None => block(headless_refusal(&ctx.tool_call.name, gate.mode())),
+                    None => {}
                 }
+                result
             })
         })
+    }
+
+    /// The decision on one call, in the gate's check order: the result for
+    /// the harness, what to record, and whether it runs without asking (so
+    /// the after-call review is skipped).
+    async fn check(
+        &self,
+        ctx: BeforeToolCallContext,
+        cancel: Option<CancellationToken>,
+    ) -> (Option<BeforeToolCallResult>, Decided, bool, Option<After>) {
+        let block = |reason: String| {
+            Some(BeforeToolCallResult {
+                block: true,
+                reason: Some(reason),
+            })
+        };
+        let verdict = self.verdict(&ctx.tool_call.name, &ctx.args).await;
+        if let Decision::Deny(reason) = &verdict.decision {
+            return (
+                block(reason.clone()),
+                Decided::from_verdict(&verdict),
+                false,
+                None,
+            );
+        }
+        // Only the user ends plan mode: hooks don't decide this one.
+        if ctx.tool_call.name == EXIT_PLAN_TOOL {
+            let (result, decided, after) = self.review_plan(&ctx, cancel).await;
+            return (result, decided, false, after);
+        }
+        if let Some(hooks) = self.hooks() {
+            let info = self.call_info(&ctx.tool_call, &ctx.args).await;
+            let emit = hooks.emit(HarnessHookEvent::ToolCall(info));
+            // Cancelling the turn drops the emit, which kills any command
+            // hook still running.
+            let outcome = match &cancel {
+                Some(cancel) => tokio::select! {
+                    outcome = emit => outcome,
+                    () = cancel.cancelled() => {
+                        let reason = "Operation aborted";
+                        return (
+                            block(reason.into()),
+                            Decided::deny(DecidedBy::Hook, reason),
+                            false,
+                            None,
+                        );
+                    }
+                },
+                None => emit.await,
+            };
+            match outcome.decision {
+                Some(ToolDecision::Block { reason }) => {
+                    let decided = Decided::deny(DecidedBy::Hook, reason.clone());
+                    return (block(reason), decided, false, None);
+                }
+                Some(ToolDecision::Allow) => {
+                    // A Policy layer's "ask" holds even against a hook.
+                    let call = self.call(&ctx.tool_call.name, &ctx.args).await;
+                    if !self.effective_policy().requires_ask(&call) {
+                        return (None, Decided::allow(DecidedBy::Hook), true, None);
+                    }
+                }
+                None => {}
+            }
+        }
+        if verdict.decision == Decision::Allow {
+            return (None, Decided::from_verdict(&verdict), true, None);
+        }
+        match self.approver() {
+            // Only some tools have an approval prompt; asking about the
+            // others would silently run them, so refuse instead.
+            Some(_)
+                if !crate::tool_approval::interactive_tools()
+                    .contains(&ctx.tool_call.name.as_str()) =>
+            {
+                let reason = format!(
+                    "`{}` needs approval, but Loop has no approval prompt for it yet. Set it \
+                     to allow or deny in settings.toolPermissions.",
+                    ctx.tool_call.name
+                );
+                let decided = Decided::deny(DecidedBy::NoApprover, reason.clone()).after(&verdict);
+                (block(reason), decided, false, None)
+            }
+            Some(approver) => {
+                let call = self.call(&ctx.tool_call.name, &ctx.args).await;
+                let ignore_grants = self.effective_policy().requires_ask(&call);
+                let (result, review) = approver
+                    .review_before_tool(ctx, cancel, ignore_grants)
+                    .await;
+                let mut after = None;
+                let decided = match review {
+                    Review::Granted => Decided::allow(DecidedBy::Grant).after(&verdict),
+                    // A file tool: the review comes after the write, and its
+                    // answer gets its own record then.
+                    Review::Later => Decided::from_verdict(&verdict),
+                    Review::Asked { escalation, grant } => {
+                        after = grant.map(After::Grant);
+                        let reason = result.as_ref().and_then(|r| r.reason.clone());
+                        Decided::answered(result.is_none(), escalation)
+                            .after(&verdict)
+                            .because(reason)
+                    }
+                };
+                (result, decided, false, after)
+            }
+            None => {
+                let reason = headless_refusal(&ctx.tool_call.name, self.mode());
+                let decided = Decided::deny(DecidedBy::NoApprover, reason.clone()).after(&verdict);
+                (block(reason), decided, false, None)
+            }
+        }
     }
 
     /// The gate's after-call step, for callers outside the harness.
@@ -634,9 +1076,28 @@ impl ToolGate {
                     Some(approver) if !allowed => {
                         let call = gate.call(&ctx.tool_call.name, &ctx.args).await;
                         let ignore_grants = gate.effective_policy().requires_ask(&call);
-                        approver
+                        let (patch, answer) = approver
                             .review_after_file_tool(ctx.clone(), cancel, ignore_grants)
-                            .await
+                            .await;
+                        // The answer to a review after the write gets its
+                        // own record. The write already happened; a reject
+                        // reverted it.
+                        if let Some(answer) = answer {
+                            let decided = Decided::answered(answer.accepted, answer.escalation);
+                            let facts = Facts {
+                                source: source_of(&ctx.tool_call),
+                                tool: &ctx.tool_call.name,
+                                kind: gate.kind(&ctx.tool_call.name).await,
+                                call_id: Some(&ctx.tool_call.id),
+                                args: &ctx.args,
+                                caller: None,
+                                session: None,
+                            };
+                            if let Err(error) = gate.record(facts, &decided).await {
+                                tracing::warn!(%error, "file review answer not recorded");
+                            }
+                        }
+                        patch
                     }
                     _ => None,
                 };
@@ -757,7 +1218,7 @@ mod tests {
         assert!(before(call("bash"), None).await.is_some());
     }
 
-    fn hooks(files: &[serde_json::Value]) -> (tempfile::TempDir, HookRegistry) {
+    pub(super) fn hooks(files: &[serde_json::Value]) -> (tempfile::TempDir, HookRegistry) {
         let dir = tempfile::tempdir().unwrap();
         let paths: Vec<_> = files
             .iter()
@@ -1363,3 +1824,7 @@ mod tests {
         assert!(prompts.try_recv().is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "tool_gate_decision_tests.rs"]
+mod decision_tests;

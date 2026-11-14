@@ -700,3 +700,29 @@ async fn a_malformed_oversized_or_reserved_assertion_is_refused() {
     .await
     .unwrap();
 }
+
+/// A remote connection that no acceptor named a caller for has no identity
+/// to check, so it never runs a shell command; the host's own connection
+/// still does.
+#[tokio::test]
+async fn a_remote_connection_with_no_caller_never_runs_a_shell_command() {
+    let backend = echo();
+    let (server, client_end) = memory();
+    let _ = loop_wire::server::serve_with_options(
+        backend.clone(),
+        server,
+        info(),
+        options(Authority::Remote),
+    );
+    let conn = client(client_end);
+    initialize(&conn, json!({})).await;
+    let refused = forbidden(
+        conn.request(
+            methods::SESSION_SHELL,
+            json!({"session": a_session(), "command": "true"}),
+        )
+        .await,
+    );
+    assert!(refused.contains("no identity"), "{refused}");
+    assert!(backend.shells.lock().unwrap().is_empty());
+}

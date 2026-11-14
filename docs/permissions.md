@@ -7,6 +7,8 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 3. **The permission mode** allows the call or asks.
 4. **Asking**: the TUI and desktop app show a prompt. With nobody to ask (`--print`, `--serve-mcp`), the call is refused, and the model is told which flag or rule would allow it.
 
+Loop records every decision of this check before the call runs: see [Decision records](#decision-records). A command you type yourself (`!command` in the TUI, `session/shell`) passes the same check: see [Commands you type](#commands-you-type).
+
 ## Modes
 
 | Mode | read, search, web | write / edit | bash | MCP tools |
@@ -23,7 +25,7 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 - **A write or edit through a symlink** shows where it lands in the approval prompt. The title starts with the real target; the detail gives the target and the link on two lines. Names are quoted, control characters are escaped, and a long link name is shortened in the middle.
 - **`read-only` is a ceiling.** A hook can't allow a call that changes files or runs commands.
 - **What `read-only` turns off is taken away, not just refused.** The model isn't offered `write`, `edit`, or MCP tools that their server doesn't mark read-only, in the agent loop or through `loop --serve-mcp`. `bash` stays, for read-only commands. Switching mode changes the toolset from the next turn.
-- **Bash in `read-only`** runs a command only when every part of it reads: `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `tree`, `file`, `stat`, `du`, `which`, `echo`, `sort`, `uniq`, `diff`, and `git status`, `log`, `diff`, `show`, `blame`, `ls-files`, `rev-parse`, and `branch` when it only lists. Output redirects (`>`), `$(…)`, backticks, variable assignments, and options that write or run programs (`find -exec`/`-delete`, `sort -o`, `rg --pre`, `git --output`) are refused.
+- **Bash in `read-only`** runs a command only when every part of it reads: `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `tree`, `file`, `stat`, `du`, `which`, `echo`, `sort`, `uniq`, `diff`, and `git status`, `log`, `diff`, `show`, `blame`, `ls-files`, `rev-parse`, and `branch` when it only lists. Output redirects (`>`), variable assignments, options that write or run programs (`find -exec`/`-delete`/`-fprint`, `sort -o`, `tree -o`, `rg --pre`, `git --output`, `git --ext-diff`) and every [unreadable command](#unreadable-commands) are refused. Git can still run programs that the repository's own configuration names (for example a diff `textconv` driver).
 - **MCP tools in `read-only`** run when their server marks them read-only (`readOnlyHint`). The server sets that hint, so deny a tool in `toolPermissions` if you don't trust it.
 - **Session approvals:** "Accept all … for this session" in a prompt stops further prompts for that group (file edits, bash or web) in this session, including after `--resume`.
 - **Deny rules and hooks apply in every mode,** `full-access` included.
@@ -111,6 +113,85 @@ The agent's permission requests are checked in this order:
 6. **Otherwise**, you are asked.
 
 Codex runs some commands without asking: read-only commands in `read-only` mode, and sandboxed commands in `workspace-write`. Loop sees those only as tool-call updates, after they run.
+
+## Commands you type
+
+A command you type in a client (`!command` in the TUI, or the `session/shell` method) runs in the Session's tool environment, as the `bash` tool does. It is not a model tool call, but it passes the same check, as a `bash` call of that Session, with these rules:
+
+| Session state | Your command |
+|---|---|
+| The Runtime's tool lock (`--tool-lock`) | refused (`ToolLocked`), before the check |
+| You connect through an Edge Gateway | refused (`Forbidden`), before the check |
+| A Policy layer turns the shell off, or Locks it off | refused |
+| A `bash` deny rule: plain (`"bash": "deny"`) or a pattern that matches (`"bash(rm *)": "deny"`) | refused, in every mode |
+| `read-only` or `plan` mode | read-only commands run (the same list as for `bash`); other commands are refused |
+| `ask` or `accept-edits` mode, a pattern `ask`, or a layer's "ask" | runs. You typed the command, so you are its approver: Loop does not show you a prompt for your own command |
+| `full-access` | runs |
+
+- **Only the host's user approves by typing.** A caller from outside the host (an Edge Gateway user) cannot approve, so where `bash` would ask, the command is refused. Today the Runtime refuses `session/shell` from those callers anyway.
+- **Hooks do not run** for a command you type. `tool_call` hooks review the agent's tool calls; a typed command is your own action.
+- **The `bash` block list applies** (below).
+- **Command patterns are advisory**, for your commands as for the agent's (see [Unreadable commands](#unreadable-commands)). A script, `make` or `find -exec` can still run a denied program. To keep the shell out of reach, turn it off with a Policy layer or use the tool lock.
+- **Protected files.** The shell can write any file your OS user can. The sandbox (`sandbox.mode: local`) protects the agent directory, project `.loop` and git metadata from commands, yours and the agent's alike.
+
+## Unreadable commands
+
+Loop reads a `bash` command with a small grammar that it models exactly. A command it can read is **readable**; everything else is **unreadable**.
+
+A readable command is one or more simple commands separated by `|`, `||`, `&&`, `;` or newlines. A simple command is:
+
+- a **program** in plain text: letters, digits and `_ . / + -` only (no quotes, no `$`, no globs);
+- **arguments** made of: plain text from letters, digits and `_ . / + - = : , @ %`; the glob characters `* ? [ ]`; `~` or `~/…` at the start of an argument (the home directory) and `~` inside a word (`HEAD~1`); a backslash before one printable character; `'single quotes'` and `"double quotes"` on one line (in double quotes no backtick or `!`); and `$NAME` or `${NAME}`;
+- **redirects**: `<`, `>`, `>>`, `>|`, `&>`, `&>>` with a file name, and `2>&1`, `>&2`, `>&-`.
+
+Anything else is unreadable, for example: a comment (`#`), `(`, `)`, `{`, `}`, backticks, `$(…)`, `$[…]`, `${x:…}` and every other `$` form, `~user`, `~+`, `~-` and a `~` after `=` or `:`, `!`, a lone `&`, here-documents, a quoted newline, unbalanced quotes, control characters, non-ASCII text outside quotes; shell keywords (`if`, `for`, `while`, …); an assignment before the program (`X=1 cmd`); programs that run another program (`env`, `command`, `exec`, `eval`, `source`, `.`, `time`, `nohup`, `nice`, `timeout`, `xargs`, `sudo`, shells such as `sh` and `bash`, …); built-ins that change how later commands run (`alias`, `hash`, `trap`, `set`, `read`, `printf -v`, …); an `export`, `declare`, `typeset`, `readonly` or `local` followed by another command (an exported variable such as `GIT_EXTERNAL_DIFF` or `BASH_FUNC_…` can change what the later command runs), or of a name that is not `[A-Za-z_][A-Za-z0-9_]*`, of `PATH`, `IFS`, `BASH_ENV` and similar, or with an option; `python* -c`, `node -e`, `perl -e`, `ruby -e`, and `awk`, `sed`, `less` and `more`, which run code or commands from their text; options that make a program run another program (`find -exec`/`-execdir`/`-ok`/`-okdir`, `git -c`/`-C`/`--config-env`/`--exec-path` before the subcommand and `--upload-pack`/`--receive-pack`/`--ext-diff`, `rg --pre`/`--pre-glob`/`--hostname-bin`, `sort --compress-program`, `tar -I`/`-F`/`--to-command`/`--use-compress-program`/`--checkpoint-action`/`--info-script`/`--new-volume-script`, `ssh`/`scp`/`sftp -o`/`-F`, `man -P`/`--pager`/`-H`); and a variable or glob passed to one of these programs (`find . $X`, `rg x *.rs`), because it could become such an option.
+
+Each tool call and each typed command starts a new shell, so an `export` alone changes nothing that runs after it. It stays readable, and it is never read-only.
+
+For an unreadable command:
+
+- it is not a read-only command, so `read-only` and `plan` refuse it;
+- if any `bash` deny pattern is set, the command is refused. The reason names what Loop could not read and how to run the command (`by: unreadable` in the record);
+- an `allow` pattern never matches it;
+- otherwise the mode decides, as for any command that is not read-only. **With no `bash` deny pattern, nothing changes except read-only status.**
+
+Deny and ask patterns match each simple command as written, with quotes and escapes removed, and with the program reduced to its last path part and lower-cased (`/usr/bin/touch` and `TOUCH` match `bash(touch*)`).
+
+A read-only command must also be readable. An argument the shell can change (a variable, an unquoted glob or a leading `~`) makes `find`, `sort`, `file`, `rg`, `tree`, `uniq` and `git` not read-only, because it could become an option that writes or runs a program.
+
+A pattern with `~` matches the text as written: `bash(cat ~/.ssh/*)` refuses `cat ~/.ssh/id_rsa`. The shell fills in the home directory after Loop checks the command, so `cat $HOME/.ssh/id_rsa` does not match that pattern; command patterns stay advisory.
+
+A test runs a seeded corpus of command strings under `sh`, `bash` and `dash`: no command that Loop calls read-only changes a file, and every readable command starts only the programs Loop reports. The corpus includes exports followed by a use, option injection through variables and globs, and the wrapper and option forms above; a self-check proves the test fails when a wrapper is missing from Loop's list (`crates/loop-app-core/tests/shell_differential.rs`).
+
+The `bash` block list reads a readable command the same way. It cuts an unreadable command at every separator and bracket and checks each piece, so `rm -rf /` after a comment or a `$'…'` is still refused.
+
+## Decision records
+
+Every decision of the check is one **decision record**: allow, ask and deny, on every path (the agent, a Subagent, a `/workflow` task, a subscription agent's permission request, an MCP tool, `--serve-mcp` and the commands you type). Loop writes the record **before** the call runs. If Loop cannot write the record, it refuses the call.
+
+| Field | What |
+|---|---|
+| `id`, `ts_ms` | A unique id (`pd-…`) and the time, in Unix milliseconds |
+| `principal`, `tenant`, `via` | Who acted: the caller that sent the prompt or the command. A Subagent, a workflow task and a subscription agent act for the person who started the parent Session. Decisions with no caller (in-process calls) have the Runtime's own principal `{service, local, runtime}` |
+| `session`, `turn`, `call_id` | Where the call came from |
+| `source` | `native` (the model), `mcp:<server>`, `agent:<id>`, `workflow`, `mcp_serve` or `user_shell` |
+| `tool`, `kind`, `capability` | The tool, its kind, and the Capability it needs (`shell`, `write_files`, `mcp:github`, …) |
+| `subject` | A short summary that holds no secrets: the program of each part of a command (not its arguments), the path a file tool names, the host of a URL (not its path or query) |
+| `args_sha256` | A hash of the arguments. The record never holds the arguments or file contents |
+| `outcome`, `answer` | `allow`, `deny` or `ask`. For `ask`, `answer` is `allow` or `deny` when you answered before the call ran. A file edit is reviewed after the write: its first record has no `answer`, and the answer gets a second record with the same `call_id` |
+| `by`, `layer`, `rule` | The step that decided: `off`, `rule`, `layer_ask`, `hook`, `grant`, `preset`, `approver`, `no_approver` or `user` (you typed the command); and the Policy layer or the `toolPermissions` key, when one decided |
+| `mode` | The permission mode |
+| `escalation`, `answered_by` | For an answered ask: the Escalation id and who answered it, which can be a different person than `principal` |
+| `reason` | The refusal reason, at most 512 bytes. When the approver or a hook refused, the record says only that (`the approver rejected it`, `a tool_call hook blocked it`), because their text can quote the call. URLs anywhere in `reason`, `tool` and `rule` lose their user info, query and fragment |
+
+**Where records go:**
+
+- **In the Runtime**, each record is a `policy_decision` row in the Event Log (`events.db`). It is audit-only: it has no Session sequence, so attach and replay do not show it. See [the Runtime docs](runtime.md#decision-records).
+- **Without the Runtime** (`--print` without the Runtime, the TUI's fallback, `--serve-mcp`), there is no Event Log. Records are JSON lines in `audit/decisions.jsonl` in the agent directory (mode 0600, folder 0700). Surfaces and replay do not see this file.
+  - Loop never writes it through a link: a symlinked `audit/` folder or file refuses the call. Both must belong to you; Loop sets their modes at every open.
+  - At 8 MiB the file is renamed to `decisions.jsonl.1`; Loop keeps 4 older files.
+  - The macOS sandbox keeps `audit/` from commands and file tools, as it does `auth.json`. Without a sandbox, a command can read or change the file, as it can `auth.json`.
+- **Durability.** A record is written before the call runs, so a crash of Loop keeps it. A record of a call with an effect is synced to disk first; a record of an allowed read of files is synced with the next such record, so a power loss can lose the last reads. In the Runtime, see [the Runtime docs](runtime.md#decision-records).
 
 ## Upgrading from 0.4
 

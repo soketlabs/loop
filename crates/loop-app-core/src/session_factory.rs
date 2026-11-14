@@ -904,6 +904,13 @@ impl SessionFactory {
         native.set_default_model(default_model);
 
         tool_gate.install(&harness);
+        // Every decision is recorded. Embedded, records go to the agent
+        // directory; the Runtime puts its Event Log sink in place.
+        tool_gate.set_decision_sink(Some(Arc::new(
+            crate::permissions::decision::JsonlDecisionSink::new(&globals.agent_dir),
+        )));
+        // User commands (`session/shell`, `!command`) pass the same gate.
+        native.set_command_gate(tool_gate.command_gate());
         let mut startup_notices = workspace.startup_notices.clone();
         let (hook_notices, hooks) = crate::hooks_load::register_reloadable_hooks(
             &harness,
