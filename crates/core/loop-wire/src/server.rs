@@ -482,8 +482,7 @@ async fn run(
                         let runtime = runtime.clone();
                         let host = host.clone();
                         tokio::spawn(in_scope(host.caller.clone(), async move {
-                            workspace::handle(runtime.as_deref(), &host, id, &method, params)
-                                .await;
+                            workspace::handle(runtime.as_deref(), &host, id, &method, params).await;
                         }));
                     }
                     continue;

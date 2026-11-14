@@ -28,8 +28,8 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::connection::{codes, Connection, Incoming, RpcError};
-use loop_protocol::session_workspace::{self as sw, TerminalOutputParams};
 use crate::transport::Transport;
+use loop_protocol::session_workspace::{self as sw, TerminalOutputParams};
 
 /// Updates a client keeps for a slow subscriber before it lags.
 const UPDATE_BUFFER: usize = 4096;

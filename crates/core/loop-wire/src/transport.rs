@@ -59,7 +59,9 @@ impl Counter {
     fn take(&self, bytes: usize) {
         let _ = self
             .messages
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1)));
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_sub(1))
+            });
         let _ = self
             .bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {

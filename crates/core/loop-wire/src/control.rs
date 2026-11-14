@@ -3,8 +3,8 @@
 
 use async_trait::async_trait;
 use loop_protocol::admin;
-use loop_protocol::session_workspace as sw;
 use loop_protocol::rpc::{RuntimeStatus, SessionInfo};
+use loop_protocol::session_workspace as sw;
 use loop_protocol::{BackendError, BackendResult, ErrorCategory, SessionRef, UpdateEnvelope};
 
 /// A consistent view of one Session's Event Log, for `session/attach`.
@@ -245,8 +245,10 @@ pub trait SessionWorkspace: Send + Sync {
         params: sw::UploadBeginParams,
     ) -> BackendResult<sw::UploadBeginResult>;
     /// `session/files/upload_write`.
-    async fn upload_write(&self, params: sw::UploadWriteParams)
-        -> BackendResult<sw::UploadProgress>;
+    async fn upload_write(
+        &self,
+        params: sw::UploadWriteParams,
+    ) -> BackendResult<sw::UploadProgress>;
     /// `session/files/upload_status`.
     async fn upload_status(&self, params: sw::UploadParams) -> BackendResult<sw::UploadProgress>;
     /// `session/files/upload_commit`.

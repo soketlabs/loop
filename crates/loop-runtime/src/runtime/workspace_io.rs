@@ -33,14 +33,13 @@ use loop_agent::harness::types::{FileErrorCode, PathKind};
 use loop_app_core::tool_gate::{ToolGate, UserFileAction, TERMINAL_COMMAND};
 use loop_protocol::rpc::SessionParams;
 use loop_protocol::session_workspace::{
-    base64, Availability, FileEntry, FileKind, FilePathParams, FilesDeleteParams,
-    FilesListParams, FilesListResult, FilesReadParams, FilesReadResult, FilesRenameParams,
-    SessionWorkspaceInfo, SessionWorkspaceLimits, TerminalAttachParams, TerminalAttachResult,
-    TerminalCloseResult, TerminalEnd, TerminalInfo, TerminalInputParams, TerminalListResult,
-    TerminalOpenParams, TerminalOpenResult, TerminalParams, TerminalResizeParams, TerminalSignal,
-    TerminalSignalParams, UploadBeginParams, UploadBeginResult, UploadCommitResult, UploadParams,
-    UploadProgress, UploadWriteParams, WorkspaceErrorCode as Code, LIST_PAGE_DEFAULT,
-    LIST_PAGE_MAX,
+    base64, Availability, FileEntry, FileKind, FilePathParams, FilesDeleteParams, FilesListParams,
+    FilesListResult, FilesReadParams, FilesReadResult, FilesRenameParams, SessionWorkspaceInfo,
+    SessionWorkspaceLimits, TerminalAttachParams, TerminalAttachResult, TerminalCloseResult,
+    TerminalEnd, TerminalInfo, TerminalInputParams, TerminalListResult, TerminalOpenParams,
+    TerminalOpenResult, TerminalParams, TerminalResizeParams, TerminalSignal, TerminalSignalParams,
+    UploadBeginParams, UploadBeginResult, UploadCommitResult, UploadParams, UploadProgress,
+    UploadWriteParams, WorkspaceErrorCode as Code, LIST_PAGE_DEFAULT, LIST_PAGE_MAX,
 };
 use loop_protocol::{BackendError, BackendResult, Caller, SessionKey, SessionRef};
 use loop_wire::{TerminalEvent, TerminalFeed};
@@ -252,7 +251,9 @@ impl Target {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// A random id: `prefix-` and 32 hex digits (two UUIDv7 random parts and
@@ -352,9 +353,8 @@ fn unknown_terminal() -> BackendError {
 }
 
 fn decode(data: &str) -> BackendResult<Vec<u8>> {
-    base64::decode(data).map_err(|e| {
-        BackendError::failed(loop_protocol::ErrorCategory::Protocol, e.to_string())
-    })
+    base64::decode(data)
+        .map_err(|e| BackendError::failed(loop_protocol::ErrorCategory::Protocol, e.to_string()))
 }
 
 fn kind_of(kind: PathKind) -> FileKind {
@@ -447,9 +447,7 @@ impl Runtime {
             (None, Some(lock)) => Availability::no(format!(
                 "this Runtime runs with the `{lock}` tool lock, which allows no file change"
             )),
-            (None, None) if !caps.upload => {
-                Availability::no("this workspace cannot take uploads")
-            }
+            (None, None) if !caps.upload => Availability::no("this workspace cannot take uploads"),
             (None, None) => Availability::yes(),
         };
         let terminal = if Actor::current().is_outside() {
@@ -500,7 +498,10 @@ impl Runtime {
                 hidden += 1;
                 continue;
             }
-            let Some(name) = info.path.file_name().map(|n| n.to_string_lossy().into_owned())
+            let Some(name) = info
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
             else {
                 continue;
             };
@@ -603,7 +604,7 @@ impl Runtime {
     }
 
     /// `session/files/upload_begin`.
-    pub(super) async fn upload_begin(
+    pub(super) async fn files_upload_begin(
         &self,
         params: UploadBeginParams,
     ) -> BackendResult<UploadBeginResult> {
@@ -685,7 +686,12 @@ impl Runtime {
     }
 
     /// The caller's upload `id` of `session`, after the access check.
-    async fn upload(&self, session: &SessionRef, id: &str, what: &str) -> BackendResult<Arc<Upload>> {
+    async fn upload(
+        &self,
+        session: &SessionRef,
+        id: &str,
+        what: &str,
+    ) -> BackendResult<Arc<Upload>> {
         let caller = Caller::current();
         self.check(session, Need::Write).await?;
         self.refuse_if_locked(what)?;
@@ -703,12 +709,16 @@ impl Runtime {
     }
 
     /// `session/files/upload_write`.
-    pub(super) async fn upload_write(
+    pub(super) async fn files_upload_write(
         &self,
         params: UploadWriteParams,
     ) -> BackendResult<UploadProgress> {
         let upload = self
-            .upload(&params.session, &params.upload, "session/files/upload_write")
+            .upload(
+                &params.session,
+                &params.upload,
+                "session/files/upload_write",
+            )
             .await?;
         let data = decode(&params.data)?;
         let most = self.workspace_limits().chunk_bytes as usize;
@@ -731,9 +741,16 @@ impl Runtime {
     }
 
     /// `session/files/upload_status`.
-    pub(super) async fn upload_status(&self, params: UploadParams) -> BackendResult<UploadProgress> {
+    pub(super) async fn files_upload_status(
+        &self,
+        params: UploadParams,
+    ) -> BackendResult<UploadProgress> {
         let upload = self
-            .upload(&params.session, &params.upload, "session/files/upload_status")
+            .upload(
+                &params.session,
+                &params.upload,
+                "session/files/upload_status",
+            )
             .await?;
         let root = upload.workspace.root();
         let committed = upload
@@ -749,12 +766,16 @@ impl Runtime {
 
     /// `session/files/upload_commit`. The gate checks the destination again
     /// (a rule or the mode may have changed since the begin).
-    pub(super) async fn upload_commit(
+    pub(super) async fn files_upload_commit(
         &self,
         params: UploadParams,
     ) -> BackendResult<UploadCommitResult> {
         let upload = self
-            .upload(&params.session, &params.upload, "session/files/upload_commit")
+            .upload(
+                &params.session,
+                &params.upload,
+                "session/files/upload_commit",
+            )
             .await?;
         let target = self.target(&params.session, Need::Write).await?;
         let native = upload.workspace.resolve(&upload.path);
@@ -783,9 +804,13 @@ impl Runtime {
     }
 
     /// `session/files/upload_abort`.
-    pub(super) async fn upload_abort(&self, params: UploadParams) -> BackendResult<()> {
+    pub(super) async fn files_upload_abort(&self, params: UploadParams) -> BackendResult<()> {
         let upload = self
-            .upload(&params.session, &params.upload, "session/files/upload_abort")
+            .upload(
+                &params.session,
+                &params.upload,
+                "session/files/upload_abort",
+            )
             .await?;
         self.forget_upload(&params.upload);
         let root = upload.workspace.root();
@@ -826,9 +851,9 @@ impl Runtime {
         // learn the kind, so a host link (also a dangling one) is removed
         // directly.
         if meta.kind == PathKind::Symlink && target.env.path_namespace() == PathNamespace::Host {
-            return tokio::fs::remove_file(&native)
-                .await
-                .map_err(|e| BackendError::workspace(Code::Io, scrub(&e.to_string(), &target.root)));
+            return tokio::fs::remove_file(&native).await.map_err(|e| {
+                BackendError::workspace(Code::Io, scrub(&e.to_string(), &target.root))
+            });
         }
         target
             .env
@@ -913,7 +938,7 @@ impl Runtime {
     }
 
     /// `session/terminal/open`.
-    pub(super) async fn terminal_open(
+    pub(super) async fn term_open(
         &self,
         params: TerminalOpenParams,
     ) -> BackendResult<TerminalOpenResult> {
@@ -1084,7 +1109,7 @@ impl Runtime {
     }
 
     /// `session/terminal/attach`.
-    pub(super) async fn terminal_attach(
+    pub(super) async fn term_attach(
         &self,
         params: TerminalAttachParams,
     ) -> BackendResult<(TerminalAttachResult, Box<dyn TerminalFeed>)> {
@@ -1112,14 +1137,14 @@ impl Runtime {
     }
 
     /// `session/terminal/detach`: only checks; the server stops the stream.
-    pub(super) async fn terminal_detach(&self, params: TerminalParams) -> BackendResult<()> {
+    pub(super) async fn term_detach(&self, params: TerminalParams) -> BackendResult<()> {
         self.terminal(&params.session, &params.terminal, "session/terminal/detach")
             .await
             .map(|_| ())
     }
 
     /// `session/terminal/input`.
-    pub(super) async fn terminal_input(&self, params: TerminalInputParams) -> BackendResult<()> {
+    pub(super) async fn term_input(&self, params: TerminalInputParams) -> BackendResult<()> {
         let terminal = self
             .terminal(&params.session, &params.terminal, "session/terminal/input")
             .await?;
@@ -1140,7 +1165,7 @@ impl Runtime {
     }
 
     /// `session/terminal/resize`.
-    pub(super) async fn terminal_resize(&self, params: TerminalResizeParams) -> BackendResult<()> {
+    pub(super) async fn term_resize(&self, params: TerminalResizeParams) -> BackendResult<()> {
         let terminal = self
             .terminal(&params.session, &params.terminal, "session/terminal/resize")
             .await?;
@@ -1165,7 +1190,7 @@ impl Runtime {
     }
 
     /// `session/terminal/signal`.
-    pub(super) async fn terminal_signal(&self, params: TerminalSignalParams) -> BackendResult<()> {
+    pub(super) async fn term_signal(&self, params: TerminalSignalParams) -> BackendResult<()> {
         let terminal = self
             .terminal(&params.session, &params.terminal, "session/terminal/signal")
             .await?;
@@ -1184,7 +1209,7 @@ impl Runtime {
     }
 
     /// `session/terminal/close`.
-    pub(super) async fn terminal_close(
+    pub(super) async fn term_close(
         &self,
         params: TerminalParams,
     ) -> BackendResult<TerminalCloseResult> {
@@ -1196,7 +1221,7 @@ impl Runtime {
     }
 
     /// `session/terminal/list`: this caller's terminals of the Session.
-    pub(super) async fn terminal_list(
+    pub(super) async fn term_list(
         &self,
         params: SessionParams,
     ) -> BackendResult<TerminalListResult> {
@@ -1379,19 +1404,19 @@ impl loop_wire::SessionWorkspace for Runtime {
         self.files_read(params).await
     }
     async fn upload_begin(&self, params: UploadBeginParams) -> BackendResult<UploadBeginResult> {
-        Runtime::upload_begin(self, params).await
+        self.files_upload_begin(params).await
     }
     async fn upload_write(&self, params: UploadWriteParams) -> BackendResult<UploadProgress> {
-        Runtime::upload_write(self, params).await
+        self.files_upload_write(params).await
     }
     async fn upload_status(&self, params: UploadParams) -> BackendResult<UploadProgress> {
-        Runtime::upload_status(self, params).await
+        self.files_upload_status(params).await
     }
     async fn upload_commit(&self, params: UploadParams) -> BackendResult<UploadCommitResult> {
-        Runtime::upload_commit(self, params).await
+        self.files_upload_commit(params).await
     }
     async fn upload_abort(&self, params: UploadParams) -> BackendResult<()> {
-        Runtime::upload_abort(self, params).await
+        self.files_upload_abort(params).await
     }
     async fn delete(&self, params: FilesDeleteParams) -> BackendResult<()> {
         self.files_delete(params).await
@@ -1403,31 +1428,31 @@ impl loop_wire::SessionWorkspace for Runtime {
         self.files_mkdir(params).await
     }
     async fn terminal_open(&self, params: TerminalOpenParams) -> BackendResult<TerminalOpenResult> {
-        Runtime::terminal_open(self, params).await
+        self.term_open(params).await
     }
     async fn terminal_attach(
         &self,
         params: TerminalAttachParams,
     ) -> BackendResult<(TerminalAttachResult, Box<dyn TerminalFeed>)> {
-        Runtime::terminal_attach(self, params).await
+        self.term_attach(params).await
     }
     async fn terminal_detach(&self, params: TerminalParams) -> BackendResult<()> {
-        Runtime::terminal_detach(self, params).await
+        self.term_detach(params).await
     }
     async fn terminal_input(&self, params: TerminalInputParams) -> BackendResult<()> {
-        Runtime::terminal_input(self, params).await
+        self.term_input(params).await
     }
     async fn terminal_resize(&self, params: TerminalResizeParams) -> BackendResult<()> {
-        Runtime::terminal_resize(self, params).await
+        self.term_resize(params).await
     }
     async fn terminal_signal(&self, params: TerminalSignalParams) -> BackendResult<()> {
-        Runtime::terminal_signal(self, params).await
+        self.term_signal(params).await
     }
     async fn terminal_close(&self, params: TerminalParams) -> BackendResult<TerminalCloseResult> {
-        Runtime::terminal_close(self, params).await
+        self.term_close(params).await
     }
     async fn terminal_list(&self, params: SessionParams) -> BackendResult<TerminalListResult> {
-        Runtime::terminal_list(self, params).await
+        self.term_list(params).await
     }
 }
 
