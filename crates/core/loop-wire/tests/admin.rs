@@ -348,18 +348,36 @@ async fn a_tool_lock_is_advertised_and_hides_the_shell_and_workflows() {
     .expect("timed out");
 }
 
+/// `fake` served over `authority`. A remote connection is the host's user
+/// with the Runtime token, as the WebSocket acceptor names it: a remote
+/// connection with no caller is served nothing.
 fn served(fake: &Arc<Fake>, authority: Authority) -> loop_wire::Transport {
     let (server_end, client_end) = memory();
-    let _ = serve_with_control(
-        fake.clone(),
-        fake.clone(),
-        server_end,
-        info("server"),
-        ServeOptions {
-            owns_backend: false,
-            authority,
-        },
-    );
+    let options = ServeOptions {
+        owns_backend: false,
+        authority,
+    };
+    match authority {
+        Authority::HostLocal => {
+            let _ = serve_with_control(
+                fake.clone(),
+                fake.clone(),
+                server_end,
+                info("server"),
+                options,
+            );
+        }
+        Authority::Remote => {
+            let _ = loop_wire::server::serve_with_caller(
+                fake.clone(),
+                Some(fake.clone()),
+                server_end,
+                info("server"),
+                options,
+                loop_protocol::Caller::local_token(loop_wire::local_principal()),
+            );
+        }
+    }
     client_end
 }
 
@@ -635,11 +653,13 @@ async fn a_server_without_a_runtime_offers_no_admin() {
         assert!(!remote.capabilities().host_usage);
         let conn = raw({
             let (server_end, client_end) = memory();
-            let _ = loop_wire::server::serve_with_options(
+            let _ = loop_wire::server::serve_with_caller(
                 fake.clone(),
+                None,
                 server_end,
                 info("server"),
                 ServeOptions::default(),
+                loop_protocol::Caller::local_token(loop_wire::local_principal()),
             );
             client_end
         })

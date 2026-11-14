@@ -150,6 +150,12 @@ fn outside_user_refusal(
     None
 }
 
+/// A remote connection with no caller: it has no identity to check, so the
+/// server serves it nothing but `initialize`.
+fn anonymous(authority: Authority, host: &ClientHost) -> bool {
+    authority != Authority::HostLocal && host.caller.is_none()
+}
+
 /// Whether `method` with `params` needs host-local authority: the host-only
 /// methods, and a `workspace/trust` change.
 fn host_only(method: &str, params: &Value) -> bool {
@@ -311,6 +317,7 @@ async fn run(
             Incoming::Response { id, result } => conn.resolve(id, result).await,
             Incoming::Notification { method, params } => {
                 if method == methods::SESSION_CANCEL
+                    && !anonymous(options.authority, &host)
                     && outside_user_refusal(&host, runtime.as_deref(), &method).is_none()
                 {
                     if let Ok(SessionParams { session }) = parse::<SessionParams>(params) {
@@ -405,16 +412,15 @@ async fn run(
                     continue;
                 }
                 // A remote connection that no acceptor named a caller for has
-                // no identity to check, so it never runs a shell command.
-                if method == methods::SESSION_SHELL
-                    && options.authority != Authority::HostLocal
-                    && host.caller.is_none()
-                {
+                // no identity to check access with (I3), so it is served
+                // nothing but `initialize`. Without a caller in scope the
+                // Runtime would treat a request as its own in-process work.
+                if anonymous(options.authority, &host) {
                     let mut body =
                         RpcErrorBody::from(&loop_protocol::BackendError::Forbidden(method.clone()));
                     body.message = format!(
                         "{method} is refused: this connection has no identity, so it cannot \
-                         run shell commands"
+                         use Sessions or run shell commands"
                     );
                     respond(&conn, id, Err(body));
                     continue;
@@ -649,9 +655,14 @@ async fn handle(
         methods::SESSION_LIST if runtime.is_some() => {
             runtime.unwrap().list().await.map(|l| to_value(&l))
         }
-        methods::RUNTIME_STATUS if runtime.is_some() => {
-            runtime.unwrap().status().await.map(|s| to_value(&s))
-        }
+        methods::RUNTIME_STATUS if runtime.is_some() => match runtime.unwrap().status().await {
+            Ok(status) if host.caller.as_ref().is_some_and(|c| !c.is_host_user()) => {
+                outside_status(runtime.unwrap(), status)
+                    .await
+                    .map(|s| to_value(&s))
+            }
+            other => other.map(|s| to_value(&s)),
+        },
         methods::RUNTIME_STOP_EMPTY if runtime.is_some() => {
             if !admin_offered(runtime).runtime_stop_empty {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
@@ -1082,10 +1093,15 @@ async fn forward(
                     if feeds.dropped > 0 {
                         // Updates were discarded while this Session was being
                         // made; never skip silently.
-                        lagged(&conn, &instance, feeds.dropped);
+                        let outside = host.caller.as_ref().is_some_and(|c| !c.is_host_user());
+                        lagged(&conn, &instance, (!outside).then_some(feeds.dropped));
                         return;
                     }
-                    register_recipient(runtime.as_deref(), &host, &session, true).await;
+                    // The Runtime checks the caller may read it; a refusal
+                    // keeps the feed off.
+                    if !register_recipient(runtime.as_deref(), &host, &session, true).await {
+                        continue;
+                    }
                     if feeds.own(key.clone()) {
                         for envelope in feeds.take_pending(&key) {
                             if feeds.deliver(&conn, envelope).is_err() {
@@ -1100,7 +1116,13 @@ async fn forward(
                     if feeds.finish_attach(&conn, id, key, op, after_seq, *result).is_err() {
                         return;
                     }
-                    if attached && feeds.map.contains_key(&session.key) { register_recipient(runtime.as_deref(), &host, &session, true).await; }
+                    if attached
+                        && feeds.map.contains_key(&session.key)
+                        && !register_recipient(runtime.as_deref(), &host, &session, true).await
+                    {
+                        // The Runtime refused this caller: no live updates.
+                        feeds.map.remove(&session.key);
+                    }
                 }
                 Some(Control::Detach { id, session }) => {
                     register_recipient(runtime.as_deref(), &host, &session, false).await;
@@ -1163,8 +1185,11 @@ async fn forward(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
-                    // Never let the client silently miss part of a turn.
-                    lagged(&conn, &instance, missed);
+                    // Never let the client silently miss part of a turn. The
+                    // channel is shared: an outside user is not told how
+                    // many updates (of every Session) went by.
+                    let outside = host.caller.as_ref().is_some_and(|c| !c.is_host_user());
+                    lagged(&conn, &instance, (!outside).then_some(missed));
                     return;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
@@ -1425,7 +1450,7 @@ impl Feeds {
 }
 
 /// Tell the client it missed updates, then close the connection.
-fn lagged(conn: &Connection, instance: &BackendInstanceId, missed: u64) {
+fn lagged(conn: &Connection, instance: &BackendInstanceId, missed: Option<u64>) {
     let notice = UpdateEnvelope::live(
         instance.clone(),
         0,
@@ -1434,9 +1459,12 @@ fn lagged(conn: &Connection, instance: &BackendInstanceId, missed: u64) {
         0,
         SessionUpdate::Notice {
             level: NoticeLevel::Error,
-            text: format!(
-                "this client fell behind and missed {missed} updates; reconnect to continue"
-            ),
+            text: match missed {
+                Some(missed) => format!(
+                    "this client fell behind and missed {missed} updates; reconnect to continue"
+                ),
+                None => "this client fell behind and missed updates; reconnect to continue".into(),
+            },
         },
     );
     let _ = conn.notify(methods::SESSION_UPDATE, to_value(&notice));
@@ -1461,25 +1489,59 @@ struct ClientHost {
     caller: Option<Caller>,
 }
 
+/// Register this connection as a watcher (and Escalation recipient) of
+/// `session`, with the connection's caller in scope: the forwarder runs
+/// outside it. False when the Runtime refuses the caller (the Session is
+/// "not found" for it): the connection must not keep a feed of it.
 async fn register_recipient(
     runtime: Option<&dyn RuntimeControl>,
     host: &Arc<ClientHost>,
     session: &loop_protocol::SessionRef,
     attached: bool,
-) {
-    if let Some(runtime) = runtime {
-        let recipient = if attached && host.interact.load(Ordering::Acquire) {
-            Some(host.clone() as Arc<dyn crate::control::EscalationRecipient>)
-        } else {
-            None
-        };
-        if let Err(error) = runtime
-            .register(session, host.id, attached, recipient)
-            .await
-        {
+) -> bool {
+    let Some(runtime) = runtime else {
+        return true;
+    };
+    let recipient = if attached && host.interact.load(Ordering::Acquire) {
+        Some(host.clone() as Arc<dyn crate::control::EscalationRecipient>)
+    } else {
+        None
+    };
+    let registered = in_scope(
+        host.caller.clone(),
+        runtime.register(session, host.id, attached, recipient),
+    )
+    .await;
+    match registered {
+        Ok(()) => true,
+        Err(loop_protocol::BackendError::SessionNotFound(_)) if attached => false,
+        Err(error) => {
             tracing::debug!(%error, "could not register Escalation recipient");
+            true
         }
     }
+}
+
+/// `runtime/status` for a user from outside the host: nothing about the
+/// host (no pid, socket, URL or where the limits came from), and counts of
+/// only the Sessions it may list (`runtime/sessions` filters them).
+async fn outside_status(
+    runtime: &dyn RuntimeControl,
+    mut status: loop_protocol::rpc::RuntimeStatus,
+) -> BackendResult<loop_protocol::rpc::RuntimeStatus> {
+    status.auto_started = false;
+    status.pid = 0;
+    status.socket = std::path::PathBuf::new();
+    status.listen_url = None;
+    status.max_sessions_from = None;
+    status.max_active_turns_from = None;
+    let totals = match runtime.admin() {
+        Some(admin) => admin.sessions().await.map(|r| r.totals).unwrap_or_default(),
+        None => Default::default(),
+    };
+    status.loaded = u64::from(totals.sessions);
+    status.busy = u64::from(totals.busy);
+    Ok(status)
 }
 
 #[async_trait]

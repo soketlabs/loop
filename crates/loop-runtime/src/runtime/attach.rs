@@ -1,6 +1,7 @@
 //! Watchers, Escalation recipients and attachments.
 use super::publish::barrier;
 use super::*;
+use crate::access::{Actor, Need};
 
 impl Runtime {
     /// Connections watching `key`. For tests that must wait for a watch
@@ -25,6 +26,24 @@ impl Runtime {
         if session.instance != self.instance || session.key.0 != session.native_id {
             return Err(BackendError::SessionNotFound(session.key.clone()));
         }
+        // A connection watches only a Session it may read; the server drops
+        // its feed when this fails. Stopping a watch needs nothing.
+        if attached {
+            self.check(session, Need::Read).await?;
+        }
+        // Escalations go only to a recipient that may act in the Session
+        // (for a Subagent below it: the same root, so the same answer).
+        let recipient = match recipient {
+            Some(recipient)
+                if attached
+                    && !self
+                        .may(&Actor::of(recipient.caller()), &session.key, Need::Write)
+                        .await? =>
+            {
+                None
+            }
+            other => other,
+        };
         self.set_watch(session, connection, attached).await;
         let mut recipients = self.recipients.lock().await;
         match &recipient {
@@ -107,6 +126,8 @@ impl Runtime {
         if session.instance != self.instance || session.key.0 != session.native_id {
             return Err(BackendError::SessionNotFound(session.key.clone()));
         }
+        // Before anything else about the Session: a refusal is not found.
+        self.check(session, Need::Read).await?;
         let added = self.set_watch(session, connection, true).await;
         if self.stopped.load(Ordering::Acquire) {
             return Err(failed("Runtime stopped"));

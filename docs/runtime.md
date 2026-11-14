@@ -493,8 +493,9 @@ decision, and every entry point calls it. The rules:
   it, but cannot attach to it, read it, prompt it or answer its
   Escalations. ADR-0009 refuses attach by another principal unless the
   Session is shared, and the operator must not act as another user in
-  silence. Such a request gets `Forbidden`, because the host's user can
-  see that the Session exists.
+  silence. Such a request gets the same `SessionNotFound` as every other
+  refusal (one refusal for every caller), although the host's user can see
+  in the list that the Session exists.
 - **A user from outside the host** (an Edge Gateway user) has every right on
   a Session only when the Session's tenant is the user's tenant AND the
   user is its owner of record (the same principal: same issuer and id).
@@ -507,7 +508,7 @@ decision, and every entry point calls it. The rules:
   grants nothing.
 - **A copy** (fork, clone, import) belongs to the caller that made it, in
   that caller's tenant. A fork or clone first needs `Read` on the source.
-- **No existence oracle.** A request that an outside user may not make on a
+- **No existence oracle.** A request that a caller may not make on a
   Session fails exactly as for a Session that does not exist:
   `SessionNotFound`, from the same check, before any other check (busy,
   closing, loaded or not). The lists leave such Sessions out.
@@ -570,16 +571,16 @@ Session in that folder.
 **The folder rule (outside users).** The tool lock lets a Session read its
 whole folder, subfolders included. So an outside user:
 
-- must name the folder (`cwd`) in `session/new`; the Runtime's own folder is
-  not a default for it;
 - cannot open, load, fork, clone or import a Session in a folder that is
   the same as, inside, or above the folder of a Session it may not read
   (another user's, or the host's). The request gets `Forbidden`.
 
 **Operator requirement.** Give each outside user a folder of their own under
 the tool-lock root, for example `/srv/loop-users/<hash of tenant and
-id>/`, and let the gateway choose it. Never use the principal id itself as
-a folder name. Loop does not create these folders.
+id>/`, and let the gateway choose it and name it (`cwd`) in every `session/new`;
+without one the Session opens in the Runtime's own folder, which the folder
+rule then gives to the first user. Never use the principal id itself as a
+folder name. Loop does not create these folders.
 
 **Updates and Escalations.** The Runtime sends every update to one channel.
 Each connection forwards only the updates of Sessions that it created,

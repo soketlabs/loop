@@ -25,6 +25,7 @@ impl Runtime {
     ) -> BackendResult<SessionRef> {
         // The connection's caller, read at entry: it does not cross spawns.
         let caller = loop_protocol::Caller::current();
+        let who = crate::access::Actor::of(caller.clone());
         // An attach checks this Surface's credentials, but never changes an
         // existing Session's environment while another Surface may use it.
         let caller_env = spec.env.clone();
@@ -132,6 +133,10 @@ impl Runtime {
                 });
             }
         }
+        // An outside user's Session never shares a folder (or a folder
+        // inside or above it) with a Session that user may not read.
+        self.check_folder(&who, &opts.cwd, existing.map(|s| &s.key))
+            .await?;
         if let Some(options) = &spec.options {
             opts.provider = options.provider.clone();
             opts.model = options.model.clone();
@@ -304,6 +309,16 @@ impl Runtime {
                     .map_err(failed)?;
                 opened.native.continue_turns_after(last.max(prompts));
             }
+            // Who may use it (I3): a Subagent its parent's users; a Session
+            // this request created its creator; a loaded one its owner of
+            // record.
+            let access = match &child {
+                Some(child) => child.parent.access.clone(),
+                None if creating => {
+                    crate::access::Subject::owned(tenant.clone(), acting.principal().clone())
+                }
+                None => self.subject(&reference.key).await?,
+            };
             let escalations = crate::EscalationHost::new(
                 reference.clone(),
                 self.log.clone(),
@@ -311,6 +326,7 @@ impl Runtime {
                 tenant.clone(),
                 actor.clone(),
             );
+            escalations.set_access(access.clone());
             // Runtime grants are live Session state, never restored after a crash.
             opened.approval_bridge.clear_session_grants();
             Arc::make_mut(&mut opened.approval_bridge).set_host(Arc::new(escalations.clone()));
@@ -440,6 +456,7 @@ impl Runtime {
                 pending_sandbox: Mutex::new(None),
                 loaded_by,
                 tenant,
+                access,
                 actor,
                 acting: Mutex::new(Acting::new(acting, opened_identity)),
             });
@@ -537,6 +554,12 @@ impl Runtime {
     /// Every wait is bounded by the close grace; a turn that ignores cancellation
     /// is aborted so the lease is always released.
     pub async fn close(&self, key: &SessionKey, force: bool) -> BackendResult<()> {
+        self.check_as(
+            &crate::access::Actor::current(),
+            key,
+            crate::access::Need::Close,
+        )
+        .await?;
         self.close_inner(key, force).await
     }
     pub(super) async fn close_inner(&self, key: &SessionKey, force: bool) -> BackendResult<()> {

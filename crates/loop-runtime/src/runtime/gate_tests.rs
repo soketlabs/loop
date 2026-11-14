@@ -152,10 +152,27 @@ async fn a_user_command_passes_the_session_s_gate_and_is_recorded() {
         let (_, record) = decisions(&log).await.pop().unwrap();
         assert_eq!(record.principal, Principal::runtime());
 
-        // A user from outside the host cannot approve its own command.
+        // A user from outside the host may not use the host's Session at
+        // all (I3), and on its own Session cannot approve its own command.
         let touch = format!("touch {}", marker.display());
-        let refused = edge("alice")
+        let not_found = edge("alice")
             .scope(shell(&rt, &session, &touch))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(not_found, BackendError::SessionNotFound(_)),
+            "{not_found}"
+        );
+        let elsewhere = tempfile::tempdir().unwrap();
+        let hers = edge("alice")
+            .scope(rt.new_session(SessionSpec {
+                cwd: Some(elsewhere.path().to_path_buf()),
+                ..SessionSpec::default()
+            }))
+            .await
+            .unwrap();
+        let refused = edge("alice")
+            .scope(shell(&rt, &hers, &touch))
             .await
             .unwrap_err();
         assert!(
@@ -323,6 +340,12 @@ async fn workspace_reads_return_no_secrets() {
         let id = tree::workspace_id(&dir.path().canonicalize().unwrap());
         let admin: &dyn RuntimeAdmin = rt.as_ref();
         let caller = edge("alice");
+        // An outside user names only the folder of a Session it may read.
+        caller
+            .clone()
+            .scope(rt.new_session(SessionSpec::default()))
+            .await
+            .unwrap();
         let answers = caller
             .scope(async {
                 vec![
@@ -447,8 +470,9 @@ impl EscalationRecipient for Watcher {
 }
 
 /// Through the Runtime: the caller that sends a prompt is carried into its
-/// turn. The host user's approval goes to the host user's connection only;
-/// an edge user's own turn reaches the edge user too.
+/// turn. Approvals go only to connections whose caller may act in the
+/// Session (I3): the host's Session asks the host user, never the edge user;
+/// the edge user's own Session asks the edge user, never the host user.
 #[tokio::test]
 async fn the_prompt_s_caller_decides_who_is_asked_to_approve() {
     tokio::time::timeout(LIMIT, async {
@@ -508,12 +532,41 @@ async fn the_prompt_s_caller_decides_who_is_asked_to_approve() {
         assert_eq!(record.by, DecidedBy::Approver);
         assert_eq!(record.answered_by.as_ref(), Some(host.principal()));
 
-        let turn = edge("alice")
+        // The edge user may not prompt the host's Session (I3).
+        let refused = edge("alice")
             .scope(rt.prompt(&session, vec![ContentBlock::text("two")]))
+            .await;
+        assert!(matches!(refused, Err(BackendError::SessionNotFound(_))));
+
+        // On its own Session the edge user is asked, and the host's user (of
+        // another tenant) is not.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let hers = edge("alice")
+            .scope(rt.new_session(SessionSpec {
+                cwd: Some(elsewhere.path().to_path_buf()),
+                ..SessionSpec::default()
+            }))
+            .await
+            .unwrap();
+        let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (edge_tx, mut edge_rx) = tokio::sync::mpsc::unbounded_channel();
+        for (connection, caller, asked) in [(3, host.clone(), host_tx), (4, edge("alice"), edge_tx)]
+        {
+            control
+                .register(
+                    &hers,
+                    connection,
+                    true,
+                    Some(Arc::new(Watcher { caller, asked })),
+                )
+                .await
+                .unwrap();
+        }
+        let turn = edge("alice")
+            .scope(rt.prompt(&hers, vec![ContentBlock::text("two")]))
             .await
             .unwrap();
         let from_edge = edge_rx.recv().await.unwrap();
-        let _from_host = host_rx.recv().await.unwrap();
         from_edge
             .send(InteractionOutcome::Selected {
                 native_id: loop_app_core::interaction::native_options::ACCEPT.into(),
@@ -521,6 +574,7 @@ async fn the_prompt_s_caller_decides_who_is_asked_to_approve() {
             })
             .unwrap();
         assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        assert!(host_rx.try_recv().is_err(), "the host's user was asked");
         let last = decisions(&log).await.pop().unwrap().1;
         assert_eq!(last.principal, *edge("alice").principal());
         assert_eq!(last.answered_by.as_ref(), Some(edge("alice").principal()));

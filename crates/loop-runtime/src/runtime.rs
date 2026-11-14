@@ -1,4 +1,5 @@
 //! Session ownership, routing and committed update publication.
+use crate::access::{Actor, Need};
 use crate::log::{Event, EventKind, EventLog};
 use async_trait::async_trait;
 use loop_agent::{
@@ -73,6 +74,7 @@ mod gate_tests;
 mod leases;
 mod pause;
 mod publish;
+mod reach;
 mod sessions;
 mod shell;
 mod tree;
@@ -115,6 +117,12 @@ pub struct Runtime {
     /// Session keys with records in more than one tenant, found at start:
     /// readable in their creating tenant, never loaded.
     split: HashMap<SessionKey, SplitSessionError>,
+    /// The access [`crate::access::Subject`] of Sessions that are not
+    /// loaded, read once from the Event Log: an owner and a tenant never
+    /// change. A loaded Session's is on it.
+    subjects: Mutex<HashMap<SessionKey, crate::access::Subject>>,
+    /// Requests refused by the access check, for tests and probes.
+    refusals: std::sync::atomic::AtomicU64,
     limits: RuntimeLimits,
     turns: Arc<Semaphore>,
     store: Arc<dyn RuntimeSessionStore>,
@@ -305,6 +313,9 @@ struct LiveSession {
     /// The Session's tenant: the creator's, fixed for its life. Every record
     /// of the Session is in it, whoever acts (ADR-0009).
     tenant: Tenant,
+    /// Who may use this Session (task I3): its tenant and the owner of
+    /// record of its root Session. A Subagent's is its parent's.
+    access: crate::access::Subject,
     /// The `actor` of every record of this Session: a Subagent's parent
     /// Session key; `None` for a Session a Surface opened.
     actor: Option<String>,
@@ -614,6 +625,8 @@ impl Runtime {
             system,
             tenants: Mutex::new(index.tenants),
             split: index.split,
+            subjects: Mutex::new(HashMap::new()),
+            refusals: std::sync::atomic::AtomicU64::new(0),
             limits,
             turns: Arc::new(Semaphore::new(limits.max_active_turns)),
             store,
@@ -1019,6 +1032,33 @@ impl Runtime {
     }
     /// Read all known Sessions without acquiring their leases.
     pub async fn list(&self) -> BackendResult<Vec<SessionInfo>> {
+        let all = self.list_all().await?;
+        let actor = Actor::current();
+        if !actor.is_outside() {
+            return Ok(all);
+        }
+        // An outside user sees its own Sessions only, and no reference to
+        // a Session it may not read.
+        let mut shown = Vec::new();
+        for mut info in all {
+            if !self.may(&actor, &info.r#ref.key, Need::List).await? {
+                continue;
+            }
+            if let Some(source) = &info.summary.fork_source {
+                if !self.may(&actor, &source.key, Need::Read).await? {
+                    info.summary.fork_source = None;
+                }
+            }
+            if let Some(parent) = &info.parent {
+                if !self.may(&actor, &parent.key, Need::Read).await? {
+                    info.parent = None;
+                }
+            }
+            shown.push(info);
+        }
+        Ok(shown)
+    }
+    async fn list_all(&self) -> BackendResult<Vec<SessionInfo>> {
         let known = self
             .factory
             .globals
@@ -1213,6 +1253,7 @@ impl Runtime {
 #[async_trait]
 impl loop_wire::RuntimeControl for Runtime {
     async fn config(&self, p: loop_protocol::rpc::SessionParams) -> BackendResult<SessionSnapshot> {
+        self.check(&p.session, Need::Read).await?;
         self.snapshot(&p.session).await
     }
 
@@ -1221,6 +1262,7 @@ impl loop_wire::RuntimeControl for Runtime {
         p: loop_protocol::session_services::SkillParams,
     ) -> BackendResult<MutationResult> {
         let session = p.session.clone();
+        self.check(&session, Need::Write).await?;
         self.set_config(&session, false, |live| async move {
             live.opened.native.skill(p).await
         })
@@ -1231,6 +1273,7 @@ impl loop_wire::RuntimeControl for Runtime {
         &self,
         p: loop_protocol::session_services::WorkflowParams,
     ) -> BackendResult<loop_protocol::session_services::WorkflowResult> {
+        self.check(&p.session, Need::Write).await?;
         let live = self.loaded(&p.session).await?;
         if let Some(result) = live.opened.native.known_workflow(&p)? {
             return Ok(result);
@@ -1378,6 +1421,7 @@ impl loop_wire::RuntimeControl for Runtime {
         if session.instance != self.instance || session.key.0 != session.native_id {
             return Err(BackendError::SessionNotFound(session.key.clone()));
         }
+        self.check(session, Need::Read).await?;
         let live = self.sessions.lock().unwrap().contains_key(&session.key);
         if !live {
             let known = self
@@ -1615,6 +1659,7 @@ impl Compaction for Runtime {
 #[async_trait]
 impl SessionStats for Runtime {
     async fn stats(&self, session: &SessionRef) -> BackendResult<StatsSummary> {
+        self.check(session, Need::Read).await?;
         let live = self.loaded(session).await?;
         let mut stats = live.opened.native.stats(session).await?;
         let turn_state = if live.escalations.has_pending().await {
@@ -1644,6 +1689,7 @@ impl LocalShell for Runtime {
 #[async_trait]
 impl ModelControl for Runtime {
     async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        self.check(session, Need::Read).await?;
         let live = self.loaded(session).await?;
         Self::control(&live)?.models(session).await
     }
@@ -1653,6 +1699,7 @@ impl ModelControl for Runtime {
         model: &str,
         expected_revision: Option<u64>,
     ) -> BackendResult<MutationResult> {
+        self.check(session, Need::Write).await?;
         // During a turn the choice waits: the running turn keeps its model.
         self.set_config(session, false, |live| async move {
             Self::control(&live)?
@@ -1662,6 +1709,7 @@ impl ModelControl for Runtime {
         .await
     }
     async fn efforts(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        self.check(session, Need::Read).await?;
         let live = self.loaded(session).await?;
         Self::control(&live)?.efforts(session).await
     }
@@ -1671,6 +1719,7 @@ impl ModelControl for Runtime {
         effort: &str,
         expected_revision: Option<u64>,
     ) -> BackendResult<MutationResult> {
+        self.check(session, Need::Write).await?;
         // During a turn the change waits for the next one.
         self.set_config(session, false, |live| async move {
             Self::control(&live)?
@@ -1680,6 +1729,7 @@ impl ModelControl for Runtime {
         .await
     }
     async fn modes(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        self.check(session, Need::Read).await?;
         let live = self.loaded(session).await?;
         Self::control(&live)?.modes(session).await
     }
@@ -1689,6 +1739,12 @@ impl ModelControl for Runtime {
         change: Option<Option<u64>>,
         expected_revision: Option<u64>,
     ) -> BackendResult<loop_protocol::rpc::TtfbResult> {
+        let need = if change.is_none() {
+            Need::Read
+        } else {
+            Need::Write
+        };
+        self.check(session, need).await?;
         if change.is_none() {
             let live = self.loaded(session).await?;
             return Self::control(&live)?.ttfb(session, None, None).await;
@@ -1729,6 +1785,7 @@ impl ModelControl for Runtime {
         mode: &str,
         expected_revision: Option<u64>,
     ) -> BackendResult<MutationResult> {
+        self.check(session, Need::Write).await?;
         self.set_config(session, false, |live| async move {
             Self::control(&live)?
                 .set_mode(session, mode, expected_revision)
@@ -1792,9 +1849,11 @@ impl AgentBackend for Runtime {
         session: &SessionRef,
         spec: SessionSpec,
     ) -> BackendResult<SessionRef> {
+        self.check(session, Need::Read).await?;
         self.open(Some(session), spec, None).await
     }
     async fn transcript(&self, session: &SessionRef) -> BackendResult<Vec<SessionUpdate>> {
+        self.check(session, Need::Read).await?;
         self.route(session)?.opened.native.transcript(session).await
     }
     async fn prompt(
@@ -1804,6 +1863,7 @@ impl AgentBackend for Runtime {
     ) -> BackendResult<TurnHandle> {
         // Read before any spawn: the task-local caller does not cross one.
         let caller = loop_protocol::Caller::current();
+        self.check(session, Need::Write).await?;
         let mut reloads = 0;
         let live = loop {
             let live = match self.route(session) {
@@ -1964,7 +2024,12 @@ impl AgentBackend for Runtime {
     }
     fn cancel(&self, session: &SessionRef) {
         if let Ok(live) = self.route(session) {
-            let _ = live.commands.send(Command::Cancel(request_caller()));
+            // A caller that may not act in the Session cancels nothing.
+            if Self::may_live(&Actor::current(), &live, Need::Write) {
+                let _ = live.commands.send(Command::Cancel(request_caller()));
+            } else {
+                self.refusals.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     fn is_busy(&self, session: &SessionRef) -> bool {
