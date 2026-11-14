@@ -155,12 +155,19 @@ impl MessageSender {
     pub fn send(&self, text: String) -> Result<(), mpsc::error::SendError<String>> {
         let (sender, budget, closed) = match &self.0 {
             SenderKind::Unbounded(sender, counter) => {
+                // Counted before the send: the receiver may take the
+                // message at once, and must find it counted.
                 let bytes = text.len();
-                sender.send(text)?;
                 if let Some(counter) = counter {
                     counter.add(bytes);
                 }
-                return Ok(());
+                let sent = sender.send(text);
+                if sent.is_err() {
+                    if let Some(counter) = counter {
+                        counter.take(bytes);
+                    }
+                }
+                return sent;
             }
             SenderKind::Bounded(sender, budget, closed) => (sender, budget, closed),
         };
@@ -401,6 +408,29 @@ mod tests {
             written, "{\"c\":3}\n",
             "dropping the sender closes the output"
         );
+    }
+
+    /// Sender and receiver on two threads: the count ends at zero (an
+    /// add after the receiver's take would leave it above zero forever).
+    #[test]
+    fn the_backlog_count_never_leaks() {
+        let (a, b) = memory();
+        let probe = a.outgoing.probe();
+        let mut incoming = b.incoming;
+        let reader = std::thread::spawn(move || {
+            let mut got = 0;
+            while got < 100_000 {
+                if incoming.try_recv().is_ok() {
+                    got += 1;
+                }
+            }
+        });
+        for _ in 0..100_000 {
+            a.outgoing.send("x".repeat(7)).unwrap();
+        }
+        reader.join().unwrap();
+        let left = probe.backlog().unwrap();
+        assert_eq!((left.messages, left.bytes), (0, 0));
     }
 
     #[tokio::test]

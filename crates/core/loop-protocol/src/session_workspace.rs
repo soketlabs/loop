@@ -408,7 +408,8 @@ pub struct UploadCommitResult {
     pub tag: String,
 }
 
-/// `session/terminal/open` params.
+/// `session/terminal/open` params. A terminal always starts the user's
+/// shell; commands are typed into it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TerminalOpenParams {
@@ -418,9 +419,6 @@ pub struct TerminalOpenParams {
     pub cols: u16,
     /// Rows.
     pub rows: u16,
-    /// A command for `sh -c`; absent: the user's shell.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
 }
 
 /// `session/terminal/open` result.

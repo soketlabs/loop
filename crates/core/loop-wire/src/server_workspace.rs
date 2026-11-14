@@ -40,9 +40,82 @@ pub(super) fn ordered(method: &str) -> bool {
     )
 }
 
-/// Most ordered requests waiting on one connection; more are refused with
+/// Most ordered requests waiting for one terminal; more are refused with
 /// `Busy`.
 pub(super) const ORDERED_QUEUE: usize = 256;
+/// Most terminals with an ordered queue on one connection.
+const ORDERED_TERMINALS: usize = 64;
+/// Most bytes of params waiting in the ordered queues of one connection.
+const ORDERED_BYTES: usize = 8 * 1024 * 1024;
+
+type Queued = (PeerRequestId, String, Value, usize);
+
+/// One ordered queue per terminal on a connection: a stuck write to one
+/// terminal does not hold up another. Bounded by count and by bytes.
+#[derive(Default)]
+pub(super) struct Ordered {
+    queues: parking_lot::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Queued>>>,
+    bytes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Ordered {
+    /// Queue an ordered request for its terminal, or refuse it with `Busy`.
+    pub(super) fn push(
+        &self,
+        runtime: Option<Arc<dyn RuntimeControl>>,
+        host: Arc<ClientHost>,
+        id: PeerRequestId,
+        method: String,
+        params: Value,
+    ) {
+        use std::sync::atomic::Ordering;
+        let size = params.to_string().len();
+        if self.bytes.fetch_add(size, Ordering::AcqRel) + size > ORDERED_BYTES {
+            self.bytes.fetch_sub(size, Ordering::AcqRel);
+            return busy(&host.conn, id);
+        }
+        let terminal = params
+            .get("terminal")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let mut queues = self.queues.lock();
+        queues.retain(|_, sender| !sender.is_closed());
+        if !queues.contains_key(&terminal) && queues.len() >= ORDERED_TERMINALS {
+            drop(queues);
+            self.bytes.fetch_sub(size, Ordering::AcqRel);
+            return busy(&host.conn, id);
+        }
+        let sender = queues
+            .entry(terminal)
+            .or_insert_with(|| {
+                let (sender, mut queue) = tokio::sync::mpsc::channel::<Queued>(ORDERED_QUEUE);
+                let bytes = Arc::clone(&self.bytes);
+                let host = Arc::clone(&host);
+                let runtime = runtime.clone();
+                let caller = host.caller.clone();
+                tokio::spawn(super::in_scope(caller, async move {
+                    while let Some((id, method, params, size)) = queue.recv().await {
+                        handle(runtime.as_deref(), &host, id, &method, params).await;
+                        bytes.fetch_sub(size, Ordering::AcqRel);
+                    }
+                }));
+                sender
+            })
+            .clone();
+        drop(queues);
+        if let Err(error) = sender.try_send((id, method, params, size)) {
+            let (id, _, _, size) = error.into_inner();
+            self.bytes.fetch_sub(size, Ordering::AcqRel);
+            busy(&host.conn, id);
+        }
+    }
+
+    /// Drop every queue (the connection ended); their workers end.
+    pub(super) fn stop_all(&self) {
+        self.queues.lock().clear();
+    }
+}
 
 /// The terminal streams of one connection, by terminal id.
 #[derive(Default)]
@@ -86,11 +159,37 @@ pub(super) async fn handle(
             Err((codes::METHOD_NOT_FOUND, format!("unknown method {method}"))),
         );
     };
+    if method == methods::SESSION_TERMINAL_ATTACH {
+        return attach(service, host, id, params).await;
+    }
     let result = match call(service, host, method, params).await {
         Ok(result) => result,
         Err(error) => return conn.respond(id, Err(error)),
     };
     respond(conn, id, result.map_err(|e| RpcErrorBody::from(&e)));
+}
+
+/// `session/terminal/attach`: the answer is queued first, then the stream
+/// starts, so a client sees no output of the terminal before the answer.
+async fn attach(
+    service: &dyn SessionWorkspace,
+    host: &Arc<ClientHost>,
+    id: PeerRequestId,
+    params: Value,
+) {
+    let params: loop_protocol::session_workspace::TerminalAttachParams = match parse(params) {
+        Ok(params) => params,
+        Err(error) => return host.conn.respond(id, Err(error)),
+    };
+    let session = params.session.key.clone();
+    let terminal = params.terminal.clone();
+    match service.terminal_attach(params).await {
+        Ok((attached, feed)) => {
+            respond(&host.conn, id, Ok(to_value(&attached)));
+            start_stream(host, session, terminal, feed);
+        }
+        Err(error) => respond(&host.conn, id, Err(RpcErrorBody::from(&error))),
+    }
 }
 
 /// The call; the outer error is a malformed request.
@@ -130,20 +229,6 @@ async fn call(
             .terminal_open(parse(params)?)
             .await
             .map(|r| to_value(&r)),
-        methods::SESSION_TERMINAL_ATTACH => {
-            let params: loop_protocol::session_workspace::TerminalAttachParams = parse(params)?;
-            let session = params.session.key.clone();
-            let terminal = params.terminal.clone();
-            match service.terminal_attach(params).await {
-                Ok((attached, feed)) => {
-                    // The answer goes out first, then the stream.
-                    let answer = to_value(&attached);
-                    start_stream(host, session, terminal, feed);
-                    Ok(answer)
-                }
-                Err(error) => Err(error),
-            }
-        }
         methods::SESSION_TERMINAL_DETACH => {
             let params: loop_protocol::session_workspace::TerminalParams = parse(params)?;
             let terminal = params.terminal.clone();

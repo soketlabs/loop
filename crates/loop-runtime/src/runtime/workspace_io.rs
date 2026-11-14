@@ -858,8 +858,15 @@ impl Runtime {
                 "session/files/upload_write",
             )
             .await?;
-        let data = decode(&params.data)?;
         let most = self.workspace_limits().chunk_bytes as usize;
+        // Refused by its encoded length before it is decoded.
+        if params.data.len() > most.div_ceil(3) * 4 {
+            return Err(BackendError::workspace(
+                Code::TooLarge,
+                format!("one piece holds at most {most} bytes"),
+            ));
+        }
+        let data = decode(&params.data)?;
         if data.len() > most {
             return Err(BackendError::workspace(
                 Code::TooLarge,
@@ -1093,10 +1100,8 @@ impl Runtime {
             })?;
         let cwd = WorkspacePath::from_native(&target.root, &target.live.opened.harness.cwd())
             .unwrap_or_else(|_| WorkspacePath::root());
-        let command = params
-            .command
-            .clone()
-            .unwrap_or_else(|| TERMINAL_COMMAND.to_owned());
+        // Always the user's shell: the command the gate judged and recorded.
+        let command = TERMINAL_COMMAND.to_owned();
         let size = PtySize {
             rows: params.rows,
             cols: params.cols,
@@ -1194,11 +1199,38 @@ impl Runtime {
         let caller = Caller::current();
         self.check(session, Need::Write).await?;
         self.terminal_refusal(what)?;
-        lock(&self.workspace_io.terminals)
+        let terminal = lock(&self.workspace_io.terminals)
             .get(id)
             .filter(|t| t.session == session.key && same_owner(&t.owner, &caller))
             .cloned()
-            .ok_or_else(unknown_terminal)
+            .ok_or_else(unknown_terminal)?;
+        // The sandbox and the gate hold at every call, not only at the
+        // sweep: a refusal closes the terminal now.
+        if let Some(reason) = self.terminal_refused_now(&terminal).await {
+            self.close_terminal(terminal, &reason).await;
+            return Err(BackendError::workspace(
+                Code::Refused,
+                format!("the terminal was closed: {reason}"),
+            ));
+        }
+        Ok(terminal)
+    }
+
+    /// Why `terminal` may not stay open now (its Session is gone, the
+    /// sandbox is on, or the gate refuses), if so.
+    async fn terminal_refused_now(&self, terminal: &Terminal) -> Option<String> {
+        match self.current(&terminal.session, &terminal.live) {
+            None => Some("the Session closed or was unloaded".to_owned()),
+            Some(live) => match sandbox_reason(&live).await {
+                Some(_) => Some("the Session's sandbox was turned on".to_owned()),
+                None => terminal
+                    .gate
+                    .user_terminal_allowed()
+                    .await
+                    .err()
+                    .map(|reason| format!("the Session no longer allows it: {reason}")),
+            },
+        }
     }
 
     /// The newest `seq` and the exit of `terminal`, from the driver.
@@ -1252,8 +1284,15 @@ impl Runtime {
         let terminal = self
             .terminal(&params.session, &params.terminal, "session/terminal/input")
             .await?;
-        let data = decode(&params.data)?;
         let most = self.workspace_limits().chunk_bytes as usize;
+        // Refused by its encoded length before it is decoded.
+        if params.data.len() > most.div_ceil(3) * 4 {
+            return Err(BackendError::workspace(
+                Code::TooLarge,
+                format!("one piece holds at most {most} bytes"),
+            ));
+        }
+        let data = decode(&params.data)?;
         if data.len() > most {
             return Err(BackendError::workspace(
                 Code::TooLarge,
@@ -1463,28 +1502,28 @@ impl Runtime {
             .cloned()
             .collect();
         let detached_limit = Duration::from_secs(self.workspace_limits().detached_terminal_secs);
+        let mut closing = Vec::new();
         for terminal in terminals {
-            let reason = match self.current(&terminal.session, &terminal.live) {
-                None => Some("the Session closed or was unloaded".to_owned()),
-                Some(live) => match sandbox_reason(&live).await {
-                    Some(_) => Some("the Session's sandbox was turned on".to_owned()),
-                    None => match terminal.gate.user_terminal_allowed().await {
-                        Err(reason) => Some(format!("the Session no longer allows it: {reason}")),
-                        Ok(()) => lock(&terminal.detached_since)
-                            .filter(|since| since.elapsed() >= detached_limit)
-                            .map(|_| {
-                                format!(
-                                    "no client streamed it for {} seconds",
-                                    detached_limit.as_secs()
-                                )
-                            }),
-                    },
-                },
+            let reason = match self.terminal_refused_now(&terminal).await {
+                Some(reason) => Some(reason),
+                None => lock(&terminal.detached_since)
+                    .filter(|since| since.elapsed() >= detached_limit)
+                    .map(|_| {
+                        format!(
+                            "no client streamed it for {} seconds",
+                            detached_limit.as_secs()
+                        )
+                    }),
             };
             if let Some(reason) = reason {
-                self.close_terminal(terminal, &reason).await;
+                closing.push((terminal, reason));
             }
         }
+        // Concurrently: one slow kill does not hold up the others.
+        futures::future::join_all(closing.into_iter().map(|(terminal, reason)| async move {
+            self.close_terminal(terminal, &reason).await;
+        }))
+        .await;
         // Too many detached terminals in one Session: the ones detached
         // longest close.
         let most = self.workspace_limits().detached_terminals_per_session as usize;
@@ -1659,12 +1698,21 @@ mod tests {
         use loop_protocol::AgentBackend;
         let dir = tempfile::tempdir().unwrap();
         let rt = runtime(dir.path()).await;
-        let session = rt.new_session(Default::default()).await.unwrap();
+        let env = [("SHELL", "/bin/sh"), ("PATH", "/usr/bin:/bin")]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let session = rt
+            .new_session(loop_protocol::SessionSpec {
+                env: Some(env),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         let open = || TerminalOpenParams {
             session: session.clone(),
             cols: 80,
             rows: 24,
-            command: Some("sleep 300".into()),
         };
         // Off: a terminal opens.
         let terminal = rt.term_open(open()).await.unwrap().terminal;

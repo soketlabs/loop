@@ -234,6 +234,7 @@ fn start(
         id: NEXT_TICKET.fetch_add(1, Ordering::Relaxed),
         caller,
         streams: workspace::Streams::default(),
+        ordered: workspace::Ordered::default(),
     });
     let served = run(
         backend,
@@ -317,19 +318,6 @@ async fn run(
         runtime.clone(),
         host.clone(),
     ));
-    // Terminal input, resize and signal of this connection run in the order
-    // they arrive, one at a time.
-    let (ordered, mut ordered_rx) =
-        mpsc::channel::<(PeerRequestId, String, Value)>(workspace::ORDERED_QUEUE);
-    let ordered_worker = {
-        let runtime = runtime.clone();
-        let host = host.clone();
-        tokio::spawn(in_scope(host.caller.clone(), async move {
-            while let Some((id, method, params)) = ordered_rx.recv().await {
-                workspace::handle(runtime.as_deref(), &host, id, &method, params).await;
-            }
-        }))
-    };
     let mut initialized = false;
     while let Some(message) = incoming.recv().await {
         match message {
@@ -474,10 +462,8 @@ async fn run(
                 }
                 if workspace::serves(&method) {
                     if workspace::ordered(&method) {
-                        if let Err(error) = ordered.try_send((id, method, params)) {
-                            let (id, _, _) = error.into_inner();
-                            workspace::busy(&conn, id);
-                        }
+                        host.ordered
+                            .push(runtime.clone(), Arc::clone(&host), id, method, params);
                     } else {
                         let runtime = runtime.clone();
                         let host = host.clone();
@@ -512,8 +498,7 @@ async fn run(
     }
     forwarder.abort();
     let _ = forwarder.await;
-    drop(ordered);
-    ordered_worker.abort();
+    host.ordered.stop_all();
     host.streams.stop_all();
     if let Some(runtime) = &runtime {
         runtime.disconnected(host.id).await;
@@ -1545,6 +1530,8 @@ struct ClientHost {
     caller: Option<Caller>,
     /// This connection's terminal streams (`session/terminal/attach`).
     streams: workspace::Streams,
+    /// This connection's ordered terminal requests, one queue per terminal.
+    ordered: workspace::Ordered,
 }
 
 /// Register this connection as a watcher (and Escalation recipient) of

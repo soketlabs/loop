@@ -22,24 +22,56 @@ use support::{client, code, log_text, new_session, runtime, Fixture, Options};
 
 const WAIT: Duration = Duration::from_secs(20);
 
-/// A plain `sh` that reads the terminal: no rc files, a known prompt.
-const SH: &str = "PS1='$ ' exec /bin/sh";
+/// "Just the shell": type nothing when the terminal opens.
+const SH: &str = "";
 
 fn sw(c: &RemoteBackend) -> &dyn SessionWorkspace {
     c
 }
 
-async fn open(c: &RemoteBackend, s: &SessionRef, command: Option<&str>) -> String {
-    sw(c)
+/// Open a terminal (the user's shell, `/bin/sh` in these Sessions) and,
+/// unless `typed` is [`SH`] or absent, type `typed` into it.
+async fn open(c: &RemoteBackend, s: &SessionRef, typed: Option<&str>) -> String {
+    let terminal = sw(c)
         .terminal_open(TerminalOpenParams {
             session: s.clone(),
             cols: 80,
             rows: 24,
-            command: command.map(str::to_owned),
         })
         .await
         .unwrap()
-        .terminal
+        .terminal;
+    if let Some(typed) = typed.filter(|t| *t != SH) {
+        type_in(c, s, &terminal, &format!("{typed}\n")).await;
+    }
+    terminal
+}
+
+/// The environment of the test Sessions: a plain POSIX shell with a known
+/// prompt, and no rc file.
+fn sh_env() -> std::collections::BTreeMap<String, String> {
+    [
+        ("PATH", std::env::var("PATH").unwrap_or_default()),
+        ("HOME", std::env::var("HOME").unwrap_or_default()),
+        ("SHELL", "/bin/sh".to_owned()),
+        ("PS1", "$ ".to_owned()),
+        ("ENV", String::new()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect()
+}
+
+/// A Session whose terminals run `/bin/sh`.
+async fn sh_session(c: &RemoteBackend, cwd: &std::path::Path) -> SessionRef {
+    use loop_protocol::AgentBackend;
+    c.new_session(loop_protocol::SessionSpec {
+        cwd: Some(cwd.to_path_buf()),
+        env: Some(sh_env()),
+        ..Default::default()
+    })
+    .await
+    .unwrap()
 }
 
 async fn attach(
@@ -140,7 +172,7 @@ async fn a_terminal_echoes_resizes_takes_ctrl_c_and_reports_the_exit_code() {
     let f = runtime(Options::default()).await;
     let c = client(&f.rt, None).await;
     assert!(support::caps(&c).session_terminal);
-    let s = new_session(&c, &f.ws).await;
+    let s = sh_session(&c, &f.ws).await;
     let t = open(&c, &s, Some(SH)).await;
     assert!(t.starts_with("term-") && t.len() == 37, "{t}");
     let feed = attach(&c, &s, &t, 0).await;
@@ -209,7 +241,7 @@ async fn a_terminal_echoes_resizes_takes_ctrl_c_and_reports_the_exit_code() {
 async fn a_new_connection_re_attaches_by_seq() {
     let f = runtime(Options::default()).await;
     let first = client(&f.rt, None).await;
-    let s = new_session(&first, &f.ws).await;
+    let s = sh_session(&first, &f.ws).await;
     let t = open(&first, &s, Some(SH)).await;
     let feed = attach(&first, &s, &t, 0).await;
     let mut seen = Seen::default();
@@ -265,8 +297,10 @@ async fn a_new_connection_re_attaches_by_seq() {
 async fn close_and_session_close_kill_the_process_tree_with_a_record() {
     let f = runtime(Options::default()).await;
     let c = client(&f.rt, None).await;
-    let s = new_session(&c, &f.ws).await;
-    let tree = "sleep 300 & echo CHILD=$!; sleep 300";
+    let s = sh_session(&c, &f.ws).await;
+    // `CH""ILD` in the typed (echoed) line, `CHILD=<pid>` in the output.
+    // A space after `$!`: macOS `/bin/sh` (bash) expands `!` before `;`.
+    let tree = "sleep 300 & echo CH\"\"ILD=$! ; sleep 300";
     // Closed by the user.
     let t = open(&c, &s, Some(tree)).await;
     let feed = attach(&c, &s, &t, 0).await;
@@ -339,14 +373,13 @@ async fn limits_count_terminals_per_session_and_a_detached_one_ends() {
         ..SessionWorkspaceLimits::default()
     });
     let c = client(&f.rt, None).await;
-    let s = new_session(&c, &f.ws).await;
+    let s = sh_session(&c, &f.ws).await;
     let t = open(&c, &s, Some(SH)).await;
     let second = sw(&c)
         .terminal_open(TerminalOpenParams {
             session: s.clone(),
             cols: 80,
             rows: 24,
-            command: None,
         })
         .await
         .unwrap_err();
@@ -386,7 +419,7 @@ async fn the_gate_refuses_a_terminal_it_cannot_check() {
     })
     .await;
     let c = client(&f.rt, None).await;
-    let s = new_session(&c, &f.ws).await;
+    let s = sh_session(&c, &f.ws).await;
     let info = sw(&c)
         .info(SessionParams { session: s.clone() })
         .await
@@ -397,7 +430,6 @@ async fn the_gate_refuses_a_terminal_it_cannot_check() {
             session: s.clone(),
             cols: 80,
             rows: 24,
-            command: None,
         })
         .await
         .unwrap_err();
@@ -416,13 +448,12 @@ async fn the_gate_refuses_a_terminal_it_cannot_check() {
     })
     .await;
     let c = client(&f.rt, None).await;
-    let s = new_session(&c, &f.ws).await;
+    let s = sh_session(&c, &f.ws).await;
     let refused = sw(&c)
         .terminal_open(TerminalOpenParams {
             session: s.clone(),
             cols: 80,
             rows: 24,
-            command: None,
         })
         .await
         .unwrap_err();
@@ -434,7 +465,7 @@ async fn the_gate_refuses_a_terminal_it_cannot_check() {
 async fn another_owner_cannot_use_a_terminal_id() {
     let f = runtime(Options::default()).await;
     let c = client(&f.rt, None).await;
-    let s = new_session(&c, &f.ws).await;
+    let s = sh_session(&c, &f.ws).await;
     let t = open(&c, &s, Some(SH)).await;
     // An in-process call has every right on the Session, but it is not the
     // terminal's owner (the host's user on the connection).
@@ -482,7 +513,7 @@ async fn another_owner_cannot_use_a_terminal_id() {
 async fn terminal_bytes_never_reach_the_event_log() {
     let f = runtime(Options::default()).await;
     let c = client(&f.rt, None).await;
-    let s = new_session(&c, &f.ws).await;
+    let s = sh_session(&c, &f.ws).await;
     let t = open(&c, &s, Some(SH)).await;
     let feed = attach(&c, &s, &t, 0).await;
     let mut seen = Seen::default();
@@ -558,17 +589,18 @@ async fn a_slow_client_gets_a_dropped_count_and_others_are_not_touched() {
         .unwrap();
     answer(&mut lines, 1).await;
     write
-        .write_all(send(methods::SESSION_NEW, json!({"cwd": f.ws})).as_bytes())
+        .write_all(send(methods::SESSION_NEW, json!({"cwd": f.ws, "env": sh_env()})).as_bytes())
         .await
         .unwrap();
     let session = answer(&mut lines, 2).await;
     const TOTAL: usize = 3_000_000;
-    let command = format!("sleep 1; head -c {TOTAL} /dev/zero | tr '\\0' x; sleep 600");
+    let typed =
+        format!("exec sh -c 'sleep 1; head -c {TOTAL} /dev/zero | tr \"\\\\0\" x; sleep 600'\n");
     write
         .write_all(
             send(
                 methods::SESSION_TERMINAL_OPEN,
-                json!({"session": session, "cols": 80, "rows": 24, "command": command}),
+                json!({"session": session, "cols": 80, "rows": 24}),
             )
             .as_bytes(),
         )
@@ -578,6 +610,20 @@ async fn a_slow_client_gets_a_dropped_count_and_others_are_not_touched() {
         .as_str()
         .unwrap()
         .to_owned();
+    // Typed before the attach (its output waits in the ring), so no output
+    // comes before the stream is counted.
+    write
+        .write_all(
+            send(
+                methods::SESSION_TERMINAL_INPUT,
+                json!({"session": session, "terminal": terminal,
+                       "data": base64::encode(typed.as_bytes())}),
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    answer(&mut lines, 4).await;
     write
         .write_all(
             send(
@@ -588,7 +634,19 @@ async fn a_slow_client_gets_a_dropped_count_and_others_are_not_touched() {
         )
         .await
         .unwrap();
-    answer(&mut lines, 4).await;
+    // The answer comes before any output of the stream.
+    loop {
+        let line = lines.next_line().await.unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_ne!(
+            value["method"],
+            methods::SESSION_TERMINAL_OUTPUT,
+            "output before the attach answer"
+        );
+        if value["id"] == 5 {
+            break;
+        }
+    }
     // Stop reading while the burst runs. Another connection is served.
     let other = client(&f.rt, None).await;
     let started = std::time::Instant::now();
@@ -602,9 +660,19 @@ async fn a_slow_client_gets_a_dropped_count_and_others_are_not_touched() {
     // Now read everything the stream gives.
     let (mut data, mut dropped, mut last) = (0usize, 0u64, 0u64);
     let mut saw_drop = false;
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while data + (dropped as usize) < TOTAL {
-            let line = lines.next_line().await.unwrap().unwrap();
+    // The echo of the typed line and the prompt come before the burst; read
+    // until the stream is quiet after the burst.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let wait = if data + (dropped as usize) < TOTAL {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_secs(2)
+            };
+            let Ok(line) = tokio::time::timeout(wait, lines.next_line()).await else {
+                break;
+            };
+            let line = line.unwrap().unwrap();
             let value: serde_json::Value = serde_json::from_str(&line).unwrap();
             if value["method"] != methods::SESSION_TERMINAL_OUTPUT {
                 continue;
@@ -630,7 +698,11 @@ async fn a_slow_client_gets_a_dropped_count_and_others_are_not_touched() {
         saw_drop,
         "a slow client must lose output, not the connection"
     );
-    assert_eq!(data + dropped as usize, TOTAL);
+    let total = data + dropped as usize;
+    assert!(
+        (TOTAL..TOTAL + 4096).contains(&total),
+        "delivered {data} + dropped {dropped} = {total}, burst {TOTAL}"
+    );
     // The connection still works.
     write
         .write_all(
@@ -642,7 +714,7 @@ async fn a_slow_client_gets_a_dropped_count_and_others_are_not_touched() {
         )
         .await
         .unwrap();
-    answer(&mut lines, 5).await;
+    answer(&mut lines, 6).await;
     finish(f).await;
 }
 
@@ -654,13 +726,12 @@ async fn opens_at_the_same_time_cannot_pass_the_limit() {
         ..SessionWorkspaceLimits::default()
     });
     let c = client(&f.rt, None).await;
-    let s = new_session(&c, &f.ws).await;
+    let s = sh_session(&c, &f.ws).await;
     let opens = (0..20).map(|_| {
         sw(&c).terminal_open(TerminalOpenParams {
             session: s.clone(),
             cols: 80,
             rows: 24,
-            command: Some("sleep 300".into()),
         })
     });
     let results = futures::future::join_all(opens).await;
@@ -724,11 +795,11 @@ async fn detached_terminals_past_the_session_limit_close() {
         ..SessionWorkspaceLimits::default()
     });
     let c = client(&f.rt, None).await;
-    let s = new_session(&c, &f.ws).await;
-    let first = open(&c, &s, Some("sleep 300")).await;
-    let streamed = open(&c, &s, Some("sleep 300")).await;
+    let s = sh_session(&c, &f.ws).await;
+    let first = open(&c, &s, Some("exec sleep 300")).await;
+    let streamed = open(&c, &s, Some("exec sleep 300")).await;
     let _feed = attach(&c, &s, &streamed, 0).await;
-    let last = open(&c, &s, Some("sleep 300")).await;
+    let last = open(&c, &s, Some("exec sleep 300")).await;
     // Two detached, one streamed: the one detached longest closes.
     tokio::time::timeout(WAIT, async {
         loop {

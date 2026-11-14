@@ -3867,6 +3867,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "upload_bytes_per_session": {
+          "default": 8589934592,
+          "description": "Most bytes of the open uploads of one Session (their declared\nsizes).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "uploads_per_caller": {
           "description": "Open uploads per caller.",
           "format": "uint32",
@@ -4585,7 +4592,7 @@
       "type": "object"
     },
     "TerminalOpenParams": {
-      "description": "`session/terminal/open` params.",
+      "description": "`session/terminal/open` params. A terminal always starts the user's\nshell; commands are typed into it.",
       "properties": {
         "cols": {
           "description": "Columns.",
@@ -4593,13 +4600,6 @@
           "maximum": 65535,
           "minimum": 0,
           "type": "integer"
-        },
-        "command": {
-          "description": "A command for `sh -c`; absent: the user's shell.",
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "rows": {
           "description": "Rows.",

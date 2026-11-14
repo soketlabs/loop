@@ -388,7 +388,6 @@ async fn files_or_terminal(r: &Runtime, method: &str, session: SessionRef) -> Ba
                 session: session.clone(),
                 cols: 0,
                 rows: 0,
-                command: None,
             },
         )
         .await
