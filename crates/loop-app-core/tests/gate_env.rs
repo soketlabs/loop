@@ -191,16 +191,18 @@ async fn the_hard_link_count_comes_from_the_env() {
     env.assert_no_leaks();
 }
 
-/// A guest env's decisions never use host facts: on macOS `/tmp` is a link
-/// to `/private/tmp` on the host, which an allow rule could follow.
+/// A guest env's decisions never use host facts: on macOS `/var` is a link
+/// to `/private/var` on the host, which an allow rule could follow. (Not
+/// `/tmp`: with `TMPDIR=/tmp` the virtual env counts `/private/tmp` as a
+/// host temp path, a leak.)
 #[tokio::test]
 async fn a_guest_env_never_uses_host_facts() {
     let dir = tree();
     let env = Arc::new(VirtualEnv::new(dir.path()).at("repo"));
-    let allow = rules(&[("write(/tmp/**)".into(), "allow")]);
+    let allow = rules(&[("write(/var/**)".into(), "allow")]);
     let gate = gate(env.clone(), allow).await;
     assert_eq!(
-        gate.decide("write", &json!({"path": "/private/tmp/x"}))
+        gate.decide("write", &json!({"path": "/private/var/loop-gate-x"}))
             .await,
         Decision::Ask
     );

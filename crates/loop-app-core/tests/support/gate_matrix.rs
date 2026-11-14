@@ -40,9 +40,45 @@ pub fn write(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
+/// Folders the `allow-abs` rules name: the fixture must not be inside one,
+/// or those rules match every fixture path on the host (and not in a
+/// virtual root).
+pub const RULE_FOLDERS: &[&str] = &["/tmp", "/private/tmp"];
+
+/// A temp folder for the fixture outside [`RULE_FOLDERS`]: the system temp
+/// folder (on macOS `/var/folders/...`, spelled through the `/var` link, so
+/// the `raw` cases see a root-owned link), or, when that is under `/tmp`
+/// (Linux, `TMPDIR=/tmp`), the build's own temp folder.
+fn scratch() -> tempfile::TempDir {
+    let named = |p: &Path| RULE_FOLDERS.iter().any(|f| p.starts_with(f));
+    let temp = std::env::temp_dir();
+    let real = temp.canonicalize().unwrap_or_else(|_| temp.clone());
+    let dir = if named(&temp) || named(&real) {
+        let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::tempdir_in(base).unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
+    let real = dir.path().canonicalize().unwrap();
+    assert!(
+        !named(dir.path()) && !named(&real),
+        "the gate fixture must not be under {RULE_FOLDERS:?}: {}",
+        real.display()
+    );
+    dir
+}
+
+/// Whether the tree is laid out as when the golden file was recorded:
+/// macOS, in the system temp folder under `/var/folders`, spelled through
+/// the `/var` link.
+pub fn recorded_layout(tree: &Tree) -> bool {
+    cfg!(target_os = "macos") && tree.raw.starts_with("/var/folders")
+}
+
 pub fn tree() -> Tree {
     use std::os::unix::fs::symlink;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scratch();
     let raw = dir.path().to_path_buf();
     let root = raw.canonicalize().unwrap();
     let r = |p: &str| root.join(p);
