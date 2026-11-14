@@ -1040,9 +1040,7 @@ fn cost_of_one_tool_update() {
     let mut seq = Sequencer::new(0, who(1));
     feed(&mut seq, &[turn_started("turn-1"), call("t")]);
     let line = "x".repeat(1024);
-    let updates: Vec<SessionUpdate> = (1..=100)
-        .map(|n| progress("t", &line.repeat(n)))
-        .collect();
+    let updates: Vec<SessionUpdate> = (1..=100).map(|n| progress("t", &line.repeat(n))).collect();
     let rounds = 200;
     let start = std::time::Instant::now();
     for _ in 0..rounds {
