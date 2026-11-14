@@ -362,7 +362,7 @@ impl Target {
             self.fs(raw, move |root| root.walk(&path, SUBTREE_MAX))
                 .await?
         };
-        for (inner, _) in &walked {
+        for inner in walked.keys() {
             let refused = workspace_fs::protected_name(inner.rsplit('/').next().unwrap_or(""))
                 .then(|| "it is `.git` or `.loop`".to_owned());
             let refused = match refused {
