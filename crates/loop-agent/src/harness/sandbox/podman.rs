@@ -836,7 +836,26 @@ exec "$@"
 "#,
             log = log.display()
         );
-        std::fs::write(&program, script).unwrap();
+        // A child process writes the script. If this process held the file
+        // open for writing, a fork from another test thread could keep that
+        // descriptor until its exec, and the kernel would then refuse to run
+        // the script ("text file busy").
+        use std::io::Write as _;
+        let mut writer = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat > \"$1\"")
+            .arg("sh")
+            .arg(&program)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         (program, log)
     }
