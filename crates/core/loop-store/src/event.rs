@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Result, StoreError};
+use crate::identity::{Identity, Principal, Tenant, Via};
 
 /// Maximum events in one atomic append (and one SQLite writer transaction).
 pub const MAX_BATCH_EVENTS: usize = 256;
@@ -53,29 +54,113 @@ pub enum EventKind {
 
 /// Activity before allocation of durable cursors.
 ///
-/// The ADR-0007 §7 identity fields are not here yet (step B3). Their type is
-/// [`crate::identity::Identity`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// `identity` is required (ADR-0007 §7.1): who acted, in which tenant. Its
+/// serde form is flat: `tenant`, `principal`, `via` and `actor` sit next to
+/// the other fields. A form written before step B3 has none of them and
+/// reads as [`Identity::unrecorded`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Event {
     pub generation: u64,
     pub session_key: Option<SessionKey>,
     pub turn: Option<TurnId>,
     pub ts_ms: i64,
     pub kind: EventKind,
+    #[serde(flatten)]
+    pub identity: Identity,
+}
+
+impl<'de> Deserialize<'de> for Event {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            generation: u64,
+            session_key: Option<SessionKey>,
+            turn: Option<TurnId>,
+            ts_ms: i64,
+            kind: EventKind,
+            #[serde(default)]
+            tenant: Option<Tenant>,
+            #[serde(default)]
+            principal: Option<Principal>,
+            #[serde(default)]
+            via: Option<Via>,
+            #[serde(default)]
+            actor: Option<String>,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        let unrecorded = Identity::unrecorded();
+        Ok(Self {
+            generation: repr.generation,
+            session_key: repr.session_key,
+            turn: repr.turn,
+            ts_ms: repr.ts_ms,
+            kind: repr.kind,
+            identity: Identity {
+                tenant: repr.tenant.unwrap_or(unrecorded.tenant),
+                principal: repr.principal.unwrap_or(unrecorded.principal),
+                via: repr.via,
+                actor: repr.actor,
+            },
+        })
+    }
 }
 
 impl Event {
+    /// A record of `kind`. Every field is required: the compiler finds a
+    /// construction that does not say who acted.
+    pub fn new(
+        generation: u64,
+        session_key: Option<SessionKey>,
+        turn: Option<TurnId>,
+        ts_ms: i64,
+        kind: EventKind,
+        identity: Identity,
+    ) -> Self {
+        Self {
+            generation,
+            session_key,
+            turn,
+            ts_ms,
+            kind,
+            identity,
+        }
+    }
+
     /// Build an Update using the envelope's Session and turn correlation.
     /// Its transient sequence and generation are replaced during append.
-    pub fn update(generation: u64, ts_ms: i64, envelope: UpdateEnvelope) -> Self {
+    pub fn update(
+        generation: u64,
+        ts_ms: i64,
+        envelope: UpdateEnvelope,
+        identity: Identity,
+    ) -> Self {
         Self {
             generation,
             session_key: Some(envelope.session.clone()),
             turn: envelope.turn.clone(),
             ts_ms,
             kind: EventKind::Update(envelope),
+            identity,
         }
     }
+
+    /// The tenant the record belongs to.
+    pub fn tenant(&self) -> &Tenant {
+        &self.identity.tenant
+    }
+}
+
+/// `session_opened` payload key that marks the opening that created the
+/// Session (a new Session, a fork, clone or import destination, or a
+/// Subagent). Its identity is the Session's owner of record. Every other
+/// `session_opened` (a load, a reload) leaves it out.
+pub const SESSION_CREATED_KEY: &str = "created";
+
+/// Whether a `session_opened` payload marks the creating opening.
+pub fn opened_creates(payload: &Value) -> bool {
+    payload.get(SESSION_CREATED_KEY) == Some(&Value::Bool(true))
 }
 
 /// A committed activity, ordered globally and (for Updates) within a Session.
@@ -118,6 +203,10 @@ pub fn validate_batch(events: &[Event]) -> Result<()> {
     }
     for event in events {
         check_seq(event.generation)?;
+        event
+            .identity
+            .validate()
+            .map_err(|reason| StoreError::Invalid(reason.into()))?;
         if matches!(
             event.kind,
             EventKind::RuntimeStarted(_) | EventKind::RuntimeStopped(_)
@@ -125,6 +214,17 @@ pub fn validate_batch(events: &[Event]) -> Result<()> {
         {
             return Err(StoreError::Invalid(
                 "Runtime activity must not have Session correlation".into(),
+            ));
+        }
+        // A Runtime record belongs to the Runtime: tenant `local` on a
+        // single node, `system` in a shared cell (ADR-0007 §7.1).
+        if matches!(
+            event.kind,
+            EventKind::RuntimeStarted(_) | EventKind::RuntimeStopped(_)
+        ) && !event.identity.tenant.is_reserved()
+        {
+            return Err(StoreError::Invalid(
+                "Runtime activity must be in a reserved tenant".into(),
             ));
         }
         if let EventKind::Unknown(raw) = &event.kind {

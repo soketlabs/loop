@@ -19,6 +19,10 @@ pub use loop_store::{
     is_recovery_record, Cursor, Event, EventKind, EventLog, LoggedEvent, Page, PageLimit, Result,
     SessionSummary, MAX_BATCH_EVENTS, WRITER_QUEUE_CAPACITY,
 };
+/// Step B3: who acted, and the tenant or scope of each read.
+pub use loop_store::{
+    Deployment, Identity, Scope, SystemScope, Tenant, TenantSession, SESSION_CREATED_KEY,
+};
 pub use sqlite::READER_POOL_SIZE;
 
 use loop_store::{stamp, validate_batch as validate};

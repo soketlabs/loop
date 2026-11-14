@@ -471,19 +471,25 @@ impl loop_runtime::log::EventLog for GatedLog {
     }
     async fn read_after(
         &self,
+        tenant: &loop_runtime::log::Tenant,
         key: &loop_protocol::SessionKey,
         seq: u64,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
-        self.inner.read_after(key, seq).await
+        self.inner.read_after(tenant, key, seq).await
     }
     async fn read_runtime_after(
         &self,
+        scope: loop_runtime::log::Scope<'_>,
         seq: u64,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
-        self.inner.read_runtime_after(seq).await
+        self.inner.read_runtime_after(scope, seq).await
     }
-    async fn latest_seq(&self, key: &loop_protocol::SessionKey) -> loop_runtime::log::Result<u64> {
-        self.inner.latest_seq(key).await
+    async fn latest_seq(
+        &self,
+        tenant: &loop_runtime::log::Tenant,
+        key: &loop_protocol::SessionKey,
+    ) -> loop_runtime::log::Result<u64> {
+        self.inner.latest_seq(tenant, key).await
     }
     async fn allocate_generation(
         &self,
@@ -501,29 +507,32 @@ impl loop_runtime::log::EventLog for GatedLog {
     }
     async fn read_session_page(
         &self,
+        tenant: &loop_runtime::log::Tenant,
         session: &loop_protocol::SessionKey,
         after_seq: u64,
         through_seq: Option<u64>,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
         self.inner
-            .read_session_page(session, after_seq, through_seq, limit)
+            .read_session_page(tenant, session, after_seq, through_seq, limit)
             .await
     }
     async fn session_summary(
         &self,
+        tenant: &loop_runtime::log::Tenant,
         session: &loop_protocol::SessionKey,
     ) -> loop_runtime::log::Result<Option<loop_runtime::log::SessionSummary>> {
-        self.inner.session_summary(session).await
+        self.inner.session_summary(tenant, session).await
     }
     async fn recovery_page(
         &self,
+        scope: loop_runtime::log::Scope<'_>,
         from_generation: u64,
         after_global: u64,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
         self.inner
-            .recovery_page(from_generation, after_global, limit)
+            .recovery_page(scope, from_generation, after_global, limit)
             .await
     }
 }
@@ -1220,9 +1229,13 @@ async fn close_unloads_an_idle_session_releases_its_lease_and_reload_continues_s
         result.unwrap();
         assert!(text.contains("is not loaded"), "{text}");
         // Data is kept: loading again continues the Session's sequence.
-        let before = loop_runtime::log::EventLog::latest_seq(log.as_ref(), &session.key)
-            .await
-            .unwrap();
+        let before = loop_runtime::log::EventLog::latest_seq(
+            log.as_ref(),
+            &loop_runtime::log::Tenant::local(),
+            &session.key,
+        )
+        .await
+        .unwrap();
         assert!(before > 0);
         let mut updates = rt.subscribe();
         let reloaded = rt
@@ -1553,7 +1566,12 @@ async fn ctrl_c_cancels_the_turn_and_drops_queued_prompts() {
         // Only the first prompt ever reached the Runtime.
         use loop_runtime::log::EventLog;
         let prompts = log
-            .read_runtime_after(0)
+            .read_runtime_after(
+                loop_runtime::log::Scope::System(
+                    &loop_runtime::log::SystemScope::for_runtime_startup(),
+                ),
+                0,
+            )
             .await
             .unwrap()
             .into_iter()
@@ -1598,7 +1616,12 @@ async fn detaching_while_an_approval_is_shown_leaves_it_pending() {
         assert!(rt.is_busy(&session), "detaching answered the approval");
         use loop_runtime::log::EventLog;
         assert!(!log
-            .read_runtime_after(0)
+            .read_runtime_after(
+                loop_runtime::log::Scope::System(
+                    &loop_runtime::log::SystemScope::for_runtime_startup()
+                ),
+                0
+            )
             .await
             .unwrap()
             .iter()

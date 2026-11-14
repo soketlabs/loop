@@ -455,8 +455,11 @@ impl Runtime {
         }
     }
 
+    /// A record of the parent's agent, made during the parent's turn: the
+    /// turn's caller, in the parent's tenant.
     async fn log_parent(&self, parent: &LiveSession, kind: EventKind) {
         let ts_ms = now();
+        let identity = parent.identity(&parent.turn_caller());
         if let Err(error) = self
             .log
             .append_batch(vec![Event {
@@ -465,6 +468,7 @@ impl Runtime {
                 turn: None,
                 ts_ms,
                 kind,
+                identity,
             }])
             .await
         {

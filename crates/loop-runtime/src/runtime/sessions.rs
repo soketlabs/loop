@@ -7,8 +7,21 @@ impl Runtime {
     pub(super) async fn open(
         &self,
         existing: Option<&SessionRef>,
+        spec: SessionSpec,
+        child: Option<subagent::ChildOpen>,
+    ) -> BackendResult<SessionRef> {
+        self.open_as(existing, spec, child, false).await
+    }
+    /// Open a Session. `fresh` marks an `existing` Session that this request
+    /// has just created (a fork, clone or import destination): like a new
+    /// one, it is in the caller's tenant and its opening is the creating
+    /// record (the owner of record).
+    pub(super) async fn open_as(
+        &self,
+        existing: Option<&SessionRef>,
         mut spec: SessionSpec,
         child: Option<subagent::ChildOpen>,
+        fresh: bool,
     ) -> BackendResult<SessionRef> {
         // The connection's caller, read at entry: it does not cross spawns.
         let caller = loop_protocol::Caller::current();
@@ -248,11 +261,33 @@ impl Runtime {
                     }
                 }
             }
+            // Who opens it: the connection's caller; a Subagent acts for the
+            // caller of its parent's turn (ADR-0009); in process, the Runtime.
+            let acting = match &child {
+                Some(child) => child.parent.turn_caller(),
+                None => caller.clone().unwrap_or_else(in_process_caller),
+            };
+            // The Session's tenant, fixed for its life: a Subagent's is its
+            // parent's; a Session this request created is the caller's; a
+            // loaded one keeps the tenant the Event Log recorded.
+            let creating = created || fresh;
+            let tenant = match &child {
+                Some(child) => child.parent.tenant.clone(),
+                None if creating => acting.tenant().clone(),
+                None => self.session_tenant(&reference.key),
+            };
+            let actor = child
+                .as_ref()
+                .map(|child| child.parent.reference.key.0.clone());
             if !created {
                 // Appends abandoned while queued (a torn-down pump) commit first.
                 self.log.sync().await.map_err(failed)?;
                 // Turn ids stay unique per Session across Runtime generations.
-                let turns = self.log.turn_ids(&reference.key).await.map_err(failed)?;
+                let turns = self
+                    .log
+                    .turn_ids(&tenant, &reference.key)
+                    .await
+                    .map_err(failed)?;
                 let last = turns
                     .iter()
                     .filter_map(|turn| turn.as_str().strip_prefix("turn-")?.parse::<u64>().ok())
@@ -261,13 +296,18 @@ impl Runtime {
                 // A turn lost before its start was logged left only its prompt.
                 let prompts = self
                     .log
-                    .prompts_sent(&reference.key)
+                    .prompts_sent(&tenant, &reference.key)
                     .await
                     .map_err(failed)?;
                 opened.native.continue_turns_after(last.max(prompts));
             }
-            let escalations =
-                crate::EscalationHost::new(reference.clone(), self.log.clone(), self.generation);
+            let escalations = crate::EscalationHost::new(
+                reference.clone(),
+                self.log.clone(),
+                self.generation,
+                tenant.clone(),
+                actor.clone(),
+            );
             // Runtime grants are live Session state, never restored after a crash.
             opened.approval_bridge.clear_session_grants();
             Arc::make_mut(&mut opened.approval_bridge).set_host(Arc::new(escalations.clone()));
@@ -284,6 +324,8 @@ impl Runtime {
                 self.log.clone(),
                 self.generation,
                 reference.key.clone(),
+                tenant.clone(),
+                actor.clone(),
                 escalations.clone(),
                 &opened.native,
             );
@@ -308,19 +350,29 @@ impl Runtime {
             let (commands, rx) = mpsc::unbounded_channel();
             let (cancel, _) = watch::channel(0);
             let ts_ms = now();
+            let mut payload =
+                json!({"cwd": opened.workspace.cwd, "parent": parent, "depth": depth});
+            if creating {
+                // The creating opening: its identity is the owner of record.
+                payload[loop_store::SESSION_CREATED_KEY] = json!(true);
+            }
+            let opened_by = Identity::acting(&acting, tenant.clone()).with_actor(actor.clone());
             self.log
                 .append_batch(vec![Event {
                     generation: self.generation,
                     session_key: Some(reference.key.clone()),
                     turn: None,
                     ts_ms,
-                    kind: EventKind::SessionOpened(
-                        json!({"cwd": opened.workspace.cwd, "parent": parent, "depth": depth}),
-                    ),
+                    kind: EventKind::SessionOpened(payload),
+                    identity: opened_by,
                 }])
                 .await
                 .map_err(failed)?;
             touch(&self.activity, &reference.key, ts_ms);
+            self.tenants
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(reference.key.clone(), tenant.clone());
             if parent.is_some() {
                 if let Some(keys) = self.subagents.lock().await.as_mut() {
                     keys.insert(reference.key.clone());
@@ -341,8 +393,12 @@ impl Runtime {
                     .is_some();
             let unannounced = !created
                 && initial_config.revision
-                    > self.logged_revision(&reference.key).await? + u64::from(marked);
-            let published = self.log.latest_seq(&reference.key).await.map_err(failed)?;
+                    > self.logged_revision(&tenant, &reference.key).await? + u64::from(marked);
+            let published = self
+                .log
+                .latest_seq(&tenant, &reference.key)
+                .await
+                .map_err(failed)?;
             let live = Arc::new(LiveSession {
                 lifecycle: AsyncMutex::new(()),
                 committed: AsyncMutex::new(None),
@@ -379,9 +435,17 @@ impl Runtime {
                 sandbox_choice: Mutex::new(sandbox_choice),
                 pending_sandbox: Mutex::new(None),
                 loaded_by,
+                tenant,
+                actor,
+                acting: Mutex::new(Acting {
+                    turn: acting.clone(),
+                    request: acting,
+                }),
             });
             decisions.bind(&live);
             if unannounced {
+                // Announced for the request that opens the Session.
+                let identity = live.identity(&live.turn_caller());
                 publish(
                     &live,
                     UpdateEnvelope::live(
@@ -392,6 +456,7 @@ impl Runtime {
                         0,
                         SessionUpdate::ConfigChanged(initial_config),
                     ),
+                    identity,
                     self.log.as_ref(),
                     self.generation,
                     &self.updates,
@@ -495,12 +560,20 @@ impl Runtime {
                 return Ok(());
             }
         }
-        let reason = if self.stopped.load(Ordering::Acquire) {
-            "shutdown"
+        let (reason, by) = if self.stopped.load(Ordering::Acquire) {
+            // The Runtime stops its Sessions on its own.
+            ("shutdown", in_process_caller())
         } else {
-            "closed"
+            // A Subagent is closed by its parent's agent, for the caller of
+            // the parent's turn.
+            let by = match loop_protocol::Caller::current() {
+                Some(caller) => caller,
+                None if live.parent.is_some() => live.turn_caller(),
+                None => in_process_caller(),
+            };
+            ("closed", by)
         };
-        self.teardown(key, live, force, reason).await
+        self.teardown(key, live, force, reason, &by).await
     }
     /// Wait until `live` is no longer the loaded instance of its Session.
     pub(super) async fn wait_removed(&self, live: &Arc<LiveSession>) {
@@ -584,7 +657,11 @@ impl Runtime {
                 "Runtime: unloading idle Session {} (least recently active) to make room",
                 key.0
             );
-            if let Err(error) = self.teardown(&key, live, false, "unloaded").await {
+            // The Runtime unloads on its own.
+            if let Err(error) = self
+                .teardown(&key, live, false, "unloaded", &in_process_caller())
+                .await
+            {
                 eprintln!("Runtime: unloading Session {}: {error}", key.0);
             }
             return true;
@@ -598,12 +675,14 @@ impl Runtime {
             .map(|_| ())
     }
     /// Close a Session whose `closing` the caller set. Always removes it.
+    /// `by` is who closes it; its records name `by`.
     pub(super) async fn teardown(
         &self,
         key: &SessionKey,
         live: Arc<LiveSession>,
         force: bool,
         reason: &str,
+        by: &Caller,
     ) -> BackendResult<()> {
         if force {
             live.cancel.send_modify(|n| *n += 1);
@@ -614,8 +693,12 @@ impl Runtime {
         // acknowledgement stalls. Bound that wait too, then interrupt decisions
         // without discarding the independent durable withdrawal task.
         let escalations = live.escalations.clone();
-        let mut withdrawing =
-            tokio::spawn(async move { escalations.withdraw("Session closed", true).await });
+        let withdrawn_by = by.clone();
+        let mut withdrawing = tokio::spawn(async move {
+            escalations
+                .withdraw("Session closed", true, &withdrawn_by)
+                .await
+        });
         let withdrawal = match tokio::time::timeout(grace, &mut withdrawing).await {
             Ok(result) => result
                 .map_err(failed)
@@ -628,7 +711,7 @@ impl Runtime {
                 }
             }
         };
-        if force && live.commands.send(Command::Cancel).is_err() {
+        if force && live.commands.send(Command::Cancel(by.clone())).is_err() {
             live.cancel.send_modify(|n| *n += 1);
             live.opened.native.cancel(&live.reference);
         }
@@ -678,6 +761,7 @@ impl Runtime {
                 kind: EventKind::SessionClosed(
                     json!({"force": force, "aborted": !settled || !stopped, "reason": reason}),
                 ),
+                identity: live.identity(by),
             }]),
         )
         .await

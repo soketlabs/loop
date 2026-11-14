@@ -15,8 +15,8 @@ use loop_protocol::{SessionKey, SessionUpdate, TurnId, UpdateEnvelope};
 
 use crate::append::Append;
 use crate::error::Result;
-use crate::event::{Committed, EventKind, LoggedEvent};
-use crate::identity::{SystemScope, Tenant};
+use crate::event::{opened_creates, Committed, EventKind, LoggedEvent};
+use crate::identity::{Identity, SystemScope, Tenant};
 use crate::lease::{Fence, Generation, OwnerInfo};
 use crate::page::{Page, PageLimit};
 use crate::tree::{SessionMetadata, SessionTreeEntry};
@@ -26,8 +26,13 @@ use crate::tree::{SessionMetadata, SessionTreeEntry};
 /// Every field is a fold over the Session's records in `global_seq` order
 /// ([`SessionSummary::apply`]). A store keeps it in the transaction of the
 /// append, so a read after an append sees the append in the summary too.
+///
+/// Step B3: a summary is keyed by `(tenant, session)`. The same Session key
+/// in two tenants is two Sessions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
+    /// The Session's tenant.
+    pub tenant: Tenant,
     /// The Session.
     pub session: SessionKey,
     /// The last `session_seq` (Updates only), or 0.
@@ -46,12 +51,20 @@ pub struct SessionSummary {
     /// `parent` is not null, and never cleared. A parent that is not a
     /// string is kept as its JSON text.
     pub parent: Option<SessionKey>,
+    /// The owner of record (step B3): the identity of the `session_opened`
+    /// that created the Session ([`crate::event::SESSION_CREATED_KEY`]),
+    /// set once and never changed. `None` when no creating record is in the
+    /// log: a Session created before step B3, or outside the Runtime. This
+    /// is not an access check; the Runtime decides access (task I3).
+    pub owner: Option<Identity>,
 }
 
 /// What one record changes in its Session's summary. Records without a
 /// Session change nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SummaryDelta {
+    /// The record's tenant.
+    pub tenant: Tenant,
     /// The record's Session.
     pub session: SessionKey,
     /// Its `session_seq` (Updates).
@@ -66,6 +79,9 @@ pub struct SummaryDelta {
     pub turn: Option<TurnId>,
     /// The parent of a `session_opened` with a parent.
     pub parent: Option<SessionKey>,
+    /// The record's identity, when it is the `session_opened` that created
+    /// the Session.
+    pub owner: Option<Identity>,
 }
 
 impl SummaryDelta {
@@ -92,7 +108,14 @@ impl SummaryDelta {
             },
             _ => None,
         };
+        let owner = match &event.kind {
+            EventKind::SessionOpened(payload) if opened_creates(payload) => {
+                Some(event.identity.clone())
+            }
+            _ => None,
+        };
         Some(Self {
+            tenant: event.identity.tenant.clone(),
             session,
             seq: record.session_seq,
             ts_ms: event.ts_ms,
@@ -100,14 +123,16 @@ impl SummaryDelta {
             prompt: matches!(event.kind, EventKind::PromptSent(_)),
             turn: event.turn.clone(),
             parent,
+            owner,
         })
     }
 }
 
 impl SessionSummary {
     /// The summary of a Session with no records.
-    pub fn empty(session: SessionKey) -> Self {
+    pub fn empty(tenant: Tenant, session: SessionKey) -> Self {
         Self {
+            tenant,
             session,
             last_seq: 0,
             last_revision: 0,
@@ -115,6 +140,7 @@ impl SessionSummary {
             prompts_sent: 0,
             turn_count: 0,
             parent: None,
+            owner: None,
         }
     }
 
@@ -138,23 +164,34 @@ impl SessionSummary {
         if self.parent.is_none() {
             self.parent.clone_from(&delta.parent);
         }
+        if self.owner.is_none() {
+            self.owner.clone_from(&delta.owner);
+        }
     }
 }
 
+/// A Session in its tenant: the key of every per-Session projection row.
+pub type TenantSession = (Tenant, SessionKey);
+
 /// The summary of each Session and its turn ids (first-seen order), folded
-/// from records in `global_seq` order. It is the reference that a store's
-/// projection must equal.
+/// from records in `global_seq` order, keyed by `(tenant, session)`. It is
+/// the reference that a store's projection must equal.
 pub fn summarize<'a>(
     records: impl IntoIterator<Item = &'a LoggedEvent>,
-) -> BTreeMap<SessionKey, (SessionSummary, Vec<TurnId>)> {
-    let mut sessions: BTreeMap<SessionKey, (SessionSummary, Vec<TurnId>)> = BTreeMap::new();
+) -> BTreeMap<TenantSession, (SessionSummary, Vec<TurnId>)> {
+    let mut sessions: BTreeMap<TenantSession, (SessionSummary, Vec<TurnId>)> = BTreeMap::new();
     for record in records {
         let Some(delta) = SummaryDelta::of(record) else {
             continue;
         };
         let (summary, turns) = sessions
-            .entry(delta.session.clone())
-            .or_insert_with(|| (SessionSummary::empty(delta.session.clone()), Vec::new()));
+            .entry((delta.tenant.clone(), delta.session.clone()))
+            .or_insert_with(|| {
+                (
+                    SessionSummary::empty(delta.tenant.clone(), delta.session.clone()),
+                    Vec::new(),
+                )
+            });
         let new_turn = match &delta.turn {
             Some(turn) if !turns.contains(turn) => {
                 turns.push(turn.clone());

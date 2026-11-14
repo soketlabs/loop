@@ -49,7 +49,10 @@ async fn two_sessions_commit_tagged_contiguous_streams_before_completion() {
         assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
     }
     for session in [&a, &b] {
-        let records = log.read_after(&session.key, 0).await.unwrap();
+        let records = log
+            .read_after(&loop_store::Tenant::local(), &session.key, 0)
+            .await
+            .unwrap();
         assert!(!records.is_empty());
         for (i, record) in records.iter().enumerate() {
             let EventKind::Update(e) = &record.event.kind else {
@@ -68,8 +71,15 @@ async fn two_sessions_commit_tagged_contiguous_streams_before_completion() {
     }
     assert_eq!(
         count,
-        log.read_after(&a.key, 0).await.unwrap().len()
-            + log.read_after(&b.key, 0).await.unwrap().len()
+        log.read_after(&loop_store::Tenant::local(), &a.key, 0)
+            .await
+            .unwrap()
+            .len()
+            + log
+                .read_after(&loop_store::Tenant::local(), &b.key, 0)
+                .await
+                .unwrap()
+                .len()
     );
     rt.shutdown().await;
 }
@@ -103,22 +113,38 @@ async fn close_releases_lease_reload_continues_sequences_and_listing_retains_his
         .unwrap()
         .outcome()
         .await;
-    let before = log.latest_seq(&a.key).await.unwrap();
+    let before = log
+        .latest_seq(&loop_store::Tenant::local(), &a.key)
+        .await
+        .unwrap();
     rt.close(&a.key, false).await.unwrap();
     assert!(store.lease(&a.native_id).await.unwrap().is_none());
     let list = rt.list().await.unwrap();
     assert!(!list[0].live);
     assert_eq!(list[0].name.as_deref(), Some("named"));
     rt.load_session(&a, SessionSpec::default()).await.unwrap();
-    assert_eq!(log.latest_seq(&a.key).await.unwrap(), before);
+    assert_eq!(
+        log.latest_seq(&loop_store::Tenant::local(), &a.key)
+            .await
+            .unwrap(),
+        before
+    );
     assert!(!rt.transcript(&a).await.unwrap().is_empty());
-    assert_eq!(log.latest_seq(&a.key).await.unwrap(), before);
+    assert_eq!(
+        log.latest_seq(&loop_store::Tenant::local(), &a.key)
+            .await
+            .unwrap(),
+        before
+    );
     rt.prompt(&a, vec![ContentBlock::text("again")])
         .await
         .unwrap()
         .outcome()
         .await;
-    let after = log.read_after(&a.key, before).await.unwrap();
+    let after = log
+        .read_after(&loop_store::Tenant::local(), &a.key, before)
+        .await
+        .unwrap();
     assert_eq!(after[0].session_seq, Some(before + 1));
     rt.shutdown().await;
 }
@@ -320,7 +346,12 @@ async fn active_turn_limit_waits_and_parent_can_release_and_reacquire() {
             .await
             .is_err()
     );
-    assert_eq!(log.latest_seq(&b.key).await.unwrap(), 0);
+    assert_eq!(
+        log.latest_seq(&loop_store::Tenant::local(), &b.key)
+            .await
+            .unwrap(),
+        0
+    );
     rt.release_turn_permit(&a).await.unwrap();
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(20), second)
@@ -345,7 +376,10 @@ async fn active_turn_limit_waits_and_parent_can_release_and_reacquire() {
     // settles an approval. Closure still waits for the actual outcome.
     let _ = first.outcome().await;
     assert!(log
-        .read_runtime_after(0)
+        .read_runtime_after(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            0
+        )
         .await
         .unwrap()
         .iter()
@@ -369,7 +403,10 @@ async fn restart_preserves_session_cursor_and_advances_generation() {
         .unwrap()
         .outcome()
         .await;
-    let old = log.latest_seq(&a.key).await.unwrap();
+    let old = log
+        .latest_seq(&loop_store::Tenant::local(), &a.key)
+        .await
+        .unwrap();
     let generation = rt.generation();
     rt.shutdown().await;
     let rt = runtime(dir.path(), log.clone(), RuntimeLimits::default()).await;
@@ -380,13 +417,22 @@ async fn restart_preserves_session_cursor_and_advances_generation() {
         .unwrap()
         .outcome()
         .await;
-    let records = log.read_after(&a.key, old).await.unwrap();
+    let records = log
+        .read_after(&loop_store::Tenant::local(), &a.key, old)
+        .await
+        .unwrap();
     assert_eq!(records[0].session_seq, Some(old + 1));
     for record in records {
         assert_eq!(record.event.generation, generation + 1);
     }
     rt.shutdown().await;
-    let records = log.read_runtime_after(0).await.unwrap();
+    let records = log
+        .read_runtime_after(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            0,
+        )
+        .await
+        .unwrap();
     assert_eq!(
         records
             .iter()
@@ -451,26 +497,33 @@ impl EventLog for FailingLog {
     }
     async fn read_after(
         &self,
+        tenant: &loop_store::Tenant,
         s: &loop_protocol::SessionKey,
         n: u64,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
-        self.inner.read_after(s, n).await
+        self.inner.read_after(tenant, s, n).await
     }
     async fn read_runtime_after(
         &self,
+        scope: loop_store::Scope<'_>,
         n: u64,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
         self.runtime_reads
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        self.inner.read_runtime_after(n).await
+        self.inner.read_runtime_after(scope, n).await
     }
-    async fn latest_seq(&self, s: &loop_protocol::SessionKey) -> loop_runtime::log::Result<u64> {
-        self.inner.latest_seq(s).await
+    async fn latest_seq(
+        &self,
+        tenant: &loop_store::Tenant,
+        s: &loop_protocol::SessionKey,
+    ) -> loop_runtime::log::Result<u64> {
+        self.inner.latest_seq(tenant, s).await
     }
     async fn subagent_sessions(
         &self,
-    ) -> loop_runtime::log::Result<std::collections::HashSet<loop_protocol::SessionKey>> {
-        self.inner.subagent_sessions().await
+        scope: loop_store::Scope<'_>,
+    ) -> loop_runtime::log::Result<std::collections::HashSet<loop_store::TenantSession>> {
+        self.inner.subagent_sessions(scope).await
     }
     async fn allocate_generation(&self, o: &str, p: u32, t: i64) -> loop_runtime::log::Result<u64> {
         self.inner.allocate_generation(o, p, t).await
@@ -501,7 +554,12 @@ async fn failed_log_write_fails_turn_without_publishing_uncommitted_updates() {
     .unwrap();
     assert!(matches!(outcome, TurnOutcome::Failed(_)));
     assert!(updates.try_recv().is_err());
-    assert_eq!(log.latest_seq(&a.key).await.unwrap(), 0);
+    assert_eq!(
+        log.latest_seq(&loop_store::Tenant::local(), &a.key)
+            .await
+            .unwrap(),
+        0
+    );
     assert!(rt
         .prompt(&a, vec![ContentBlock::text("again")])
         .await
@@ -603,7 +661,7 @@ async fn live_leases_renew_and_ownership_loss_stops_admission() {
     // write as well. Wait for that record rather than for the interval.
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let lost = log.read_runtime_after(0).await.unwrap().iter().any(|e| {
+            let lost = log.read_runtime_after(loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()), 0).await.unwrap().iter().any(|e| {
                 e.event.session_key.as_ref() == Some(&a.key)
                     && matches!(&e.event.kind, EventKind::Cancelled(p) if p["reason"] == "lease lost")
             });
@@ -677,7 +735,13 @@ async fn shutdown_releases_leases_logs_stop_finishes_generation_once() {
     for s in [&a, &b] {
         assert!(store.lease(&s.native_id).await.unwrap().is_none());
     }
-    let records = log.read_runtime_after(0).await.unwrap();
+    let records = log
+        .read_runtime_after(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            0,
+        )
+        .await
+        .unwrap();
     let count = |f: fn(&EventKind) -> bool| records.iter().filter(|e| f(&e.event.kind)).count();
     assert_eq!(count(|k| matches!(k, EventKind::RuntimeStopped(_))), 1);
     assert_eq!(count(|k| matches!(k, EventKind::SessionClosed(_))), 2);
@@ -742,7 +806,13 @@ async fn forced_close_gives_up_on_a_turn_that_ignores_cancellation() {
         .is_none());
     assert!(!rt.is_busy(&a));
     assert!(rt.tail(&a).is_err());
-    let records = log.read_runtime_after(0).await.unwrap();
+    let records = log
+        .read_runtime_after(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            0,
+        )
+        .await
+        .unwrap();
     assert!(records
         .iter()
         .any(|e| matches!(e.event.kind, EventKind::SessionClosed(_))));
@@ -861,7 +931,11 @@ async fn turn_ids_continue_across_runtime_restarts() {
                 .outcome()
                 .await;
             rt.shutdown().await;
-            let turns = turn_starts(&log.read_after(&a.key, 0).await.unwrap());
+            let turns = turn_starts(
+                &log.read_after(&loop_store::Tenant::local(), &a.key, 0)
+                    .await
+                    .unwrap(),
+            );
             assert_eq!(turns, ["turn-1", "turn-2", "turn-3"], "log {n}");
         }
     })
@@ -898,6 +972,7 @@ async fn a_turn_lost_before_its_start_was_logged_never_has_its_id_reused() {
                 turn: None,
                 ts_ms: 1,
                 kind: EventKind::PromptSent(serde_json::json!({"content": []})),
+                identity: loop_store::Identity::unrecorded(),
             }])
             .await
             .unwrap();
@@ -909,7 +984,11 @@ async fn a_turn_lost_before_its_start_was_logged_never_has_its_id_reused() {
                 .outcome()
                 .await;
             rt.shutdown().await;
-            let turns = turn_starts(&log.read_after(&a.key, 0).await.unwrap());
+            let turns = turn_starts(
+                &log.read_after(&loop_store::Tenant::local(), &a.key, 0)
+                    .await
+                    .unwrap(),
+            );
             assert_eq!(turns, ["turn-1", "turn-3"], "log {n}");
         }
     })
@@ -952,7 +1031,10 @@ async fn tree_mutation_log_failure_is_reconciled_before_a_new_snapshot() {
                 revision: renamed.revision
             }
         );
-        let before = log.latest_seq(&source.key).await.unwrap();
+        let before = log
+            .latest_seq(&loop_store::Tenant::local(), &source.key)
+            .await
+            .unwrap();
         log.fail_updates
             .store(true, std::sync::atomic::Ordering::Release);
         assert!(rt
@@ -964,7 +1046,12 @@ async fn tree_mutation_log_failure_is_reconciled_before_a_new_snapshot() {
             })
             .await
             .is_err());
-        assert_eq!(log.latest_seq(&source.key).await.unwrap(), before);
+        assert_eq!(
+            log.latest_seq(&loop_store::Tenant::local(), &source.key)
+                .await
+                .unwrap(),
+            before
+        );
         assert!(rt
             .prompt(&source, vec![ContentBlock::text("must not start")])
             .await

@@ -66,6 +66,7 @@ fn update(generation: u64, session: &SessionKey, turn: &str, update: SessionUpda
             0,
             update,
         ),
+        loop_store::Identity::unrecorded(),
     )
 }
 fn started(generation: u64, session: &SessionKey, turn: &str) -> Event {
@@ -97,6 +98,7 @@ fn audit(generation: u64, session: &SessionKey, kind: EventKind) -> Event {
         turn: None,
         ts_ms: 1,
         kind,
+        identity: loop_store::Identity::unrecorded(),
     }
 }
 fn reference(key: &SessionKey) -> SessionRef {
@@ -191,8 +193,8 @@ async fn recovery_ends_open_turns_withdraws_parked_escalations_and_reclaims_leas
     tokio::time::timeout(LIMIT, async {
         let dir = tempfile::tempdir().unwrap();
         let Seeded { a, b, store, log } = seed(dir.path()).await;
-        let a_before = log.latest_seq(&a).await.unwrap();
-        let b_before = log.latest_seq(&b).await.unwrap();
+        let a_before = log.latest_seq(&loop_store::Tenant::local(), &a).await.unwrap();
+        let b_before = log.latest_seq(&loop_store::Tenant::local(), &b).await.unwrap();
         let rt = runtime(dir.path(), log.clone()).await;
         assert_eq!(rt.generation(), 2);
 
@@ -221,9 +223,9 @@ async fn recovery_ends_open_turns_withdraws_parked_escalations_and_reclaims_leas
             SessionUpdate::TurnEnded { turn_id, stop: StopReason::RuntimeRestarted, error: None }
                 if turn_id.0 == "turn-2"
         ));
-        assert_eq!(log.latest_seq(&b).await.unwrap(), b_before);
+        assert_eq!(log.latest_seq(&loop_store::Tenant::local(), &b).await.unwrap(), b_before);
 
-        let all = log.read_runtime_after(0).await.unwrap();
+        let all = log.read_runtime_after(loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()), 0).await.unwrap();
         let withdrawn = withdrawals(&all);
         assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
         assert_eq!(withdrawn[0]["id"], "approval-1");
@@ -245,7 +247,7 @@ async fn recovery_ends_open_turns_withdraws_parked_escalations_and_reclaims_leas
         // Idempotent within a generation.
         let count = all.len();
         assert_eq!(rt.recover(Some(&held)).await.unwrap(), Recovery::default());
-        assert_eq!(log.read_runtime_after(0).await.unwrap().len(), count);
+        assert_eq!(log.read_runtime_after(loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()), 0).await.unwrap().len(), count);
 
         // Session A is usable again.
         let session = rt
@@ -265,10 +267,10 @@ async fn recovery_ends_open_turns_withdraws_parked_escalations_and_reclaims_leas
         let rt = runtime(dir.path(), log.clone()).await;
         assert_eq!(rt.generation(), 3);
         assert_eq!(rt.recover(Some(&held)).await.unwrap(), Recovery::default());
-        let after = log.read_runtime_after(0).await.unwrap();
+        let after = log.read_runtime_after(loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()), 0).await.unwrap();
         assert_eq!(withdrawals(&after).len(), 1);
         let restarted = log
-            .read_after(&a, 0)
+            .read_after(&loop_store::Tenant::local(), &a, 0)
             .await
             .unwrap()
             .into_iter()
@@ -417,7 +419,13 @@ async fn recovery_reads_only_what_it_needs_since_the_last_recovered_generation()
         )])
         .await
         .unwrap();
-        let records = log.recovery_records(1).await.unwrap();
+        let records = log
+            .recovery_records(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                1,
+            )
+            .await
+            .unwrap();
         assert!(records.iter().all(|r| match &r.event.kind {
             EventKind::Update(e) => matches!(
                 e.update,
@@ -429,14 +437,31 @@ async fn recovery_reads_only_what_it_needs_since_the_last_recovered_generation()
             _ => false,
         }));
         assert_eq!(records.len(), 10);
-        assert_eq!(log.last_recovered_generation().await.unwrap(), 0);
+        assert_eq!(
+            log.last_recovered_generation(&loop_store::SystemScope::for_runtime_startup())
+                .await
+                .unwrap(),
+            0
+        );
 
         // Generation 2 dies before recovering; generation 3 still finds turn-2.
         drop(runtime(dir.path(), log.clone()).await);
         let rt = runtime(dir.path(), log.clone()).await;
         assert_eq!(rt.recover(None).await.unwrap().turns_ended, 1);
-        assert_eq!(log.last_recovered_generation().await.unwrap(), 3);
-        assert!(log.recovery_records(4).await.unwrap().is_empty());
+        assert_eq!(
+            log.last_recovered_generation(&loop_store::SystemScope::for_runtime_startup())
+                .await
+                .unwrap(),
+            3
+        );
+        assert!(log
+            .recovery_records(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                4
+            )
+            .await
+            .unwrap()
+            .is_empty());
         rt.shutdown().await;
 
         // Records older than the recovered generation are never read again.
@@ -471,19 +496,25 @@ impl EventLog for CrashBetweenChunks {
     }
     async fn read_after(
         &self,
+        tenant: &loop_store::Tenant,
         session: &SessionKey,
         after: u64,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
-        self.inner.read_after(session, after).await
+        self.inner.read_after(tenant, session, after).await
     }
     async fn read_runtime_after(
         &self,
+        scope: loop_store::Scope<'_>,
         after: u64,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
-        self.inner.read_runtime_after(after).await
+        self.inner.read_runtime_after(scope, after).await
     }
-    async fn latest_seq(&self, session: &SessionKey) -> loop_runtime::log::Result<u64> {
-        self.inner.latest_seq(session).await
+    async fn latest_seq(
+        &self,
+        tenant: &loop_store::Tenant,
+        session: &SessionKey,
+    ) -> loop_runtime::log::Result<u64> {
+        self.inner.latest_seq(tenant, session).await
     }
     async fn allocate_generation(
         &self,
@@ -498,12 +529,16 @@ impl EventLog for CrashBetweenChunks {
     }
     async fn recovery_records(
         &self,
+        scope: loop_store::Scope<'_>,
         from: u64,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
-        self.inner.recovery_records(from).await
+        self.inner.recovery_records(scope, from).await
     }
-    async fn last_recovered_generation(&self) -> loop_runtime::log::Result<u64> {
-        self.inner.last_recovered_generation().await
+    async fn last_recovered_generation(
+        &self,
+        scope: &loop_store::SystemScope,
+    ) -> loop_runtime::log::Result<u64> {
+        self.inner.last_recovered_generation(scope).await
     }
     async fn mark_recovered(&self, generation: u64, ms: i64) -> loop_runtime::log::Result<()> {
         self.inner.mark_recovered(generation, ms).await
@@ -513,29 +548,32 @@ impl EventLog for CrashBetweenChunks {
     }
     async fn read_session_page(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
         after_seq: u64,
         through_seq: Option<u64>,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
         self.inner
-            .read_session_page(session, after_seq, through_seq, limit)
+            .read_session_page(tenant, session, after_seq, through_seq, limit)
             .await
     }
     async fn session_summary(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
     ) -> loop_runtime::log::Result<Option<loop_runtime::log::SessionSummary>> {
-        self.inner.session_summary(session).await
+        self.inner.session_summary(tenant, session).await
     }
     async fn recovery_page(
         &self,
+        scope: loop_store::Scope<'_>,
         from_generation: u64,
         after_global: u64,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
         self.inner
-            .recovery_page(from_generation, after_global, limit)
+            .recovery_page(scope, from_generation, after_global, limit)
             .await
     }
 }
@@ -568,12 +606,12 @@ async fn a_crash_between_recovery_chunks_is_finished_once_by_the_next_start() {
             .store(true, std::sync::atomic::Ordering::Release);
         assert!(rt.recover(None).await.is_err());
         drop(rt);
-        assert_eq!(log.last_recovered_generation().await.unwrap(), 0);
+        assert_eq!(log.last_recovered_generation(&loop_store::SystemScope::for_runtime_startup()).await.unwrap(), 0);
 
         let rt = runtime(dir.path(), log.clone()).await;
         rt.recover(None).await.unwrap();
         let ends = log
-            .read_after(&a, 0)
+            .read_after(&loop_store::Tenant::local(), &a, 0)
             .await
             .unwrap()
             .into_iter()
@@ -629,7 +667,10 @@ async fn clean_shutdown_mid_turn_leaves_no_turn_for_recovery() {
             .await
             .unwrap();
         while !log
-            .read_runtime_after(0)
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
             .await
             .unwrap()
             .iter()

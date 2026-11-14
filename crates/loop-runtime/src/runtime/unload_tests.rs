@@ -192,16 +192,30 @@ async fn the_least_recently_active_idle_session_is_unloaded_and_logged() {
         );
         assert_eq!(rt.status().loaded, 2);
         assert!(rt.store.lease(&b.native_id).await.unwrap().is_none());
-        let events = log.read_runtime_after(0).await.unwrap();
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         assert_eq!(closed_reasons(&events, &b.key), ["unloaded"]);
         // Its data is kept: loading it again unloads the next idle one.
-        let before = log.latest_seq(&b.key).await.unwrap();
+        let before = log
+            .latest_seq(&loop_store::Tenant::local(), &b.key)
+            .await
+            .unwrap();
         rt.load_session(&b, SessionSpec::default()).await.unwrap();
         assert!(matches!(
             run(&rt, &b, "again").await,
             TurnOutcome::Completed(_)
         ));
-        assert!(log.latest_seq(&b.key).await.unwrap() > before);
+        assert!(
+            log.latest_seq(&loop_store::Tenant::local(), &b.key)
+                .await
+                .unwrap()
+                > before
+        );
         assert_eq!(rt.status().loaded, 2);
         rt.shutdown().await;
     })
@@ -946,7 +960,7 @@ async fn an_attach_snapshot_holds_turn_settlement_until_it_is_captured() {
 }
 
 async fn resets(log: &MemoryEventLog, session: &SessionRef) -> usize {
-    log.read_after(&session.key, 0)
+    log.read_after(&loop_store::Tenant::local(), &session.key, 0)
         .await
         .unwrap()
         .into_iter()

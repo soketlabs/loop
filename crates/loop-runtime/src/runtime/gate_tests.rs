@@ -90,18 +90,21 @@ fn setup(
 
 /// Every decision record in `log`, with its committed record.
 async fn decisions(log: &MemoryEventLog) -> Vec<(LoggedEvent, PolicyDecisionRecord)> {
-    log.read_runtime_after(0)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter_map(|record| match &record.event.kind {
-            EventKind::PolicyDecision(value) => {
-                let decision = serde_json::from_value(value.clone()).unwrap();
-                Some((record, decision))
-            }
-            _ => None,
-        })
-        .collect()
+    log.read_runtime_after(
+        loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+        0,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .filter_map(|record| match &record.event.kind {
+        EventKind::PolicyDecision(value) => {
+            let decision = serde_json::from_value(value.clone()).unwrap();
+            Some((record, decision))
+        }
+        _ => None,
+    })
+    .collect()
 }
 
 fn edge(id: &str) -> Caller {
@@ -219,7 +222,13 @@ async fn a_tool_call_s_decision_commits_after_its_tool_call_and_before_it_runs()
             std::fs::read_to_string(dir.path().join("made")).unwrap(),
             "ran"
         );
-        let all = log.read_runtime_after(0).await.unwrap();
+        let all = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         let at = |find: &dyn Fn(&LoggedEvent) -> bool| {
             all.iter()
                 .find(|record| find(record))
@@ -265,7 +274,10 @@ async fn a_tool_call_s_decision_commits_after_its_tool_call_and_before_it_runs()
             record.turn
         );
         // Replay never sees it.
-        let replay = log.read_after(&session.key, 0).await.unwrap();
+        let replay = log
+            .read_after(&loop_store::Tenant::local(), &session.key, 0)
+            .await
+            .unwrap();
         assert!(replay
             .iter()
             .all(|r| !matches!(r.event.kind, EventKind::PolicyDecision(_))));
@@ -612,7 +624,13 @@ async fn parallel_tool_calls_commit_each_decision_before_any_tool_runs() {
             let made = std::fs::read_to_string(dir.path().join(format!("made-{i}"))).unwrap();
             assert_eq!(made, i.to_string(), "control: call {i} ran");
         }
-        let all = log.read_runtime_after(0).await.unwrap();
+        let all = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         let seq_of = |find: &dyn Fn(&LoggedEvent) -> bool| {
             all.iter().find(|r| find(r)).map(|r| r.global_seq)
         };
@@ -677,16 +695,25 @@ impl EventLog for NoDecisions {
     }
     async fn read_after(
         &self,
+        tenant: &loop_store::Tenant,
         session: &SessionKey,
         after_seq: u64,
     ) -> crate::log::Result<Vec<LoggedEvent>> {
-        self.0.read_after(session, after_seq).await
+        self.0.read_after(tenant, session, after_seq).await
     }
-    async fn read_runtime_after(&self, global_seq: u64) -> crate::log::Result<Vec<LoggedEvent>> {
-        self.0.read_runtime_after(global_seq).await
+    async fn read_runtime_after(
+        &self,
+        scope: loop_store::Scope<'_>,
+        global_seq: u64,
+    ) -> crate::log::Result<Vec<LoggedEvent>> {
+        self.0.read_runtime_after(scope, global_seq).await
     }
-    async fn latest_seq(&self, session: &SessionKey) -> crate::log::Result<u64> {
-        self.0.latest_seq(session).await
+    async fn latest_seq(
+        &self,
+        tenant: &loop_store::Tenant,
+        session: &SessionKey,
+    ) -> crate::log::Result<u64> {
+        self.0.latest_seq(tenant, session).await
     }
     async fn allocate_generation(
         &self,

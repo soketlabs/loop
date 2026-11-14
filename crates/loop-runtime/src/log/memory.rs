@@ -2,7 +2,10 @@ use super::*;
 use async_trait::async_trait;
 use loop_protocol::{SessionKey, TurnId};
 use loop_store::page::cut;
-use loop_store::{record_bytes, Cursor, Page, PageLimit, SessionSummary, StoreCapabilities};
+use loop_store::{
+    record_bytes, Cursor, Page, PageLimit, Scope, SessionSummary, StoreCapabilities, SystemScope,
+    Tenant, TenantSession,
+};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::Mutex;
 
@@ -20,7 +23,9 @@ struct SessionState {
 struct State {
     /// Each record with its payload size, for the byte limit of a page.
     events: Vec<(LoggedEvent, usize)>,
-    sessions: HashMap<SessionKey, SessionState>,
+    /// Keyed by `(tenant, session)`: the same key in two tenants is two
+    /// Sessions.
+    sessions: HashMap<TenantSession, SessionState>,
     generations: Vec<Option<i64>>,
     recovered: u64,
 }
@@ -31,7 +36,10 @@ impl State {
         let Some(delta) = loop_store::SummaryDelta::of(record) else {
             return;
         };
-        let session = self.sessions.entry(delta.session.clone()).or_default();
+        let session = self
+            .sessions
+            .entry((delta.tenant.clone(), delta.session.clone()))
+            .or_default();
         if record.session_seq.is_some() {
             session.updates.push(index);
         }
@@ -44,24 +52,30 @@ impl State {
         };
         session
             .summary
-            .get_or_insert_with(|| SessionSummary::empty(delta.session.clone()))
+            .get_or_insert_with(|| {
+                SessionSummary::empty(delta.tenant.clone(), delta.session.clone())
+            })
             .apply(&delta, new_turn);
     }
 
-    fn latest(&self, session: &SessionKey) -> u64 {
-        self.sessions
-            .get(session)
+    fn session(&self, tenant: &Tenant, session: &SessionKey) -> Option<&SessionState> {
+        self.sessions.get(&(tenant.clone(), session.clone()))
+    }
+
+    fn latest(&self, tenant: &Tenant, session: &SessionKey) -> u64 {
+        self.session(tenant, session)
             .map_or(0, |s| s.updates.len() as u64)
     }
 
     fn session_page(
         &self,
+        tenant: &Tenant,
         session: &SessionKey,
         after_seq: u64,
         through_seq: u64,
         limit: PageLimit,
     ) -> Page<LoggedEvent> {
-        let Some(state) = self.sessions.get(session) else {
+        let Some(state) = self.session(tenant, session) else {
             return Page::last(Vec::new());
         };
         let start = usize::try_from(after_seq).unwrap_or(usize::MAX);
@@ -100,12 +114,15 @@ impl EventLog for MemoryEventLog {
         validate(&events)?;
         let mut state = self.state.lock().await;
         // Sequences of this batch; the state changes only after this loop.
-        let mut next: HashMap<SessionKey, u64> = HashMap::new();
+        let mut next: HashMap<TenantSession, u64> = HashMap::new();
         let mut seqs = Vec::with_capacity(events.len());
         for event in &events {
             seqs.push(match (&event.kind, &event.session_key) {
                 (EventKind::Update(_), Some(key)) => {
-                    let seq = next.entry(key.clone()).or_insert_with(|| state.latest(key));
+                    let tenant = event.tenant();
+                    let seq = next
+                        .entry((tenant.clone(), key.clone()))
+                        .or_insert_with(|| state.latest(tenant, key));
                     *seq += 1;
                     Some(*seq)
                 }
@@ -126,16 +143,23 @@ impl EventLog for MemoryEventLog {
         }
         Ok(result)
     }
-    async fn read_after(&self, session: &SessionKey, after_seq: u64) -> Result<Vec<LoggedEvent>> {
-        let through = self.latest_seq(session).await?;
+    async fn read_after(
+        &self,
+        tenant: &Tenant,
+        session: &SessionKey,
+        after_seq: u64,
+    ) -> Result<Vec<LoggedEvent>> {
+        let through = self.latest_seq(tenant, session).await?;
         let mut records = Vec::new();
         let mut after = after_seq;
         loop {
-            let page =
-                self.state
-                    .lock()
-                    .await
-                    .session_page(session, after, through, PageLimit::DEFAULT);
+            let page = self.state.lock().await.session_page(
+                tenant,
+                session,
+                after,
+                through,
+                PageLimit::DEFAULT,
+            );
             records.extend(page.items);
             match page.next {
                 Some(Cursor(next)) => after = next,
@@ -143,50 +167,62 @@ impl EventLog for MemoryEventLog {
             }
         }
     }
-    async fn read_runtime_after(&self, global_seq: u64) -> Result<Vec<LoggedEvent>> {
+    async fn read_runtime_after(
+        &self,
+        scope: Scope<'_>,
+        global_seq: u64,
+    ) -> Result<Vec<LoggedEvent>> {
         let state = self.state.lock().await;
         let start = usize::try_from(global_seq)
             .unwrap_or(usize::MAX)
             .min(state.events.len());
         Ok(state.events[start..]
             .iter()
+            .filter(|(record, _)| scope.admits(record.event.tenant()))
             .map(|(record, _)| record.clone())
             .collect())
     }
-    async fn latest_seq(&self, session: &SessionKey) -> Result<u64> {
-        Ok(self.state.lock().await.latest(session))
+    async fn latest_seq(&self, tenant: &Tenant, session: &SessionKey) -> Result<u64> {
+        Ok(self.state.lock().await.latest(tenant, session))
     }
     fn capabilities(&self) -> StoreCapabilities {
         StoreCapabilities {
             paged_reads: true,
+            tenant_scoped: true,
             ..StoreCapabilities::EVENT_LOG_V1
         }
     }
     async fn read_session_page(
         &self,
+        tenant: &Tenant,
         session: &SessionKey,
         after_seq: u64,
         through_seq: Option<u64>,
         limit: PageLimit,
     ) -> Result<Page<LoggedEvent>> {
         Ok(self.state.lock().await.session_page(
+            tenant,
             session,
             after_seq,
             through_seq.unwrap_or(u64::MAX),
             limit,
         ))
     }
-    async fn session_summary(&self, session: &SessionKey) -> Result<Option<SessionSummary>> {
+    async fn session_summary(
+        &self,
+        tenant: &Tenant,
+        session: &SessionKey,
+    ) -> Result<Option<SessionSummary>> {
         Ok(self
             .state
             .lock()
             .await
-            .sessions
-            .get(session)
+            .session(tenant, session)
             .and_then(|s| s.summary.clone()))
     }
     async fn recovery_page(
         &self,
+        scope: Scope<'_>,
         from_generation: u64,
         after_global: u64,
         limit: PageLimit,
@@ -197,7 +233,9 @@ impl EventLog for MemoryEventLog {
             .min(state.events.len());
         let page = cut(
             state.events[start..].iter().filter(|(r, _)| {
-                r.event.generation >= from_generation && is_recovery_record(&r.event.kind)
+                r.event.generation >= from_generation
+                    && is_recovery_record(&r.event.kind)
+                    && scope.admits(r.event.tenant())
             }),
             limit,
             |(_, bytes)| *bytes,
@@ -208,44 +246,50 @@ impl EventLog for MemoryEventLog {
             next: page.next,
         })
     }
-    async fn subagent_sessions(&self) -> Result<HashSet<SessionKey>> {
+    async fn subagent_sessions(&self, scope: Scope<'_>) -> Result<HashSet<TenantSession>> {
         Ok(self
             .state
             .lock()
             .await
             .sessions
             .iter()
-            .filter(|(_, s)| s.summary.as_ref().is_some_and(|s| s.parent.is_some()))
+            .filter(|((tenant, _), s)| {
+                scope.admits(tenant) && s.summary.as_ref().is_some_and(|s| s.parent.is_some())
+            })
             .map(|(key, _)| key.clone())
             .collect())
     }
-    async fn prompts_sent(&self, session: &SessionKey) -> Result<u64> {
+    async fn prompts_sent(&self, tenant: &Tenant, session: &SessionKey) -> Result<u64> {
         Ok(self
-            .session_summary(session)
+            .session_summary(tenant, session)
             .await?
             .map_or(0, |s| s.prompts_sent))
     }
-    async fn turn_ids(&self, session: &SessionKey) -> Result<Vec<TurnId>> {
+    async fn turn_ids(&self, tenant: &Tenant, session: &SessionKey) -> Result<Vec<TurnId>> {
         Ok(self
             .state
             .lock()
             .await
-            .sessions
-            .get(session)
+            .session(tenant, session)
             .map(|s| s.turns.clone())
             .unwrap_or_default())
     }
-    async fn last_activity_ms(&self) -> Result<HashMap<SessionKey, i64>> {
+    async fn last_activity_ms(&self, scope: Scope<'_>) -> Result<HashMap<TenantSession, i64>> {
         Ok(self
             .state
             .lock()
             .await
             .sessions
             .iter()
+            .filter(|((tenant, _), _)| scope.admits(tenant))
             .filter_map(|(key, s)| Some((key.clone(), s.summary.as_ref()?.last_activity_ms)))
             .collect())
     }
-    async fn recovery_records(&self, from_generation: u64) -> Result<Vec<LoggedEvent>> {
+    async fn recovery_records(
+        &self,
+        scope: Scope<'_>,
+        from_generation: u64,
+    ) -> Result<Vec<LoggedEvent>> {
         Ok(self
             .state
             .lock()
@@ -253,7 +297,9 @@ impl EventLog for MemoryEventLog {
             .events
             .iter()
             .filter(|(r, _)| {
-                r.event.generation >= from_generation && is_recovery_record(&r.event.kind)
+                r.event.generation >= from_generation
+                    && is_recovery_record(&r.event.kind)
+                    && scope.admits(r.event.tenant())
             })
             .map(|(r, _)| r.clone())
             .collect())
@@ -263,7 +309,7 @@ impl EventLog for MemoryEventLog {
         state.generations.push(None);
         Ok(state.generations.len() as u64)
     }
-    async fn last_recovered_generation(&self) -> Result<u64> {
+    async fn last_recovered_generation(&self, _scope: &SystemScope) -> Result<u64> {
         Ok(self.state.lock().await.recovered)
     }
     async fn mark_recovered(&self, generation: u64, _recovered_ms: i64) -> Result<()> {
