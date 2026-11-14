@@ -154,6 +154,65 @@ pub mod methods {
     pub const RUNTIME_MCP_AUTH: &str = "runtime/mcp_auth";
     /// Host-only Runtime tracing.
     pub const RUNTIME_TRACING: &str = "runtime/tracing";
+    /// Client → server request: [`super::SessionParams`] →
+    /// [`crate::session_workspace::SessionWorkspaceInfo`]. Needs
+    /// `session_files`.
+    pub const SESSION_WORKSPACE: &str = "session/workspace";
+    /// [`crate::session_workspace::FilesListParams`] →
+    /// [`crate::session_workspace::FilesListResult`].
+    pub const SESSION_FILES_LIST: &str = "session/files/list";
+    /// [`crate::session_workspace::FilePathParams`] →
+    /// [`crate::session_workspace::FileEntry`].
+    pub const SESSION_FILES_STAT: &str = "session/files/stat";
+    /// [`crate::session_workspace::FilesReadParams`] →
+    /// [`crate::session_workspace::FilesReadResult`].
+    pub const SESSION_FILES_READ: &str = "session/files/read";
+    /// [`crate::session_workspace::UploadBeginParams`] →
+    /// [`crate::session_workspace::UploadBeginResult`].
+    pub const SESSION_FILES_UPLOAD_BEGIN: &str = "session/files/upload_begin";
+    /// [`crate::session_workspace::UploadWriteParams`] →
+    /// [`crate::session_workspace::UploadProgress`].
+    pub const SESSION_FILES_UPLOAD_WRITE: &str = "session/files/upload_write";
+    /// [`crate::session_workspace::UploadParams`] →
+    /// [`crate::session_workspace::UploadProgress`].
+    pub const SESSION_FILES_UPLOAD_STATUS: &str = "session/files/upload_status";
+    /// [`crate::session_workspace::UploadParams`] →
+    /// [`crate::session_workspace::UploadCommitResult`].
+    pub const SESSION_FILES_UPLOAD_COMMIT: &str = "session/files/upload_commit";
+    /// [`crate::session_workspace::UploadParams`] → `{}`.
+    pub const SESSION_FILES_UPLOAD_ABORT: &str = "session/files/upload_abort";
+    /// [`crate::session_workspace::FilesDeleteParams`] → `{}`.
+    pub const SESSION_FILES_DELETE: &str = "session/files/delete";
+    /// [`crate::session_workspace::FilesRenameParams`] → `{}`.
+    pub const SESSION_FILES_RENAME: &str = "session/files/rename";
+    /// [`crate::session_workspace::FilePathParams`] → `{}`.
+    pub const SESSION_FILES_MKDIR: &str = "session/files/mkdir";
+    /// [`crate::session_workspace::TerminalOpenParams`] →
+    /// [`crate::session_workspace::TerminalOpenResult`]. Needs
+    /// `session_terminal`.
+    pub const SESSION_TERMINAL_OPEN: &str = "session/terminal/open";
+    /// [`crate::session_workspace::TerminalAttachParams`] →
+    /// [`crate::session_workspace::TerminalAttachResult`], then
+    /// [`SESSION_TERMINAL_OUTPUT`] notifications on this connection.
+    pub const SESSION_TERMINAL_ATTACH: &str = "session/terminal/attach";
+    /// [`crate::session_workspace::TerminalParams`] → `{}`: stop this
+    /// connection's stream; the terminal runs on.
+    pub const SESSION_TERMINAL_DETACH: &str = "session/terminal/detach";
+    /// [`crate::session_workspace::TerminalInputParams`] → `{}`.
+    pub const SESSION_TERMINAL_INPUT: &str = "session/terminal/input";
+    /// [`crate::session_workspace::TerminalResizeParams`] → `{}`.
+    pub const SESSION_TERMINAL_RESIZE: &str = "session/terminal/resize";
+    /// [`crate::session_workspace::TerminalSignalParams`] → `{}`.
+    pub const SESSION_TERMINAL_SIGNAL: &str = "session/terminal/signal";
+    /// [`crate::session_workspace::TerminalParams`] →
+    /// [`crate::session_workspace::TerminalCloseResult`].
+    pub const SESSION_TERMINAL_CLOSE: &str = "session/terminal/close";
+    /// [`super::SessionParams`] →
+    /// [`crate::session_workspace::TerminalListResult`].
+    pub const SESSION_TERMINAL_LIST: &str = "session/terminal/list";
+    /// Server → client notification:
+    /// [`crate::session_workspace::TerminalOutputParams`]. Live only.
+    pub const SESSION_TERMINAL_OUTPUT: &str = "session/terminal/output";
 
     /// Methods served only with host-local authority (the Runtime's 0600
     /// Unix socket or an embedded adapter), never over a WebSocket.
@@ -700,6 +759,8 @@ pub mod error_codes {
     pub const FORBIDDEN: i64 = -32006;
     /// [`crate::BackendError::ToolLocked`]; data is `{"what": …, "lock": …}`.
     pub const TOOL_LOCKED: i64 = -32007;
+    /// [`crate::BackendError::Workspace`]; data is `{"code": …}`.
+    pub const WORKSPACE: i64 = -32008;
 }
 
 /// A JSON-RPC error: code, message and optional data.
@@ -737,6 +798,10 @@ impl From<&BackendError> for RpcErrorBody {
             BackendError::ToolLocked { what, lock } => (
                 error_codes::TOOL_LOCKED,
                 Some(serde_json::json!({ "what": what, "lock": lock })),
+            ),
+            BackendError::Workspace { code, .. } => (
+                error_codes::WORKSPACE,
+                Some(serde_json::json!({ "code": code })),
             ),
         };
         Self {
@@ -776,6 +841,11 @@ impl RpcErrorBody {
                 what: data["what"].as_str().unwrap_or(&self.message).to_owned(),
                 lock: serde_json::from_value(data["lock"].clone())
                     .unwrap_or(crate::ToolLock::Unknown),
+            },
+            error_codes::WORKSPACE => BackendError::Workspace {
+                code: serde_json::from_value(data["code"].clone())
+                    .unwrap_or(crate::session_workspace::WorkspaceErrorCode::Other),
+                message: self.message,
             },
             _ => BackendError::failed(ErrorCategory::Protocol, self.message),
         }
@@ -1042,6 +1112,9 @@ pub fn json_schema() -> Value {
     for (name, entry) in s3_methods {
         schema["methods"][name] = entry;
     }
+    for (name, entry) in session_workspace_methods(&mut generator) {
+        schema["methods"][name] = entry;
+    }
     for (name, params, result) in admin {
         let mut entry = method(up, "request", &params, Some(&result));
         if methods::HOST_ONLY.contains(&name) {
@@ -1051,7 +1124,160 @@ pub fn json_schema() -> Value {
     }
     schema["methods"][methods::RUNTIME_STOP]["host_only"] = Value::Bool(true);
     schema["methods"][methods::RUNTIME_STOP_EMPTY]["host_only"] = Value::Bool(true);
+    // Again, with the types the later entries added.
+    schema["$defs"] = serde_json::to_value(generator.definitions()).unwrap_or_default();
     schema
+}
+
+/// The schema entries of the file and terminal methods
+/// ([`crate::session_workspace`]).
+#[cfg(feature = "schema")]
+fn session_workspace_methods(
+    generator: &mut schemars::SchemaGenerator,
+) -> Vec<(&'static str, Value)> {
+    use crate::session_workspace::*;
+    let r = |schema: schemars::Schema| serde_json::to_value(schema).unwrap_or_default();
+    let empty = serde_json::json!({"type": "object"});
+    let request = |params: Value, result: Value| {
+        serde_json::json!({
+            "direction": "client_to_server",
+            "kind": "request",
+            "params": params,
+            "result": result,
+        })
+    };
+    let session = r(generator.subschema_for::<SessionParams>());
+    let path = r(generator.subschema_for::<FilePathParams>());
+    let upload = r(generator.subschema_for::<UploadParams>());
+    let progress = r(generator.subschema_for::<UploadProgress>());
+    let terminal = r(generator.subschema_for::<TerminalParams>());
+    vec![
+        (
+            methods::SESSION_WORKSPACE,
+            request(
+                session.clone(),
+                r(generator.subschema_for::<SessionWorkspaceInfo>()),
+            ),
+        ),
+        (
+            methods::SESSION_FILES_LIST,
+            request(
+                r(generator.subschema_for::<FilesListParams>()),
+                r(generator.subschema_for::<FilesListResult>()),
+            ),
+        ),
+        (
+            methods::SESSION_FILES_STAT,
+            request(path.clone(), r(generator.subschema_for::<FileEntry>())),
+        ),
+        (
+            methods::SESSION_FILES_READ,
+            request(
+                r(generator.subschema_for::<FilesReadParams>()),
+                r(generator.subschema_for::<FilesReadResult>()),
+            ),
+        ),
+        (
+            methods::SESSION_FILES_UPLOAD_BEGIN,
+            request(
+                r(generator.subschema_for::<UploadBeginParams>()),
+                r(generator.subschema_for::<UploadBeginResult>()),
+            ),
+        ),
+        (
+            methods::SESSION_FILES_UPLOAD_WRITE,
+            request(
+                r(generator.subschema_for::<UploadWriteParams>()),
+                progress.clone(),
+            ),
+        ),
+        (
+            methods::SESSION_FILES_UPLOAD_STATUS,
+            request(upload.clone(), progress),
+        ),
+        (
+            methods::SESSION_FILES_UPLOAD_COMMIT,
+            request(
+                upload.clone(),
+                r(generator.subschema_for::<UploadCommitResult>()),
+            ),
+        ),
+        (
+            methods::SESSION_FILES_UPLOAD_ABORT,
+            request(upload, empty.clone()),
+        ),
+        (
+            methods::SESSION_FILES_DELETE,
+            request(
+                r(generator.subschema_for::<FilesDeleteParams>()),
+                empty.clone(),
+            ),
+        ),
+        (
+            methods::SESSION_FILES_RENAME,
+            request(
+                r(generator.subschema_for::<FilesRenameParams>()),
+                empty.clone(),
+            ),
+        ),
+        (methods::SESSION_FILES_MKDIR, request(path, empty.clone())),
+        (
+            methods::SESSION_TERMINAL_OPEN,
+            request(
+                r(generator.subschema_for::<TerminalOpenParams>()),
+                r(generator.subschema_for::<TerminalOpenResult>()),
+            ),
+        ),
+        (
+            methods::SESSION_TERMINAL_ATTACH,
+            request(
+                r(generator.subschema_for::<TerminalAttachParams>()),
+                r(generator.subschema_for::<TerminalAttachResult>()),
+            ),
+        ),
+        (
+            methods::SESSION_TERMINAL_DETACH,
+            request(terminal.clone(), empty.clone()),
+        ),
+        (
+            methods::SESSION_TERMINAL_INPUT,
+            request(
+                r(generator.subschema_for::<TerminalInputParams>()),
+                empty.clone(),
+            ),
+        ),
+        (
+            methods::SESSION_TERMINAL_RESIZE,
+            request(
+                r(generator.subschema_for::<TerminalResizeParams>()),
+                empty.clone(),
+            ),
+        ),
+        (
+            methods::SESSION_TERMINAL_SIGNAL,
+            request(r(generator.subschema_for::<TerminalSignalParams>()), empty),
+        ),
+        (
+            methods::SESSION_TERMINAL_CLOSE,
+            request(
+                terminal,
+                r(generator.subschema_for::<TerminalCloseResult>()),
+            ),
+        ),
+        (
+            methods::SESSION_TERMINAL_LIST,
+            request(session, r(generator.subschema_for::<TerminalListResult>())),
+        ),
+        (
+            methods::SESSION_TERMINAL_OUTPUT,
+            serde_json::json!({
+                "direction": "server_to_client",
+                "kind": "notification",
+                "params": r(generator.subschema_for::<TerminalOutputParams>()),
+                "live_only": true,
+            }),
+        ),
+    ]
 }
 
 /// Maximum UTF-8 JSONL transfer size, in bytes.

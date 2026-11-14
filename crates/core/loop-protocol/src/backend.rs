@@ -54,9 +54,28 @@ pub enum BackendError {
         /// The lock in force.
         lock: crate::ToolLock,
     },
+    /// A file or terminal call of a Session's workspace failed
+    /// (`session/files/*`, `session/terminal/*`).
+    Workspace {
+        /// What failed, as a stable code.
+        code: crate::session_workspace::WorkspaceErrorCode,
+        /// For people. Never a host path or file contents.
+        message: String,
+    },
 }
 
 impl BackendError {
+    /// A workspace failure with `code`.
+    pub fn workspace(
+        code: crate::session_workspace::WorkspaceErrorCode,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Workspace {
+            code,
+            message: message.into(),
+        }
+    }
+
     /// A failure with a category.
     pub fn failed(category: ErrorCategory, message: impl Into<String>) -> Self {
         Self::Failed(ErrorInfo::new(category, message))
@@ -82,6 +101,7 @@ impl fmt::Display for BackendError {
                 f,
                 "{what} is off: this Runtime runs with the `{lock}` tool lock"
             ),
+            Self::Workspace { message, .. } => f.write_str(message),
         }
     }
 }

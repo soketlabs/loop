@@ -229,6 +229,86 @@ pub(crate) struct Facts<'a> {
     pub(crate) session: Option<String>,
 }
 
+/// The `source` of the records of a user's file actions.
+pub const USER_FILES: &str = "user_files";
+/// The `source` of the records of a user's terminals.
+pub const USER_TERMINAL: &str = "user_terminal";
+/// The command a terminal is judged as: unreadable on purpose (a `${…}`
+/// form and the `exec` wrapper), so an `allow` pattern never matches it and
+/// any `bash` deny pattern refuses it. It is also the default command.
+pub const TERMINAL_COMMAND: &str = "exec \"${SHELL:-/bin/sh}\" -i";
+
+/// A file action of the user ([`ToolGate::check_user_file_action`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserFileAction {
+    /// List a folder (judged as `ls`).
+    List,
+    /// Read or download a file, or stat it (judged as `read`).
+    Read,
+    /// Upload, make a folder, or one end of a rename (judged as `write`).
+    Write,
+    /// Delete a file or folder (judged as `write`).
+    Delete,
+}
+
+impl UserFileAction {
+    fn tool(self) -> &'static str {
+        match self {
+            Self::List => "ls",
+            Self::Read => "read",
+            Self::Write | Self::Delete => "write",
+        }
+    }
+
+    fn writes(self) -> bool {
+        matches!(self, Self::Write | Self::Delete)
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Read => "read",
+            Self::Write => "change",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// Why the gate refused a user's file action or terminal.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct UserActionRefused(pub String);
+
+/// Whether `path` is under a `.git` or `.loop` component below
+/// `workspace`, as written or resolved, in any case. A path that cannot be
+/// resolved counts (fail closed).
+fn git_or_loop(
+    paths: &crate::permissions::PathFacts,
+    path: &std::path::Path,
+    workspace: &std::path::Path,
+) -> bool {
+    use crate::permissions::policy::{resolve, Resolved};
+    use std::path::Component;
+    let check = |path: &std::path::Path| {
+        path.components().any(|c| {
+            matches!(c, Component::Normal(name)
+                if name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".loop"))
+        })
+    };
+    if check(path.strip_prefix(workspace).unwrap_or(path)) {
+        return true;
+    }
+    let root = match resolve(paths, workspace) {
+        Resolved::Path(root) => root,
+        Resolved::Gone => PathBuf::new(),
+        Resolved::Unknown => return true,
+    };
+    match resolve(paths, path) {
+        Resolved::Path(real) => check(real.strip_prefix(&root).unwrap_or(&real)),
+        Resolved::Gone | Resolved::Unknown => true,
+    }
+}
+
 /// The rule name a record gives the `bash` block list.
 const BLOCK_LIST: &str = "bash block list";
 
@@ -976,6 +1056,204 @@ impl ToolGate {
                 .await
             })
         })
+    }
+
+    /// The Policy check for a file action the user takes in a client's
+    /// file panel (`session/files/*`): list, read, write (upload, new
+    /// folder, both ends of a rename) or delete, on `path`, an absolute
+    /// path in the Session's Workspace. The tool lock and the access rules
+    /// come before it.
+    ///
+    /// The action is judged as a tool call of the Session (`ls`, `read`,
+    /// or `write` for a write and a delete) with the same Policy layers,
+    /// `toolPermissions` rules and mode, path facts from the Session's
+    /// Workspace env, and fail closed on a path the gate cannot resolve. A
+    /// write or delete under a `.git` or `.loop` component (as written or
+    /// resolved, below the workspace, any case) is refused in every mode.
+    /// Where the tool would ask, the user who clicked is the approver, as
+    /// for [`Self::check_user_command`]; a caller from outside the host
+    /// cannot approve, so an ask refuses. Hooks do not run.
+    ///
+    /// The decision is recorded (`source: user_files`) before `Ok`
+    /// returns. `Err` is the refusal.
+    pub async fn check_user_file_action(
+        &self,
+        action: UserFileAction,
+        path: &std::path::Path,
+        session: Option<String>,
+        caller: Option<Caller>,
+    ) -> Result<(), UserActionRefused> {
+        let tool = action.tool();
+        let mut args = serde_json::json!({ "path": path.to_string_lossy() });
+        if action == UserFileAction::Delete {
+            args["action"] = serde_json::Value::from("delete");
+        }
+        let mut verdict = self.verdict(tool, &args).await;
+        if action.writes() && !matches!(verdict.decision, Decision::Deny(_)) {
+            let protected = self
+                .with_call(tool, &args, |call| {
+                    git_or_loop(&call.paths, path, &call.workspace)
+                })
+                .await
+                .unwrap_or(true);
+            if protected {
+                verdict = Verdict {
+                    decision: Decision::Deny(format!(
+                        "the file panel does not {} files in `.git` or `.loop`; \
+                         use a terminal or your own editor",
+                        action.verb()
+                    )),
+                    by: DecidedBy::Protected,
+                    rule: None,
+                    layer: None,
+                };
+            }
+        }
+        let kind = if action.writes() {
+            ToolKind::Edit
+        } else {
+            ToolKind::Read
+        };
+        let facts = Facts {
+            source: DecisionSource::Other(USER_FILES.to_owned()),
+            tool,
+            kind,
+            call_id: None,
+            args: &args,
+            caller,
+            session,
+        };
+        self.user_decision(facts, &verdict, "this file action")
+            .await
+    }
+
+    /// The Policy check to open a terminal for the user
+    /// (`session/terminal/open`). The tool lock, the sandbox and the
+    /// outside-user refusal come before it.
+    ///
+    /// A terminal is a shell with a command stream Loop cannot read, so it
+    /// needs the strongest shell right: it is judged as a `bash` call of
+    /// the unreadable command [`TERMINAL_COMMAND`] (an `allow` pattern never
+    /// matches it), and any `bash` deny rule, plain or pattern, refuses it.
+    /// A layer or Lock that turns the shell off, `read-only` and `plan`
+    /// refuse it. Where `bash` would ask, the user who opens the terminal
+    /// approves it once for this terminal (`by: user`); a caller from
+    /// outside the host cannot. `terminal` is the record's `call_id`.
+    ///
+    /// The decision is recorded (`source: user_terminal`) before `Ok`
+    /// returns. `Err` is the refusal.
+    pub async fn check_user_terminal(
+        &self,
+        terminal: &str,
+        session: Option<String>,
+        caller: Option<Caller>,
+    ) -> Result<(), UserActionRefused> {
+        let args = serde_json::json!({ "command": TERMINAL_COMMAND });
+        let verdict = self.terminal_verdict(&args).await;
+        let facts = Facts {
+            source: DecisionSource::Other(USER_TERMINAL.to_owned()),
+            tool: "bash",
+            kind: ToolKind::Execute,
+            call_id: Some(terminal),
+            args: &args,
+            caller,
+            session,
+        };
+        self.user_decision(facts, &verdict, "a terminal").await
+    }
+
+    /// Whether a terminal that is open may stay open: the check of
+    /// [`Self::check_user_terminal`] for the host's user, without a record.
+    /// `Err` is the reason to close it.
+    pub async fn user_terminal_allowed(&self) -> Result<(), String> {
+        let args = serde_json::json!({ "command": TERMINAL_COMMAND });
+        match self.terminal_verdict(&args).await.decision {
+            Decision::Deny(reason) => Err(reason),
+            Decision::Allow | Decision::Ask => Ok(()),
+        }
+    }
+
+    /// Record that terminal `terminal` ended, with `why` (the reason and
+    /// the exit state): the second record of its `call_id`, `by: user`.
+    pub async fn record_user_terminal_end(
+        &self,
+        terminal: &str,
+        why: &str,
+        session: Option<String>,
+        caller: Option<Caller>,
+    ) -> Result<(), String> {
+        let args = serde_json::json!({ "command": TERMINAL_COMMAND });
+        let facts = Facts {
+            source: DecisionSource::Other(USER_TERMINAL.to_owned()),
+            tool: "bash",
+            kind: ToolKind::Execute,
+            call_id: Some(terminal),
+            args: &args,
+            caller,
+            session,
+        };
+        let decided =
+            Decided::allow(DecidedBy::User).because(Some(format!("terminal ended: {why}")));
+        self.record(facts, &decided).await
+    }
+
+    /// The verdict on a terminal: the `bash` verdict of the unreadable
+    /// command, refused also when any `bash` deny rule exists.
+    async fn terminal_verdict(&self, args: &serde_json::Value) -> Verdict {
+        let verdict = self.verdict("bash", args).await;
+        if matches!(verdict.decision, Decision::Deny(_)) {
+            return verdict;
+        }
+        let rules = self.rules();
+        let denied = rules.iter().find(|(key, permission)| {
+            **permission == ToolPermission::Deny && (*key == "bash" || key.starts_with("bash("))
+        });
+        match denied {
+            Some((key, _)) => Verdict {
+                decision: Decision::Deny(format!(
+                    "a terminal is refused: Loop cannot check what is typed in a terminal \
+                     against the deny rule `{key}` in settings.toolPermissions. Use \
+                     single commands, or remove the rule"
+                )),
+                by: DecidedBy::Unreadable,
+                rule: Some(key.clone()),
+                layer: None,
+            },
+            None => verdict,
+        }
+    }
+
+    /// Decide and record a user action from `verdict`: an ask is the
+    /// user's own approval for the host's user (or an in-process call), and
+    /// a refusal for a caller from outside the host.
+    async fn user_decision(
+        &self,
+        facts: Facts<'_>,
+        verdict: &Verdict,
+        what: &str,
+    ) -> Result<(), UserActionRefused> {
+        let host = facts.caller.as_ref().is_none_or(Caller::is_host_user);
+        let (result, decided) = match &verdict.decision {
+            Decision::Deny(reason) => (
+                Err(UserActionRefused(reason.clone())),
+                Decided::from_verdict(verdict),
+            ),
+            Decision::Allow => (Ok(()), Decided::from_verdict(verdict)),
+            Decision::Ask if host => (Ok(()), Decided::allow(DecidedBy::User).after(verdict)),
+            Decision::Ask => {
+                let reason = format!(
+                    "{what} needs approval in {} mode, and a user from outside this host \
+                     cannot approve it",
+                    self.mode().as_str()
+                );
+                let decided = Decided::deny(DecidedBy::NoApprover, reason.clone()).after(verdict);
+                (Err(UserActionRefused(reason)), decided)
+            }
+        };
+        self.record(facts, &decided)
+            .await
+            .map_err(UserActionRefused)?;
+        result
     }
 
     /// The gate's before-call check, for callers outside the harness
@@ -1903,3 +2181,7 @@ mod tests {
 #[cfg(test)]
 #[path = "tool_gate_decision_tests.rs"]
 mod decision_tests;
+
+#[cfg(test)]
+#[path = "tool_gate_user_action_tests.rs"]
+mod user_action_tests;

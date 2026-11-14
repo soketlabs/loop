@@ -126,6 +126,19 @@ pub struct Capabilities {
     /// client can hide the shell, file edits and workflows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_lock: Option<ToolLock>,
+    /// Lists, reads and downloads a Session's files (`session/workspace`,
+    /// `session/files/list`, `stat`, `read`). A Session can still refuse:
+    /// read `session/workspace` for each Session.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_files: bool,
+    /// Uploads, deletes, renames and makes folders (`session/files/upload_*`,
+    /// `delete`, `rename`, `mkdir`). False under a tool lock.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_files_write: bool,
+    /// Opens terminals (`session/terminal/*`). False under a tool lock and
+    /// for a caller from outside the host.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_terminal: bool,
 }
 
 /// A Runtime-wide tool lock: a fixed set of tools for every Session, which

@@ -18,6 +18,7 @@ mod ids;
 mod interaction;
 pub mod rpc;
 pub mod session_services;
+pub mod session_workspace;
 mod update;
 
 pub use backend::shell_timeout;
