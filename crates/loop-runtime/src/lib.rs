@@ -1,4 +1,5 @@
 //! Runtime Session ownership and durable Event Log.
+pub mod access;
 pub mod log;
 mod recovery;
 mod runtime;

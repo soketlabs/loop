@@ -39,6 +39,37 @@ fn host() -> Caller {
     Caller::host(Principal::local_uid(501))
 }
 
+/// The host's user on its WebSocket with the Runtime token: another
+/// identity (`via: token`) with the same full access to `local` Sessions.
+fn token() -> Caller {
+    Caller::local_token(Principal::local_uid(501))
+}
+
+/// Who an in-process call (no connection) acts as: the Runtime.
+fn runtime_caller() -> Caller {
+    Caller::host(Principal::runtime())
+}
+
+/// A turn of an in-process call (internal authority, no caller).
+async fn prompt_in_process(rt: &Runtime, session: &SessionRef, text: &str) {
+    let turn = rt
+        .prompt(session, vec![ContentBlock::text(text)])
+        .await
+        .unwrap();
+    assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+}
+
+/// A folder of its own for an edge user's Session: a Session of another
+/// owner may not share, contain or sit in it (the folder rule, I3).
+fn own_folder(dir: &std::path::Path, name: &str) -> SessionSpec {
+    let cwd = dir.join(name);
+    std::fs::create_dir_all(&cwd).unwrap();
+    SessionSpec {
+        cwd: Some(cwd),
+        ..SessionSpec::default()
+    }
+}
+
 fn acme() -> Tenant {
     Tenant::new("acme").unwrap()
 }
@@ -219,15 +250,16 @@ async fn a_session_keeps_its_tenant_whoever_acts_and_reads_are_scoped() {
         let (rt, _) = runtime(dir.path(), log.clone()).await;
         let (me, alice) = (host(), edge("alice"));
 
-        // Alice (tenant acme) creates a Session; then the host user uses it.
+        // Alice (tenant acme) creates a Session; then in-process work (the
+        // only other identity that may act in it, I3) uses it.
         let theirs = alice
             .clone()
-            .scope(rt.new_session(SessionSpec::default()))
+            .scope(rt.new_session(own_folder(dir.path(), "alice")))
             .await
             .unwrap();
         assert_eq!(rt.session_tenant(&theirs.key), acme());
         prompt(&rt, &alice, &theirs, "first").await;
-        prompt(&rt, &me, &theirs, "second").await;
+        prompt_in_process(&rt, &theirs, "second").await;
         let records = records_of(log.as_ref(), &theirs.key).await;
         assert!(records.iter().all(|r| r.event.tenant() == &acme()));
         let prompts: Vec<_> = records
@@ -237,7 +269,7 @@ async fn a_session_keeps_its_tenant_whoever_acts_and_reads_are_scoped() {
             .collect();
         assert_eq!(
             prompts,
-            vec![acting(&alice, acme()), acting(&me, acme())],
+            vec![acting(&alice, acme()), acting(&runtime_caller(), acme())],
             "the principal is who acted; the tenant is the Session's"
         );
         // One contiguous sequence, in acme only.
@@ -265,12 +297,22 @@ async fn a_session_keeps_its_tenant_whoever_acts_and_reads_are_scoped() {
             Some(acting(&alice, acme()))
         );
 
-        // Alice uses a Session the host user created: it stays local.
+        // Alice may not use a Session the host user created (I3); the host
+        // user on its token connection may: it stays local.
         let mine = me
             .clone()
             .scope(rt.new_session(SessionSpec::default()))
             .await
             .unwrap();
+        let refused = alice
+            .clone()
+            .scope(rt.prompt(&mine, vec![ContentBlock::text("hi")]))
+            .await;
+        assert!(matches!(
+            refused,
+            Err(loop_protocol::BackendError::SessionNotFound(_))
+        ));
+        let alice = token();
         prompt(&rt, &alice, &mine, "hi").await;
         let records = records_of(log.as_ref(), &mine.key).await;
         assert!(records.iter().all(|r| r.event.tenant() == &Tenant::local()));
@@ -281,7 +323,7 @@ async fn a_session_keeps_its_tenant_whoever_acts_and_reads_are_scoped() {
         assert_eq!(alice_prompt.event.identity, acting(&alice, Tenant::local()));
         assert_eq!(
             alice_prompt.event.identity.via,
-            Some(loop_protocol::Via::edge())
+            Some(loop_protocol::Via::token())
         );
         let turn_updates: Vec<_> = records
             .iter()
@@ -294,7 +336,7 @@ async fn a_session_keeps_its_tenant_whoever_acts_and_reads_are_scoped() {
         assert_eq!(
             rt.session_owner(&mine.key).await.unwrap(),
             Some(acting(&me, Tenant::local())),
-            "using a Session does not make Alice its owner"
+            "using a Session does not make its user its owner"
         );
         // An attach reads the Session's tenant.
         let attached = loop_wire::RuntimeControl::attach(rt.as_ref(), &theirs, 0)
@@ -313,7 +355,7 @@ async fn a_config_change_during_another_caller_s_turn_names_its_own_caller() {
         let dir = tempfile::tempdir().unwrap();
         let log = Arc::new(MemoryEventLog::new());
         let (rt, script) = runtime(dir.path(), log.clone()).await;
-        let (me, alice) = (host(), edge("alice"));
+        let (me, alice) = (host(), token());
         let session = me
             .clone()
             .scope(rt.new_session(SessionSpec::default()))
@@ -384,7 +426,7 @@ async fn a_subagent_acts_for_its_parent_turn_s_caller_with_the_parent_as_actor()
         let alice = edge("alice");
         let parent = alice
             .clone()
-            .scope(rt.new_session(SessionSpec::default()))
+            .scope(rt.new_session(own_folder(dir.path(), "alice")))
             .await
             .unwrap();
         prompt(&rt, &alice, &parent, "SPAWN").await;
@@ -441,7 +483,7 @@ async fn after_a_restart_a_session_keeps_its_tenant_and_recovery_names_the_runti
             let (rt, _) = runtime(dir.path(), log.clone()).await;
             let session = alice
                 .clone()
-                .scope(rt.new_session(SessionSpec::default()))
+                .scope(rt.new_session(own_folder(dir.path(), "alice")))
                 .await
                 .unwrap();
             let generation = rt.generation();
@@ -484,12 +526,20 @@ async fn after_a_restart_a_session_keeps_its_tenant_and_recovery_names_the_runti
         assert_eq!(ended.event.identity, Identity::runtime_in(acme()));
         // The new Runtime knows the Session's tenant from the log.
         assert_eq!(rt.session_tenant(&session.key), acme());
-        let me = host();
-        me.clone()
+        // The host's user may not load another tenant's Session (I3); an
+        // in-process load (the Runtime) may, and is not its owner.
+        let refused = host()
             .scope(rt.load_session(&session, SessionSpec::default()))
+            .await;
+        assert!(matches!(
+            refused,
+            Err(loop_protocol::BackendError::SessionNotFound(_))
+        ));
+        let me = runtime_caller();
+        rt.load_session(&session, SessionSpec::default())
             .await
             .unwrap();
-        prompt(&rt, &me, &session, "again").await;
+        prompt_in_process(&rt, &session, "again").await;
         let records = records_of(log.as_ref(), &session.key).await;
         assert!(records.iter().all(|r| r.event.tenant() == &acme()));
         let reopened = records
@@ -553,11 +603,30 @@ async fn a_command_a_clone_and_an_unload_name_who_acted() {
         let shell = decisions.last().expect("a decision of the command");
         assert_eq!(shell.event.identity, acting(&token, Tenant::local()));
 
-        // Alice clones the host user's Session: the copy is hers, in acme.
-        let copy = alice
+        // Alice may not clone the host user's Session (I3: it needs read
+        // access to the source). She clones her own: the copy is hers, in
+        // acme.
+        let refused = alice
             .clone()
             .scope(rt.clone_session(loop_protocol::rpc::CloneParams {
                 session: session.clone(),
+                name: None,
+                request_id: "copy-0".into(),
+            }))
+            .await;
+        assert!(matches!(
+            refused,
+            Err(loop_protocol::BackendError::SessionNotFound(_))
+        ));
+        let source = alice
+            .clone()
+            .scope(rt.new_session(own_folder(dir.path(), "alice")))
+            .await
+            .unwrap();
+        let copy = alice
+            .clone()
+            .scope(rt.clone_session(loop_protocol::rpc::CloneParams {
+                session: source,
                 name: None,
                 request_id: "copy-1".into(),
             }))
@@ -682,7 +751,7 @@ async fn a_queued_config_change_keeps_its_caller_when_another_caller_prompts() {
         let dir = tempfile::tempdir().unwrap();
         let log = GatedLog::new();
         let (rt, _) = runtime(dir.path(), log.clone()).await;
-        let (me, alice) = (host(), edge("alice"));
+        let (me, alice) = (host(), token());
         let session = me
             .clone()
             .scope(rt.new_session(SessionSpec::default()))
@@ -751,7 +820,7 @@ async fn cancel_rename_navigate_compact_and_an_edge_decision_name_their_callers(
         let dir = tempfile::tempdir().unwrap();
         let log = Arc::new(MemoryEventLog::new());
         let (rt, script) = runtime(dir.path(), log.clone()).await;
-        let (me, alice) = (host(), edge("alice"));
+        let (me, alice) = (host(), token());
         let session = me
             .clone()
             .scope(rt.new_session(SessionSpec::default()))
@@ -831,24 +900,32 @@ async fn cancel_rename_navigate_compact_and_an_edge_decision_name_their_callers(
             .expect("the rename's update");
         assert_eq!(rename.event.identity, alice_local);
 
-        // A decision of Alice's command on the host user's Session: the row
-        // is in the Session's tenant; the record keeps Alice's tenant.
-        alice
+        // A decision of an edge user's command on its own Session: the row
+        // and the record name the edge user, in its tenant. (An edge user
+        // may not act in the host user's Session, I3; the server never runs
+        // its shell commands at all.)
+        let edge_user = edge("alice");
+        let theirs = edge_user
+            .clone()
+            .scope(rt.new_session(own_folder(dir.path(), "alice")))
+            .await
+            .unwrap();
+        edge_user
             .clone()
             .scope(loop_protocol::LocalShell::run(
                 rt.as_ref(),
-                &session,
+                &theirs,
                 "echo hi",
                 None,
             ))
             .await
             .unwrap();
-        let decision = records_of(log.as_ref(), &session.key)
+        let decision = records_of(log.as_ref(), &theirs.key)
             .await
             .into_iter()
             .rfind(|r| matches!(r.event.kind, EventKind::PolicyDecision(_)))
             .expect("a decision");
-        assert_eq!(decision.event.identity, alice_local);
+        assert_eq!(decision.event.identity, acting(&edge_user, acme()));
         let EventKind::PolicyDecision(payload) = &decision.event.kind else {
             unreachable!()
         };
@@ -874,7 +951,7 @@ async fn a_session_split_across_tenants_by_an_older_binary_is_refused() {
             let (rt, _) = runtime(dir.path(), log).await;
             let session = alice
                 .clone()
-                .scope(rt.new_session(SessionSpec::default()))
+                .scope(rt.new_session(own_folder(dir.path(), "alice")))
                 .await
                 .unwrap();
             prompt(&rt, &alice, &session, "hello").await;
@@ -905,7 +982,8 @@ async fn a_session_split_across_tenants_by_an_older_binary_is_refused() {
         let log = Arc::new(loop_runtime::log::SqliteEventLog::open(&events).await.unwrap());
         let (rt, _) = runtime(dir.path(), log).await;
         assert_eq!(rt.session_tenant(&session.key), acme(), "the creating tenant");
-        let refused = host()
+        let refused = alice
+            .clone()
             .scope(rt.load_session(&session, SessionSpec::default()))
             .await
             .unwrap_err();
@@ -923,7 +1001,7 @@ async fn a_workflow_s_records_are_its_caller_s() {
         let dir = tempfile::tempdir().unwrap();
         let log = Arc::new(MemoryEventLog::new());
         let (rt, _) = runtime(dir.path(), log.clone()).await;
-        let (me, alice) = (host(), edge("alice"));
+        let (me, alice) = (host(), token());
         let session = me
             .clone()
             .scope(rt.new_session(SessionSpec::default()))

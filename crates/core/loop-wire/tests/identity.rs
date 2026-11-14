@@ -246,7 +246,7 @@ async fn a_remote_connection_without_a_named_caller_has_no_identity() {
         let (server, client_end) = memory();
         let _ = serve_with_control(
             backend.clone(),
-            backend,
+            backend.clone(),
             server,
             info(),
             options(Authority::Remote),
@@ -256,8 +256,28 @@ async fn a_remote_connection_without_a_named_caller_has_no_identity() {
         assert_eq!(result.principal, None);
         assert_eq!(result.tenant, None);
         assert!(value.get("principal").is_none() && value.get("tenant").is_none());
-        // No fallback identity reaches the backend either.
-        assert_eq!(new_session_sees(&conn).await, "none");
+        // No fallback identity reaches the backend either: with no identity
+        // to check access with, nothing but `initialize` is served (I3).
+        let refused = conn
+            .request(methods::SESSION_NEW, json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{refused:?}").contains("no identity"),
+            "{refused:?}"
+        );
+        let refused = conn
+            .request(methods::SESSION_LIST, json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{refused:?}").contains("no identity"),
+            "{refused:?}"
+        );
+        conn.notify(methods::SESSION_CANCEL, json!({"session": a_session()}))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(backend.cancels.lock().unwrap().is_empty());
     })
     .await
     .unwrap();

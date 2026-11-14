@@ -192,9 +192,10 @@ async fn the_runtime_records_the_connection_s_caller_for_each_session() {
 
         // Interleave Session creation over all three connections.
         let (h, a, b) = tokio::join!(
-            host.new_session(SessionSpec::default()),
-            edges[0].0.new_session(SessionSpec::default()),
-            edges[1].0.new_session(SessionSpec::default()),
+            // Each in a folder of its own (the folder rule, I3).
+            host.new_session(own_folder(dir.path(), "h")),
+            edges[0].0.new_session(own_folder(dir.path(), "a")),
+            edges[1].0.new_session(own_folder(dir.path(), "b")),
         );
         let local = Caller::host(loop_wire::local_principal());
         assert_eq!(rt.loaded_by(&h.unwrap().key), Some(local));
@@ -203,7 +204,7 @@ async fn the_runtime_records_the_connection_s_caller_for_each_session() {
 
         // An in-process call has no connection, so no caller: there is no
         // fallback identity.
-        let direct = rt.new_session(SessionSpec::default()).await.unwrap();
+        let direct = rt.new_session(own_folder(dir.path(), "d")).await.unwrap();
         assert_eq!(rt.loaded_by(&direct.key), None);
 
         rt.shutdown().await;
@@ -221,13 +222,15 @@ async fn every_way_a_shared_runtime_loads_a_session_records_its_caller() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
         let (rt, _) = shared(dir.path(), false, RuntimeLimits::default()).await;
+        // Only callers that may use a Session (I3): the host's user, on its
+        // socket and on its token connection, take turns.
         let (alice, bob, carol, dave, erin, frank) = (
-            edge("alice", "t-a"),
-            edge("bob", "t-a"),
-            edge("carol", "t-a"),
-            edge("dave", "t-a"),
-            edge("erin", "t-a"),
-            edge("frank", "t-a"),
+            token_user(),
+            host_user(),
+            token_user(),
+            host_user(),
+            host_user(),
+            host_user(),
         );
 
         let source = alice
@@ -331,7 +334,26 @@ async fn every_way_a_shared_runtime_loads_a_session_records_its_caller() {
 }
 
 fn bob_again() -> Caller {
-    edge("bob", "t-a")
+    host_user()
+}
+
+fn host_user() -> Caller {
+    Caller::host(loop_wire::local_principal())
+}
+
+/// The host's user over the token WebSocket: another caller (`via`) with
+/// the same access to `local` Sessions.
+fn token_user() -> Caller {
+    Caller::local_token(loop_wire::local_principal())
+}
+
+fn own_folder(dir: &std::path::Path, name: &str) -> SessionSpec {
+    let cwd = dir.join("ws").join(name);
+    std::fs::create_dir_all(&cwd).unwrap();
+    SessionSpec {
+        cwd: Some(cwd),
+        ..SessionSpec::default()
+    }
 }
 
 /// A Subagent copies its parent's `loaded_by`, whoever runs the child.
@@ -343,7 +365,7 @@ async fn a_subagent_copies_its_parent_s_loaded_by() {
         let alice = edge("alice", "t-a");
         let parent = alice
             .clone()
-            .scope(rt.new_session(SessionSpec::default()))
+            .scope(rt.new_session(own_folder(dir.path(), "alice")))
             .await
             .unwrap();
         // Prompted with no caller in scope (and the turn runs on the

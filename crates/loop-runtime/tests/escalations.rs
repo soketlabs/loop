@@ -993,13 +993,13 @@ fn edge(id: &str) -> loop_protocol::Caller {
     loop_protocol::Caller::asserted(principal, loop_protocol::Tenant::new("acme").unwrap()).unwrap()
 }
 
-/// Two connections on one Session, the host user's and an edge user's: an
-/// edge user never receives, and so can never answer, an Escalation of a
-/// turn it did not start, whether it was attached before the request or
-/// after. The host user keeps today's behaviour: it gets every request. The
-/// answer record names who answered.
+/// Who gets and answers an Escalation follows the access rules (I3), not
+/// who started the turn. A `local` Session: the host's user is asked, an
+/// edge user never (also for a turn it started). Alice's Session in tenant
+/// acme: Alice is asked; Bob (same tenant) and the host's user (another
+/// tenant) are not. The answer record names who answered.
 #[tokio::test]
-async fn an_edge_user_cannot_answer_an_escalation_of_a_turn_it_did_not_start() {
+async fn escalations_go_only_to_callers_who_may_act_in_the_session() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let log = Arc::new(MemoryEventLog::new());
         let session = SessionRef {
@@ -1019,15 +1019,13 @@ async fn an_edge_user_cannot_answer_an_escalation_of_a_turn_it_did_not_start() {
         let (alice, mut alice_rx) = connection(Some(edge("alice")));
         host.attach(1, mine).await;
         host.attach(2, alice.clone()).await;
-
-        // The host user's turn: only the host user's connection is asked.
-        host.set_turn_caller(Some(host_user.clone()));
+        // Even a turn the edge user started: it may not act in a local Session.
+        host.set_turn_caller(Some(edge("alice")));
         let asking = tokio::spawn({
             let host = host.clone();
             async move { host.interact(request()).await }
         });
         let (_, answer) = mine_rx.recv().await.unwrap();
-        // Attaching again after the request does not deliver it either.
         host.detach(2).await;
         host.attach(2, alice.clone()).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1045,22 +1043,33 @@ async fn an_edge_user_cannot_answer_an_escalation_of_a_turn_it_did_not_start() {
             panic!("missing answer")
         };
         assert_eq!(payload["answered_by"]["principal"]["id"], "uid:501");
-        // Raised for the turn's caller; answered by the answerer; both in
-        // the Session's tenant.
-        let host_identity = loop_store::Identity::acting(&host_user, loop_store::Tenant::local());
-        assert_eq!(events[0].event.identity, host_identity);
-        assert_eq!(events[1].event.identity, host_identity);
         let id = payload["id"].as_str().unwrap();
         assert_eq!(host.take_answered_by(id), Some(host_user.clone()));
 
-        // Alice's own turn: she is asked, and so is the host user.
-        host.set_turn_caller(Some(edge("alice")));
+        // Alice's Session in tenant acme.
+        let acme = loop_store::Tenant::new("acme").unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let theirs = EscalationHost::new(session, log.clone(), 1, acme.clone(), None);
+        theirs.set_access(loop_runtime::access::Subject::owned(
+            acme.clone(),
+            edge("alice").principal().clone(),
+        ));
+        let (mine, mut mine_rx) = connection(Some(host_user.clone()));
+        let (alice, mut alice_rx) = connection(Some(edge("alice")));
+        let (bob, mut bob_rx) = connection(Some(edge("bob")));
+        theirs.attach(1, mine).await;
+        theirs.attach(2, alice).await;
+        theirs.attach(3, bob).await;
+        // Whoever started the turn, only Alice is asked.
+        theirs.set_turn_caller(Some(edge("bob")));
         let asking = tokio::spawn({
-            let host = host.clone();
+            let host = theirs.clone();
             async move { host.interact(request()).await }
         });
         let (_, from_alice) = alice_rx.recv().await.unwrap();
-        let (_, _from_host) = mine_rx.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(bob_rx.try_recv().is_err(), "another edge user was asked");
+        assert!(mine_rx.try_recv().is_err(), "the host's user was asked");
         from_alice.send(selected("accept")).unwrap();
         assert_eq!(asking.await.unwrap(), selected("accept"));
         let events = log
@@ -1075,35 +1084,19 @@ async fn an_edge_user_cannot_answer_an_escalation_of_a_turn_it_did_not_start() {
         };
         assert_eq!(payload["answered_by"]["principal"]["id"], "alice");
         assert_eq!(payload["answered_by"]["via"], "edge");
-        // Alice's answer row: her principal and `via`, in the Session's
-        // tenant (local), not hers.
         assert_eq!(
             events.last().unwrap().event.identity,
-            loop_store::Identity::acting(&edge("alice"), loop_store::Tenant::local())
+            loop_store::Identity::acting(&edge("alice"), acme)
         );
-
-        // Another edge user is not asked about Alice's turn.
-        let (bob, mut bob_rx) = connection(Some(edge("bob")));
-        host.attach(3, bob).await;
-        let asking = tokio::spawn({
-            let host = host.clone();
-            async move { host.interact(request()).await }
-        });
-        let (_, from_alice) = alice_rx.recv().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(bob_rx.try_recv().is_err(), "another edge user was asked");
-        from_alice.send(selected("reject")).unwrap();
-        let _ = asking.await.unwrap();
-        let _ = mine_rx.try_recv();
     })
     .await
     .unwrap();
 }
 
 /// The same outside identity on a new connection (a reconnect) still
-/// answers the Escalation of the turn it started.
+/// answers the Escalation of its own Session.
 #[tokio::test]
-async fn a_reconnected_edge_user_answers_its_own_turn() {
+async fn a_reconnected_edge_user_answers_its_own_session() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let log = Arc::new(MemoryEventLog::new());
         let session = SessionRef {
@@ -1111,7 +1104,12 @@ async fn a_reconnected_edge_user_answers_its_own_turn() {
             key: "s".into(),
             native_id: "s".into(),
         };
-        let host = EscalationHost::new(session, log.clone(), 1, loop_store::Tenant::local(), None);
+        let acme = loop_store::Tenant::new("acme").unwrap();
+        let host = EscalationHost::new(session, log.clone(), 1, acme.clone(), None);
+        host.set_access(loop_runtime::access::Subject::owned(
+            acme,
+            edge("alice").principal().clone(),
+        ));
         let (first, mut first_rx) = connection(Some(edge("alice")));
         host.attach(2, first).await;
         host.set_turn_caller(Some(edge("alice")));

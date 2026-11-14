@@ -1,17 +1,20 @@
 //! Session-scoped Escalation arbitration and durable decisions.
 //!
-//! Who may answer: a host user's connection (or an in-process recipient)
-//! gets every Escalation of the Session, as before. A user from outside the
-//! host ([`Caller::is_host_user`] is false) gets, and can answer, only the
-//! Escalations of a turn it started. The caller that started the turn is
-//! captured when the Runtime admits the prompt ([`EscalationHost::set_turn_caller`]).
-//! The `escalation_answered` record names the caller that answered.
+//! Who may answer (task I3): a recipient whose caller may act in the Session
+//! ([`Need::Write`] under [`crate::access::decide`]) gets, and can answer,
+//! its Escalations; an in-process recipient always. So the host's user gets
+//! every Escalation of a `local` Session, as before; an outside user only
+//! those of its own Sessions; nobody those of a Session it may not act in.
+//! The Runtime gives the host the Session's [`Subject`]
+//! ([`EscalationHost::set_access`]); until then it is host-only. The
+//! `escalation_answered` record names the caller that answered.
 //!
 //! Who each record names (step B3): `escalation_raised` the caller that
 //! started the turn; `escalation_answered` the caller that answered;
 //! `escalation_withdrawn` the caller whose cancel or close withdrew it, or
 //! the Runtime when it withdraws on its own. Every record is in the
 //! Session's tenant.
+use crate::access::{decide, Actor, Need, Subject};
 use crate::log::{Event, EventKind, EventLog};
 use async_trait::async_trait;
 use loop_protocol::{
@@ -40,6 +43,8 @@ struct Inner {
     /// here from prompt admission: the task-local caller does not cross
     /// the turn's spawned task. `None` for an in-process prompt.
     turn_caller: std::sync::Mutex<Option<Caller>>,
+    /// Who may see and answer this Session's Escalations.
+    access: std::sync::Mutex<Subject>,
     /// Who answered recent Escalations, by id, until the decision record
     /// takes it. Holds at most [`ANSWERS_KEPT`].
     answered: std::sync::Mutex<std::collections::VecDeque<(String, Option<Caller>)>>,
@@ -48,15 +53,10 @@ struct Inner {
 /// How many answers [`Inner::answered`] keeps for the decision records.
 const ANSWERS_KEPT: usize = 64;
 
-/// Whether `recipient` may see and answer an Escalation of a turn that
-/// `started_by` started: a host user or an in-process recipient always; a
-/// user from outside the host only for its own turn.
-fn may_answer(recipient: &dyn EscalationRecipient, started_by: Option<&Caller>) -> bool {
-    match recipient.caller() {
-        None => true,
-        Some(caller) if caller.is_host_user() => true,
-        Some(caller) => started_by.is_some_and(|started| started.same_identity(&caller)),
-    }
+/// Whether `recipient` may see and answer an Escalation of the Session
+/// that `access` describes: the same rule as every other act in it.
+fn may_answer(recipient: &dyn EscalationRecipient, access: &Subject) -> bool {
+    decide(&Actor::of(recipient.caller()), access, Need::Write)
 }
 #[derive(Default)]
 struct State {
@@ -70,8 +70,6 @@ struct Pending {
     request: InteractionRequest,
     answer: oneshot::Sender<InteractionOutcome>,
     deliveries: HashMap<u64, Delivery>,
-    /// The caller that started the turn that raised it.
-    started_by: Option<Caller>,
 }
 struct Delivery {
     token: u64,
@@ -131,6 +129,7 @@ impl EscalationHost {
         actor: Option<String>,
     ) -> Self {
         Self(Arc::new(Inner {
+            access: std::sync::Mutex::new(Subject::unowned(tenant.clone())),
             session,
             log,
             generation,
@@ -141,6 +140,23 @@ impl EscalationHost {
             turn_caller: std::sync::Mutex::new(None),
             answered: std::sync::Mutex::new(Default::default()),
         }))
+    }
+    /// Set who may see and answer this Session's Escalations: the Session's
+    /// access subject (for a Subagent, its root's). Before this, only the
+    /// host's user and in-process recipients may.
+    pub fn set_access(&self, access: Subject) {
+        *self
+            .0
+            .access
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = access;
+    }
+    fn access(&self) -> Subject {
+        self.0
+            .access
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
     /// Set the caller that started the turn about to run, at prompt
     /// admission. Escalations raised from now on belong to its turn.
@@ -218,10 +234,11 @@ impl EscalationHost {
             return;
         }
         state.recipients.insert(connection, recipient.clone());
+        let access = self.access();
         let mut next = state.delivery;
         for (&ticket, pending) in &mut state.pending {
             if !pending.deliveries.contains_key(&connection)
-                && may_answer(recipient.as_ref(), pending.started_by.as_ref())
+                && may_answer(recipient.as_ref(), &access)
             {
                 next += 1;
                 self.dispatch(ticket, pending, connection, next, recipient.clone());
@@ -316,7 +333,7 @@ impl EscalationHost {
         };
         let answered_by = delivery.recipient.caller();
         if !valid(&pending.request, &answer)
-            || !may_answer(delivery.recipient.as_ref(), pending.started_by.as_ref())
+            || !may_answer(delivery.recipient.as_ref(), &self.access())
         {
             return;
         }
@@ -441,7 +458,6 @@ impl HostServices for EscalationHost {
                     request: request.clone(),
                     answer: tx,
                     deliveries: HashMap::new(),
-                    started_by: self.turn_caller(),
                 },
             );
             let waiting = WaitingTool {
@@ -469,8 +485,9 @@ impl HostServices for EscalationHost {
             }
             let mut pending = state.pending.remove(&ticket).unwrap();
             let recipients = state.recipients.clone();
+            let access = self.access();
             for (connection, recipient) in recipients {
-                if !may_answer(recipient.as_ref(), pending.started_by.as_ref()) {
+                if !may_answer(recipient.as_ref(), &access) {
                     continue;
                 }
                 state.delivery += 1;

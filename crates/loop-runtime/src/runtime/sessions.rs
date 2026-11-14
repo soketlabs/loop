@@ -25,6 +25,20 @@ impl Runtime {
     ) -> BackendResult<SessionRef> {
         // The connection's caller, read at entry: it does not cross spawns.
         let caller = loop_protocol::Caller::current();
+        // Whose folders this opening may use (the folder rule): the
+        // caller's; a Subagent's are its parent's owner's, so a child never
+        // opens in another user's folder (it runs as internal work).
+        let who = match &child {
+            Some(child) => child.parent.access.folder_actor(),
+            None => crate::access::Actor::of(caller.clone()),
+        };
+        // An outside user names its Session's folder: the default is the
+        // Runtime's own folder, which is no user's.
+        if existing.is_none() && child.is_none() && spec.cwd.is_none() && who.is_outside() {
+            return Err(BackendError::Forbidden(
+                "a Session without a folder (`cwd`) for a user from outside the host".into(),
+            ));
+        }
         // An attach checks this Surface's credentials, but never changes an
         // existing Session's environment while another Surface may use it.
         let caller_env = spec.env.clone();
@@ -100,8 +114,6 @@ impl Runtime {
         let mut opts = self.session_opts();
         if let Some(child) = &child {
             opts.cwd = child.cwd.clone();
-        } else if let Some(cwd) = spec.cwd {
-            opts.cwd = cwd;
         } else if let Some(session) = existing {
             let known = self
                 .factory
@@ -114,24 +126,63 @@ impl Runtime {
                 .iter()
                 .find(|m| m.id == session.native_id)
                 .ok_or_else(|| BackendError::SessionNotFound(session.key.clone()))?;
-            if let Some(cwd) = &meta.cwd {
-                opts.cwd = PathBuf::from(cwd);
+            // A Session keeps the folder it was created in: a load never
+            // moves it (for any caller), so the folder in the list is the
+            // folder it runs in, and no load takes another user's folder.
+            // A `cwd` equal to the stored one is accepted; with no stored
+            // folder (a very old Session), the asked one is used.
+            match (&meta.cwd, spec.cwd.take()) {
+                (Some(stored), Some(asked)) => {
+                    let stored = PathBuf::from(stored);
+                    if !same_folder(&stored, &asked).await {
+                        return Err(BackendError::Unsupported(format!(
+                            "moving Session {} to another folder ({}); it stays in {}: load it \
+                             without `cwd`",
+                            session.native_id,
+                            asked.display(),
+                            stored.display()
+                        )));
+                    }
+                    opts.cwd = stored;
+                }
+                (Some(stored), None) => opts.cwd = PathBuf::from(stored),
+                (None, Some(asked)) => opts.cwd = asked,
+                (None, None) => {}
             }
+        } else if let Some(cwd) = spec.cwd {
+            opts.cwd = cwd;
         }
         // Under a tool lock no Session opens outside the lock root, by any
         // entry: a new Session, a load from the store, a fork or a child.
         // The workspace loader checks again.
         if let Some(lock) = self.factory.globals.tool_lock_config() {
-            if lock.admit(&opts.cwd).is_err() {
-                return Err(BackendError::ToolLocked {
-                    what: format!(
-                        "a Session in {} (outside the tool lock root)",
-                        opts.cwd.display()
-                    ),
-                    lock: lock.lock(),
-                });
+            match lock.admit(&opts.cwd) {
+                Err(_) => {
+                    return Err(BackendError::ToolLocked {
+                        what: format!(
+                            "a Session in {} (outside the tool lock root)",
+                            opts.cwd.display()
+                        ),
+                        lock: lock.lock(),
+                    })
+                }
+                // Every user's folder is below the root: an outside user's
+                // Session in the root itself would read them all and block
+                // them (the folder rule). It must be strictly inside.
+                Ok(admitted) if who.is_outside() && admitted == lock.root() => {
+                    return Err(BackendError::Forbidden(format!(
+                        "a Session in the tool lock root {} itself (a user from outside the \
+                         host needs a folder inside it)",
+                        lock.root().display()
+                    )))
+                }
+                Ok(_) => {}
             }
         }
+        // An outside user's Session never shares a folder (or a folder
+        // inside or above it) with a Session that user may not read.
+        self.check_folder(&who, &opts.cwd, existing.map(|s| &s.key))
+            .await?;
         if let Some(options) = &spec.options {
             opts.provider = options.provider.clone();
             opts.model = options.model.clone();
@@ -304,6 +355,16 @@ impl Runtime {
                     .map_err(failed)?;
                 opened.native.continue_turns_after(last.max(prompts));
             }
+            // Who may use it (I3): a Subagent its parent's users; a Session
+            // this request created its creator; a loaded one its owner of
+            // record.
+            let access = match &child {
+                Some(child) => child.parent.access.clone(),
+                None if creating => {
+                    crate::access::Subject::owned(tenant.clone(), acting.principal().clone())
+                }
+                None => self.subject(&reference.key).await?,
+            };
             let escalations = crate::EscalationHost::new(
                 reference.clone(),
                 self.log.clone(),
@@ -311,6 +372,7 @@ impl Runtime {
                 tenant.clone(),
                 actor.clone(),
             );
+            escalations.set_access(access.clone());
             // Runtime grants are live Session state, never restored after a crash.
             opened.approval_bridge.clear_session_grants();
             Arc::make_mut(&mut opened.approval_bridge).set_host(Arc::new(escalations.clone()));
@@ -440,6 +502,7 @@ impl Runtime {
                 pending_sandbox: Mutex::new(None),
                 loaded_by,
                 tenant,
+                access,
                 actor,
                 acting: Mutex::new(Acting::new(acting, opened_identity)),
             });
@@ -537,6 +600,12 @@ impl Runtime {
     /// Every wait is bounded by the close grace; a turn that ignores cancellation
     /// is aborted so the lease is always released.
     pub async fn close(&self, key: &SessionKey, force: bool) -> BackendResult<()> {
+        self.check_as(
+            &crate::access::Actor::current(),
+            key,
+            crate::access::Need::Close,
+        )
+        .await?;
         self.close_inner(key, force).await
     }
     pub(super) async fn close_inner(&self, key: &SessionKey, force: bool) -> BackendResult<()> {
@@ -786,4 +855,15 @@ impl Runtime {
         }
         Ok(())
     }
+}
+
+/// Whether `a` and `b` name the same folder, links resolved where they exist.
+async fn same_folder(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let a = tokio::fs::canonicalize(a)
+        .await
+        .unwrap_or_else(|_| a.to_path_buf());
+    let b = tokio::fs::canonicalize(b)
+        .await
+        .unwrap_or_else(|_| b.to_path_buf());
+    a == b
 }

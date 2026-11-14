@@ -20,7 +20,7 @@ use loop_protocol::{
     PermissionKind, PermissionOption, SessionRef, SessionUpdate, TurnOutcome, UpdateEnvelope,
 };
 use loop_wire::transport::memory;
-use loop_wire::{serve, Connection, Incoming, RemoteBackend, RpcError};
+use loop_wire::{Connection, Incoming, RemoteBackend, RpcError};
 use serde_json::json;
 use tokio::sync::{broadcast, Notify};
 
@@ -433,7 +433,7 @@ async fn the_server_asks_the_client_through_host_interact() {
 async fn nothing_but_initialize_is_answered_before_initialize() {
     let backend = native(vec![], vec![]).await;
     let (server_end, client_end) = memory();
-    let _served = serve(backend, server_end, info("server"));
+    let _served = serve_host(backend, server_end);
     let (conn, mut incoming) = Connection::new(client_end);
     let early = tokio::spawn({
         let conn = Arc::clone(&conn);
@@ -529,7 +529,7 @@ async fn a_refused_second_prompt_does_not_lose_the_first_turns_answer() {
     .await;
     let session = backend.current_session().await;
     let (server_end, client_end) = memory();
-    let _served = serve(backend, server_end, info("server"));
+    let _served = serve_host(backend, server_end);
     // A raw client: no local busy check, so the server has to refuse.
     let (conn, mut incoming) = Connection::new(client_end);
     let (tool_running, mut tool_running_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -767,7 +767,7 @@ async fn modes_follow_the_capability_and_missing_ones_are_unsupported() {
             mode: parking_lot::Mutex::new("ask".into()),
         });
         let (server_end, client_end) = memory();
-        let _served = serve(backend.clone(), server_end, info("server"));
+        let _served = serve_host(backend.clone(), server_end);
         let remote = RemoteBackend::connect(client_end, info("client"), Arc::new(FirstOption))
             .await
             .unwrap();
@@ -1017,7 +1017,7 @@ async fn compact_stats_and_shell_need_their_capabilities() {
             mode: parking_lot::Mutex::new("ask".into()),
         });
         let (server_end, client_end) = memory();
-        let _served = serve(backend.clone(), server_end, info("server"));
+        let _served = serve_host(backend.clone(), server_end);
         let remote = RemoteBackend::connect(client_end, info("client"), Arc::new(FirstOption))
             .await
             .unwrap();

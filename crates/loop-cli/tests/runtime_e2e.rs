@@ -231,9 +231,12 @@ async fn an_edge_gateway_names_the_user_and_each_token_opens_only_its_listener()
         assert_eq!(result.tenant.as_ref(), Some(caller.tenant()));
         assert_eq!(result.via.unwrap().as_str(), "edge");
         assert!(result.capabilities.tool_lock.is_some());
-        // An edge user never runs shell commands on the Runtime host.
+        // An edge user never runs shell commands on the Runtime host. The
+        // gateway names the user's own folder inside the root (I3).
+        let folder = std::path::Path::new(&root).join("user-1");
+        std::fs::create_dir_all(&folder).unwrap();
         let made = conn
-            .request(methods::SESSION_NEW, json!({}))
+            .request(methods::SESSION_NEW, json!({"cwd": folder}))
             .await
             .unwrap();
         let shell = conn

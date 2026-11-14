@@ -17,6 +17,7 @@ impl Runtime {
         // it. An in-process call acts as the Runtime.
         let caller = loop_protocol::Caller::current()
             .unwrap_or_else(|| loop_protocol::Caller::host(loop_protocol::Principal::runtime()));
+        self.check(session, crate::access::Need::Write).await?;
         let live = self.loaded(session).await?;
         // Checked before the Session is reserved.
         let timeout_ms = live.opened.native.shell_timeout(timeout_ms)?;

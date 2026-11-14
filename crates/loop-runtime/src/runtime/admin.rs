@@ -16,6 +16,7 @@ use loop_protocol::admin::*;
 use loop_wire::RuntimeAdmin;
 
 use super::*;
+use crate::access::{Actor, Need};
 
 /// Tools the Runtime adds to its Sessions, kept across a reload.
 const RUNTIME_TOOLS: &[&str] = &[super::subagent::TOOL];
@@ -268,11 +269,21 @@ impl Runtime {
 
     /// The workspace an id names: one the Runtime has loaded, or its
     /// startup workspace. Never read as a path.
+    ///
+    /// An outside user names only the folder of a loaded Session it may
+    /// read; any other id is unknown to it, with the same error.
     fn resolve_workspace(&self, id: &str) -> BackendResult<PathBuf> {
-        let mut known: Vec<PathBuf> = self.workspaces.lock().unwrap().keys().cloned().collect();
-        if let Ok(cwd) = self.defaults.cwd.canonicalize() {
-            known.push(cwd);
-        }
+        let known: Vec<PathBuf> = match self.readable_folders(&Actor::current()) {
+            Some(folders) => folders,
+            None => {
+                let mut known: Vec<PathBuf> =
+                    self.workspaces.lock().unwrap().keys().cloned().collect();
+                if let Ok(cwd) = self.defaults.cwd.canonicalize() {
+                    known.push(cwd);
+                }
+                known
+            }
+        };
         known
             .into_iter()
             .find(|cwd| tree::workspace_id(cwd) == id)
@@ -675,7 +686,16 @@ impl RuntimeAdmin for Runtime {
         })
     }
     async fn sessions(&self) -> BackendResult<RuntimeSessionsResult> {
-        let live: Vec<Arc<LiveSession>> = self.sessions.lock().unwrap().values().cloned().collect();
+        // Only the Sessions this caller may list; the totals count only them.
+        let actor = Actor::current();
+        let live: Vec<Arc<LiveSession>> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|live| Self::may_live(&actor, live, Need::List))
+            .cloned()
+            .collect();
         let mut rows = Vec::with_capacity(live.len());
         let mut totals = RuntimeSessionTotals::default();
         for live in live {
@@ -687,10 +707,17 @@ impl RuntimeAdmin for Runtime {
             } else {
                 "idle"
             };
-            let tokens = SessionStats::stats(self, &live.reference)
-                .await
-                .ok()
-                .map(|s| s.total_tokens);
+            // A row the caller may list but not read (the host's user on
+            // another tenant's Session) shows no model and no tokens.
+            let readable = Self::may_live(&actor, &live, Need::Read);
+            let tokens = if readable {
+                SessionStats::stats(self, &live.reference)
+                    .await
+                    .ok()
+                    .map(|s| s.total_tokens)
+            } else {
+                None
+            };
             totals.sessions += 1;
             totals.busy += u32::from(busy);
             match tokens {
@@ -701,7 +728,9 @@ impl RuntimeAdmin for Runtime {
                 session: live.reference.clone(),
                 workspace_id: tree::workspace_id(&live.opened.workspace.cwd),
                 state: state.into(),
-                model: live.announced.lock().unwrap().latest.config.model.clone(),
+                model: readable
+                    .then(|| live.announced.lock().unwrap().latest.config.model.clone())
+                    .flatten(),
                 tokens,
             });
         }
@@ -720,6 +749,14 @@ impl RuntimeAdmin for Runtime {
             self.refuse_if_locked("workspace/mcp changes")?;
         }
         let cwd = self.resolve_workspace(&params.workspace_id)?;
+        // A reload changes every Session in the folder (as `reload`).
+        if params.action == AdminAction::Reload && !self.may_change_folder(&Actor::current(), &cwd)
+        {
+            return Err(protocol(format!(
+                "unknown workspace {}",
+                params.workspace_id
+            )));
+        }
         let _admin = self.admin.lock().await;
         let mut pending_sessions = 0;
         let workspace = match params.action {
@@ -890,6 +927,14 @@ impl RuntimeAdmin for Runtime {
 
     async fn reload(&self, params: ReloadParams) -> BackendResult<ReloadResult> {
         let cwd = self.resolve_workspace(&params.workspace_id)?;
+        // A reload changes every Session in the folder: an outside user
+        // reloads only a folder whose loaded Sessions are all its own.
+        if !self.may_change_folder(&Actor::current(), &cwd) {
+            return Err(protocol(format!(
+                "unknown workspace {}",
+                params.workspace_id
+            )));
+        }
         let _admin = self.admin.lock().await;
         self.check_workspace(&cwd, params.expected_revision)?;
         let (_, revision, notices, pending_sessions) = self.reload_workspace(&cwd).await?;
@@ -924,6 +969,12 @@ impl RuntimeAdmin for Runtime {
     }
 
     async fn sandbox(&self, params: SandboxParams) -> BackendResult<SandboxResult> {
+        let need = if params.action == SandboxAction::Set {
+            Need::Write
+        } else {
+            Need::Read
+        };
+        self.check(&params.session, need).await?;
         let live = self.loaded(&params.session).await?;
         let mut mutation = None;
         if params.action == SandboxAction::Set {
@@ -975,6 +1026,12 @@ impl RuntimeAdmin for Runtime {
     ) -> BackendResult<PermissionModeResult> {
         use loop_app_core::permissions::PermissionMode;
         let session = &params.session;
+        let need = if params.mode.is_some() {
+            Need::Write
+        } else {
+            Need::Read
+        };
+        self.check(session, need).await?;
         let Some(name) = params.mode else {
             let live = self.loaded(session).await?;
             let mode = live.opened.tool_gate.mode();

@@ -1,5 +1,6 @@
 //! Session-tree services. Destination creation never replaces a source harness.
 use super::*;
+use crate::access::{Actor, Need};
 use loop_agent::harness::session::{
     fork_points_from_branch, read_session_entries_for_fork, session_tree_rows, PendingSessionWrite,
     SessionFile, SessionForkSelection, SessionTreeEntry,
@@ -74,6 +75,23 @@ fn fingerprint(params: &impl serde::Serialize) -> BackendResult<String> {
         "{:x}",
         Sha256::digest(serde_json::to_vec(params).map_err(failed)?)
     ))
+}
+/// The store key of a copy or import receipt: request ids are per user
+/// (tenant and principal), so one user can neither learn nor take another
+/// user's id. The user part is a hash: an id is never stored as given.
+fn receipt_key(kind: &str, request_id: &str, caller: &loop_protocol::Caller) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for part in [
+        caller.tenant().as_str(),
+        caller.principal().issuer(),
+        caller.principal().id(),
+    ] {
+        digest.update(part.as_bytes());
+        digest.update([0]);
+    }
+    let user = format!("{:x}", digest.finalize());
+    format!("{kind}:{}:{request_id}", &user[..32])
 }
 fn destination_result(id: &str, receipt: &str) -> BackendResult<DestinationResult> {
     let receipt: serde_json::Value = serde_json::from_str(receipt).map_err(failed)?;
@@ -343,6 +361,7 @@ impl Runtime {
     }
     /// Read an immutable transcript page. Expired views fail explicitly.
     pub async fn view(&self, params: ViewParams) -> BackendResult<ViewResult> {
+        self.check(&params.session, Need::Read).await?;
         let views = self.views.lock().unwrap();
         let view = views
             .get(&params.view_id)
@@ -358,6 +377,7 @@ impl Runtime {
     }
     /// Branches, fork points and related Sessions, without replacing the source.
     pub async fn tree(&self, params: TreeParams) -> BackendResult<TreeResult> {
+        self.check(&params.session, Need::Read).await?;
         let live = self.route(&params.session)?;
         let _guard = live.lifecycle.lock().await;
         let (file, busy) = self.capture(&live).await?;
@@ -453,6 +473,15 @@ impl Runtime {
         if family.len() > 1000 {
             return Err(failed("Session family exceeds the page limit"));
         }
+        // Only the relatives this caller may read.
+        let actor = Actor::current();
+        let mut readable = Vec::with_capacity(family.len());
+        for relative in family {
+            if self.may(&actor, &relative.key, Need::Read).await? {
+                readable.push(relative);
+            }
+        }
+        let family = readable;
         Ok(TreeResult {
             entries,
             fork_points,
@@ -463,6 +492,7 @@ impl Runtime {
     }
     /// Rename metadata and publish an ordered ConfigChanged, without a branch reset.
     pub async fn rename(&self, params: RenameParams) -> BackendResult<MutationResult> {
+        self.check(&params.session, Need::Write).await?;
         if params.name.trim().is_empty() || params.name.len() > 4096 {
             return Err(failed("Session name must contain 1 to 4096 bytes"));
         }
@@ -498,6 +528,7 @@ impl Runtime {
     }
     /// Move the active branch while idle, then announce its immutable replacement.
     pub async fn navigate(&self, params: NavigateParams) -> BackendResult<NavigateResult> {
+        self.check(&params.session, Need::Write).await?;
         let live = self.route(&params.session)?;
         let _guard = live.lifecycle.lock().await;
         self.check_tree_live(&live)?;
@@ -548,6 +579,7 @@ impl Runtime {
         session: &SessionRef,
         instructions: Option<&str>,
     ) -> BackendResult<loop_protocol::CompactionReport> {
+        self.check(session, Need::Write).await?;
         let live = self.loaded(session).await?;
         let head = {
             let _guard = live.lifecycle.lock().await;
@@ -670,6 +702,7 @@ impl Runtime {
     }
     /// Return a bounded, consistent payload. The caller writes its own files.
     pub async fn export(&self, session: &SessionRef) -> BackendResult<ExportResult> {
+        self.check(session, Need::Read).await?;
         let live = self.route(session)?;
         let _guard = live.lifecycle.lock().await;
         let file = self.committed_file(&live).await?;
@@ -709,6 +742,8 @@ impl Runtime {
     }
     /// Fork before a user message. Its text is returned to the initiating draft.
     pub async fn fork(&self, params: ForkParams) -> BackendResult<DestinationResult> {
+        // The source first: a copy needs `Read` on it.
+        self.check(&params.session, Need::Read).await?;
         match self.shared() {
             // The caller does not cross the spawn on its own.
             Some(me) => tokio::spawn(in_caller_scope(async move { me.fork_owned(params).await }))
@@ -736,6 +771,8 @@ impl Runtime {
     }
     /// Copy a full committed branch into another leased Session.
     pub async fn clone_session(&self, params: CloneParams) -> BackendResult<DestinationResult> {
+        // The source first: a copy needs `Read` on it.
+        self.check(&params.session, Need::Read).await?;
         match self.shared() {
             // The caller does not cross the spawn on its own.
             Some(me) => tokio::spawn(in_caller_scope(async move {
@@ -829,6 +866,22 @@ impl Runtime {
         if params.jsonl.len() > SESSION_TRANSFER_LIMIT {
             return Err(failed("Session transfer exceeds 8 MiB"));
         }
+        // An outside user imports only into the folder of a Session it may
+        // read; any other id is unknown to it.
+        let readable = self.readable_folders(&Actor::current());
+        let cwd = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|cwd| {
+                readable
+                    .as_ref()
+                    .is_none_or(|folders| folders.contains(cwd))
+            })
+            .find(|cwd| workspace_id(cwd) == params.workspace_id)
+            .cloned()
+            .ok_or_else(|| failed("unknown workspace id"))?;
         let fingerprint = fingerprint(&params)?;
         if let Some(result) = self
             .retry_destination("import", &params.request_id, &fingerprint)
@@ -836,14 +889,6 @@ impl Runtime {
         {
             return Ok(result);
         }
-        let cwd = self
-            .workspaces
-            .lock()
-            .unwrap()
-            .keys()
-            .find(|cwd| workspace_id(cwd) == params.workspace_id)
-            .cloned()
-            .ok_or_else(|| failed("unknown workspace id"))?;
         let file = SessionFile::from_jsonl(&params.jsonl).map_err(failed)?;
         validate_file(&file)?;
         self.destination(file, cwd, None, params.request_id, fingerprint, None, None)
@@ -872,12 +917,38 @@ impl Runtime {
         if request_id.trim().is_empty() || request_id.len() > 256 {
             return Err(failed("request id must contain 1 to 256 bytes"));
         }
-        self.store
-            .destination_receipt(&format!("{kind}:{request_id}"), fingerprint)
+        let caller = request_caller();
+        let mut found = self
+            .store
+            .destination_receipt(&receipt_key(kind, request_id, &caller), fingerprint)
             .await
-            .map_err(failed)?
+            .map_err(failed)?;
+        // A receipt written before request ids were per user had no user in
+        // its key. The host's user (the only user before) still finds it, so
+        // a retry across an upgrade answers from it.
+        if found.is_none() && caller.tenant().as_str() == Tenant::LOCAL {
+            found = self
+                .store
+                .destination_receipt(&format!("{kind}:{request_id}"), fingerprint)
+                .await
+                .map_err(failed)?;
+        }
+        let result = found
             .map(|(id, receipt)| destination_result(&id, &receipt))
-            .transpose()
+            .transpose()?;
+        // A receipt answers only a caller that may read its Session: the
+        // same request id and payload from another user names nothing.
+        if let Some(result) = &result {
+            if !self
+                .may(&Actor::current(), &result.session.key, Need::Read)
+                .await?
+            {
+                return Err(failed(
+                    "this request id is already used; send the request with a new id",
+                ));
+            }
+        }
+        Ok(result)
     }
     #[allow(clippy::too_many_arguments)]
     async fn destination(
@@ -904,10 +975,7 @@ impl Runtime {
             return Err(BackendError::Busy);
         }
         let receipt = json!({"workspace_id":workspace_id(&cwd),"source_branch_revision":revision,"draft":draft}).to_string();
-        let key = format!(
-            "{}:{request_id}",
-            if parent.is_some() { "copy" } else { "import" }
-        );
+        let key = receipt_key(kind, &request_id, &request_caller());
         let created = self
             .store
             .create_destination(
