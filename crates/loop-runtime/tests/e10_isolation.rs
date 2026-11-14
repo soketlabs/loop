@@ -195,14 +195,59 @@ fn masked(error: &RpcError, key: &str) -> String {
     format!("{error:?}").replace(key, "<KEY>")
 }
 
+/// What one probe run found.
+struct Found {
+    attempts: u64,
+    refused: u64,
+    checks: u64,
+    leaks: Vec<String>,
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "probe: run explicitly"]
 async fn e10_isolation() {
     let started = std::time::Instant::now();
+    let found = probe("bob").await;
+    say(format!(
+        "RESULT|attempts={}|refused={}|access_refusals={}|leaks={}|wall={}ms",
+        found.attempts,
+        found.refused,
+        found.checks,
+        found.leaks.len(),
+        started.elapsed().as_millis()
+    ));
+    for leak in &found.leaks {
+        say(format!("LEAK|{leak}"));
+    }
+    assert!(found.leaks.is_empty(), "{} leaks", found.leaks.len());
+    assert_eq!(found.attempts, found.refused);
+}
+
+/// The probe must be able to fail: with Alice herself as the attacker,
+/// every attempt reaches her Session, and the probe reports it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "negative control for E10: run explicitly"]
+async fn e10_negative_control() {
+    let found = probe("alice").await;
+    say(format!(
+        "CONTROL|attacker is the owner: attempts={}|leaks={} (a working probe reports many)",
+        found.attempts,
+        found.leaks.len()
+    ));
+    assert!(
+        found.leaks.len() as u64 > found.attempts / 2,
+        "{:?}",
+        found.leaks
+    );
+}
+
+/// Alice works; `attacker` (Bob, or Alice herself for the control) tries
+/// her Session.
+async fn probe(attacker: &str) -> Found {
     let dir = tempfile::tempdir().unwrap();
     let rt = runtime(dir.path()).await;
     let alice = connect(&rt, edge("alice")).await;
-    let bob = connect(&rt, edge("bob")).await;
+    let bob = connect(&rt, edge(attacker)).await;
     let alice_folder = folder(dir.path(), "alice");
     let bob_folder = folder(dir.path(), "bob");
 
@@ -407,15 +452,11 @@ async fn e10_isolation() {
     }
     let _ = his;
     let checks = rt.access_refusals() - before;
-    say(format!(
-        "RESULT|attempts={attempts}|refused={refused}|access_refusals={checks}|leaks={}|wall={}ms",
-        leaks.len(),
-        started.elapsed().as_millis()
-    ));
-    for leak in &leaks {
-        say(format!("LEAK|{leak}"));
-    }
     rt.shutdown().await;
-    assert!(leaks.is_empty(), "{} leaks", leaks.len());
-    assert_eq!(attempts, refused);
+    Found {
+        attempts,
+        refused,
+        checks,
+        leaks,
+    }
 }

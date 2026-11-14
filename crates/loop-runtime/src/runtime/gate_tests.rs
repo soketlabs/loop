@@ -575,6 +575,44 @@ async fn the_prompt_s_caller_decides_who_is_asked_to_approve() {
             .unwrap();
         assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
         assert!(host_rx.try_recv().is_err(), "the host's user was asked");
+
+        // Bob, an outside user of the same tenant, on Alice's Session: his
+        // own registration is refused as not found; a registration made for
+        // him anyway (in process) never asks him.
+        let (bob_tx, mut bob_rx) = tokio::sync::mpsc::unbounded_channel();
+        let bob = edge("bob");
+        let watcher = || {
+            Arc::new(Watcher {
+                caller: edge("bob"),
+                asked: bob_tx.clone(),
+            })
+        };
+        let refused = bob
+            .clone()
+            .scope(control.register(&hers, 5, true, Some(watcher())))
+            .await;
+        assert!(
+            matches!(refused, Err(BackendError::SessionNotFound(_))),
+            "{refused:?}"
+        );
+        control
+            .register(&hers, 6, true, Some(watcher()))
+            .await
+            .unwrap();
+        let turn = edge("alice")
+            .scope(rt.prompt(&hers, vec![ContentBlock::text("three")]))
+            .await
+            .unwrap();
+        let from_edge = edge_rx.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(bob_rx.try_recv().is_err(), "another outside user was asked");
+        from_edge
+            .send(InteractionOutcome::Selected {
+                native_id: loop_app_core::interaction::native_options::ACCEPT.into(),
+                note: None,
+            })
+            .unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
         let last = decisions(&log).await.pop().unwrap().1;
         assert_eq!(last.principal, *edge("alice").principal());
         assert_eq!(last.answered_by.as_ref(), Some(edge("alice").principal()));

@@ -849,13 +849,6 @@ impl Runtime {
         if params.jsonl.len() > SESSION_TRANSFER_LIMIT {
             return Err(failed("Session transfer exceeds 8 MiB"));
         }
-        let fingerprint = fingerprint(&params)?;
-        if let Some(result) = self
-            .retry_destination("import", &params.request_id, &fingerprint)
-            .await?
-        {
-            return Ok(result);
-        }
         // An outside user imports only into the folder of a Session it may
         // read; any other id is unknown to it.
         let readable = self.readable_folders(&Actor::current());
@@ -872,6 +865,13 @@ impl Runtime {
             .find(|cwd| workspace_id(cwd) == params.workspace_id)
             .cloned()
             .ok_or_else(|| failed("unknown workspace id"))?;
+        let fingerprint = fingerprint(&params)?;
+        if let Some(result) = self
+            .retry_destination("import", &params.request_id, &fingerprint)
+            .await?
+        {
+            return Ok(result);
+        }
         let file = SessionFile::from_jsonl(&params.jsonl).map_err(failed)?;
         validate_file(&file)?;
         self.destination(file, cwd, None, params.request_id, fingerprint, None, None)

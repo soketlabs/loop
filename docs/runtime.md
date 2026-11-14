@@ -585,6 +585,13 @@ without one the Session opens in the Runtime's own folder, which the folder
 rule then gives to the first user. Never use the principal id itself as a
 folder name. Loop does not create these folders.
 
+The folder rule counts every Session the Runtime's store knows, also closed
+ones, the host's own and those made before identity was stored. So a host
+Session in the tool-lock root itself refuses every outside user's new
+Session, and a host Session made later in a user's folder makes that user's
+next load of its own Session fail with `Forbidden`. Keep the host's own
+Sessions out of the users' folders.
+
 **Updates and Escalations.** The Runtime sends every update to one channel.
 Each connection forwards only the updates of Sessions that it created,
 loaded or attached, and each of those requests passed the check above. The
@@ -602,7 +609,11 @@ used the caller of the turn.
 - That a folder is in use by another user's Session (the folder rule).
 - The time of a refused request: a refusal for another user's Session of the
   same tenant reads its owner once (then from a cache); a refusal for an
-  unknown Session reads nothing.
+  unknown Session reads nothing. The time of `session/list` grows with the
+  number of Sessions of all users.
+- A host's user listing another tenant's Sessions sees each one's key,
+  folder id, size, owner kind, times and state, not its title, name or
+  model.
 - Escalation ids (`approval-<n>`) count across the whole Runtime.
 - Being dropped for lag: the update channel is shared, so a burst of
   another user's updates can make a slow connection fall behind. The

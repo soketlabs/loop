@@ -558,6 +558,20 @@ async fn lists_show_only_what_the_caller_may_list() {
                 .map(key)
                 .collect();
             assert_eq!(listed, want, "session/list for {who:?}");
+            // What a row may show without `Read`: no title, name or model.
+            for info in who.caller().scope(rt.list()).await.unwrap() {
+                let kind = Kind::ALL
+                    .into_iter()
+                    .find(|kind| key(*kind) == info.r#ref.key)
+                    .unwrap();
+                if !expected(who, kind, Need::Read) {
+                    assert_eq!(info.summary.first_prompt, None, "{who:?} {kind:?}");
+                    assert_eq!(info.summary.selected_model, None, "{who:?} {kind:?}");
+                    assert_eq!(info.name, None, "{who:?} {kind:?}");
+                } else if matches!(kind, Kind::Local | Kind::Alice | Kind::Bob) {
+                    assert!(info.summary.first_prompt.is_some(), "{who:?} {kind:?}");
+                }
+            }
             // `runtime/sessions`: the loaded ones (the three roots), and
             // totals of only the rows shown.
             let loaded = who
@@ -610,6 +624,51 @@ async fn a_copy_belongs_to_its_copier() {
         let owner = rt.session_owner(&copy.session.key).await.unwrap().unwrap();
         assert!(owner.principal.same_principal(alice.principal()));
         assert_eq!(owner.tenant, Tenant::new("acme").unwrap());
+        // A fork of hers, before her first message: hers too.
+        let tree = alice
+            .clone()
+            .scope(RuntimeControl::tree(
+                rt.as_ref(),
+                loop_protocol::rpc::TreeParams {
+                    session: a.clone(),
+                    cursor: None,
+                    limit: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let fork = alice
+            .clone()
+            .scope(RuntimeControl::fork(
+                rt.as_ref(),
+                loop_protocol::rpc::ForkParams {
+                    session: a.clone(),
+                    before_entry_id: tree.fork_points[0].entry_id.clone(),
+                    name: None,
+                    request_id: "alice-fork".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        let owner = rt.session_owner(&fork.session.key).await.unwrap().unwrap();
+        assert!(owner.principal.same_principal(alice.principal()));
+        assert_eq!(
+            rt.session_tenant(&fork.session.key),
+            Tenant::new("acme").unwrap()
+        );
+        // Bob cannot fork it, and its tree names no Session he could reach.
+        let refused = edge("bob", "acme")
+            .scope(RuntimeControl::fork(
+                rt.as_ref(),
+                loop_protocol::rpc::ForkParams {
+                    session: a.clone(),
+                    before_entry_id: tree.fork_points[0].entry_id.clone(),
+                    name: None,
+                    request_id: "bob-fork".into(),
+                },
+            ))
+            .await;
+        assert!(matches!(refused, Err(BackendError::SessionNotFound(_))));
         assert_eq!(
             rt.session_tenant(&copy.session.key),
             Tenant::new("acme").unwrap()
@@ -960,4 +1019,42 @@ async fn two_outside_users_never_see_each_other() {
     })
     .await
     .unwrap();
+}
+
+/// What the check costs per request, by caller kind: a cheap read
+/// (`session/permission_mode`) timed in process (internal authority), as
+/// the host's user, and as the outside owner. Ignored: run with
+/// `--ignored --nocapture`; prints one `ACCESS|COST|` line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "timing: run explicitly"]
+async fn access_check_cost() {
+    let world = world(true).await;
+    let rt = &world.rt;
+    const N: u32 = 20_000;
+    let read = |session: SessionRef| loop_protocol::admin::PermissionModeParams {
+        session,
+        mode: None,
+        expected_revision: None,
+    };
+    let mut line = String::from("ACCESS|COST");
+    for (name, caller, kind) in [
+        ("internal", None, Kind::Local),
+        ("host", Some(host()), Kind::Local),
+        ("outside_owner", Some(edge("alice", "acme")), Kind::Alice),
+        ("outside_refused", Some(edge("bob", "acme")), Kind::Alice),
+    ] {
+        let session = world.sessions[&kind].clone();
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            let call = RuntimeAdmin::permission_mode(rt.as_ref(), read(session.clone()));
+            let _ = match &caller {
+                Some(caller) => caller.clone().scope(call).await,
+                None => call.await,
+            };
+        }
+        let per = started.elapsed().as_nanos() / u128::from(N);
+        line.push_str(&format!("|{name}_ns={per}"));
+    }
+    println!("{line}");
+    rt.shutdown().await;
 }

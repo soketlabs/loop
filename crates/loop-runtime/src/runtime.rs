@@ -308,7 +308,7 @@ struct LiveSession {
     ///
     /// It is NOT the Session's owner and must never be used for
     /// authorization: another caller's reload replaces it. Ownership comes
-    /// from a record stored when the Session is created (later work).
+    /// from the record stored when the Session is created (`access`).
     loaded_by: Option<loop_protocol::Caller>,
     /// The Session's tenant: the creator's, fixed for its life. Every record
     /// of the Session is in it, whoever acts (ADR-0009).
@@ -837,7 +837,8 @@ impl Runtime {
     }
     /// The caller whose request last loaded the live Session `key`
     /// (ADR-0009), or `None` when it is not loaded or was loaded in process.
-    /// Not the owner: never use it for authorization (see `LiveSession`).
+    /// Not the owner: never use it for authorization (see `LiveSession`;
+    /// access uses the owner of record, `crate::access`).
     pub fn loaded_by(&self, key: &SessionKey) -> Option<loop_protocol::Caller> {
         let sessions = self
             .sessions
@@ -852,7 +853,8 @@ impl Runtime {
     /// The tenant of Session `key`: a loaded Session's own, else the one the
     /// Event Log recorded, else `local` (a Session that has no record yet
     /// was made on this host, by `loop` or an older Runtime). Reads of the
-    /// Session's records use it. It does not decide access (task I3).
+    /// Session's records use it, and so does the access check
+    /// (`crate::access`).
     pub fn session_tenant(&self, key: &SessionKey) -> Tenant {
         if let Some(live) = self
             .sessions
@@ -872,8 +874,8 @@ impl Runtime {
     /// The owner of record of Session `key` (step B3): the identity of the
     /// `session_opened` that created it, read from the Session summary in
     /// the Session's tenant. `None` for a Session created before step B3 or
-    /// outside the Runtime. Groundwork for access checks (task I3); nothing
-    /// uses it to decide access yet.
+    /// outside the Runtime. The access check reads the same record
+    /// (`Runtime::subject`).
     pub async fn session_owner(&self, key: &SessionKey) -> BackendResult<Option<Identity>> {
         let tenant = self.session_tenant(key);
         self.log.session_owner(&tenant, key).await.map_err(failed)
@@ -1035,6 +1037,16 @@ impl Runtime {
         let all = self.list_all().await?;
         let actor = Actor::current();
         if !actor.is_outside() {
+            // The host's user lists another tenant's Sessions but may not
+            // read them: no title, name or model of theirs.
+            let mut all = all;
+            for info in &mut all {
+                if !self.may(&actor, &info.r#ref.key, Need::Read).await? {
+                    info.summary.first_prompt = None;
+                    info.summary.selected_model = None;
+                    info.name = None;
+                }
+            }
             return Ok(all);
         }
         // An outside user sees its own Sessions only, and no reference to

@@ -740,6 +740,14 @@ impl RuntimeAdmin for Runtime {
             self.refuse_if_locked("workspace/mcp changes")?;
         }
         let cwd = self.resolve_workspace(&params.workspace_id)?;
+        // A reload changes every Session in the folder (as `reload`).
+        if params.action == AdminAction::Reload && !self.may_change_folder(&Actor::current(), &cwd)
+        {
+            return Err(protocol(format!(
+                "unknown workspace {}",
+                params.workspace_id
+            )));
+        }
         let _admin = self.admin.lock().await;
         let mut pending_sessions = 0;
         let workspace = match params.action {
