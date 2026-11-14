@@ -14,6 +14,10 @@ use loop_agent::harness::sandbox::{
     WorkspaceSpec,
 };
 
+/// `kill_all_host_processes` kills every host process of this test
+/// process: tests that start processes hold this lock.
+static PROCESSES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn workspace(dir: &std::path::Path) -> Arc<dyn Workspace> {
     let ws = HostWorkspaceDriver
         .create(WorkspaceSpec {
@@ -49,6 +53,7 @@ async fn output(p: &dyn loop_agent::harness::sandbox::WorkspaceProcess) -> (Stri
 /// spawned command.
 #[tokio::test]
 async fn runtime_descriptors_do_not_leak_into_commands() {
+    let _only = PROCESSES.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let ws = workspace(dir.path()).await;
     let marker = dir.path().join("marker");
@@ -103,6 +108,7 @@ fn an_empty_listing_still_kills_the_group() {
 /// dropped or destroyed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kill_all_host_processes_stops_every_workspace() {
+    let _only = PROCESSES.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let ws = workspace(dir.path()).await;
     let p = ws
@@ -135,7 +141,7 @@ fn a_dead_runtime_takes_its_leaders_along() {
             let p = ws
                 .spawn(SpawnRequest {
                     command: format!(
-                        "echo $$ > '{}'; exec sleep 60",
+                        "echo $$ > '{}'; echo ready; exec sleep 60",
                         std::path::Path::new(&pid_file).display()
                     ),
                     inherit_env: true,
@@ -144,7 +150,9 @@ fn a_dead_runtime_takes_its_leaders_along() {
                 })
                 .await
                 .unwrap();
+            // Wait until the shell wrote its pid and runs `sleep`.
             let _ = p.next_event().await;
+            assert!(std::path::Path::new(&pid_file).exists());
             std::mem::forget(p);
             std::mem::forget(ws);
             std::mem::forget(dir);
