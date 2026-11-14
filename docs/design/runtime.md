@@ -182,8 +182,10 @@ it records it:
   changes the acting caller with `act()` in its own task, before the
   backend starts. The pump first commits everything the backend sent
   before, then switches. So an update keeps its caller also when it waits
-  in the queue while the next caller's turn is admitted. Admission itself
-  does not wait for the pump.
+  in the queue while the next caller's turn is admitted. Prompt and
+  command admission do not wait for the pump. The one exception is a
+  workflow: it calls `act()` under the lifecycle lock, on an idle Session,
+  so it waits only for updates that are still in the queue.
 - A `config_changed` with no turn id is the caller that made its revision.
   A setter claims the revisions it makes (`claim_changes`). A claimed
   revision stays until a newer revision commits, so a change that takes
