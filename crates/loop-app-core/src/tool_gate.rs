@@ -1072,18 +1072,14 @@ impl ToolGate {
                 },
                 None => emit.await,
             };
-            match outcome.decision {
-                Some(ToolDecision::Block { reason }) => {
-                    let decided = Decided::deny(DecidedBy::Hook, reason.clone());
-                    return (block(reason), decided, false, None);
-                }
-                Some(ToolDecision::Allow) => {
-                    // A Policy layer's "ask" holds even against a hook.
-                    if !self.requires_ask(&ctx.tool_call.name, &ctx.args).await {
-                        return (None, Decided::allow(DecidedBy::Hook), true, None);
-                    }
-                }
-                None => {}
+            let hook_allows = matches!(outcome.decision, Some(ToolDecision::Allow));
+            if let Some(ToolDecision::Block { reason }) = outcome.decision {
+                let decided = Decided::deny(DecidedBy::Hook, reason.clone());
+                return (block(reason), decided, false, None);
+            }
+            // A Policy layer's "ask" holds even against a hook.
+            if hook_allows && !self.requires_ask(&ctx.tool_call.name, &ctx.args).await {
+                return (None, Decided::allow(DecidedBy::Hook), true, None);
             }
         }
         if verdict.decision == Decision::Allow {
