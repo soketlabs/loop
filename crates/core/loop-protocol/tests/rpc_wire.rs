@@ -192,6 +192,76 @@ fn every_backend_error_survives_the_wire() {
     ));
 }
 
+/// The file and terminal error: code -32008 with its stable code; an
+/// older reader that does not know the code keeps the message.
+#[test]
+fn a_workspace_error_crosses_the_wire_with_its_code() {
+    use loop_protocol::session_workspace::WorkspaceErrorCode;
+    let error = BackendError::workspace(WorkspaceErrorCode::Changed, "a.txt changed");
+    let body = RpcErrorBody::from(&error);
+    assert_eq!(body.code, error_codes::WORKSPACE);
+    assert_eq!(body.data, Some(json!({"code": "changed"})));
+    assert_eq!(body.message, "a.txt changed");
+    assert_eq!(body.clone().into_backend_error(), error);
+    let newer = RpcErrorBody {
+        code: error_codes::WORKSPACE,
+        message: "a newer code".into(),
+        data: Some(json!({"code": "quota"})),
+    };
+    assert_eq!(
+        newer.into_backend_error(),
+        BackendError::workspace(WorkspaceErrorCode::Other, "a newer code")
+    );
+}
+
+/// The file and terminal messages as they look on the wire.
+#[test]
+fn file_and_terminal_messages_wire() {
+    use loop_protocol::session_workspace::*;
+    roundtrip(
+        &FilesReadParams {
+            session: session(),
+            path: "src/a.rs".into(),
+            offset: 4,
+            length: None,
+            if_match: Some("v1-1".into()),
+        },
+        json!({"session": {"instance":"native","key":"s1","native_id":"n1"},
+            "path": "src/a.rs", "offset": 4, "if_match": "v1-1"}),
+    );
+    roundtrip(
+        &TerminalOutputParams {
+            session: "s1".into(),
+            terminal: "term-1".into(),
+            seq: 9,
+            data: None,
+            dropped: Some(4096),
+            exit: None,
+        },
+        json!({"session": "s1", "terminal": "term-1", "seq": 9, "dropped": 4096}),
+    );
+    roundtrip(
+        &FileEntry {
+            name: "a".into(),
+            path: "d/a".into(),
+            kind: FileKind::Symlink,
+            size: 3,
+            mtime_ms: None,
+            tag: None,
+        },
+        json!({"name": "a", "path": "d/a", "kind": "symlink", "size": 3}),
+    );
+    // Defaults: an empty path is the Session's folder; no flags.
+    let list: FilesListParams = serde_json::from_value(json!({"session": session()})).unwrap();
+    assert_eq!(list.path, "");
+    let delete: FilesDeleteParams =
+        serde_json::from_value(json!({"session": session(), "path": "x"})).unwrap();
+    assert!(!delete.recursive);
+    // An old client reads the new capability flags as absent.
+    let caps: loop_protocol::Capabilities = serde_json::from_value(json!({})).unwrap();
+    assert!(!caps.session_files && !caps.session_terminal);
+}
+
 #[test]
 fn negotiation_picks_a_version_both_speak() {
     assert_eq!(negotiate(PROTOCOL_VERSION), PROTOCOL_VERSION);

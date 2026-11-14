@@ -77,6 +77,26 @@
       ],
       "type": "object"
     },
+    "Availability": {
+      "description": "Whether a part of the panel works for this Session now.",
+      "properties": {
+        "available": {
+          "description": "The calls are served (the gate still decides each one).",
+          "type": "boolean"
+        },
+        "reason": {
+          "description": "Why not, when not.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "available"
+      ],
+      "type": "object"
+    },
     "BackendInstanceId": {
       "description": "One configured backend: an agent kind plus its account and settings.",
       "type": "string"
@@ -207,6 +227,14 @@
           "description": "Accepts a caller environment in session/new.",
           "type": "boolean"
         },
+        "session_files": {
+          "description": "Lists, reads and downloads a Session's files (`session/workspace`,\n`session/files/list`, `stat`, `read`). A Session can still refuse:\nread `session/workspace` for each Session.",
+          "type": "boolean"
+        },
+        "session_files_write": {
+          "description": "Uploads, deletes, renames and makes folders (`session/files/upload_*`,\n`delete`, `rename`, `mkdir`). False under a tool lock.",
+          "type": "boolean"
+        },
         "session_fork": {
           "description": "Creates separately leased forks and clones.",
           "type": "boolean"
@@ -225,6 +253,10 @@
         },
         "session_stats": {
           "description": "Reports Session token statistics (`session/stats`).",
+          "type": "boolean"
+        },
+        "session_terminal": {
+          "description": "Opens terminals (`session/terminal/*`). False under a tool lock and\nfor a caller from outside the host.",
           "type": "boolean"
         },
         "session_transfer": {
@@ -855,6 +887,288 @@
         "markdown",
         "jsonl",
         "branch_revision"
+      ],
+      "type": "object"
+    },
+    "FileEntry": {
+      "description": "One file or folder.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/FileKind",
+          "description": "The kind."
+        },
+        "mtime_ms": {
+          "description": "Last change, in Unix milliseconds, when the workspace gives it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The last part of the path.",
+          "type": "string"
+        },
+        "path": {
+          "description": "The workspace path.",
+          "type": "string"
+        },
+        "size": {
+          "description": "Size in bytes (0 for a folder).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tag": {
+          "description": "The file's version (a regular file in `session/files/stat`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "path",
+        "kind",
+        "size"
+      ],
+      "type": "object"
+    },
+    "FileKind": {
+      "description": "The kind of a path, without following a final link.",
+      "oneOf": [
+        {
+          "const": "file",
+          "description": "A regular file.",
+          "type": "string"
+        },
+        {
+          "const": "dir",
+          "description": "A folder.",
+          "type": "string"
+        },
+        {
+          "const": "symlink",
+          "description": "A symbolic link.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "Anything else (socket, device, FIFO), or a kind this reader does not\nknow.",
+          "type": "string"
+        }
+      ]
+    },
+    "FilePathParams": {
+      "description": "Params naming one path (`session/files/stat`, `session/files/mkdir`).",
+      "properties": {
+        "path": {
+          "description": "The path.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        }
+      },
+      "required": [
+        "session",
+        "path"
+      ],
+      "type": "object"
+    },
+    "FilesDeleteParams": {
+      "description": "`session/files/delete` params.",
+      "properties": {
+        "path": {
+          "description": "The path. A link is removed, not its target.",
+          "type": "string"
+        },
+        "recursive": {
+          "default": false,
+          "description": "Remove a folder with its entries.",
+          "type": "boolean"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        }
+      },
+      "required": [
+        "session",
+        "path"
+      ],
+      "type": "object"
+    },
+    "FilesListParams": {
+      "description": "`session/files/list` params.",
+      "properties": {
+        "cursor": {
+          "description": "The `next_cursor` of the page before.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "description": "Entries per page ([`LIST_PAGE_DEFAULT`], at most [`LIST_PAGE_MAX`]).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "default": "",
+          "description": "The folder; empty for the Session's folder.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "FilesListResult": {
+      "description": "`session/files/list` result.",
+      "properties": {
+        "entries": {
+          "description": "Entries in name order.",
+          "items": {
+            "$ref": "#/$defs/FileEntry"
+          },
+          "type": "array"
+        },
+        "hidden": {
+          "default": 0,
+          "description": "Entries of this page that a rule hides.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "next_cursor": {
+          "description": "Pass as `cursor` for the next page; absent on the last page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "The folder.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "entries"
+      ],
+      "type": "object"
+    },
+    "FilesReadParams": {
+      "description": "`session/files/read` params.",
+      "properties": {
+        "if_match": {
+          "description": "Fail with `changed` unless the file has this tag.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "length": {
+          "description": "Most bytes ([`CHUNK_BYTES_MAX`] when absent or larger).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "default": 0,
+          "description": "Where to start.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "description": "A regular file.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        }
+      },
+      "required": [
+        "session",
+        "path"
+      ],
+      "type": "object"
+    },
+    "FilesReadResult": {
+      "description": "`session/files/read` result.",
+      "properties": {
+        "data": {
+          "description": "The bytes, Base64.",
+          "type": "string"
+        },
+        "eof": {
+          "description": "`data` ends at the end of the file.",
+          "type": "boolean"
+        },
+        "offset": {
+          "description": "Offset of `data` in the file.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tag": {
+          "description": "The file's version; pass it as `if_match` for the next piece.",
+          "type": "string"
+        },
+        "total_size": {
+          "description": "The file size when it was read.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "offset",
+        "data",
+        "total_size",
+        "eof",
+        "tag"
+      ],
+      "type": "object"
+    },
+    "FilesRenameParams": {
+      "description": "`session/files/rename` params. An existing `to` is never replaced.",
+      "properties": {
+        "from": {
+          "description": "The path now.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        },
+        "to": {
+          "description": "The new path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "from",
+        "to"
       ],
       "type": "object"
     },
@@ -3463,6 +3777,107 @@
       ],
       "description": "One change in a session."
     },
+    "SessionWorkspaceInfo": {
+      "description": "`session/workspace` result: what the Session serves now.",
+      "properties": {
+        "files": {
+          "$ref": "#/$defs/Availability",
+          "description": "List, stat and read."
+        },
+        "files_write": {
+          "$ref": "#/$defs/Availability",
+          "description": "Upload, delete, rename and mkdir."
+        },
+        "limits": {
+          "$ref": "#/$defs/SessionWorkspaceLimits",
+          "description": "The limits."
+        },
+        "sandboxed": {
+          "description": "The Session's sandbox is on.",
+          "type": "boolean"
+        },
+        "terminal": {
+          "$ref": "#/$defs/Availability",
+          "description": "Terminals."
+        },
+        "tool_lock": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolLock"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The Runtime's tool lock, when it has one."
+        }
+      },
+      "required": [
+        "files",
+        "files_write",
+        "terminal",
+        "sandboxed",
+        "limits"
+      ],
+      "type": "object"
+    },
+    "SessionWorkspaceLimits": {
+      "description": "The limits of the file and terminal calls.",
+      "properties": {
+        "chunk_bytes": {
+          "description": "Most data bytes in one read answer or one upload piece.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "detached_terminal_secs": {
+          "description": "A terminal no connection streams is closed after this many seconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "terminal_buffer_bytes": {
+          "description": "Output kept per terminal for a re-attach, in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "terminals_per_caller": {
+          "description": "Terminals per caller, for the whole Runtime.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "terminals_per_session": {
+          "description": "Terminals per Session.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "upload_bytes": {
+          "description": "Largest upload, in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "uploads_per_caller": {
+          "description": "Open uploads per caller.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "chunk_bytes",
+        "upload_bytes",
+        "uploads_per_caller",
+        "terminals_per_session",
+        "terminals_per_caller",
+        "detached_terminal_secs",
+        "terminal_buffer_bytes"
+      ],
+      "type": "object"
+    },
     "SetEffortParams": {
       "description": "`session/set_effort` params.",
       "properties": {
@@ -3959,6 +4374,414 @@
       "minLength": 1,
       "pattern": "^[a-z0-9]([a-z0-9._-]*[a-z0-9_-])?$",
       "type": "string"
+    },
+    "TerminalAttachParams": {
+      "description": "`session/terminal/attach` params.",
+      "properties": {
+        "after_seq": {
+          "default": 0,
+          "description": "The last `seq` the client has; 0 for all that is buffered.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        },
+        "terminal": {
+          "description": "The terminal.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "terminal"
+      ],
+      "type": "object"
+    },
+    "TerminalAttachResult": {
+      "description": "`session/terminal/attach` result.",
+      "properties": {
+        "exit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerminalEnd"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How it ended, when it has ended."
+        },
+        "last_seq": {
+          "description": "The newest event's `seq` when the attach began.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "last_seq"
+      ],
+      "type": "object"
+    },
+    "TerminalCloseResult": {
+      "description": "`session/terminal/close` result.",
+      "properties": {
+        "exit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerminalEnd"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How it ended, when known."
+        }
+      },
+      "type": "object"
+    },
+    "TerminalEnd": {
+      "description": "How a terminal's process ended.",
+      "properties": {
+        "code": {
+          "description": "The exit code, for `exited`.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "signal": {
+          "description": "The signal number, for `signaled`.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "state": {
+          "description": "`exited`, `signaled`, `timed_out`, `cancelled` or `lost`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    },
+    "TerminalInfo": {
+      "description": "One terminal in `session/terminal/list`.",
+      "properties": {
+        "attached": {
+          "description": "Connections that stream it now.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cols": {
+          "description": "Columns.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "command": {
+          "description": "The command.",
+          "type": "string"
+        },
+        "exit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerminalEnd"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How it ended, when it has ended."
+        },
+        "last_seq": {
+          "description": "The newest event's `seq`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "opened_ms": {
+          "description": "When it opened, in Unix milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "description": "Rows.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "terminal": {
+          "description": "The id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "terminal",
+        "command",
+        "cols",
+        "rows",
+        "last_seq",
+        "attached",
+        "opened_ms"
+      ],
+      "type": "object"
+    },
+    "TerminalInputParams": {
+      "description": "`session/terminal/input` params.",
+      "properties": {
+        "data": {
+          "description": "The bytes to type, Base64.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        },
+        "terminal": {
+          "description": "The terminal.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "terminal",
+        "data"
+      ],
+      "type": "object"
+    },
+    "TerminalListResult": {
+      "description": "`session/terminal/list` result: this caller's terminals of the Session.",
+      "properties": {
+        "terminals": {
+          "description": "The terminals.",
+          "items": {
+            "$ref": "#/$defs/TerminalInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "terminals"
+      ],
+      "type": "object"
+    },
+    "TerminalOpenParams": {
+      "description": "`session/terminal/open` params.",
+      "properties": {
+        "cols": {
+          "description": "Columns.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "command": {
+          "description": "A command for `sh -c`; absent: the user's shell.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rows": {
+          "description": "Rows.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        }
+      },
+      "required": [
+        "session",
+        "cols",
+        "rows"
+      ],
+      "type": "object"
+    },
+    "TerminalOpenResult": {
+      "description": "`session/terminal/open` result.",
+      "properties": {
+        "cwd": {
+          "description": "The folder it started in.",
+          "type": "string"
+        },
+        "terminal": {
+          "description": "The terminal's id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "terminal",
+        "cwd"
+      ],
+      "type": "object"
+    },
+    "TerminalOutputParams": {
+      "description": "`session/terminal/output` (server to client): one event of a terminal\nthis connection attached. Live only: it is never in the Event Log.",
+      "properties": {
+        "data": {
+          "description": "Output bytes, Base64.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dropped": {
+          "description": "This reader lost this many bytes; `seq` is the last lost event.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "exit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerminalEnd"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The process ended. No event follows."
+        },
+        "seq": {
+          "description": "1 for the first event, one more for each next.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "The Session."
+        },
+        "terminal": {
+          "description": "The terminal.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "terminal",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "TerminalParams": {
+      "description": "Params naming one terminal (`detach`, `close`).",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        },
+        "terminal": {
+          "description": "The terminal.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "terminal"
+      ],
+      "type": "object"
+    },
+    "TerminalResizeParams": {
+      "description": "`session/terminal/resize` params.",
+      "properties": {
+        "cols": {
+          "description": "Columns.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "description": "Rows.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        },
+        "terminal": {
+          "description": "The terminal.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "terminal",
+        "cols",
+        "rows"
+      ],
+      "type": "object"
+    },
+    "TerminalSignal": {
+      "description": "A signal for a terminal's process tree.",
+      "oneOf": [
+        {
+          "const": "interrupt",
+          "description": "Ctrl-C.",
+          "type": "string"
+        },
+        {
+          "const": "terminate",
+          "description": "A polite stop.",
+          "type": "string"
+        },
+        {
+          "const": "kill",
+          "description": "A forced stop of the whole tree.",
+          "type": "string"
+        },
+        {
+          "const": "hangup",
+          "description": "The terminal hung up.",
+          "type": "string"
+        }
+      ]
+    },
+    "TerminalSignalParams": {
+      "description": "`session/terminal/signal` params.",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        },
+        "signal": {
+          "$ref": "#/$defs/TerminalSignal",
+          "description": "The signal."
+        },
+        "terminal": {
+          "description": "The terminal.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "terminal",
+        "signal"
+      ],
+      "type": "object"
     },
     "ToolCall": {
       "description": "A tool call as first reported.",
@@ -4668,6 +5491,165 @@
         "seq",
         "origin",
         "update"
+      ],
+      "type": "object"
+    },
+    "UploadBeginParams": {
+      "description": "`session/files/upload_begin` params.",
+      "properties": {
+        "if_match": {
+          "description": "Commit only when the destination still has this tag.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "overwrite": {
+          "default": false,
+          "description": "Replace an existing file without `if_match`. Without both, a file\nthat exists is refused with `exists`.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Where the file goes. Missing folders are made.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        },
+        "sha256": {
+          "description": "The SHA-256 of the whole file, hex; checked at commit.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size": {
+          "description": "The whole size in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session",
+        "path",
+        "size"
+      ],
+      "type": "object"
+    },
+    "UploadBeginResult": {
+      "description": "`session/files/upload_begin` result.",
+      "properties": {
+        "chunk_max": {
+          "description": "Most data bytes in one piece.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "upload": {
+          "description": "The upload's id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "upload",
+        "chunk_max"
+      ],
+      "type": "object"
+    },
+    "UploadCommitResult": {
+      "description": "`session/files/upload_commit` result.",
+      "properties": {
+        "path": {
+          "description": "The file.",
+          "type": "string"
+        },
+        "size": {
+          "description": "Its size.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tag": {
+          "description": "Its new version.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "size",
+        "tag"
+      ],
+      "type": "object"
+    },
+    "UploadParams": {
+      "description": "Params naming one upload (`upload_status`, `upload_commit`,\n`upload_abort`).",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        },
+        "upload": {
+          "description": "The upload.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "upload"
+      ],
+      "type": "object"
+    },
+    "UploadProgress": {
+      "description": "`session/files/upload_write` and `upload_status` result.",
+      "properties": {
+        "committed": {
+          "description": "Bytes stored, from the start.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "size": {
+          "description": "The declared size.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "committed",
+        "size"
+      ],
+      "type": "object"
+    },
+    "UploadWriteParams": {
+      "description": "`session/files/upload_write` params.",
+      "properties": {
+        "data": {
+          "description": "The bytes, Base64.",
+          "type": "string"
+        },
+        "offset": {
+          "description": "Where this piece starts; not after the committed offset.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        },
+        "upload": {
+          "description": "The upload.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "upload",
+        "offset",
+        "data"
       ],
       "type": "object"
     },
@@ -5388,6 +6370,116 @@
         "$ref": "#/$defs/ExportResult"
       }
     },
+    "session/files/delete": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/FilesDeleteParams"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "session/files/list": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/FilesListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/FilesListResult"
+      }
+    },
+    "session/files/mkdir": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/FilePathParams"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "session/files/read": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/FilesReadParams"
+      },
+      "result": {
+        "$ref": "#/$defs/FilesReadResult"
+      }
+    },
+    "session/files/rename": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/FilesRenameParams"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "session/files/stat": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/FilePathParams"
+      },
+      "result": {
+        "$ref": "#/$defs/FileEntry"
+      }
+    },
+    "session/files/upload_abort": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/UploadParams"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "session/files/upload_begin": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/UploadBeginParams"
+      },
+      "result": {
+        "$ref": "#/$defs/UploadBeginResult"
+      }
+    },
+    "session/files/upload_commit": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/UploadParams"
+      },
+      "result": {
+        "$ref": "#/$defs/UploadCommitResult"
+      }
+    },
+    "session/files/upload_status": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/UploadParams"
+      },
+      "result": {
+        "$ref": "#/$defs/UploadProgress"
+      }
+    },
+    "session/files/upload_write": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/UploadWriteParams"
+      },
+      "result": {
+        "$ref": "#/$defs/UploadProgress"
+      }
+    },
     "session/fork": {
       "direction": "client_to_server",
       "kind": "request",
@@ -5571,6 +6663,94 @@
         "$ref": "#/$defs/StatsResult"
       }
     },
+    "session/terminal/attach": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TerminalAttachParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TerminalAttachResult"
+      }
+    },
+    "session/terminal/close": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TerminalParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TerminalCloseResult"
+      }
+    },
+    "session/terminal/detach": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TerminalParams"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "session/terminal/input": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TerminalInputParams"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "session/terminal/list": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TerminalListResult"
+      }
+    },
+    "session/terminal/open": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TerminalOpenParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TerminalOpenResult"
+      }
+    },
+    "session/terminal/output": {
+      "direction": "server_to_client",
+      "kind": "notification",
+      "live_only": true,
+      "params": {
+        "$ref": "#/$defs/TerminalOutputParams"
+      }
+    },
+    "session/terminal/resize": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TerminalResizeParams"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "session/terminal/signal": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TerminalSignalParams"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
     "session/transcript": {
       "direction": "client_to_server",
       "kind": "request",
@@ -5629,6 +6809,16 @@
       },
       "result": {
         "$ref": "#/$defs/WorkflowResult"
+      }
+    },
+    "session/workspace": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionWorkspaceInfo"
       }
     },
     "shutdown": {
