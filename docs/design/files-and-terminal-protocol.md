@@ -34,7 +34,7 @@ path is the Session's folder.
 | Method | Params | Result |
 |---|---|---|
 | `session/workspace` | `session` | `SessionWorkspaceInfo`: what this Session serves now (files, writes, terminal), with a reason for each refusal, and the limits |
-| `session/files/list` | `session`, `path`, `cursor?`, `limit?` (default 200, at most 1000) | `entries[]` (`name`, `path`, `kind` = `file`/`dir`/`symlink`/`other`, `size`, `mtime_ms?`, `tag?`), `next_cursor?`, `hidden` (entries a rule hides) |
+| `session/files/list` | `session`, `path`, `cursor?`, `limit?` (default 200, at most 1000) | `entries[]` (`name`, `path`, `kind` = `file`/`dir`/`symlink`/`other`, `size`, `mtime_ms?`, `tag?`), `next_cursor?`, `hidden` (entries of the folder that a rule hides) |
 | `session/files/stat` | `session`, `path` | one entry; a regular file has a `tag` |
 | `session/files/read` | `session`, `path`, `offset`, `length?` (default and most 1 MiB), `if_match?` | `offset`, `data` (Base64), `total_size`, `eof`, `tag` |
 | `session/files/upload_begin` | `session`, `path`, `size`, `sha256?`, `if_match?`, `overwrite?` | `upload` (an id), `chunk_max` |
@@ -117,7 +117,7 @@ Rules:
 |---|---|
 | Channel | One task per (connection, terminal), made by `session/terminal/attach`. It reads the driver's process handle and sends `session/terminal/output` on that connection only |
 | Not durable | The bytes never pass `publish`, the update broadcast or the Event Log. A test reads the Event Log after a terminal session and finds none of the bytes |
-| Back-pressure | The task asks for the next event only when the connection has room: the connection queue has at least 1024 free places and the transport holds at most 1 MiB of unsent text (and, on a WebSocket, at most 32 messages). Otherwise it waits (polls every 10 ms). The process never waits: the driver's ring buffer (1 MiB) evicts the oldest output, and the reader then gets one `dropped` event with the lost bytes. So a slow client never fills its queues, is never disconnected because of terminal output, and its `session/update` feed is not delayed. Other connections are not touched |
+| Back-pressure | The task asks for the next event only when the connection has room: the connection queue has at least 1024 free places and the transport holds at most 1 MiB and 32 messages of unsent text (the Unix-socket writer, the memory transport and the WebSocket count what they hold). Otherwise it waits (polls every 10 ms). The process never waits: the driver's ring buffer (1 MiB) evicts the oldest output, and the reader then gets one `dropped` event with the lost bytes. So a slow client never fills its queues, is never disconnected because of terminal output, and its `session/update` feed is not delayed. Other connections are not touched |
 | Re-attach | A new connection (or the same one) calls `attach` with `after_seq` = the last `seq` it has. It gets the buffered events after it. If some were evicted, the first event is `dropped`. `after_seq` past the newest event is refused with `seq_ahead` |
 | Attach twice | A second attach of the same terminal on one connection replaces the first stream |
 
@@ -216,7 +216,8 @@ today; a later change in `loop-store` can name them).
   they share terminals and uploads. Outside users exist only on a locked
   Runtime, where uploads and terminals are refused. So two principals can
   hold ids at the same time only for in-process callers; a test covers
-  them (`tests/session_workspace.rs`).
+  them (`crates/loop-runtime/tests/session_files.rs` and `session_terminal.rs`:
+  an in-process call is not the owner of a host user's terminal or upload).
 
 ## 6. Capabilities
 
@@ -309,6 +310,6 @@ checks that.
 | No rename and no time stamp in the Workspace contract | Add `FileSystem::rename` and `mtime` to `FileInfo` (C4 owner) |
 | List, stat, delete, mkdir check containment by path, not by descriptor: a folder swapped for a link during the call is a race | Descriptor-checked versions in the driver |
 | Sandbox on: no files, no terminal | C4a and C4b |
-| The Unix socket transport has no byte limit, so back-pressure there uses the connection queue only | A bounded `lines` writer |
+| A transport made outside `loop-wire` (an unbounded channel given to `Transport`) cannot tell its backlog, so back-pressure there uses the connection queue only. `lines` (Unix socket), `memory` and the WebSocket count theirs | — |
+| `DecisionSource` has no named variants for these sources | `loop-store` owner |
 | Limits are not in `settings.json` yet | Settings keys |
-| `user_files`, `user_terminal` are `Other` sources | Named variants in `loop-store` |

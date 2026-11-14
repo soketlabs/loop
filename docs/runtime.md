@@ -189,6 +189,12 @@ Session of the Runtime:
   still starts is its own document reader, for `read`.
 - **can't fetch or search private addresses,** even if
   `allowPrivateAddresses` is set.
+- **serves its files to a client, read only.** `session/files/list`,
+  `stat` and `read` work inside the Session's folder with the same rules
+  as `read` (no link out, one hard link). Uploads, deletes, renames, new
+  folders and terminals (`session/terminal/*`) are refused with
+  `ToolLocked`. See
+  [the design note](design/files-and-terminal-protocol.md).
 - **refuses `session/shell` and `session/workflow`** with the typed error
   `ToolLocked` (JSON-RPC code `-32007`, data
   `{"what": "session/shell", "lock": "chat"}`).
@@ -559,6 +565,10 @@ decision, and every entry point calls it. The rules:
 | `runtime/sessions` | every loaded Session | `List` (filter; the totals count only the rows shown) | `RuntimeAdmin::sessions` |
 | `runtime/status` | the Runtime | for an outside user: no pid, socket, URL or limit sources; counts of its own Sessions only | server |
 | `runtime/stop`, `runtime/stop_empty`, `runtime/usage`, `runtime/defaults`, `runtime/providers`, `runtime/mcp_auth`, `runtime/tracing` | the host | host-only (Unix socket) | server (`HOST_ONLY`) |
+| `session/workspace`, `session/files/list`, `session/files/stat`, `session/files/read` | a Session | `Read` | `Runtime` (`runtime/workspace_io.rs`) |
+| `session/files/upload_*`, `session/files/delete`, `session/files/rename`, `session/files/mkdir` | a Session | `Write`; refused under a tool lock | `Runtime` (`runtime/workspace_io.rs`) |
+| `session/terminal/*` (open, attach, detach, input, resize, signal, close, list) | a Session | `Write`; never for an outside user; refused under a tool lock | server, then `Runtime` |
+| `session/terminal/output` (to the client) | a terminal | `Write`, checked at attach; only the attaching connection | server stream |
 
 A test fails when `rpc.rs` gets a method that this table (in
 `crates/loop-runtime/src/access.rs`) does not classify.

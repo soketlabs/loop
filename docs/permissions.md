@@ -135,6 +135,34 @@ A command you type in a client (`!command` in the TUI, or the `session/shell` me
 - **Command patterns are advisory**, for your commands as for the agent's (see [Unreadable commands](#unreadable-commands)). A script, `make` or `find -exec` can still run a denied program. To keep the shell out of reach, turn it off with a Policy layer or use the tool lock.
 - **Protected files.** The shell can write any file your OS user can. The sandbox (`sandbox.mode: local`) protects the agent directory, project `.loop` and git metadata from commands, yours and the agent's alike.
 
+## File actions and terminals in a client
+
+A client's file panel and terminal (`session/files/*`,
+`session/terminal/*`) are your own actions in a Session, as a typed
+command is. Each passes the same check as the Session's tools, and each
+decision is recorded (`source: user_files` or `user_terminal`). See
+[the design note](design/files-and-terminal-protocol.md).
+
+| Session state | List, read, download | Upload, new folder, rename, delete | Open a terminal |
+|---|---|---|---|
+| The Runtime's tool lock | inside the Session's folder only | refused (`ToolLocked`) | refused (`ToolLocked`) |
+| You connect through an Edge Gateway | as above | refused | refused (`Forbidden`) |
+| The Session's sandbox is on | refused (`Unsupported`) | refused (`Unsupported`) | refused (`Unsupported`) |
+| A deny rule that matches (`read`, `ls` or `write`) | refused; a hidden entry is left out of a listing | refused | — |
+| Any `bash` deny rule, plain or a pattern | — | — | refused: Loop cannot check what you type in a terminal |
+| A layer or Lock turns the Capability off | refused | refused | refused |
+| A path under `.git` or `.loop` | allowed | refused in every mode | — |
+| `read-only` or `plan` mode | allowed | refused | refused |
+| `ask`, `accept-edits`, a pattern `ask` or a layer's ask | allowed | runs: you clicked, so you are the approver | opens: you are the approver, once for this terminal |
+| `full-access` | allowed | allowed | opens |
+
+- A terminal records one decision when it opens and one when it ends (with
+  the exit state and the reason). Keystrokes are not recorded.
+- While a terminal is open, Loop checks the rules again every 250 ms. A
+  change that would refuse a new terminal (a mode change, a new deny rule,
+  the sandbox turned on) closes it, with a record.
+- Terminal output is live only: it is never stored in the Event Log.
+
 ## Unreadable commands
 
 Loop reads a `bash` command with a small grammar that it models exactly. A command it can read is **readable**; everything else is **unreadable**.
