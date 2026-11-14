@@ -230,11 +230,14 @@ it names. Clients see it in `initialize`: `capabilities.tool_lock` is
 so a client can hide those controls. `runtime/status` has `"tool_lock":
 "chat"`, and `loop runtime status` shows `tool lock: chat`.
 
-**One Runtime and one root per user.** The root bounds the Runtime, not the
-users in it. A Session may open in the root itself, so a root shared by
-several users gives each of them the other users' files. Give each user a
-Runtime of their own, with their own folder as its root, and do not let one
-user's client reach another user's Runtime socket.
+**One root, one folder per user.** The root bounds the Runtime, not the
+users in it. The safest setup is still one Runtime per user, with the
+user's own folder as its root. Edge Gateway users may share one Runtime and
+one root: the access rules keep each to its own Sessions, and the folder
+rule (see "Who can reach a Session") refuses a Session in the folder of
+another user's Session, or in a folder above or inside it. The Runtime
+knows only the folders of Sessions, not whose folder is whose, so the
+gateway must name each user's own folder. Never let a user's client reach the Runtime's socket.
 
 **For the program that writes uploads into the folder.** The lock's
 guarantees assume that this writer:
