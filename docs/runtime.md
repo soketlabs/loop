@@ -285,6 +285,12 @@ its pid may now belong to another program.
   lease released, then the socket is removed. It waits up to 10 seconds for
   the socket to go and fails if it is still there. With no Runtime answering
   it prints `No Runtime running at …` and exits 0.
+- Every shutdown also ends the processes that the Runtime's host workspaces
+  started (each wait is bounded to a few seconds). Closing the last Session of
+  a folder ends that folder's detached processes and open uploads, and so does
+  `workspace/reload` for the old workspace. Unloading never does: a Session
+  that is the last one of its folder and has a running process is not
+  unloaded, so a full Runtime refuses a new Session with `Busy` instead.
 
 ### Remote use and WebSocket clients
 

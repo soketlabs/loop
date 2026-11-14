@@ -15,6 +15,11 @@ pub struct GlobalResources {
     /// workspace and Session built from these resources is locked
     /// ([`crate::permissions::tool_lock`]).
     tool_lock: Option<crate::permissions::tool_lock::RuntimeToolLock>,
+    /// Every host Workspace that workspaces built from these resources made,
+    /// held weakly: the Runtime that owns the resources ends exactly these
+    /// at its shutdown, also those whose Sessions already closed.
+    host_workspaces:
+        std::sync::Mutex<Vec<std::sync::Weak<dyn loop_agent::harness::sandbox::Workspace>>>,
 }
 
 impl GlobalResources {
@@ -99,6 +104,28 @@ impl GlobalResources {
         }
     }
 
+    fn track_host_workspace(&self, workspace: &Arc<dyn loop_agent::harness::sandbox::Workspace>) {
+        let mut all = self
+            .host_workspaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        all.retain(|w| w.strong_count() > 0);
+        all.push(Arc::downgrade(workspace));
+    }
+
+    /// The host Workspaces made for workspaces of these resources that still
+    /// exist (loaded, replaced but not yet dropped, or opened for one
+    /// Session). For the Runtime's shutdown, so it ends its own host
+    /// processes and no other Runtime's.
+    pub fn host_workspaces(&self) -> Vec<Arc<dyn loop_agent::harness::sandbox::Workspace>> {
+        let mut all = self
+            .host_workspaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        all.retain(|w| w.strong_count() > 0);
+        all.iter().filter_map(std::sync::Weak::upgrade).collect()
+    }
+
     fn from_parts(
         agent_dir: PathBuf,
         credentials: Arc<FileCredentialStore>,
@@ -114,6 +141,7 @@ impl GlobalResources {
             sessions_db,
             repository: create_session_repository(store, None),
             tool_lock: None,
+            host_workspaces: Default::default(),
         })
     }
 }
@@ -145,6 +173,7 @@ impl GlobalResources {
             models,
             repository: create_session_repository(store, None),
             tool_lock: None,
+            host_workspaces: Default::default(),
         })
     }
 
@@ -284,6 +313,7 @@ impl WorkspaceResources {
         // a link between the gate's check and the open is refused. It also
         // starts no process and takes no upload.
         let host_workspace = host_workspace(&cwd, globals.tool_lock().is_some()).await?;
+        globals.track_host_workspace(&host_workspace);
         let host: Arc<dyn ExecutionEnv> = host_workspace.env();
         let mut resources =
             load_resources_in(&*host, &globals.agent_dir, &cwd, project_trusted, &settings).await;
