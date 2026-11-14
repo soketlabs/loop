@@ -33,8 +33,9 @@ pub use error::WorkspaceError;
 pub use path::WorkspacePath;
 pub use platform::HostOs;
 pub use process::{
-    ExitState, ProcessEvent, ProcessEventKind, ProcessId, ProcessInfo, ProcessSignal, PtySize,
-    SpawnRequest, StreamId, WorkspaceProcess,
+    output_buffer_bytes, ExitState, ProcessEvent, ProcessEventKind, ProcessId, ProcessInfo,
+    ProcessSignal, PtySize, SpawnRequest, StreamId, WorkspaceProcess, DEFAULT_OUTPUT_BUFFER_BYTES,
+    MAX_OUTPUT_BUFFER_BYTES, MIN_OUTPUT_BUFFER_BYTES,
 };
 pub use registry::{
     register_workspace_driver, registered_workspace_drivers, replace_builtin_workspace_driver,

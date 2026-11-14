@@ -217,6 +217,9 @@ impl Shell for SessionExecutionEnv {
 }
 #[async_trait]
 impl FileSystem for SessionExecutionEnv {
+    fn path_namespace(&self) -> loop_workspace::PathNamespace {
+        self.inner.path_namespace()
+    }
     fn cwd(&self) -> &Path {
         self.inner.cwd()
     }
@@ -299,6 +302,80 @@ mod tests {
             .collect::<Vec<_>>()
             .join("; ");
         env.exec(&command, Default::default()).await.unwrap().stdout
+    }
+
+    /// A host env that says its paths are guest paths.
+    struct Guest(HostExecutionEnv);
+
+    #[async_trait]
+    impl FileSystem for Guest {
+        fn path_namespace(&self) -> loop_workspace::PathNamespace {
+            loop_workspace::PathNamespace::Guest
+        }
+        fn cwd(&self) -> &Path {
+            self.0.cwd()
+        }
+        fn absolute_path(&self, p: &Path) -> Result<PathBuf, FileError> {
+            self.0.absolute_path(p)
+        }
+        fn join_path(&self, b: &Path, c: &Path) -> PathBuf {
+            self.0.join_path(b, c)
+        }
+        async fn read_text_file(&self, p: &Path) -> Result<String, FileError> {
+            self.0.read_text_file(p).await
+        }
+        async fn read_binary_file(&self, p: &Path) -> Result<Vec<u8>, FileError> {
+            self.0.read_binary_file(p).await
+        }
+        async fn write_file(&self, p: &Path, d: &[u8]) -> Result<(), FileError> {
+            self.0.write_file(p, d).await
+        }
+        async fn append_file(&self, p: &Path, d: &[u8]) -> Result<(), FileError> {
+            self.0.append_file(p, d).await
+        }
+        async fn file_info(&self, p: &Path) -> Result<FileInfo, FileError> {
+            self.0.file_info(p).await
+        }
+        async fn list_dir(&self, p: &Path) -> Result<Vec<FileInfo>, FileError> {
+            self.0.list_dir(p).await
+        }
+        async fn exists(&self, p: &Path) -> Result<bool, FileError> {
+            self.0.exists(p).await
+        }
+        async fn create_dir(&self, p: &Path) -> Result<(), FileError> {
+            self.0.create_dir(p).await
+        }
+        async fn remove(&self, p: &Path) -> Result<(), FileError> {
+            self.0.remove(p).await
+        }
+        async fn canonical_path(&self, p: &Path) -> Result<PathBuf, FileError> {
+            self.0.canonical_path(p).await
+        }
+        async fn create_temp_dir(&self, p: &str) -> Result<PathBuf, FileError> {
+            self.0.create_temp_dir(p).await
+        }
+    }
+
+    #[async_trait]
+    impl Shell for Guest {
+        async fn exec(&self, c: &str, o: ShellExecOptions) -> Result<ShellOutput, ExecutionError> {
+            self.0.exec(c, o).await
+        }
+    }
+
+    #[test]
+    fn the_session_env_keeps_the_path_namespace() {
+        let guest: Arc<dyn ExecutionEnv> =
+            Arc::new(Guest(HostExecutionEnv::new(std::env::temp_dir())));
+        let wrapped =
+            SessionExecutionEnv::for_tools(guest, Some(&map(&[])), &ToolEnvPolicy::default());
+        assert_eq!(
+            wrapped.path_namespace(),
+            loop_workspace::PathNamespace::Guest
+        );
+        let host =
+            SessionExecutionEnv::for_tools(host(), Some(&map(&[])), &ToolEnvPolicy::default());
+        assert_eq!(host.path_namespace(), loop_workspace::PathNamespace::Host);
     }
 
     #[test]

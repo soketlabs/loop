@@ -8,8 +8,9 @@
 //!
 //! `podman` and `seatbelt` are adapters ([`FactoryDriver`]) over the
 //! existing factories; the backends do not change. The `host` driver wraps
-//! the host environment that tools use with the sandbox off. The app does
-//! not route the sandbox-off path through it yet (task C4 does).
+//! the host environment that tools use with the sandbox off, and adds
+//! streaming processes, PTYs and chunked transfer (`host_ws`). The Session
+//! factory makes every sandbox-off Session's Workspace with it.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +29,11 @@ use super::seatbelt::SeatbeltSandboxFactory;
 use super::{Sandbox, SandboxError, SandboxInfo, SandboxStatus};
 use crate::harness::env::HostExecutionEnv;
 use crate::harness::types::ExecutionEnv;
+#[cfg(unix)]
+use loop_workspace::{
+    FileChunk, FileTag, ProcessId, ProcessInfo, SpawnRequest, UploadId, UploadRequest,
+    WorkspacePath, WorkspaceProcess,
+};
 
 /// Driver id of the Podman sandbox.
 pub const PODMAN_DRIVER_ID: &str = "podman";
@@ -136,11 +142,24 @@ pub fn seatbelt_capabilities(spec: &WorkspaceSpec) -> WorkspaceCapabilities {
 }
 
 /// Capabilities of a host Workspace for `spec`.
+///
+/// With `confineReads` (the tool lock) the Workspace starts no process and
+/// writes no upload: `streaming_exec`, `pty` and `upload` are off, and
+/// those calls return `Unsupported`. Downloads (`read_chunk`) work and
+/// obey the same confinement as file reads.
 pub fn host_capabilities(spec: &WorkspaceSpec) -> WorkspaceCapabilities {
+    let confined = option_bool(spec, "confineReads");
+    let unix = cfg!(unix);
     WorkspaceCapabilities {
         isolation: Isolation::None,
         persistent: true,
-        confines_reads: option_bool(spec, "confineReads"),
+        streaming_exec: unix && !confined,
+        pty: unix && !confined,
+        chunked_transfer: unix,
+        upload: unix && !confined,
+        // `WorkspaceDriver::attach` (reopen after a Runtime restart): no.
+        attach: false,
+        confines_reads: confined,
         confines_writes: false,
         own_environment: false,
         path_namespace: PathNamespace::Host,
@@ -149,9 +168,22 @@ pub fn host_capabilities(spec: &WorkspaceSpec) -> WorkspaceCapabilities {
         network: NetworkPolicy::NotEnforced,
         limits: ResourceLimits {
             max_output_bytes: Some(HOST_OUTPUT_CAP),
+            max_upload_bytes: host_max_upload(unix && !confined),
             ..ResourceLimits::default()
         },
         ..WorkspaceCapabilities::default()
+    }
+}
+
+fn host_max_upload(enabled: bool) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        enabled.then_some(super::host_ws::MAX_UPLOAD_BYTES)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = enabled;
+        None
     }
 }
 
@@ -190,7 +222,12 @@ pub fn builtin_workspace_drivers() -> Vec<Arc<dyn WorkspaceDriver>> {
 ///
 /// Spec options: `confineReads` (bool) confines every file read to the
 /// project folder, as the tool lock does
-/// ([`HostExecutionEnv::confine_reads`]).
+/// ([`HostExecutionEnv::confine_reads`]), and turns off processes and
+/// uploads. `uploadIdleMs` (number) sets the idle time after which an
+/// upload expires (default 10 minutes). `pauseUnwatchedOutput` (bool,
+/// default true): a detached process with no handle stops being read when
+/// its buffer is full, so it waits on its output instead of running on
+/// unread; a handle that attaches resumes it.
 pub struct HostWorkspaceDriver;
 
 #[async_trait]
@@ -222,24 +259,57 @@ impl WorkspaceDriver for HostWorkspaceDriver {
         if capabilities.confines_reads {
             env = env.confine_reads(workdir);
         }
+        #[cfg(unix)]
+        let transfers = {
+            use crate::harness::types::FileSystem;
+            let idle = option_u64(&spec, "uploadIdleMs")
+                .map(std::time::Duration::from_millis)
+                .unwrap_or(super::host_ws::UPLOAD_IDLE);
+            super::host_ws::Transfers::new(
+                env.cwd().to_path_buf(),
+                capabilities.confines_reads,
+                idle,
+            )
+        };
         Ok(Arc::new(HostWorkspace {
             id: loop_ai::new_id(),
             env: Arc::new(env),
             capabilities,
             status: Mutex::new(SandboxStatus::Created),
             destroyed: AtomicBool::new(false),
+            #[cfg(unix)]
+            processes: super::host_ws::ProcessTable::new(
+                spec.options
+                    .get("pauseUnwatchedOutput")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+            ),
+            #[cfg(unix)]
+            transfers: Arc::new(transfers),
         }))
     }
 }
 
-/// A host Workspace. Start, stop and destroy only change its status; destroy
-/// never removes the project folder.
+/// A host Workspace. Start makes it ready. Stop and destroy kill its
+/// processes (the whole tree, then reaped) and drop its uploads; destroy
+/// never removes the project folder. Dropping it kills its processes too.
 pub struct HostWorkspace {
     id: String,
     env: Arc<HostExecutionEnv>,
     capabilities: WorkspaceCapabilities,
     status: Mutex<SandboxStatus>,
     destroyed: AtomicBool,
+    #[cfg(unix)]
+    processes: super::host_ws::ProcessTable,
+    #[cfg(unix)]
+    transfers: Arc<super::host_ws::Transfers>,
+}
+
+impl Drop for HostWorkspace {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        self.processes.kill_all_now();
+    }
 }
 
 impl HostWorkspace {
@@ -272,16 +342,99 @@ impl Sandbox for HostWorkspace {
             return Err(SandboxError::NotReady("workspace was destroyed".into()));
         }
         *self.status.lock() = SandboxStatus::Ready;
+        #[cfg(unix)]
+        self.processes.open();
         Ok(())
     }
     async fn stop(&self) -> Result<(), SandboxError> {
         *self.status.lock() = SandboxStatus::Stopped;
+        #[cfg(unix)]
+        {
+            self.processes.kill_all(false).await;
+            self.clear_uploads().await;
+        }
         Ok(())
     }
     async fn destroy(&self) -> Result<(), SandboxError> {
         self.destroyed.store(true, Ordering::Release);
         *self.status.lock() = SandboxStatus::Stopped;
+        #[cfg(unix)]
+        {
+            self.processes.kill_all(true).await;
+            self.clear_uploads().await;
+        }
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl HostWorkspace {
+    fn refused(&self, operation: &'static str) -> Result<(), WorkspaceError> {
+        if self.capabilities.confines_reads {
+            // The tool lock allows no process and no write.
+            return Err(WorkspaceError::unsupported(HOST_DRIVER_ID, operation));
+        }
+        Ok(())
+    }
+
+    fn ready(&self) -> Result<(), WorkspaceError> {
+        if self.destroyed.load(Ordering::Acquire) {
+            return Err(WorkspaceError::Gone {
+                id: self.id.clone(),
+            });
+        }
+        match *self.status.lock() {
+            SandboxStatus::Ready => Ok(()),
+            other => Err(WorkspaceError::Sandbox(SandboxError::NotReady(format!(
+                "workspace is {other}"
+            )))),
+        }
+    }
+
+    async fn clear_uploads(&self) {
+        let transfers = Arc::clone(&self.transfers);
+        let _ = tokio::task::spawn_blocking(move || transfers.clear()).await;
+    }
+
+    /// Run a blocking transfer call on the blocking pool.
+    async fn transfer<T, F>(&self, call: F) -> Result<T, WorkspaceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&super::host_ws::Transfers) -> Result<T, WorkspaceError> + Send + 'static,
+    {
+        self.ready()?;
+        let transfers = Arc::clone(&self.transfers);
+        tokio::task::spawn_blocking(move || call(&transfers))
+            .await
+            .map_err(|e| {
+                WorkspaceError::File(crate::harness::types::FileError::new(
+                    crate::harness::types::FileErrorCode::Io,
+                    e.to_string(),
+                ))
+            })?
+    }
+
+    /// The working folder of a spawn: `cwd` under the root, resolved, and
+    /// still inside the root.
+    async fn spawn_cwd(&self, cwd: Option<&WorkspacePath>) -> Result<PathBuf, WorkspaceError> {
+        let root = self.workdir();
+        let Some(cwd) = cwd else {
+            return Ok(root);
+        };
+        let outside = || WorkspaceError::InvalidPath {
+            path: cwd.as_str().to_owned(),
+            reason: "is not a folder inside the workspace root",
+        };
+        let resolved = tokio::fs::canonicalize(cwd.to_native(&root))
+            .await
+            .map_err(|_| outside())?;
+        let is_dir = tokio::fs::metadata(&resolved)
+            .await
+            .is_ok_and(|m| m.is_dir());
+        if !resolved.starts_with(&root) || !is_dir {
+            return Err(outside());
+        }
+        Ok(resolved)
     }
 }
 
@@ -292,6 +445,99 @@ impl Workspace for HostWorkspace {
     }
     fn capabilities(&self) -> WorkspaceCapabilities {
         self.capabilities.clone()
+    }
+
+    #[cfg(unix)]
+    async fn spawn(
+        &self,
+        request: SpawnRequest,
+    ) -> Result<Box<dyn WorkspaceProcess>, WorkspaceError> {
+        self.refused("spawn")?;
+        self.ready()?;
+        let cwd = self.spawn_cwd(request.cwd.as_ref()).await?;
+        self.processes
+            .spawn(super::host_ws::Launch {
+                request,
+                cwd,
+                workspace_id: self.id.clone(),
+            })
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn attach_process(
+        &self,
+        id: &ProcessId,
+        after_seq: u64,
+    ) -> Result<Box<dyn WorkspaceProcess>, WorkspaceError> {
+        self.refused("attach_process")?;
+        self.processes.attach(id, after_seq)
+    }
+
+    #[cfg(unix)]
+    async fn list_processes(&self) -> Result<Vec<ProcessInfo>, WorkspaceError> {
+        self.refused("list_processes")?;
+        Ok(self.processes.list())
+    }
+
+    #[cfg(unix)]
+    async fn read_chunk(
+        &self,
+        path: &WorkspacePath,
+        offset: u64,
+        max_len: usize,
+        if_match: Option<&FileTag>,
+    ) -> Result<FileChunk, WorkspaceError> {
+        let path = path.clone();
+        let if_match = if_match.cloned();
+        self.transfer(move |t| t.read_chunk(&path, offset, max_len, if_match.as_ref()))
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn begin_upload(&self, request: UploadRequest) -> Result<UploadId, WorkspaceError> {
+        self.refused("begin_upload")?;
+        let id = self.id.clone();
+        self.transfer(move |t| t.begin(&id, request)).await
+    }
+
+    #[cfg(unix)]
+    async fn upload_write(
+        &self,
+        upload: &UploadId,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u64, WorkspaceError> {
+        self.refused("upload_write")?;
+        let upload = upload.clone();
+        let data = data.to_vec();
+        self.transfer(move |t| t.write(&upload, offset, &data))
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn upload_committed_offset(&self, upload: &UploadId) -> Result<u64, WorkspaceError> {
+        self.refused("upload_committed_offset")?;
+        let upload = upload.clone();
+        self.transfer(move |t| t.committed(&upload)).await
+    }
+
+    #[cfg(unix)]
+    async fn upload_commit(&self, upload: &UploadId) -> Result<FileTag, WorkspaceError> {
+        self.refused("upload_commit")?;
+        let upload = upload.clone();
+        self.transfer(move |t| t.commit(&upload)).await
+    }
+
+    #[cfg(unix)]
+    async fn upload_abort(&self, upload: &UploadId) -> Result<(), WorkspaceError> {
+        self.refused("upload_abort")?;
+        let upload = upload.clone();
+        self.transfer(move |t| {
+            t.abort(&upload);
+            Ok(())
+        })
+        .await
     }
 }
 

@@ -943,6 +943,132 @@ impl FileSystem for KrunExecutionEnv {
             _ => Ok(None),
         }
     }
+
+    async fn symlink_metadata(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PathMetadata, FileError> {
+        use crate::harness::types::{PathKind, PathMetadata};
+        if let Some(fs) = &self.host_fs {
+            return fs.symlink_metadata(path).await;
+        }
+        // `stat` without `-L` describes a final link itself (lstat). GNU
+        // `stat -c` in the guest; BSD `stat -f` for a guest without it.
+        let guest = self.guest_path(path)?;
+        let script = format!(
+            "p={p}; if [ -L \"$p\" ]; then k=l; elif [ -d \"$p\" ]; then k=d; \
+             elif [ -f \"$p\" ]; then k=f; elif [ -e \"$p\" ]; then k=o; \
+             else echo MISSING; exit 0; fi; printf '%s ' \"$k\"; \
+             stat -c '%s %u %h %a' -- \"$p\" 2>/dev/null || stat -f '%z %u %l %Lp' -- \"$p\"",
+            p = sh_quote(&guest.to_string_lossy())
+        );
+        let out = self
+            .exec_sh(&script, None, None)
+            .await
+            .map_err(map_exec_file)?;
+        let line = out.stdout.trim();
+        if line == "MISSING" {
+            return Err(FileError::new(
+                FileErrorCode::NotFound,
+                format!("not found: {}", path.display()),
+            ));
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [kind, size, uid, nlink, mode] = fields.as_slice() else {
+            return Err(FileError::new(
+                FileErrorCode::Io,
+                format!("unexpected stat output for {}: {line:?}", path.display()),
+            ));
+        };
+        Ok(PathMetadata {
+            kind: match *kind {
+                "l" => PathKind::Symlink,
+                "d" => PathKind::Dir,
+                "f" => PathKind::File,
+                _ => PathKind::Other,
+            },
+            size: size.parse().unwrap_or(0),
+            uid: uid.parse().ok(),
+            nlink: nlink.parse().ok(),
+            mode: u32::from_str_radix(mode, 8).ok().map(|m| m & 0o7777),
+        })
+    }
+
+    async fn read_link(&self, path: &Path) -> Result<PathBuf, FileError> {
+        if let Some(fs) = &self.host_fs {
+            return fs.read_link(path).await;
+        }
+        let guest = self.guest_path(path)?;
+        let script = format!(
+            "p={p}; if [ -L \"$p\" ]; then printf L; readlink -- \"$p\"; \
+             elif [ -e \"$p\" ]; then printf N; else printf M; fi",
+            p = sh_quote(&guest.to_string_lossy())
+        );
+        let out = self
+            .exec_sh(&script, None, None)
+            .await
+            .map_err(map_exec_file)?;
+        let text = out.stdout.strip_suffix('\n').unwrap_or(&out.stdout);
+        match text.split_at_checked(1) {
+            Some(("L", target)) if out.exit_code == 0 => Ok(PathBuf::from(target)),
+            Some(("N", _)) => Err(FileError::new(
+                FileErrorCode::InvalidPath,
+                format!("not a link: {}", path.display()),
+            )),
+            Some(("M", _)) => Err(FileError::new(
+                FileErrorCode::NotFound,
+                format!("not found: {}", path.display()),
+            )),
+            _ => Err(FileError::new(
+                FileErrorCode::Io,
+                format!("readlink {}: {}", path.display(), out.stderr.trim()),
+            )),
+        }
+    }
+
+    async fn resolve_for_policy(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PolicyPath, FileError> {
+        if let Some(fs) = &self.host_fs {
+            return fs.resolve_for_policy(path).await;
+        }
+        // `guest_path` refuses `..`, so the lexical path is the path.
+        let guest = self.guest_path(path)?;
+        let script = format!(
+            "p={p}; if r=$(readlink -f -- \"$p\" 2>/dev/null) && [ -e \"$r\" ]; then e=1; \
+             else r=\"$p\"; e=0; fi; l=0; q=; IFS=/; set -f; \
+             for c in $p; do [ -z \"$c\" ] && continue; q=\"$q/$c\"; \
+             if [ -L \"$q\" ]; then l=1; fi; [ -e \"$q\" ] || [ -L \"$q\" ] || break; done; \
+             unset IFS; echo \"$e $l\"; if [ $e = 1 ]; then \
+             stat -L -c '%u %h' -- \"$r\" 2>/dev/null || stat -L -f '%u %l' -- \"$r\"; \
+             else echo '- -'; fi; printf '%s' \"$r\"",
+            p = sh_quote(&guest.to_string_lossy())
+        );
+        let out = self
+            .exec_sh(&script, None, None)
+            .await
+            .map_err(map_exec_file)?;
+        let mut lines = out.stdout.splitn(3, '\n');
+        let (Some(flags), Some(owner), Some(resolved)) = (lines.next(), lines.next(), lines.next())
+        else {
+            return Err(FileError::new(
+                FileErrorCode::Io,
+                format!("resolve {}: {}", path.display(), out.stderr.trim()),
+            ));
+        };
+        let mut flags = flags.split_whitespace();
+        let exists = flags.next() == Some("1");
+        let has_link = flags.next() == Some("1");
+        let mut owner = owner.split_whitespace();
+        Ok(crate::harness::types::PolicyPath {
+            resolved: PathBuf::from(resolved),
+            exists,
+            has_link,
+            uid: owner.next().and_then(|v| v.parse().ok()),
+            nlink: owner.next().and_then(|v| v.parse().ok()),
+        })
+    }
 }
 
 #[async_trait]
@@ -1014,6 +1140,22 @@ impl JailedHostFs {
         }
         self.resolved(&abs)?;
         Ok(abs)
+    }
+
+    /// `path` with its folder resolved (inside the root) and the final
+    /// component kept, not followed.
+    fn unfollowed(&self, path: &Path) -> Result<PathBuf, FileError> {
+        if path.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(FileError::new(
+                FileErrorCode::InvalidPath,
+                "path escape (..) rejected",
+            ));
+        }
+        let abs = self.inner.absolute_path(path)?;
+        match (abs.parent(), abs.file_name()) {
+            (Some(parent), Some(name)) => Ok(self.resolved(parent)?.join(name)),
+            _ => self.resolved(&abs),
+        }
     }
 
     /// `abs` with every symlink resolved (missing children kept), which
@@ -1225,5 +1367,154 @@ impl FileSystem for JailedHostFs {
     ) -> Result<Option<crate::harness::types::FileIdentity>, FileError> {
         let path = self.assert_in_root(path)?;
         self.inner.file_identity(&path).await
+    }
+
+    async fn symlink_metadata(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PathMetadata, FileError> {
+        let target = self.unfollowed(path)?;
+        self.inner.symlink_metadata(&target).await
+    }
+
+    async fn read_link(&self, path: &Path) -> Result<PathBuf, FileError> {
+        let target = self.unfollowed(path)?;
+        self.inner.read_link(&target).await.map_err(|e| {
+            if e.code == FileErrorCode::Io && target.exists() {
+                FileError::new(
+                    FileErrorCode::InvalidPath,
+                    format!("not a link: {}", target.display()),
+                )
+            } else {
+                e
+            }
+        })
+    }
+
+    async fn resolve_for_policy(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PolicyPath, FileError> {
+        let abs = self.assert_in_root(path)?;
+        self.inner.resolve_for_policy(&abs).await
+    }
+}
+
+#[cfg(all(test, unix))]
+mod gate_tests {
+    //! The gate primitives of both isolations, against the host env's
+    //! answers. "Full" runs its guest scripts on this machine through a
+    //! client that executes the argv locally.
+    use super::*;
+    use crate::harness::types::PathKind;
+
+    struct LocalClient;
+
+    #[async_trait]
+    impl PodmanClient for LocalClient {
+        async fn preflight(&self, _runtime: &str) -> Result<(), SandboxError> {
+            Ok(())
+        }
+        async fn run(&self, _opts: super::super::PodmanRunOpts) -> Result<String, SandboxError> {
+            Ok("local".into())
+        }
+        async fn exec(&self, opts: PodmanExecOpts) -> Result<ShellOutput, ExecutionError> {
+            let out = tokio::process::Command::new(&opts.argv[0])
+                .args(&opts.argv[1..])
+                .current_dir(opts.workdir.as_deref().unwrap_or("/"))
+                .output()
+                .await
+                .map_err(|e| ExecutionError::new(ExecutionErrorCode::SpawnFailed, e.to_string()))?;
+            Ok(ShellOutput {
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                exit_code: out.status.code().unwrap_or(-1),
+                truncated: false,
+            })
+        }
+        async fn stop(&self, _container: &str) -> Result<(), SandboxError> {
+            Ok(())
+        }
+        async fn rm(&self, _container: &str) -> Result<(), SandboxError> {
+            Ok(())
+        }
+    }
+
+    fn layout() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("project");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("f.txt"), "x").unwrap();
+        std::fs::hard_link(root.join("f.txt"), root.join("h.txt")).unwrap();
+        std::os::unix::fs::symlink(root.join("f.txt"), root.join("l")).unwrap();
+        std::os::unix::fs::symlink(root.join("sub"), root.join("dl")).unwrap();
+        std::fs::write(base.join("outside.txt"), "out").unwrap();
+        std::os::unix::fs::symlink(base.join("outside.txt"), root.join("out")).unwrap();
+        (dir, root)
+    }
+
+    #[tokio::test]
+    async fn both_isolations_answer_like_the_host_for_paths_inside() {
+        let (_dir, root) = layout();
+        let host = HostExecutionEnv::new(&root);
+        for isolation in [KrunIsolation::Partial, KrunIsolation::Full] {
+            let env = KrunExecutionEnv::new(
+                Arc::new(LocalClient),
+                "local".into(),
+                root.clone(),
+                isolation,
+            );
+            let what = isolation.as_str();
+            let link = env.symlink_metadata(&root.join("l")).await.unwrap();
+            assert_eq!(link.kind, PathKind::Symlink, "{what}");
+            let file = env.symlink_metadata(&root.join("f.txt")).await.unwrap();
+            let want = host.symlink_metadata(&root.join("f.txt")).await.unwrap();
+            assert_eq!(file, want, "{what}: lstat facts with mode");
+            assert!(file.mode.is_some(), "{what}: mode is filled");
+            assert_eq!(
+                env.symlink_metadata(&root.join("sub")).await.unwrap().kind,
+                PathKind::Dir,
+                "{what}"
+            );
+            assert_eq!(
+                env.read_link(&root.join("l")).await.unwrap(),
+                root.join("f.txt"),
+                "{what}"
+            );
+            let not_link = env.read_link(&root.join("f.txt")).await.unwrap_err();
+            assert_eq!(not_link.code, FileErrorCode::InvalidPath, "{what}");
+            let missing = env.symlink_metadata(&root.join("none")).await.unwrap_err();
+            assert_eq!(missing.code, FileErrorCode::NotFound, "{what}");
+
+            for rel in ["l", "f.txt", "h.txt", "dl/x", "none", "sub"] {
+                let got = env.resolve_for_policy(&root.join(rel)).await.unwrap();
+                let want = host.resolve_for_policy(&root.join(rel)).await.unwrap();
+                assert_eq!(got, want, "{what}: resolve {rel}");
+            }
+            assert!(
+                env.read_link(&root.join("../x")).await.is_err(),
+                "{what}: `..` is refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_isolation_refuses_a_link_out_of_the_root() {
+        let (_dir, root) = layout();
+        let env = KrunExecutionEnv::new(
+            Arc::new(LocalClient),
+            "local".into(),
+            root.clone(),
+            KrunIsolation::Partial,
+        );
+        // The link itself is inside: lstat and readlink see it.
+        assert_eq!(
+            env.symlink_metadata(&root.join("out")).await.unwrap().kind,
+            PathKind::Symlink
+        );
+        assert!(env.read_link(&root.join("out")).await.is_ok());
+        // Following it leaves the root: the jail refuses.
+        assert!(env.resolve_for_policy(&root.join("out")).await.is_err());
     }
 }

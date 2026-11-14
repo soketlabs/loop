@@ -23,6 +23,7 @@ tempfile = { workspace = true }
 loop-ai = { workspace = true }
 loop-protocol = { workspace = true }
 loop-workspace = { workspace = true }
+sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

@@ -38,8 +38,12 @@ use std::sync::Arc;
 use loop_workspace::{Workspace, WorkspaceDriver, WorkspaceSpec};
 
 mod checks;
+mod process_checks;
+mod transfer_checks;
 
 pub use checks::*;
+pub use process_checks::*;
+pub use transfer_checks::*;
 
 /// Name of the file every fixture with an outside folder must hold there.
 pub const OUTSIDE_SECRET: &str = "secret.txt";
@@ -72,6 +76,9 @@ pub struct DriverFixture {
     /// holds [`OUTSIDE_SECRET`] with [`OUTSIDE_SECRET_TEXT`]. The escape
     /// checks try to read and write it. `None` skips them.
     pub outside: Option<PathBuf>,
+    /// The spec makes an idle upload expire after this time. `None` skips
+    /// the expiry check.
+    pub upload_idle: Option<std::time::Duration>,
     _guard: Option<Box<dyn Any + Send + Sync>>,
 }
 
@@ -82,8 +89,15 @@ impl DriverFixture {
             driver,
             spec,
             outside: None,
+            upload_idle: None,
             _guard: None,
         }
+    }
+
+    /// Say that the spec makes an idle upload expire after `idle`.
+    pub fn with_upload_idle(mut self, idle: std::time::Duration) -> Self {
+        self.upload_idle = Some(idle);
+        self
     }
 
     /// Set the outside folder for the escape checks.
@@ -129,4 +143,6 @@ where
     exec_timeout_and_cancel(&factory).await;
     exec_output_is_capped(&factory).await;
     exec_runs_concurrently(&factory).await;
+    processes_conform(&factory).await;
+    transfers_conform(&factory).await;
 }

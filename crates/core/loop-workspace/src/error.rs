@@ -115,9 +115,32 @@ pub enum WorkspaceError {
     /// No such upload (never begun, committed, aborted or expired).
     #[error("unknown upload {0}")]
     UnknownUpload(String),
+    /// An upload write starts after the committed offset (a gap), or the
+    /// upload is not complete at commit. Nothing was written; resume from
+    /// `committed` (see `Workspace::upload_committed_offset`).
+    #[error("upload {upload}: offset {offset} does not match the committed offset {committed}")]
+    UploadOffset {
+        /// Upload id.
+        upload: String,
+        /// Offset of the refused write, or the size at commit.
+        offset: u64,
+        /// Bytes stored so far.
+        committed: u64,
+    },
     /// The uploaded bytes do not match the declared SHA-256.
     #[error("upload {0}: checksum mismatch")]
     ChecksumMismatch(String),
+    /// `attach_process` asked for events after a `seq` the process has
+    /// not reached. Nothing was attached.
+    #[error("process {process}: after_seq {after_seq} is past its last event {last_seq}")]
+    SeqAhead {
+        /// Process id.
+        process: String,
+        /// The `after_seq` asked for.
+        after_seq: u64,
+        /// The `seq` of its newest event.
+        last_seq: u64,
+    },
     /// No such process.
     #[error("unknown process {0}")]
     UnknownProcess(String),

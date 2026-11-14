@@ -898,6 +898,18 @@ impl JailedHostFs {
         Ok(file)
     }
 
+    /// `path` with its folder resolved in the jail and the final component
+    /// kept (not followed), after the read policy accepted the path (a
+    /// denied path, or a link to one, is refused).
+    fn unfollowed(&self, path: &Path) -> Result<PathBuf, FileError> {
+        let resolved = self.policy.resolve(path, false)?;
+        let absolute = loop_workspace::lexical(&self.policy.project.join(path));
+        match (absolute.parent(), absolute.file_name()) {
+            (Some(parent), Some(name)) => Ok(self.policy.resolve(parent, false)?.join(name)),
+            _ => Ok(resolved),
+        }
+    }
+
     fn info(&self, path: &Path) -> Result<FileInfo, FileError> {
         let file = self.open(path, false, rustix::fs::OFlags::RDONLY, false)?;
         let meta = file.metadata().map_err(io_error)?;
@@ -1057,6 +1069,67 @@ impl FileSystem for JailedHostFs {
         Ok(meta
             .is_file()
             .then(|| crate::harness::types::FileIdentity::from_metadata(&meta)))
+    }
+    async fn symlink_metadata(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PathMetadata, FileError> {
+        let target = self.unfollowed(path)?;
+        let meta = std::fs::symlink_metadata(&target).map_err(io_error)?;
+        Ok(crate::harness::env::path_metadata(&meta))
+    }
+    async fn read_link(&self, path: &Path) -> Result<PathBuf, FileError> {
+        let target = self.unfollowed(path)?;
+        std::fs::read_link(&target).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                FileError::new(
+                    FileErrorCode::InvalidPath,
+                    format!("not a link: {}", target.display()),
+                )
+            } else {
+                io_error(e)
+            }
+        })
+    }
+    async fn resolve_for_policy(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PolicyPath, FileError> {
+        let resolved = self.policy.resolve(path, false)?;
+        let absolute = loop_workspace::lexical(&self.policy.project.join(path));
+        let mut has_link = false;
+        let mut prefix = PathBuf::new();
+        for component in absolute.components() {
+            prefix.push(component.as_os_str());
+            match std::fs::symlink_metadata(&prefix) {
+                Ok(meta) if meta.file_type().is_symlink() => has_link = true,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(io_error(e)),
+            }
+        }
+        match std::fs::metadata(&resolved) {
+            Ok(meta) => {
+                let facts = crate::harness::env::path_metadata(&meta);
+                Ok(crate::harness::types::PolicyPath {
+                    resolved,
+                    exists: true,
+                    has_link,
+                    uid: facts.uid,
+                    nlink: facts.nlink,
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(crate::harness::types::PolicyPath {
+                    resolved: absolute,
+                    exists: false,
+                    has_link,
+                    uid: None,
+                    nlink: None,
+                })
+            }
+            Err(e) => Err(io_error(e)),
+        }
     }
 }
 
@@ -1445,6 +1518,21 @@ impl FileSystem for SeatbeltEnv {
     ) -> Result<Option<crate::harness::types::FileIdentity>, FileError> {
         self.fs.file_identity(p).await
     }
+    async fn symlink_metadata(
+        &self,
+        p: &Path,
+    ) -> Result<crate::harness::types::PathMetadata, FileError> {
+        self.fs.symlink_metadata(p).await
+    }
+    async fn read_link(&self, p: &Path) -> Result<PathBuf, FileError> {
+        self.fs.read_link(p).await
+    }
+    async fn resolve_for_policy(
+        &self,
+        p: &Path,
+    ) -> Result<crate::harness::types::PolicyPath, FileError> {
+        self.fs.resolve_for_policy(p).await
+    }
 }
 
 #[cfg(unix)]
@@ -1640,6 +1728,65 @@ mod tests {
                 policy.resolve(&root.path().join(name), true).is_err(),
                 "{name}"
             );
+        }
+    }
+
+    /// The gate primitives answer in the jail: links and modes inside the
+    /// project as the host sees them; a denied path (or a link to one) is
+    /// refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gate_primitives_answer_in_the_jail() {
+        use crate::harness::env::HostExecutionEnv;
+        use crate::harness::types::PathKind;
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let project = base.join("project");
+        let home = base.join("home");
+        std::fs::create_dir_all(project.join("sub")).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/id"), "key").unwrap();
+        std::fs::write(project.join("f.txt"), "x").unwrap();
+        std::fs::hard_link(project.join("f.txt"), project.join("h.txt")).unwrap();
+        std::os::unix::fs::symlink(project.join("f.txt"), project.join("l")).unwrap();
+        std::os::unix::fs::symlink(home.join(".ssh/id"), project.join("key")).unwrap();
+        let policy =
+            SeatbeltPolicy::new(&project, &home, &base.join("agent"), &[], false, &[]).unwrap();
+        let env = JailedHostFs::new(policy);
+        let host = HostExecutionEnv::new(&project);
+
+        assert_eq!(
+            env.symlink_metadata(&project.join("l")).await.unwrap().kind,
+            PathKind::Symlink
+        );
+        let file = env.symlink_metadata(&project.join("f.txt")).await.unwrap();
+        assert_eq!(
+            file,
+            host.symlink_metadata(&project.join("f.txt")).await.unwrap()
+        );
+        assert!(file.mode.is_some());
+        assert_eq!(
+            env.read_link(&project.join("l")).await.unwrap(),
+            project.join("f.txt")
+        );
+        assert_eq!(
+            env.read_link(&project.join("f.txt"))
+                .await
+                .unwrap_err()
+                .code,
+            FileErrorCode::InvalidPath
+        );
+        for rel in ["l", "f.txt", "h.txt", "none", "sub/none", "sub"] {
+            assert_eq!(
+                env.resolve_for_policy(&project.join(rel)).await.unwrap(),
+                host.resolve_for_policy(&project.join(rel)).await.unwrap(),
+                "{rel}"
+            );
+        }
+        // A credential path and a link to it are refused.
+        for path in [home.join(".ssh/id"), project.join("key")] {
+            assert!(env.symlink_metadata(&path).await.is_err(), "{path:?}");
+            assert!(env.resolve_for_policy(&path).await.is_err(), "{path:?}");
         }
     }
 

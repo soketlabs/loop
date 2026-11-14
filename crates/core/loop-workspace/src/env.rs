@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::capabilities::PathNamespace;
+
 /// Whether the agent loop may run a failed operation again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -348,6 +350,12 @@ impl FileIdentity {
 /// Filesystem capability (Result-based, never panics).
 #[async_trait]
 pub trait FileSystem: Send + Sync {
+    /// Whose namespace the paths of this environment are in: `Host` when
+    /// they are Runtime host paths, `Guest` when they are valid only inside
+    /// the Workspace. The default is `Host`. A wrapper must forward it.
+    fn path_namespace(&self) -> PathNamespace {
+        PathNamespace::Host
+    }
     /// Current working directory.
     fn cwd(&self) -> &Path;
     /// Absolute path resolution.

@@ -110,15 +110,23 @@ pub struct WorkspaceCapabilities {
     pub network: NetworkPolicy,
     /// Enforced limits.
     pub limits: ResourceLimits,
-    /// `Workspace::spawn` without a PTY works.
+    /// `Workspace::spawn` without a PTY works, and so do
+    /// `attach_process` and `list_processes`.
     pub streaming_exec: bool,
     /// `Workspace::spawn` with a PTY works.
     pub pty: bool,
     /// `snapshot`, `hibernate` and `wake` work.
     pub snapshot: bool,
-    /// `read_chunk` and `write_chunk` work.
+    /// `read_chunk` works (download in pieces, with a [`crate::FileTag`]).
     pub chunked_transfer: bool,
+    /// The upload sessions work: `begin_upload`, `upload_write`,
+    /// `upload_committed_offset`, `upload_commit` and `upload_abort`. A
+    /// Workspace can download without upload: the host under the tool lock
+    /// allows no write.
+    #[serde(default)]
+    pub upload: bool,
     /// `WorkspaceDriver::attach` can reopen a Workspace by id after a
-    /// Runtime restart.
+    /// Runtime restart. This is not `Workspace::attach_process` (a
+    /// process), which `streaming_exec` covers.
     pub attach: bool,
 }
