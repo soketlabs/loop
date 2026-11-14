@@ -935,3 +935,239 @@ async fn closing_the_session_aborts_its_uploads() {
     }
     f.rt.shutdown().await;
 }
+
+/// H1, M1: a refused path and a missing one look the same. Under the tool
+/// lock, through a link out, every file method answers `l/exists/…` and
+/// `l/missing/…` identically; with a deny rule, `vault/real` and
+/// `vault/nope` are identical too.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_path_never_tells_whether_something_is_there() {
+    let f = runtime(Options {
+        lock: true,
+        settings: json!({"toolPermissions": {"read(*vault*)": "deny", "ls(*vault*)": "deny"}}),
+        ..Options::default()
+    })
+    .await;
+    let outside = f.dir.path().join("outside");
+    std::fs::create_dir_all(outside.join("exists")).unwrap();
+    std::fs::write(outside.join("exists/x"), "x").unwrap();
+    let folder = f.ws.join("mine");
+    std::fs::create_dir_all(folder.join("vault/real")).unwrap();
+    std::fs::write(folder.join("vault/real/f"), "f").unwrap();
+    std::os::unix::fs::symlink(&outside, folder.join("l")).unwrap();
+    let c = client(&f.rt, None).await;
+    let s = new_session(&c, &folder).await;
+    let all = |p: &str| {
+        let s = s.clone();
+        let c = c.clone();
+        let p = p.to_owned();
+        async move {
+            let mut out = Vec::new();
+            out.push(format!("{:?}", c.stat(path(&s, &p)).await.err()));
+            out.push(format!(
+                "{:?}",
+                sw(&c)
+                    .list(FilesListParams {
+                        session: s.clone(),
+                        path: p.clone(),
+                        cursor: None,
+                        limit: None
+                    })
+                    .await
+                    .err()
+            ));
+            out.push(format!(
+                "{:?}",
+                c.read(FilesReadParams {
+                    session: s.clone(),
+                    path: p.clone(),
+                    offset: 0,
+                    length: None,
+                    if_match: None
+                })
+                .await
+                .err()
+            ));
+            out
+        }
+    };
+    for (there, missing) in [
+        ("l/exists/x", "l/missing/x"),
+        ("l/exists", "l/missing"),
+        ("vault/real", "vault/nope"),
+        ("vault/real/f", "vault/nope/f"),
+    ] {
+        let a = all(there).await;
+        let b = all(missing).await;
+        assert_eq!(a, b, "{there} vs {missing}");
+        assert!(a.iter().all(|e| e.contains("Refused")), "{there}: {a:?}");
+    }
+    f.rt.shutdown().await;
+}
+
+/// M2: a folder swapped for a link to a folder outside, again and again
+/// during delete, rename and mkdir: nothing outside is ever touched.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_swapped_for_a_link_never_leads_a_change_outside() {
+    let f = runtime(Options::default()).await;
+    let outside = f.dir.path().join("outside");
+    std::fs::create_dir_all(outside.join("b")).unwrap();
+    std::fs::write(outside.join("b/keep.txt"), "keep").unwrap();
+    let real = f.ws.join("realA");
+    std::fs::create_dir_all(real.join("b")).unwrap();
+    std::os::unix::fs::symlink(&outside, f.ws.join("linkA")).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let swapper = {
+        let (ws, stop) = (f.ws.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                for name in ["realA", "linkA"] {
+                    if std::fs::rename(ws.join(name), ws.join("a")).is_ok() {
+                        std::thread::yield_now();
+                        let _ = std::fs::rename(ws.join("a"), ws.join(name));
+                    }
+                }
+            }
+        })
+    };
+    let c = client(&f.rt, None).await;
+    let s = new_session(&c, &f.ws).await;
+    for _ in 0..300 {
+        let _ = std::fs::create_dir_all(real.join("b"));
+        let _ = c
+            .delete(FilesDeleteParams {
+                session: s.clone(),
+                path: "a/b".into(),
+                recursive: true,
+            })
+            .await;
+        let _ = sw(&c)
+            .rename(FilesRenameParams {
+                session: s.clone(),
+                from: "a/b".into(),
+                to: "moved".into(),
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(f.ws.join("moved"));
+        let _ = c.mkdir(path(&s, "a/new")).await;
+        let _ = std::fs::remove_dir(real.join("new"));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    swapper.join().unwrap();
+    assert_eq!(std::fs::read(outside.join("b/keep.txt")).unwrap(), b"keep");
+    assert!(!outside.join("new").exists(), "mkdir reached outside");
+    let names: Vec<_> = std::fs::read_dir(&outside)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["b"], "outside changed: {names:?}");
+    f.rt.shutdown().await;
+}
+
+/// L4, L5: an upload never leaves an execute bit, also over a file that had
+/// one; without overwrite, a file that appears before the commit is not
+/// replaced.
+#[cfg(unix)]
+#[tokio::test]
+async fn uploads_clear_execute_bits_and_never_replace_a_late_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = runtime(Options::default()).await;
+    let c = client(&f.rt, None).await;
+    let s = new_session(&c, &f.ws).await;
+    std::fs::write(f.ws.join("run.sh"), "old").unwrap();
+    std::fs::set_permissions(f.ws.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    upload(&c, &s, "run.sh", b"#!/bin/sh\n", 4).await.unwrap();
+    let mode = std::fs::metadata(f.ws.join("run.sh"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0, "{mode:o}");
+    let up = c
+        .upload_begin(UploadBeginParams {
+            session: s.clone(),
+            path: "late.txt".into(),
+            size: 1,
+            sha256: None,
+            if_match: None,
+            overwrite: false,
+        })
+        .await
+        .unwrap()
+        .upload;
+    c.upload_write(UploadWriteParams {
+        session: s.clone(),
+        upload: up.clone(),
+        offset: 0,
+        data: base64::encode(b"u"),
+    })
+    .await
+    .unwrap();
+    std::fs::write(f.ws.join("late.txt"), "someone else").unwrap();
+    let commit = c
+        .upload_commit(UploadParams {
+            session: s.clone(),
+            upload: up,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(code(&commit), "exists");
+    assert_eq!(
+        std::fs::read(f.ws.join("late.txt")).unwrap(),
+        b"someone else"
+    );
+    f.rt.shutdown().await;
+}
+
+/// L6: upload files a killed Runtime left behind go at the first file call
+/// in the folder (only stale ones with the exact name pattern); the open
+/// upload bytes of a Session have a limit.
+#[tokio::test]
+async fn stale_upload_files_are_swept_and_session_upload_bytes_are_limited() {
+    let f = runtime(Options::default()).await;
+    std::fs::create_dir_all(f.ws.join("sub")).unwrap();
+    let stale = f.ws.join("sub/.a.txt.loop-upload-upload-0001");
+    let fresh = f.ws.join("sub/.b.txt.loop-upload-upload-0002");
+    let other = f.ws.join("sub/.c.txt.loop-uploadX");
+    for file in [&stale, &fresh, &other] {
+        std::fs::write(file, "t").unwrap();
+    }
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for file in [&stale, &other] {
+        std::fs::File::options()
+            .write(true)
+            .open(file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    f.rt.set_workspace_limits(loop_protocol::session_workspace::SessionWorkspaceLimits {
+        upload_bytes_per_session: 100,
+        ..Default::default()
+    });
+    let c = client(&f.rt, None).await;
+    let s = new_session(&c, &f.ws).await;
+    sw(&c)
+        .list(FilesListParams {
+            session: s.clone(),
+            path: String::new(),
+            cursor: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert!(!stale.exists() && fresh.exists() && other.exists());
+    let begin = |p: &str, size| UploadBeginParams {
+        session: s.clone(),
+        path: p.into(),
+        size,
+        sha256: None,
+        if_match: None,
+        overwrite: false,
+    };
+    c.upload_begin(begin("one", 60)).await.unwrap();
+    let over = c.upload_begin(begin("two", 60)).await.unwrap_err();
+    assert_eq!(code(&over), "limit");
+    f.rt.shutdown().await;
+}

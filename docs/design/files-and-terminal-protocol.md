@@ -56,39 +56,62 @@ Rules:
   after the committed offset is refused with `upload_offset` and changes
   nothing; resume from `upload_status`. `upload_commit` checks the size and
   the SHA-256, then moves the file into place in one rename. A new file gets
-  mode 0644 (never an execute bit). Without `if_match` and without
-  `overwrite: true`, a destination that exists at `upload_begin` is refused
-  with `exists`.
+  mode 0644; over an existing file the execute bits are cleared after the
+  commit (by descriptor), so an upload never leaves an execute bit. Without
+  `if_match` and without `overwrite: true`, a destination that exists at
+  `upload_begin` is refused with `exists`, and a file that appears before
+  the commit is not replaced (`exists`; a file made between this last check
+  and the driver's rename is the remaining race). Temporary upload files
+  that a killed Runtime left in a Session folder (the exact
+  `.<name>.loop-upload-upload-<id>` pattern, regular files, older than 10
+  minutes) are removed at the first list or upload in that folder.
 - **Listing.** Entries come in name order. The cursor is the last name of
   the page. An entry that a `read` or `ls` deny rule hides, or (under the
   tool lock) an entry that leads out of the folder or has more than one hard
-  link, is left out and counted in `hidden`. `mtime_ms` comes from the env's
-  `file_identity` (absent when the env cannot tell). `tag` is absent in a
-  listing; use `stat`.
+  link, is left out and counted in `hidden` (counted for the names this page
+  looked at). The names are read once per call, and only the entries of the
+  page are stat'ed (by descriptor, `fstatat` without following a link).
+  `mtime_ms` has second precision. `tag` is absent in a listing; use
+  `stat`.
 - **Paths.** `..` above the root, an absolute path, a NUL byte, a backslash
-  and a drive prefix are refused with `invalid_path` before any work. A path
-  whose folder leads out of the Session's folder through a link is refused
-  with `invalid_path` (list, stat, delete, rename, mkdir: checked through the
-  env; read and upload: checked by descriptor in the driver).
+  and a drive prefix are refused with `invalid_path` before any work.
+- **No link is followed.** list, stat, delete, rename and mkdir walk the
+  Session's folder by descriptor (`openat` with `O_NOFOLLOW | O_DIRECTORY`
+  from one descriptor of the folder, then `fstatat`, `unlinkat`, `mkdirat`,
+  `renameat`). A path that passes through a link fails (`invalid_path`;
+  under the tool lock, the one refusal below). A final link is shown,
+  deleted or renamed as a link. So a folder swapped for a link during a call
+  cannot lead the call out of the folder. Read and upload are checked by
+  descriptor in the `host` driver, which follows links that stay inside.
+- **One refusal under the tool lock.** A path that a rule refuses, that
+  leads out of the folder, or that the gate cannot resolve gets the same
+  answer: code `refused`, the same text, whether or not something is there.
 - **Delete** removes a link, not its target. A folder that is not empty needs
   `recursive: true`.
-- **Folders.** A recursive delete or the rename of a folder first walks the
-  folder (links not followed, at most 10 000 entries). An entry that the user
-  could not change on its own (a deny rule, `.git`, `.loop`) refuses the
-  whole call.
-- **Order of checks.** Path syntax, containment, the gate, and only then
-  whether the target exists. So a refused path never tells whether a file is
-  there. (A missing folder on the way inside the Session's folder is still
-  `not_found` before the gate.)
-- **Rename** works only for a Workspace whose paths are host paths: the
-  contract has no rename yet (follow-up: `FileSystem::rename`). Another
-  Workspace gives `Unsupported`.
+- **Folders: a check pass, then a delete pass.** A recursive delete or the
+  rename of a folder first walks the folder by descriptor (links listed, not
+  entered; at most 10 000 entries, else refused). Every entry is checked as a
+  write of its own (deny rules, `.git`, `.loop`); one refused entry refuses
+  the whole call before anything changes. The delete pass then works by
+  descriptor and removes only entries that the check pass saw, with the same
+  kind; an entry that appeared or changed in between stops the delete
+  (`refused`), and what was deleted before that stays deleted. A protected
+  name stops it too.
+- **Order of checks.** Access, the tool lock, the sandbox, path syntax, the
+  gate, and only then anything that touches the disk. So a refused path
+  never tells whether something is there.
+- **Rename** never replaces `to`: `renameat2(RENAME_NOREPLACE)` on Linux,
+  `renameatx_np(RENAME_EXCL)` on macOS; elsewhere `Unsupported`.
+- **Name-based protection has gaps.** `.git` and `.loop` are refused for
+  writes in every mode. Other files that change what runs (`core.hooksPath`
+  folders, `.husky/`, `.envrc`) are not protected by name, the same gap as
+  for the agent's `write` tool.
 
 ### 2.2 Terminal
 
 | Method | Params | Result |
 |---|---|---|
-| `session/terminal/open` | `session`, `cols`, `rows`, `command?` | `terminal` (an id), `cwd` (a WorkspacePath) |
+| `session/terminal/open` | `session`, `cols`, `rows` | `terminal` (an id), `cwd` (a WorkspacePath) |
 | `session/terminal/attach` | `session`, `terminal`, `after_seq` | `last_seq`, `exit?`. Then `session/terminal/output` notifications |
 | `session/terminal/detach` | `session`, `terminal` | `{}`. The terminal runs on |
 | `session/terminal/input` | `session`, `terminal`, `data` (Base64) | `{}` |
@@ -100,8 +123,13 @@ Rules:
 
 Rules:
 
-- **Default command.** `exec "${SHELL:-/bin/sh}" -i` in the Session's cwd,
-  with `TERM=xterm-256color`.
+- **Always the user's shell.** `exec "${SHELL:-/bin/sh}" -i` in the
+  Session's cwd, with `TERM=xterm-256color`. There is no `command`
+  parameter: what the gate judged and recorded is what runs; commands are
+  typed into the shell.
+- **Checked at every call.** Each terminal call checks the sandbox and the
+  gate again; a refusal closes the terminal (with a record) and refuses the
+  call.
 - **Environment.** The Session's tool environment: the caller environment
   given at `session/new` (or the Runtime's), minus the names the tool env
   policy removes (provider keys, Runtime tokens, `LOOP_*` secrets, custom
@@ -111,10 +139,16 @@ Rules:
   for a reader that keeps up. `dropped` stands for the events that this
   reader lost; its `seq` is the last lost one, so the next event has the next
   `seq`. `exit` is the last event.
-- **Input order.** The server runs `input` and `resize` of one connection in
-  the order they arrive, on one queue (256 requests; more are refused with
-  `Busy`). A `signal` does not wait in that queue, so a stuck write never
-  holds up a kill. Ctrl-C typed as input (byte 3) keeps its place.
+- **Input order.** The server runs `input` and `resize` of one terminal in
+  the order they arrive, on one queue per terminal (256 requests, at most 64
+  terminals and 8 MiB of queued params per connection; more are refused
+  with `Busy`). A stuck write holds up only its own terminal. A `signal`
+  does not wait in a queue, so a stuck write never holds up a kill. Ctrl-C
+  typed as input (byte 3) keeps its place. An input over the piece limit is
+  refused by its encoded length, before it is decoded.
+- **Attach answer first.** The answer to `attach` is queued before the
+  stream starts, so a client sees no output before it; `last_seq` in the
+  answer is the newest event when the attach began.
 - **Limits at the same time.** An open takes its slot under the same lock as
   the count, so calls at the same time cannot pass a limit together.
 - **Shared Runtime only.** Terminals and uploads need the Runtime's sweep
@@ -202,7 +236,7 @@ today; a later change in `loop-store` can name them).
 | Sandbox | Runtime, after the lock |
 | Path syntax | Runtime (`WorkspacePath::parse`), before any work |
 | Gate | Runtime, through the Session's `ToolGate` |
-| Containment by descriptor | `host` driver (read, upload) |
+| Containment by descriptor | `host` driver (read, upload); Runtime `workspace_fs.rs` (list, stat, delete, rename, mkdir) |
 
 ## 5. Access
 
@@ -248,19 +282,24 @@ today; a later change in `loop-store` can name them).
 | Detached terminal | 10 minutes | A terminal that no connection streams is closed after this time, with a record |
 | Detached terminals per Session | 2 | Past it, the terminals detached longest close, with a record. A client attaches right after it opens |
 | Open uploads per caller | 8 | `limit` error after; the driver also has 16 per Workspace |
+| Open upload bytes per Session | 8 GiB | The declared sizes of its open uploads; `limit` error after |
 | Upload idle time | 10 minutes | The driver removes it; the Runtime forgets it at the next sweep |
 | Ring buffer | 1 MiB | Per terminal (driver) |
 | Read and upload piece | 1 MiB | |
-| Session closed, unloaded or reloaded into a new instance | | Its terminals close with a record ("the Session closed or was unloaded"); its uploads are aborted |
+| Session closed, or reloaded into a new instance (workspace reload) | | Its terminals close with a record ("the Session closed or was unloaded"); its uploads are aborted. The last explicit close of a folder also stops the folder's host workspace (another change) |
+| Unload | | A Session whose folder's host workspace runs a process is not unloaded (another change), so a terminal pins its Session until it ends. Open uploads do not pin it: an unload aborts them (the sweep) |
 | Sandbox turned on, mode or rule change | | The terminal closes with a record, within 250 ms |
 | Runtime shutdown | | Every terminal closes with a record and every upload is aborted, before the Sessions close |
 | Idle shutdown | | An open terminal does not keep an auto-started owner alive |
 
 The limits are in `SessionWorkspaceLimits` on the Runtime
 (`Runtime::set_workspace_limits`). Reading them from `settings.json` is a
-follow-up. A Session with a live terminal can still be unloaded to make room
-when no connection watches it; its terminals then close with the reason in
-the record.
+follow-up. So a terminal ends on: its close, the Session's explicit close, a
+workspace reload, Runtime shutdown (before the host workspaces are
+destroyed), the detached time or count, and the sandbox and gate re-check
+(at each call and every 250 ms). If unload of a Session with a running
+process is ever allowed again, the sweep closes its terminals with the
+reason in the record.
 
 ## 8. Tool lock: upload exception (specified, not built)
 
@@ -321,8 +360,9 @@ checks that.
 
 | Gap | Follow-up |
 |---|---|
-| No rename in the Workspace contract; the time stamp costs one more env call per entry | Add `FileSystem::rename` and `mtime` to `FileInfo` (C4 owner) |
-| List, stat, delete, mkdir check containment by path, not by descriptor: a folder swapped for a link during the call is a race | Descriptor-checked versions in the driver |
+| No rename in the Workspace contract: the Runtime does list, stat, delete, rename and mkdir by descriptor itself, so only for a Workspace whose paths are host paths | `FileSystem::rename` and descriptor-based operations in the contract (C4 owner) |
+| Upload commit has no "must not exist" mode in the driver: a file made between the Runtime's last check and the driver's rename is replaced | A no-replace commit in the driver |
+| The tool-lock upload exception (section 8) | A later task; its precondition, descriptor-based writes, is now in place |
 | Sandbox on: no files, no terminal | C4a and C4b |
 | A transport made outside `loop-wire` (an unbounded channel given to `Transport`) cannot tell its backlog, so back-pressure there uses the connection queue only. `lines` (Unix socket), `memory` and the WebSocket count theirs | — |
 | `DecisionSource` has no named variants for these sources | `loop-store` owner |

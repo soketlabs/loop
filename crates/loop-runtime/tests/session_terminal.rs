@@ -823,3 +823,81 @@ async fn detached_terminals_past_the_session_limit_close() {
     .unwrap();
     finish(f).await;
 }
+
+/// M4: a terminal call checks the gate at once, not only at the sweep: after
+/// a switch to read-only, the next input is refused and the terminal ends
+/// with a record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mode_change_refuses_the_next_terminal_call() {
+    let f = runtime(Options::default()).await;
+    let c = client(&f.rt, None).await;
+    let s = sh_session(&c, &f.ws).await;
+    let t = open(&c, &s, Some(SH)).await;
+    loop_wire::RuntimeAdmin::permission_mode(
+        &*f.rt,
+        loop_protocol::admin::PermissionModeParams {
+            session: s.clone(),
+            mode: Some("read-only".into()),
+            expected_revision: None,
+        },
+    )
+    .await
+    .unwrap();
+    let refused = sw(&c)
+        .terminal_input(TerminalInputParams {
+            session: s.clone(),
+            terminal: t.clone(),
+            data: base64::encode(b"echo hi\n"),
+        })
+        .await
+        .unwrap_err();
+    // The sweep may have closed it a moment before: then it is unknown.
+    assert!(
+        matches!(code(&refused).as_str(), "refused" | "unknown_terminal"),
+        "{refused}"
+    );
+    tokio::time::timeout(WAIT, async {
+        while !log_text(&f.log).await.contains("no longer allows it") {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    finish(f).await;
+}
+
+/// L3: a terminal whose input is stuck (its program does not read) does
+/// not hold up input to another terminal of the same connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stuck_terminal_does_not_hold_up_another() {
+    let f = runtime(Options::default()).await;
+    let c = client(&f.rt, None).await;
+    let s = sh_session(&c, &f.ws).await;
+    let stuck = open(&c, &s, Some("exec sleep 300")).await;
+    let other = open(&c, &s, Some(SH)).await;
+    let feed = attach(&c, &s, &other, 0).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Far more than a PTY buffer holds: these writes block.
+    let flood = {
+        let (c, s, stuck) = (c.clone(), s.clone(), stuck.clone());
+        tokio::spawn(async move {
+            for _ in 0..64 {
+                let _ = sw(&c)
+                    .terminal_input(TerminalInputParams {
+                        session: s.clone(),
+                        terminal: stuck.clone(),
+                        data: base64::encode(&[b'z'; 64 * 1024]),
+                    })
+                    .await;
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    type_in(&c, &s, &other, "echo other-$((2+3))\n").await;
+    let mut seen = Seen::default();
+    let started = std::time::Instant::now();
+    until(&*feed, &mut seen, |text| text.contains("other-5")).await;
+    assert!(started.elapsed() < Duration::from_secs(10));
+    flood.abort();
+    finish(f).await;
+}
