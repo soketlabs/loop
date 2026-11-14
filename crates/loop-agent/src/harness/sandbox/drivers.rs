@@ -418,7 +418,10 @@ impl HostWorkspace {
         let resolved = tokio::fs::canonicalize(cwd.to_native(&root))
             .await
             .map_err(|_| outside())?;
-        if !resolved.starts_with(&root) || !resolved.is_dir() {
+        let is_dir = tokio::fs::metadata(&resolved)
+            .await
+            .is_ok_and(|m| m.is_dir());
+        if !resolved.starts_with(&root) || !is_dir {
             return Err(outside());
         }
         Ok(resolved)

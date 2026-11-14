@@ -192,7 +192,7 @@ The `podman` values come from the code. The kit did not run on Linux in C1 or C1
 | Kill tree | The process group and every live member of the session, killed in passes until none is left (`/proc` on Linux; `proc_listallpids` and `getsid` on macOS). Signals hold the waiter's lock and are skipped after the reap, so a recycled pid is never signalled. `signal(Interrupt/Terminate/Hangup)` goes to the whole session too. **Out of reach:** a descendant that starts its own session (`setsid`, a daemon); the buffered `exec` cannot reach it either |
 | Leader ends | The rest of its session is killed (no orphans), as a terminal hang-up would end a shell's jobs |
 | Detach | `detach: false`: the drop of the last handle kills the tree. `detach: true`: it runs on; `attach_process(id, after_seq)` replays and continues; `list_processes` shows it. At most 64 running processes per Workspace (`Busy`), and the 32 newest ended ones stay listed |
-| Shutdown | `stop`, `destroy` and the drop of the Workspace kill every process (tree) and reap it. Processes do not survive the Runtime process. If the Runtime is killed (no shutdown runs), its processes can stay |
+| Shutdown | `stop`, `destroy` and the drop of the Workspace kill every process (tree) and reap it. Gap: the Runtime shutdown (`loop-runtime` `runtime.rs`) destroys only the enabled sandbox, not `WorkspaceResources::host_workspace`, and the factory's cache can keep the resources alive to the end, so at a normal exit host processes are killed only if the Workspace is dropped (follow-up C4f). Spawned processes have their own session, so a terminal hang-up does not reach them (buffered `exec` stays in Loop's session). If the Runtime is killed, its processes can stay |
 | PTY input | `close_stdin` sends Ctrl-D once and refuses later writes; the PTY stays open. `resize` sets the window size on the master; `Unsupported` without a PTY |
 
 **Transfer** (`harness::sandbox::host_ws::transfer`).
@@ -318,7 +318,7 @@ A protocol task (not in this list) adds file and terminal methods with `Workspac
 | C4c | The `worktree` driver |
 | C4d | The Session wrapper for `spawn`: the tool env policy (`removed_tool_env_names`, `tools.passEnv`) on `SpawnRequest`, as `SessionExecutionEnv` does for `exec` |
 | C4e | `sandbox.driver` (Q1) in global settings |
-| C4f | `WorkspaceState::sandbox` in `loop-runtime` to `Arc<dyn Workspace>`, with `AgentHarness::ensure_sandbox_ready` |
+| C4f | `WorkspaceState::sandbox` in `loop-runtime` to `Arc<dyn Workspace>`, with `AgentHarness::ensure_sandbox_ready`; the Runtime shutdown calls `destroy` on each `host_workspace` too |
 | C4g | Process limits as settings (running processes, buffer budget per Workspace), and a Runtime-wide kill of host processes at exit for the case where no Workspace is dropped |
 
 ## 15. Open questions
