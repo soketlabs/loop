@@ -390,7 +390,10 @@ it, in the columns `tenant`, `principal_kind`, `principal_issuer`,
   of another tenant uses the Session.
 - The principal and `via` are of the caller that caused the row: the caller
   that sent the prompt (for the whole turn), the config change, the command,
-  the close, or the Escalation answer. A Subagent acts for the caller of its
+  the close, or the Escalation answer. An update that waits in the
+  Runtime's queue keeps its caller when the next caller's prompt starts. A
+  config change that no request made (for example a mode change of the
+  tool gate) is the caller's of the turn or command in progress. A Subagent acts for the caller of its
   parent's turn, and its rows have `actor` set to the parent Session's key.
 - Rows the Runtime makes on its own (start and stop, recovery after a crash,
   a lost lease, an unload) have the Runtime's own principal

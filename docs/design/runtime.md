@@ -132,6 +132,83 @@ publication and fails the affected work visibly. Broadcast lag at the
 backend-to-pump boundary must also fail visibly; that missing activity
 cannot be recovered from a log that never received it.
 
+### The Session sequencer (ADR-0007, step A0)
+
+Each loaded Session has one sequencer. The pump puts every update of the
+Session through it, in the order that the backend sent them. It has two
+halves:
+
+| Half | Where | What it does |
+|---|---|---|
+| Durable | `crates/loop-runtime/src/sequencer.rs` (`Sequencer`) | Makes the `Event` to commit for an update, with who caused it. Skips `Origin::Replay`. After the commit, it moves `H` (the last committed `session_seq`) and applies the update to the accumulators. It has no tokio type, no channel, no clock and no wire type. Step B8 moves it to `loop-agent` as the `SessionRecorder`. |
+| Delivery | `crates/loop-runtime/src/runtime/publish.rs` (`publish`, `pump`, `barrier`, `act`) | Commits each update, one `append_batch` per update, then updates the sequencer, the tail and the broadcast. |
+
+The store gives `session_seq` in the commit transaction. The sequencer does
+not give it. It counts a commit whose `seq` is not `H + 1`
+(`unexpected_seqs`): while the pump is the only writer of the Session's
+updates, the count is 0.
+
+**The in-progress snapshot.** The accumulators hold the open turn, the text
+and thought of each open message, the merged state of each open tool call
+(each set field replaces the old value) and each tool call that is being
+prepared. Text joins the last text block; other blocks keep their place.
+Text and thought of one message share one part counter. An item opens at
+`message_started` or `tool_call`. A part with no start opens its item at the
+last durable record. An item ends at `message_ended`, at a terminal
+`tool_call_update`, at `turn_ended` (also of a cancelled or failed turn) and
+when the Session fails. A `branch_reset`, a `config_changed` and an unknown
+kind do not change the open items.
+
+`H` and the accumulators are in one mutex (`Announced::seq`). The pump
+changes both in one critical section after each commit and before the
+broadcast. So a snapshot (`Runtime::in_progress`) holds exactly the updates
+with `seq <= H`. A reader that subscribes first, then takes `H` and the
+snapshot, then reads the log up to `H`, gets each part exactly once
+(ADR-0007 §2.3). No client gets the snapshot yet.
+
+**Limits.** One open message or tool call holds at most 8 MiB of content.
+All open items of a Session hold at most 32 MiB. An item that would go above
+a limit is marked `overflowed`. It keeps what it has, it stops storing
+content and it keeps counting its parts. Nothing is dropped from the log and
+the Session does not fail. The fixed cost of one open message is the
+`OpenMessage` struct (see its size test) plus its text.
+
+**Who caused an update.** The sequencer gives each update an identity when
+it records it:
+
+- An update that the Runtime made for a request (`Command::Publish`, the
+  opening config) carries its own identity.
+- Otherwise it is the acting caller. A turn or a `session/shell` command
+  changes the acting caller with `act()` in its own task, before the
+  backend starts. The pump first commits everything the backend sent
+  before, then switches. So an update keeps its caller also when it waits
+  in the queue while the next caller's turn is admitted. Admission itself
+  does not wait for the pump.
+- A `config_changed` with no turn id is the caller that made its revision.
+  A setter claims the revisions it makes (`claim_changes`). A claimed
+  revision stays until a newer revision commits, so a change that takes
+  effect at the end of a turn (the same revision) is still its setter's. A
+  revision that no setter claimed (for example a mode that the tool gate
+  changes on its own, or an automatic compaction) is the acting caller's.
+- Known limit: a workspace reload during a turn takes effect at the end of
+  the turn with a new, unclaimed revision. It is stamped with the turn's
+  caller, not with the caller of the reload.
+
+**What the next steps use.**
+
+| Step | Uses | Still needs |
+|---|---|---|
+| A1, per-Session channels and refill | `H` and the snapshot under one lock; the commit-then-broadcast point | a channel for each Session in place of the global broadcast; refill from the log after `last_sent` |
+| A2, `message_ended` content | the accumulated `content` and `thought`, the merged tool state | fill the record in `record()` before the commit; a rule for an `overflowed` item (for example: keep its chunk rows and send `message_ended` with no `content`, the old format) |
+| A3, `session/delta` | `Applied::Part { item, part }` from `committed()` | the wire types and the capability |
+| A4, live-only chunks | the durability class of each update (`loop_store::class`), the snapshot for attach | do not commit live-only parts; pipeline durable records that are not barriers |
+| A5, write-ahead barrier | `barrier()` and `act()` are still "commit everything before this point" | `tool_call` and `policy_decision` in one batch |
+| B8, embedded owners | the durable half has no Runtime type | move it to `loop-agent`; a writer for embedded owners |
+
+The backend-to-pump hop is still a `broadcast` channel of 4096 items. A lag
+there fails the Session ("pump lost activity"). ADR-0007 §3.3 replaces it
+with a bounded `mpsc` in step A6.
+
 Keep wire prompt completion ordered after the committed and forwarded
 `turn_ended`. Today's forwarder already coordinates the outcome and end
 update (`crates/core/loop-wire/src/server.rs`, `Waiting`, `forward`).

@@ -15,7 +15,10 @@
 //!    the open turn, each open message (its text and thought so far), each
 //!    open tool call (its merged state so far) and each tool call that is
 //!    being prepared. Together they are the **in-progress snapshot**
-//!    (ADR-0007 §2.3), which [`Sequencer::snapshot`] returns with `H`.
+//!    (ADR-0007 §2.3), which [`Sequencer::snapshot`] returns with `H`. An
+//!    item ends at `message_ended`, at a terminal `tool_call_update`, at
+//!    `turn_ended` (also of a cancelled or failed turn) and at
+//!    [`Sequencer::reset`] (the Session failed).
 //! 4. The pump then sends the update to subscribers.
 //!
 //! The pump keeps the sequencer in one mutex with the rest of the Session's

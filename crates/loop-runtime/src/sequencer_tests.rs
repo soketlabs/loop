@@ -929,3 +929,56 @@ fn property_final_content_equals_the_concatenated_chunks() {
         }
     }
 }
+
+/// The hot-path cost of the durable half: `record` and `committed` of one
+/// 16-byte text chunk. Ignored; run it in an optimised profile:
+/// `cargo test -p loop-runtime --lib sequencer::tests::cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn cost_of_one_chunk() {
+    const N: u64 = 2_000_000;
+    let mut seq = Sequencer::new(0, who(1));
+    feed(&mut seq, &[turn_started("turn-1"), started("m")]);
+    let chunk = envelope(Some("turn-1"), text("m", "0123456789abcdef"));
+    let start = std::time::Instant::now();
+    for _ in 0..N {
+        let event = seq.record(chunk.clone(), None, 1, 0).unwrap();
+        let next = seq.through_seq() + 1;
+        if let EventKind::Update(envelope) = &event.kind {
+            std::hint::black_box(seq.committed(next, &envelope.update));
+        }
+        // A message ends every 100 chunks, as in the load tool.
+        if next.is_multiple_of(100) {
+            let next = seq.through_seq() + 1;
+            seq.committed(next, &ended("m"));
+            let next = seq.through_seq() + 1;
+            seq.committed(next, &started("m"));
+        }
+    }
+    let per = start.elapsed().as_nanos() as f64 / N as f64;
+    // The same work without the sequencer: the envelope clone and the Event.
+    let start = std::time::Instant::now();
+    for _ in 0..N {
+        std::hint::black_box(Event::update(1, 0, chunk.clone(), who(1)));
+    }
+    let base = start.elapsed().as_nanos() as f64 / N as f64;
+    let snapshot = seq.snapshot();
+    let message = &snapshot.messages[0];
+    let held = std::mem::size_of::<OpenMessage>()
+        + message
+            .content
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Text { text } => text.capacity(),
+                _ => 0,
+            })
+            .sum::<usize>()
+        + message.content.capacity() * std::mem::size_of::<ContentBlock>()
+        + message.id.0.capacity();
+    eprintln!(
+        "SEQ|COST| record+committed per chunk {per:.0} ns (Event::update alone {base:.0} ns); \
+         OpenMessage fixed {} B; one open message with {} B of text holds {held} B",
+        std::mem::size_of::<OpenMessage>(),
+        message.bytes
+    );
+}
