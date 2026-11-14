@@ -277,7 +277,7 @@ async fn an_upload_resumes_from_the_committed_offset_and_checks_size_and_sum() {
     );
     // The file exists now: refused without overwrite or if_match.
     assert_eq!(
-        code(&c.upload_begin(begin("00")).await.unwrap_err()),
+        code(&c.upload_begin(begin(&"0".repeat(64))).await.unwrap_err()),
         "exists"
     );
     // A wrong checksum: the commit fails and the file stays as it was.
@@ -507,6 +507,20 @@ async fn paths_never_leave_the_sessions_folder() {
         ] {
             assert_eq!(code(&error), "invalid_path", "{what}: {error}");
         }
+        // Existence through the link is not told: refused as a path out,
+        // not `exists`.
+        let begun = c
+            .upload_begin(UploadBeginParams {
+                session: s.clone(),
+                path: "out/secret".into(),
+                size: 1,
+                sha256: None,
+                if_match: None,
+                overwrite: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&begun), "invalid_path", "{begun}");
         // The link itself: stat shows a link; delete removes the link only.
         assert_eq!(
             c.stat(path(&s, "out")).await.unwrap().kind,
@@ -567,6 +581,47 @@ async fn protected_paths_and_deny_rules_hold_for_the_file_panel() {
         "refused"
     );
     assert!(f.ws.join(".git/config").exists());
+    // A folder change takes nothing with it that the user could not change.
+    std::fs::create_dir_all(f.ws.join("proj/.git")).unwrap();
+    std::fs::write(f.ws.join("proj/.git/HEAD"), "ref").unwrap();
+    std::fs::create_dir_all(f.ws.join("box/inner")).unwrap();
+    std::fs::write(f.ws.join("box/inner/locked.txt"), "l").unwrap();
+    for (what, error) in [
+        (
+            "delete proj",
+            c.delete(FilesDeleteParams {
+                session: s.clone(),
+                path: "proj".into(),
+                recursive: true,
+            })
+            .await
+            .unwrap_err(),
+        ),
+        (
+            "rename proj",
+            sw(&c)
+                .rename(FilesRenameParams {
+                    session: s.clone(),
+                    from: "proj".into(),
+                    to: "proj2".into(),
+                })
+                .await
+                .unwrap_err(),
+        ),
+        (
+            "delete box",
+            c.delete(FilesDeleteParams {
+                session: s.clone(),
+                path: "box".into(),
+                recursive: true,
+            })
+            .await
+            .unwrap_err(),
+        ),
+    ] {
+        assert_eq!(code(&error), "refused", "{what}: {error}");
+    }
+    assert!(f.ws.join("proj/.git/HEAD").exists() && f.ws.join("box/inner/locked.txt").exists());
     // Reading `.git` is a read; a read deny rule hides and refuses.
     download(&c, &s, ".git/config", 1024).await;
     let read = c
@@ -812,6 +867,17 @@ async fn another_caller_gets_session_not_found_and_cannot_use_an_upload_id() {
         .await
         .unwrap();
     assert_eq!(status.committed, 0);
+    // An in-process call may use the Session, but it is not the owner.
+    let internal = SessionWorkspace::upload_status(
+        &*f.rt,
+        UploadParams {
+            session: s.clone(),
+            upload: up.clone(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code(&internal), "unknown_upload");
     // A guessed id on the owner's own Session is unknown.
     let guess = host
         .upload_status(UploadParams {

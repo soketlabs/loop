@@ -1127,6 +1127,29 @@ impl ToolGate {
             .await
     }
 
+    /// Whether a write or delete of `path` would pass
+    /// [`Self::check_user_file_action`], without a record: for the entries
+    /// inside a folder that a recursive delete or a rename takes with it,
+    /// after the folder's own action was decided and recorded. An "ask"
+    /// passes (the user approved the folder's action); a refusal, a
+    /// protected path and a path the gate cannot resolve do not.
+    pub async fn user_file_write_allowed(&self, path: &std::path::Path) -> Result<(), String> {
+        let args = serde_json::json!({ "path": path.to_string_lossy() });
+        if let Decision::Deny(reason) = self.verdict("write", &args).await.decision {
+            return Err(reason);
+        }
+        let protected = self
+            .with_call("write", &args, |call| {
+                git_or_loop(&call.paths, path, &call.workspace)
+            })
+            .await
+            .unwrap_or(true);
+        if protected {
+            return Err("it holds a `.git` or `.loop` entry".to_owned());
+        }
+        Ok(())
+    }
+
     /// The Policy check to open a terminal for the user
     /// (`session/terminal/open`). The tool lock, the sandbox and the
     /// outside-user refusal come before it.

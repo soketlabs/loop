@@ -62,9 +62,9 @@ Rules:
 - **Listing.** Entries come in name order. The cursor is the last name of
   the page. An entry that a `read` or `ls` deny rule hides, or (under the
   tool lock) an entry that leads out of the folder or has more than one hard
-  link, is left out and counted in `hidden`. `mtime_ms` is absent today: the
-  Workspace contract has no time stamp yet. `tag` is absent in a listing; use
-  `stat`.
+  link, is left out and counted in `hidden`. `mtime_ms` comes from the env's
+  `file_identity` (absent when the env cannot tell). `tag` is absent in a
+  listing; use `stat`.
 - **Paths.** `..` above the root, an absolute path, a NUL byte, a backslash
   and a drive prefix are refused with `invalid_path` before any work. A path
   whose folder leads out of the Session's folder through a link is refused
@@ -72,6 +72,14 @@ Rules:
   env; read and upload: checked by descriptor in the driver).
 - **Delete** removes a link, not its target. A folder that is not empty needs
   `recursive: true`.
+- **Folders.** A recursive delete or the rename of a folder first walks the
+  folder (links not followed, at most 10 000 entries). An entry that the user
+  could not change on its own (a deny rule, `.git`, `.loop`) refuses the
+  whole call.
+- **Order of checks.** Path syntax, containment, the gate, and only then
+  whether the target exists. So a refused path never tells whether a file is
+  there. (A missing folder on the way inside the Session's folder is still
+  `not_found` before the gate.)
 - **Rename** works only for a Workspace whose paths are host paths: the
   contract has no rename yet (follow-up: `FileSystem::rename`). Another
   Workspace gives `Unsupported`.
@@ -103,9 +111,14 @@ Rules:
   for a reader that keeps up. `dropped` stands for the events that this
   reader lost; its `seq` is the last lost one, so the next event has the next
   `seq`. `exit` is the last event.
-- **Input order.** The server runs `input`, `resize` and `signal` of one
-  connection in the order they arrive, on one queue (256 requests; more are
-  refused with `Busy`).
+- **Input order.** The server runs `input` and `resize` of one connection in
+  the order they arrive, on one queue (256 requests; more are refused with
+  `Busy`). A `signal` does not wait in that queue, so a stuck write never
+  holds up a kill. Ctrl-C typed as input (byte 3) keeps its place.
+- **Limits at the same time.** An open takes its slot under the same lock as
+  the count, so calls at the same time cannot pass a limit together.
+- **Shared Runtime only.** Terminals and uploads need the Runtime's sweep
+  task, which only a shared Runtime runs; otherwise they are `Unsupported`.
 - **Detach and close.** `detach` (or a lost connection) stops this
   connection's stream only. The terminal runs on and its output stays in the
   ring buffer (1 MiB). `close` stops the process tree and removes the
@@ -307,7 +320,7 @@ checks that.
 
 | Gap | Follow-up |
 |---|---|
-| No rename and no time stamp in the Workspace contract | Add `FileSystem::rename` and `mtime` to `FileInfo` (C4 owner) |
+| No rename in the Workspace contract; the time stamp costs one more env call per entry | Add `FileSystem::rename` and `mtime` to `FileInfo` (C4 owner) |
 | List, stat, delete, mkdir check containment by path, not by descriptor: a folder swapped for a link during the call is a race | Descriptor-checked versions in the driver |
 | Sandbox on: no files, no terminal | C4a and C4b |
 | A transport made outside `loop-wire` (an unbounded channel given to `Transport`) cannot tell its backlog, so back-pressure there uses the connection queue only. `lines` (Unix socket), `memory` and the WebSocket count theirs | — |

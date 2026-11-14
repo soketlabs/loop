@@ -52,6 +52,8 @@ const SWEEP: Duration = Duration::from_millis(250);
 /// An upload no call touched for this long is forgotten (the `host`
 /// driver expires it after 10 minutes too).
 const UPLOAD_IDLE: Duration = Duration::from_secs(600);
+/// Most entries a recursive delete or a folder rename checks.
+const SUBTREE_MAX: usize = 10_000;
 /// How long a close waits for the process tree to end after the kill.
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
 
@@ -63,6 +65,75 @@ pub(super) struct WorkspaceIo {
     terminals: Mutex<HashMap<String, Arc<Terminal>>>,
     /// The sweep task runs.
     sweeping: AtomicBool,
+    /// Slots taken by opens and upload begins still running, so that
+    /// calls at the same time cannot pass a count limit together.
+    opening: Mutex<HashMap<u64, Reserved>>,
+    next_slot: std::sync::atomic::AtomicU64,
+}
+
+/// What a running open or upload begin holds a slot for.
+#[derive(Clone)]
+struct Reserved {
+    session: SessionKey,
+    owner: Option<Caller>,
+    terminal: bool,
+}
+
+/// A slot of [`WorkspaceIo::opening`]; dropping it frees the slot.
+struct Slot<'a> {
+    io: &'a WorkspaceIo,
+    id: u64,
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        lock(&self.io.opening).remove(&self.id);
+    }
+}
+
+impl WorkspaceIo {
+    /// Count the open terminals (or uploads) of `session` and of `owner`,
+    /// with the slots of calls still running, and take a slot when both
+    /// are below the limits. One lock: two calls never both pass.
+    fn reserve(
+        &self,
+        terminal: bool,
+        session: &SessionKey,
+        owner: &Option<Caller>,
+        per_session: usize,
+        per_owner: usize,
+    ) -> Option<Slot<'_>> {
+        let mut opening = lock(&self.opening);
+        let (mut here, mut mine) = (0, 0);
+        if terminal {
+            for t in lock(&self.terminals).values() {
+                here += usize::from(&t.session == session);
+                mine += usize::from(same_owner(&t.owner, owner));
+            }
+        } else {
+            for u in lock(&self.uploads).values() {
+                here += usize::from(&u.session == session);
+                mine += usize::from(same_owner(&u.owner, owner));
+            }
+        }
+        for r in opening.values().filter(|r| r.terminal == terminal) {
+            here += usize::from(&r.session == session);
+            mine += usize::from(same_owner(&r.owner, owner));
+        }
+        if here >= per_session || mine >= per_owner {
+            return None;
+        }
+        let id = self.next_slot.fetch_add(1, Ordering::AcqRel);
+        opening.insert(
+            id,
+            Reserved {
+                session: session.clone(),
+                owner: owner.clone(),
+                terminal,
+            },
+        );
+        Some(Slot { io: self, id })
+    }
 }
 
 /// One upload, owned by `owner` in `session`.
@@ -188,7 +259,9 @@ impl Target {
         self.gate()
             .check_user_file_action(action, native, self.record_session(), self.caller.clone())
             .await
-            .map_err(|refused| BackendError::workspace(Code::Refused, refused.0))
+            .map_err(|refused| {
+                BackendError::workspace(Code::Refused, scrub(&refused.0, &self.root))
+            })
     }
 
     /// A driver error as the client sees it, without host paths.
@@ -229,6 +302,56 @@ impl Target {
                 Ok(real) if !real.starts_with(&root) => return Err(outside()),
                 Ok(_) => {}
                 Err(error) => return Err(self.error(error.into())),
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a folder change that would take with it an entry the gate
+    /// would not let the user change itself (a deny rule, `.git`, `.loop`).
+    /// Walks the folder without following links, at most
+    /// [`SUBTREE_MAX`] entries.
+    async fn subtree_allowed(&self, folder: &Path, raw: &str) -> BackendResult<()> {
+        let mut todo = vec![folder.to_path_buf()];
+        let mut seen = 0usize;
+        while let Some(dir) = todo.pop() {
+            let entries = self
+                .env
+                .list_dir(&dir)
+                .await
+                .map_err(|e| self.error(e.into()))?;
+            for entry in entries {
+                seen += 1;
+                if seen > SUBTREE_MAX {
+                    return Err(BackendError::workspace(
+                        Code::Refused,
+                        format!(
+                            "`{raw}` holds more than {SUBTREE_MAX} entries; Loop does not \
+                             check that many, so use a terminal"
+                        ),
+                    ));
+                }
+                if let Err(reason) = self.gate().user_file_write_allowed(&entry.path).await {
+                    let inner = WorkspacePath::from_native(&self.root, &entry.path)
+                        .map(|p| p.as_str().to_owned())
+                        .unwrap_or_default();
+                    return Err(BackendError::workspace(
+                        Code::Refused,
+                        scrub(
+                            &format!("`{raw}` holds `{inner}`, which cannot be changed: {reason}"),
+                            &self.root,
+                        ),
+                    ));
+                }
+                let kind = self
+                    .env
+                    .symlink_metadata(&entry.path)
+                    .await
+                    .map(|m| m.kind)
+                    .map_err(|e| self.error(e.into()))?;
+                if kind == PathKind::Dir {
+                    todo.push(entry.path);
+                }
             }
         }
         Ok(())
@@ -355,6 +478,13 @@ fn unknown_terminal() -> BackendError {
 fn decode(data: &str) -> BackendResult<Vec<u8>> {
     base64::decode(data)
         .map_err(|e| BackendError::failed(loop_protocol::ErrorCategory::Protocol, e.to_string()))
+}
+
+/// The last change of `native` (without following a final link), when the
+/// env can tell.
+async fn mtime_ms(env: &dyn loop_agent::harness::ExecutionEnv, native: &Path) -> Option<u64> {
+    let identity = env.file_identity(native).await.ok()??;
+    u64::try_from(identity.mtime_ns? / 1_000_000).ok()
 }
 
 fn kind_of(kind: PathKind) -> FileKind {
@@ -514,12 +644,13 @@ impl Runtime {
                 Err(_) if info.is_file => (FileKind::File, info.size),
                 Err(_) => (FileKind::Other, info.size),
             };
+            let mtime_ms = mtime_ms(&*target.env, &info.path).await;
             entries.push(FileEntry {
                 name,
                 path: entry_path,
                 kind,
                 size: if kind == FileKind::Dir { 0 } else { size },
-                mtime_ms: None,
+                mtime_ms,
                 tag: None,
             });
         }
@@ -573,7 +704,7 @@ impl Runtime {
             path: path.as_str().to_owned(),
             kind,
             size: if kind == FileKind::Dir { 0 } else { meta.size },
-            mtime_ms: None,
+            mtime_ms: mtime_ms(&*target.env, &native).await,
             tag,
         })
     }
@@ -612,6 +743,7 @@ impl Runtime {
         self.check(&params.session, Need::Write).await?;
         self.refuse_if_locked("session/files/upload_begin")?;
         let target = self.target(&params.session, Need::Write).await?;
+        self.need_sweep()?;
         let (path, native) = target.below_root(&params.path, "upload to")?;
         let limits = self.workspace_limits();
         if params.size > limits.upload_bytes {
@@ -623,11 +755,13 @@ impl Runtime {
                 ),
             ));
         }
-        let mine = lock(&self.workspace_io.uploads)
-            .values()
-            .filter(|upload| same_owner(&upload.owner, &caller))
-            .count();
-        if mine >= limits.uploads_per_caller as usize {
+        let Some(_slot) = self.workspace_io.reserve(
+            false,
+            &params.session.key,
+            &caller,
+            usize::MAX,
+            limits.uploads_per_caller as usize,
+        ) else {
             return Err(BackendError::workspace(
                 Code::Limit,
                 format!(
@@ -635,22 +769,9 @@ impl Runtime {
                     limits.uploads_per_caller
                 ),
             ));
-        }
-        if params.if_match.is_none() && !params.overwrite {
-            match target.env.symlink_metadata(&native).await {
-                Ok(_) => {
-                    return Err(BackendError::workspace(
-                        Code::Exists,
-                        format!(
-                            "`{}` exists; pass its tag as if_match, or overwrite",
-                            path.as_str()
-                        ),
-                    ))
-                }
-                Err(error) if error.code == FileErrorCode::NotFound => {}
-                Err(error) => return Err(target.error(error.into())),
-            }
-        }
+        };
+        // Containment (the driver checks the folders by descriptor at the
+        // begin), then the gate, and only then whether the file exists.
         target.allow(UserFileAction::Write, &native).await?;
         let driver = target
             .workspace
@@ -658,12 +779,30 @@ impl Runtime {
                 path: path.clone(),
                 size: params.size,
                 sha256: params.sha256,
-                if_match: params.if_match.map(FileTag),
+                if_match: params.if_match.clone().map(FileTag),
                 // 0644: an upload never gets an execute bit.
                 mode: None,
             })
             .await
             .map_err(|e| target.error(e))?;
+        if params.if_match.is_none() && !params.overwrite {
+            let exists = match target.env.symlink_metadata(&native).await {
+                Ok(_) => Ok(true),
+                Err(error) if error.code == FileErrorCode::NotFound => Ok(false),
+                Err(error) => Err(target.error(error.into())),
+            };
+            if !matches!(exists, Ok(false)) {
+                let _ = target.workspace.upload_abort(&driver).await;
+                exists?;
+                return Err(BackendError::workspace(
+                    Code::Exists,
+                    format!(
+                        "`{}` exists; pass its tag as if_match, or overwrite",
+                        path.as_str()
+                    ),
+                ));
+            }
+        }
         let id = new_id("up");
         lock(&self.workspace_io.uploads).insert(
             id.clone(),
@@ -678,7 +817,6 @@ impl Runtime {
                 touched: Mutex::new(Instant::now()),
             }),
         );
-        self.start_sweep();
         Ok(UploadBeginResult {
             upload: id,
             chunk_max: limits.chunk_bytes,
@@ -828,11 +966,15 @@ impl Runtime {
         let target = self.target(&params.session, Need::Write).await?;
         let (_, native) = target.below_root(&params.path, "delete")?;
         target.contained(&native, false).await?;
+        target.allow(UserFileAction::Delete, &native).await?;
         let meta = target
             .env
             .symlink_metadata(&native)
             .await
             .map_err(|e| target.error(e.into()))?;
+        if meta.kind == PathKind::Dir && params.recursive {
+            target.subtree_allowed(&native, &params.path).await?;
+        }
         if meta.kind == PathKind::Dir && !params.recursive {
             let entries = target
                 .env
@@ -846,7 +988,6 @@ impl Runtime {
                 ));
             }
         }
-        target.allow(UserFileAction::Delete, &native).await?;
         // A link goes, never its target. `remove` follows a final link to
         // learn the kind, so a host link (also a dangling one) is removed
         // directly.
@@ -877,11 +1018,16 @@ impl Runtime {
         let (_, to) = target.below_root(&params.to, "rename to")?;
         target.contained(&from, false).await?;
         target.contained(&to, false).await?;
-        target
+        target.allow(UserFileAction::Write, &from).await?;
+        target.allow(UserFileAction::Write, &to).await?;
+        let meta = target
             .env
             .symlink_metadata(&from)
             .await
             .map_err(|e| target.error(e.into()))?;
+        if meta.kind == PathKind::Dir {
+            target.subtree_allowed(&from, &params.from).await?;
+        }
         match target.env.symlink_metadata(&to).await {
             Ok(_) => {
                 return Err(BackendError::workspace(
@@ -892,8 +1038,6 @@ impl Runtime {
             Err(error) if error.code == FileErrorCode::NotFound => {}
             Err(error) => return Err(target.error(error.into())),
         }
-        target.allow(UserFileAction::Write, &from).await?;
-        target.allow(UserFileAction::Write, &to).await?;
         // Host namespace: the env's paths are host paths.
         tokio::fs::rename(&from, &to)
             .await
@@ -907,6 +1051,7 @@ impl Runtime {
         let target = self.target(&params.session, Need::Write).await?;
         let (_, native) = target.below_root(&params.path, "make")?;
         target.contained(&native, false).await?;
+        target.allow(UserFileAction::Write, &native).await?;
         let parent = native.parent().unwrap_or(&target.root);
         let parent_meta = target
             .env
@@ -929,7 +1074,6 @@ impl Runtime {
             Err(error) if error.code == FileErrorCode::NotFound => {}
             Err(error) => return Err(target.error(error.into())),
         }
-        target.allow(UserFileAction::Write, &native).await?;
         target
             .env
             .create_dir(&native)
@@ -957,35 +1101,31 @@ impl Runtime {
                 "cols and rows must be at least 1",
             ));
         }
+        self.need_sweep()?;
         let limits = self.workspace_limits();
-        {
-            let terminals = lock(&self.workspace_io.terminals);
-            let here = terminals
-                .values()
-                .filter(|t| t.session == params.session.key)
-                .count();
-            let mine = terminals
-                .values()
-                .filter(|t| same_owner(&t.owner, &caller))
-                .count();
-            if here >= limits.terminals_per_session as usize
-                || mine >= limits.terminals_per_caller as usize
-            {
-                return Err(BackendError::workspace(
-                    Code::Limit,
-                    format!(
-                        "too many terminals: at most {} per Session and {} per user; close one",
-                        limits.terminals_per_session, limits.terminals_per_caller
-                    ),
-                ));
-            }
-        }
+        let Some(_slot) = self.workspace_io.reserve(
+            true,
+            &params.session.key,
+            &caller,
+            limits.terminals_per_session as usize,
+            limits.terminals_per_caller as usize,
+        ) else {
+            return Err(BackendError::workspace(
+                Code::Limit,
+                format!(
+                    "too many terminals: at most {} per Session and {} per user; close one",
+                    limits.terminals_per_session, limits.terminals_per_caller
+                ),
+            ));
+        };
         let id = new_id("term");
         target
             .gate()
             .check_user_terminal(&id, target.record_session(), caller.clone())
             .await
-            .map_err(|refused| BackendError::workspace(Code::Refused, refused.0))?;
+            .map_err(|refused| {
+                BackendError::workspace(Code::Refused, scrub(&refused.0, &target.root))
+            })?;
         let cwd = WorkspacePath::from_native(&target.root, &target.live.opened.harness.cwd())
             .unwrap_or_else(|_| WorkspacePath::root());
         let command = params
@@ -1019,7 +1159,6 @@ impl Runtime {
             closed: AtomicBool::new(false),
         });
         lock(&self.workspace_io.terminals).insert(id.clone(), terminal);
-        self.start_sweep();
         Ok(TerminalOpenResult {
             terminal: id,
             cwd: cwd.as_str().to_owned(),
@@ -1309,14 +1448,17 @@ impl Runtime {
         }
     }
 
-    /// Start the sweep task once (a shared Runtime only).
-    fn start_sweep(&self) {
+    /// Start the sweep task once. Only a shared Runtime can run it; without
+    /// it no terminal or upload would end with its Session, so none opens.
+    fn need_sweep(&self) -> BackendResult<()> {
         if self.workspace_io.sweeping.swap(true, Ordering::AcqRel) {
-            return;
+            return Ok(());
         }
         let Some(me) = self.me.get().cloned() else {
             self.workspace_io.sweeping.store(false, Ordering::Release);
-            return;
+            return Err(BackendError::Unsupported(
+                "terminals and uploads need a shared Runtime".into(),
+            ));
         };
         tokio::spawn(async move {
             loop {
@@ -1327,6 +1469,7 @@ impl Runtime {
                 runtime.sweep().await;
             }
         });
+        Ok(())
     }
 
     /// Whether `live` is still the loaded instance of its Session.

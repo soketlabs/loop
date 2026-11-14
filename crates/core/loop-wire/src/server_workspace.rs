@@ -30,13 +30,13 @@ pub(super) fn serves(method: &str) -> bool {
 }
 
 /// Requests that keep their order on one connection: what the user types
-/// and the size and signals between the keys.
+/// and the size changes between the keys. A signal does not wait behind
+/// them (a stuck write must not hold up Ctrl-C or a kill); Ctrl-C typed as
+/// input keeps its place.
 pub(super) fn ordered(method: &str) -> bool {
     matches!(
         method,
-        methods::SESSION_TERMINAL_INPUT
-            | methods::SESSION_TERMINAL_RESIZE
-            | methods::SESSION_TERMINAL_SIGNAL
+        methods::SESSION_TERMINAL_INPUT | methods::SESSION_TERMINAL_RESIZE
     )
 }
 

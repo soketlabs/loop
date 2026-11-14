@@ -219,13 +219,21 @@ async fn a_new_connection_re_attaches_by_seq() {
     // The client goes away; the terminal runs on, detached.
     drop(feed);
     first.disconnect();
-    tokio::time::sleep(Duration::from_millis(200)).await;
     let second = client(&f.rt, None).await;
-    let listed = sw(&second)
-        .terminal_list(SessionParams { session: s.clone() })
-        .await
-        .unwrap();
-    assert_eq!(listed.terminals[0].attached, 0);
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let listed = sw(&second)
+                .terminal_list(SessionParams { session: s.clone() })
+                .await
+                .unwrap();
+            if listed.terminals[0].attached == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the stream of the lost connection ends");
     type_in(&second, &s, &t, "echo two-$((1+1))\n").await;
     let feed = attach(&second, &s, &t, cursor).await;
     let mut after = Seen {
@@ -493,7 +501,8 @@ async fn terminal_bytes_never_reach_the_event_log() {
     f.rt.shutdown().await;
     let log = log_text(&f.log).await;
     assert!(!log.contains("MARK77319902"), "terminal output in the log");
-    assert!(!log.contains("7731"), "typed text in the log");
+    assert!(!log.contains("MARK"), "typed text in the log");
+    assert!(!log.contains("printf"), "typed text in the log");
     assert!(log.contains("user_terminal"), "{log}");
 }
 
@@ -634,5 +643,75 @@ async fn a_slow_client_gets_a_dropped_count_and_others_are_not_touched() {
         .await
         .unwrap();
     answer(&mut lines, 5).await;
+    finish(f).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opens_at_the_same_time_cannot_pass_the_limit() {
+    let f = runtime(Options::default()).await;
+    f.rt.set_workspace_limits(SessionWorkspaceLimits {
+        terminals_per_session: 2,
+        ..SessionWorkspaceLimits::default()
+    });
+    let c = client(&f.rt, None).await;
+    let s = new_session(&c, &f.ws).await;
+    let opens = (0..20).map(|_| {
+        sw(&c).terminal_open(TerminalOpenParams {
+            session: s.clone(),
+            cols: 80,
+            rows: 24,
+            command: Some("sleep 300".into()),
+        })
+    });
+    let results = futures::future::join_all(opens).await;
+    let opened = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(opened, 2, "{results:?}");
+    for refused in results.iter().filter_map(|r| r.as_ref().err()) {
+        assert_eq!(code(refused), "limit");
+    }
+    finish(f).await;
+}
+
+/// The terminal gets the Session's tool environment: the caller's
+/// variables without provider keys and Runtime tokens. With no command it
+/// runs the user's shell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_gets_the_tool_environment_and_the_users_shell() {
+    use loop_protocol::AgentBackend;
+    let f = runtime(Options::default()).await;
+    let c = client(&f.rt, None).await;
+    let env: std::collections::BTreeMap<String, String> = [
+        ("PATH", std::env::var("PATH").unwrap_or_default().as_str()),
+        ("SHELL", "/bin/sh"),
+        ("PS1", "$ "),
+        ("LOOP_RUNTIME_TOKEN", "tok-secret-1"),
+        ("ANTHROPIC_API_KEY", "key-secret-2"),
+        ("PLAIN_VAR", "plain-value-3"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    let s = c
+        .new_session(loop_protocol::SessionSpec {
+            cwd: Some(f.ws.clone()),
+            env: Some(env),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let t = open(&c, &s, None).await;
+    let feed = attach(&c, &s, &t, 0).await;
+    let mut seen = Seen::default();
+    type_in(
+        &c,
+        &s,
+        &t,
+        "echo \"A=$LOOP_RUNTIME_TOKEN B=$ANTHROPIC_API_KEY C=$PLAIN_VAR T=$TERM\" | tr a-z A-Z\n",
+    )
+    .await;
+    until(&*feed, &mut seen, |text| text.contains("C=PLAIN-VALUE-3")).await;
+    assert!(!seen.text.contains("TOK-SECRET"), "{}", seen.text);
+    assert!(!seen.text.contains("KEY-SECRET"), "{}", seen.text);
+    assert!(seen.text.contains("T=XTERM-256COLOR"), "{}", seen.text);
     finish(f).await;
 }
