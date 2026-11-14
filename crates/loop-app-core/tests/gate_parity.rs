@@ -9,18 +9,30 @@
 //! from the gate before it moved onto the execution env. Set
 //! `LOOP_GATE_GOLDEN_WRITE=1` to record them again. A platform without a
 //! golden file still runs the comparisons between the code paths.
+//!
+//! The same cases then run through [`GatePaths`]: over the host env (the
+//! lines must be the recorded ones), and over [`VirtualEnv`], whose root is
+//! not on the host (the lines must be the same, with the virtual root as
+//! `$ROOT`): every fact the gate used came from the env.
 #![cfg(unix)]
+
+#[path = "../../loop-agent/tests/support/virtual_env.rs"]
+mod virtual_env;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use loop_agent::harness::sandbox::PathNamespace;
+use loop_agent::harness::HostExecutionEnv;
 use loop_app_core::permissions::tool_lock::{Confinement, ToolLock};
 use loop_app_core::permissions::{
-    search_may_show_in, Call, Decision, PermissionMode, Policy, ToolPermission, Verdict,
+    search_may_show_in, search_may_show_with, Call, Decision, GatePaths, PermissionMode, Policy,
+    ToolPermission, Verdict,
 };
 use loop_app_core::tool_gate::ToolGate;
 use serde_json::json;
+use virtual_env::{VirtualEnv, VIRTUAL_ROOT};
 
 /// The fixture tree.
 struct Tree {
@@ -269,22 +281,47 @@ fn sync_line(case: &Case, roots: &[&Path]) -> String {
     line(&case.id, &verdict, roots)
 }
 
-/// What a search tool may show, for walked paths, as lines.
-fn search_lines(root: &Path, raw: &Path) -> Vec<String> {
-    let walked = [
-        "repo/src/a.rs",
-        "repo/link-src/a.rs",
-        "repo/sec/key",
-        "repo/svc/secrets/key",
-        "repo/svc/sec-link/key",
-        "repo/svc/.env",
-        "repo/.env",
-        "repo/~/x",
-        "repo/hard",
-        "repo/loop1",
-        "home/.ssh/id",
-        "home/.secret/key",
-    ];
+/// The same decision through `paths` (the env), with every fact from it.
+async fn env_line(paths: &GatePaths, case: &Case, roots: &[&Path]) -> String {
+    let kind = loop_agent::protocol_events::tool_kind(case.tool);
+    let verdict = paths
+        .run(|facts| {
+            let call = Call {
+                home: Some(case.home.clone()),
+                ..Call::resolve_with(
+                    facts,
+                    case.tool,
+                    kind,
+                    &case.args,
+                    &case.workspace,
+                    &case.cwd,
+                )
+            };
+            Policy::default().decide_why(case.mode, &case.rules, &call)
+        })
+        .await;
+    line(&case.id, &verdict, roots)
+}
+
+/// Walked paths for the search filter, below the root.
+const WALKED: [&str; 12] = [
+    "repo/src/a.rs",
+    "repo/link-src/a.rs",
+    "repo/sec/key",
+    "repo/svc/secrets/key",
+    "repo/svc/sec-link/key",
+    "repo/svc/.env",
+    "repo/.env",
+    "repo/~/x",
+    "repo/hard",
+    "repo/loop1",
+    "home/.ssh/id",
+    "home/.secret/key",
+];
+
+/// What a search tool may show, for walked paths, as lines: on the Runtime
+/// host, or through `paths`.
+async fn search_lines(root: &Path, raw: &Path, paths: Option<&GatePaths>) -> Vec<String> {
     let mut out = Vec::new();
     for (set, entries) in rule_sets() {
         let mut settings = BTreeMap::new();
@@ -297,17 +334,38 @@ fn search_lines(root: &Path, raw: &Path) -> Vec<String> {
             let cwd = root.join(cwd_rel);
             let home = root.join("home");
             for tool in ["grep", "glob", "ls"] {
-                for walked in walked {
-                    let shown = search_may_show_in(
-                        &rules,
-                        tool,
-                        &root.join(walked),
-                        &workspace,
-                        &cwd,
-                        &[],
-                        Some(&home),
-                    );
-                    out.push(format!("search|{set}|{cwd_name}|{tool}|{walked} => {shown}"));
+                for walked in WALKED {
+                    let path = root.join(walked);
+                    let shown = match paths {
+                        None => search_may_show_in(
+                            &rules,
+                            tool,
+                            &path,
+                            &workspace,
+                            &cwd,
+                            &[],
+                            Some(&home),
+                        ),
+                        Some(paths) => {
+                            paths
+                                .run(|facts| {
+                                    search_may_show_with(
+                                        facts,
+                                        &rules,
+                                        tool,
+                                        &path,
+                                        &workspace,
+                                        &cwd,
+                                        &[],
+                                        Some(&home),
+                                    )
+                                })
+                                .await
+                        }
+                    };
+                    out.push(format!(
+                        "search|{set}|{cwd_name}|{tool}|{walked} => {shown}"
+                    ));
                 }
             }
         }
@@ -362,7 +420,11 @@ async fn swapped_lines(root: &Path) -> Vec<String> {
     )];
     std::fs::rename(&folder, root.join("repo/svc-old")).unwrap();
     std::os::unix::fs::symlink(root.join("outside"), &folder).unwrap();
-    out.push(line("swap|after", &gate.verdict("read", &args).await, &[root]));
+    out.push(line(
+        "swap|after",
+        &gate.verdict("read", &args).await,
+        &[root],
+    ));
     let filter = gate.search_filter();
     out.push(format!(
         "swap-search|after => {}",
@@ -436,7 +498,7 @@ async fn all_lines(tree: &Tree) -> Vec<String> {
     let cases = cases(&tree.root, &tree.raw);
     let mut lines: Vec<String> = cases.iter().map(|c| sync_line(c, &roots)).collect();
     lines.extend(gate_lines(&cases, &roots).await);
-    lines.extend(search_lines(&tree.root, &tree.raw));
+    lines.extend(search_lines(&tree.root, &tree.raw, None).await);
     lines.extend(lock_lines(&tree.root).await);
     lines.extend(swapped_lines(&tree.root).await);
     lines
@@ -448,4 +510,81 @@ async fn gate_path_decisions_match_the_recorded_ones() {
     let lines = all_lines(&tree).await;
     assert!(lines.len() > 5000, "{} lines", lines.len());
     check_golden(&lines);
+}
+
+/// The host env gives every decision the sync code gives (and so the
+/// recorded one).
+#[tokio::test]
+async fn decisions_through_the_host_env_match() {
+    let tree = tree();
+    let roots = [tree.root.as_path(), tree.raw.as_path()];
+    let paths = GatePaths::new(
+        Arc::new(HostExecutionEnv::new(&tree.root)),
+        PathNamespace::Host,
+    );
+    let mut differ = Vec::new();
+    for case in cases(&tree.root, &tree.raw) {
+        let want = sync_line(&case, &roots);
+        let got = env_line(&paths, &case, &roots).await;
+        if want != got {
+            differ.push(format!("want {want}\n got {got}"));
+        }
+    }
+    let want = search_lines(&tree.root, &tree.raw, None).await;
+    let got = search_lines(&tree.root, &tree.raw, Some(&paths)).await;
+    for (w, g) in want.iter().zip(&got) {
+        if w != g {
+            differ.push(format!("want {w}\n got {g}"));
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{}:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+}
+
+/// An env whose root is not on the host gives the same decisions: every
+/// link, `..` and existence fact came from the env.
+#[tokio::test]
+async fn decisions_through_a_virtual_root_match() {
+    let tree = tree();
+    let real_roots = [tree.root.as_path(), tree.raw.as_path()];
+    let expected: BTreeMap<String, String> = cases(&tree.root, &tree.raw)
+        .iter()
+        .map(|case| (case.id.clone(), sync_line(case, &real_roots)))
+        .collect();
+    let env = Arc::new(VirtualEnv::new(&tree.root));
+    let paths = GatePaths::new(env.clone(), PathNamespace::Guest);
+    let virt = Path::new(VIRTUAL_ROOT);
+    let mut differ = Vec::new();
+    let mut checked = 0;
+    for case in cases(virt, virt) {
+        if case.host_only || case.id.contains("|raw|") {
+            continue;
+        }
+        checked += 1;
+        let got = env_line(&paths, &case, &[virt]).await;
+        let want = &expected[&case.id];
+        if *want != got {
+            differ.push(format!("want {want}\n got {got}"));
+        }
+    }
+    assert!(checked > 3000, "{checked}");
+    let want = search_lines(&tree.root, &tree.root, None).await;
+    let got = search_lines(virt, virt, Some(&paths)).await;
+    for (w, g) in want.iter().zip(&got) {
+        if w != g {
+            differ.push(format!("want {w}\n got {g}"));
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{}:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+    env.assert_no_leaks();
+    assert!(env.called("canonical_path") && env.called("read_link"));
 }

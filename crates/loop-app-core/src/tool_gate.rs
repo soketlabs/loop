@@ -42,8 +42,11 @@ use crate::permissions::decision::{
     self, DecidedBy, DecisionAnswer, DecisionOutcome, DecisionSink, DecisionSource,
     PolicyDecisionRecord,
 };
-use crate::permissions::{Call, Decision, LayerSource, PermissionMode, Policy, Verdict};
+use crate::permissions::{
+    Call, Decision, GatePaths, LayerSource, PathFacts, PermissionMode, Policy, Verdict,
+};
 use crate::tool_approval::{PlanReview, Review, ToolApprovalBridge, ToolPermission};
+use loop_agent::harness::sandbox::PathNamespace;
 use loop_protocol::Caller;
 
 /// Why a call that needs approval is refused when nobody can approve it,
@@ -109,6 +112,9 @@ pub struct ToolGate {
     /// Where the decision records go. `None` records nothing (a bare gate in
     /// tests); every Session the factory opens has one.
     decisions: Mutex<Option<Arc<dyn DecisionSink>>>,
+    /// Where path checks get their facts: the Session's Workspace env.
+    /// `None` uses the Runtime host's env ([`GatePaths::host`]).
+    paths: Mutex<Option<GatePaths>>,
 }
 
 /// What the gate decided about one call, before it is recorded.
@@ -295,6 +301,37 @@ impl ToolGate {
         gate
     }
 
+    /// Create a gate bound to a Session's Workspace env: every path check
+    /// gets its facts from `paths`. `cwd` is the Session's folder for a
+    /// host-namespace env; a guest env's own cwd is used instead. The git
+    /// root is found through the env.
+    pub async fn new_for_env(
+        permissions: BTreeMap<String, ToolPermission>,
+        cwd: &std::path::Path,
+        paths: GatePaths,
+    ) -> Arc<Self> {
+        let gate = Self::new(permissions);
+        let cwd = match paths.namespace() {
+            PathNamespace::Host => cwd.to_path_buf(),
+            _ => paths.env().cwd().to_path_buf(),
+        };
+        gate.set_workspace(paths.workspace_root(&cwd).await);
+        *gate.cwd.lock() = Some(cwd);
+        gate.set_paths(paths);
+        gate
+    }
+
+    /// Get path facts from `paths` from the next call on.
+    pub fn set_paths(&self, paths: GatePaths) {
+        *self.paths.lock() = Some(paths);
+        self.allowed.lock().clear();
+    }
+
+    /// Where path checks get their facts.
+    pub fn paths(&self) -> GatePaths {
+        self.paths.lock().clone().unwrap_or_else(GatePaths::host)
+    }
+
     /// Install the gate into `harness`'s tool slots and run its hooks.
     pub fn install(self: &Arc<Self>, harness: &Arc<AgentHarness>) {
         self.workspace
@@ -341,9 +378,9 @@ impl ToolGate {
 
     /// Whether a locked gate may let a read of `path` through: inside the
     /// stored folder and root. A locked gate without a confinement refuses.
-    fn locked_read_ok(&self, path: &std::path::Path) -> bool {
+    fn locked_read_ok(&self, facts: &PathFacts, path: &std::path::Path) -> bool {
         match self.confinement.get() {
-            Some(confined) => confined.allows(path),
+            Some(confined) => confined.allows_in(facts, path),
             None => false,
         }
     }
@@ -464,35 +501,60 @@ impl ToolGate {
 
     /// [`Self::decide`], with the step and the layer that decided.
     pub async fn verdict(&self, tool: &str, args: &serde_json::Value) -> Verdict {
-        if let Some(confined) = self.confinement.get() {
-            if confined.moved() {
-                return Verdict {
-                    decision: Decision::Deny(format!(
-                        "`{tool}` is refused: this Session's folder {} was moved or replaced \
-                         after the Session opened, so the tool lock refuses every call of \
-                         this Session. Open a new Session.",
-                        confined.folder().display()
-                    )),
-                    by: DecidedBy::Off,
-                    rule: None,
-                    layer: Some(LayerSource::Runtime),
-                };
+        let policy = self.effective_policy();
+        let mode = self.mode();
+        let rules = self.rules();
+        self.with_call(tool, args, |call| {
+            if let Some(confined) = &call.confinement {
+                if confined.moved_in(&call.paths) {
+                    return Verdict {
+                        decision: Decision::Deny(format!(
+                            "`{tool}` is refused: this Session's folder {} was moved or \
+                             replaced after the Session opened, so the tool lock refuses \
+                             every call of this Session. Open a new Session.",
+                            confined.folder().display()
+                        )),
+                        by: DecidedBy::Off,
+                        rule: None,
+                        layer: Some(LayerSource::Runtime),
+                    };
+                }
             }
-        }
-        let call = self.call(tool, args).await;
-        self.effective_policy()
-            .decide_why(self.mode(), &self.rules(), &call)
+            policy.decide_why(mode, &rules, call)
+        })
+        .await
     }
 
-    async fn call(&self, tool: &str, args: &serde_json::Value) -> Call {
+    /// Whether a Policy layer's "ask" holds for the call.
+    async fn requires_ask(&self, tool: &str, args: &serde_json::Value) -> bool {
+        let policy = self.effective_policy();
+        self.with_call(tool, args, |call| policy.requires_ask(call))
+            .await
+    }
+
+    /// Run `decide` on the call, with its path facts from the Session's
+    /// Workspace env ([`GatePaths::run`]). `decide` may run more than once.
+    async fn with_call<T>(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+        decide: impl Fn(&Call) -> T,
+    ) -> T {
         let workspace = self.workspace();
         let cwd = self.cwd(&workspace);
         let kind = self.kind(tool).await;
-        Call {
-            rule_bases: self.rule_bases.lock().clone(),
-            confinement: self.confinement.get().cloned(),
-            ..Call::resolve_in(tool, kind, args, &workspace, &cwd)
-        }
+        let bases = self.rule_bases.lock().clone();
+        let confinement = self.confinement.get().cloned();
+        self.paths()
+            .run(|facts| {
+                let call = Call {
+                    rule_bases: bases.clone(),
+                    confinement: confinement.clone(),
+                    ..Call::resolve_with(facts, tool, kind, args, &workspace, &cwd)
+                };
+                decide(&call)
+            })
+            .await
     }
 
     /// The directory the tools open relative paths against: the harness's
@@ -542,10 +604,13 @@ impl ToolGate {
         };
         let rules = self.rules();
         let workspace = self.workspace();
+        // An external agent runs on the Runtime host, in its own folder
+        // there: its paths are host paths.
+        let host = PathFacts::host();
         tools.iter().find_map(|tool| {
             let call = Call {
                 rule_bases: self.rule_bases.lock().clone(),
-                ..Call::resolve_in(tool, kind, args, &workspace, cwd)
+                ..Call::resolve_with(&host, tool, kind, args, &workspace, cwd)
             };
             let (rule, key) = crate::permissions::rule_and_key(&rules, &call);
             (rule.permission == ToolPermission::Deny).then(|| {
@@ -611,16 +676,21 @@ impl ToolGate {
             };
             let workspace = gate.workspace();
             let cwd = gate.cwd(&workspace);
+            // The filter cannot wait for the env (`SearchFilter` is sync):
+            // host facts for a host-namespace Session, none (fail closed)
+            // for a guest one.
+            let facts = gate.paths().sync_facts();
             // Under a tool lock every walked entry must resolve inside the
             // Session's folder: a symlink or hard link out is hidden, and a
             // walk never enters a linked folder outside.
-            if gate.tool_lock().is_some() && !gate.locked_read_ok(path) {
+            if gate.tool_lock().is_some() && !gate.locked_read_ok(&facts, path) {
                 return false;
             }
             let bases = gate.rule_bases.lock().clone();
-            // Not under the lock: matching reads the filesystem.
+            // Not under the lock: matching reads the file system.
             let rules = gate.rules();
-            crate::permissions::search_may_show_in(
+            crate::permissions::rules::search_may_show_with(
+                &facts,
                 &rules,
                 tool,
                 path,
@@ -1009,8 +1079,7 @@ impl ToolGate {
                 }
                 Some(ToolDecision::Allow) => {
                     // A Policy layer's "ask" holds even against a hook.
-                    let call = self.call(&ctx.tool_call.name, &ctx.args).await;
-                    if !self.effective_policy().requires_ask(&call) {
+                    if !self.requires_ask(&ctx.tool_call.name, &ctx.args).await {
                         return (None, Decided::allow(DecidedBy::Hook), true, None);
                     }
                 }
@@ -1036,8 +1105,7 @@ impl ToolGate {
                 (block(reason), decided, false, None)
             }
             Some(approver) => {
-                let call = self.call(&ctx.tool_call.name, &ctx.args).await;
-                let ignore_grants = self.effective_policy().requires_ask(&call);
+                let ignore_grants = self.requires_ask(&ctx.tool_call.name, &ctx.args).await;
                 let (result, review) = approver
                     .review_before_tool(ctx, cancel, ignore_grants)
                     .await;
@@ -1074,8 +1142,7 @@ impl ToolGate {
                 let allowed = gate.take_allowed(&ctx.tool_call, &ctx.args);
                 let patch = match gate.approver() {
                     Some(approver) if !allowed => {
-                        let call = gate.call(&ctx.tool_call.name, &ctx.args).await;
-                        let ignore_grants = gate.effective_policy().requires_ask(&call);
+                        let ignore_grants = gate.requires_ask(&ctx.tool_call.name, &ctx.args).await;
                         let (patch, answer) = approver
                             .review_after_file_tool(ctx.clone(), cancel, ignore_grants)
                             .await;

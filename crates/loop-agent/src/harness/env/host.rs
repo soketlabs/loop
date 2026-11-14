@@ -355,17 +355,22 @@ fn path_metadata(meta: &std::fs::Metadata) -> crate::harness::types::PathMetadat
         PathKind::Other
     };
     #[cfg(unix)]
-    let (uid, nlink) = {
+    let (uid, nlink, mode) = {
         use std::os::unix::fs::MetadataExt;
-        (Some(meta.uid()), Some(meta.nlink()))
+        (
+            Some(meta.uid()),
+            Some(meta.nlink()),
+            Some(meta.mode() & 0o7777),
+        )
     };
     #[cfg(not(unix))]
-    let (uid, nlink) = (None, None);
+    let (uid, nlink, mode) = (None, None, None);
     PathMetadata {
         kind,
         size: meta.len(),
         uid,
         nlink,
+        mode,
     }
 }
 

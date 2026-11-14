@@ -15,6 +15,7 @@
 //! shared crate would add a dependency edge.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -38,12 +39,17 @@ pub struct VirtualEnv {
     /// The same folder as the test spelled it (`/var/...` on macOS).
     raw: PathBuf,
     virt: PathBuf,
+    /// The env's cwd: the virtual root, or a folder below it ([`Self::at`]).
+    cwd: PathBuf,
     /// The system temp folder, as the host resolves it, and its virtual name.
     tmp_real: PathBuf,
     tmp_raw: PathBuf,
     tmp_virt: PathBuf,
     calls: Mutex<Vec<String>>,
     leaks: Mutex<Vec<String>>,
+    /// `symlink_metadata` answers set by the test, by virtual path. The
+    /// path need not exist (`/` or the virtual root itself).
+    reported: Mutex<HashMap<PathBuf, PathMetadata>>,
 }
 
 fn fold(path: &Path) -> PathBuf {
@@ -75,13 +81,32 @@ impl VirtualEnv {
             inner: HostExecutionEnv::new(&real),
             real,
             raw: dir.to_path_buf(),
+            cwd: virt.clone(),
             virt,
             tmp_real: std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir"),
             tmp_raw: std::env::temp_dir(),
             tmp_virt: PathBuf::from(VIRTUAL_TMP),
             calls: Mutex::new(Vec::new()),
             leaks: Mutex::new(Vec::new()),
+            reported: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Answer `symlink_metadata` for the virtual `path` with `meta` (an
+    /// owner, mode or link count the host files do not have).
+    pub fn report_metadata(&self, path: &Path, meta: PathMetadata) {
+        lock(&self.reported).insert(fold(path), meta);
+    }
+
+    /// Forget the calls recorded so far.
+    pub fn clear_calls(&self) {
+        lock(&self.calls).clear();
+    }
+
+    /// The same env with its cwd at `sub` below the virtual root.
+    pub fn at(mut self, sub: &str) -> Self {
+        self.cwd = self.virt.join(sub);
+        self
     }
 
     /// The virtual root path.
@@ -142,7 +167,7 @@ impl VirtualEnv {
         let abs = fold(&if path.is_absolute() {
             path.to_path_buf()
         } else {
-            self.virt.join(path)
+            self.cwd.join(path)
         });
         if abs.starts_with(&self.real)
             || abs.starts_with(&self.raw)
@@ -158,12 +183,23 @@ impl VirtualEnv {
         if let Ok(rest) = abs.strip_prefix(&self.tmp_virt) {
             return Ok(self.tmp_real.join(rest));
         }
-        match abs.strip_prefix(&self.virt) {
-            Ok(rest) => Ok(self.real.join(rest)),
-            Err(_) => Err(FileError::new(
+        if !abs.starts_with(&self.virt) {
+            return Err(FileError::new(
                 FileErrorCode::NotFound,
                 format!("no such file: {}", path.display()),
-            )),
+            ));
+        }
+        // The `..` parts go to the host as written, so a `..` after a link
+        // leaves the link's target, as the kernel does (`link/..`). The
+        // folded form above already refused a path that leaves the root.
+        let unfolded = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.cwd.join(path)
+        };
+        match unfolded.strip_prefix(&self.virt) {
+            Ok(rest) => Ok(self.real.join(rest)),
+            Err(_) => Ok(self.real.join(abs.strip_prefix(&self.virt).unwrap_or(&abs))),
         }
     }
 }
@@ -175,7 +211,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[async_trait]
 impl FileSystem for VirtualEnv {
     fn cwd(&self) -> &Path {
-        &self.virt
+        &self.cwd
     }
 
     fn absolute_path(&self, path: &Path) -> Result<PathBuf, FileError> {
@@ -183,7 +219,7 @@ impl FileSystem for VirtualEnv {
         Ok(if path.is_absolute() {
             path.to_path_buf()
         } else {
-            self.virt.join(path)
+            self.cwd.join(path)
         })
     }
 
@@ -299,6 +335,10 @@ impl FileSystem for VirtualEnv {
     }
 
     async fn symlink_metadata(&self, path: &Path) -> Result<PathMetadata, FileError> {
+        if let Some(meta) = lock(&self.reported).get(&fold(path)).cloned() {
+            lock(&self.calls).push(format!("symlink_metadata {}", path.display()));
+            return Ok(meta);
+        }
         let real = self.to_real("symlink_metadata", path)?;
         self.inner
             .symlink_metadata(&real)

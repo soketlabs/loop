@@ -125,16 +125,21 @@ pub fn parse_local_sandbox_flags(args: &[&str]) -> Result<LocalSandboxFlags, Str
     Ok(flags)
 }
 
-/// Whether the Session uses a path policy that reads the Runtime host disk.
+/// Which path policy the Session uses. Path rules check paths through the
+/// Session's Workspace env (task C2b), so a guest-namespace driver can
+/// serve them. The tool lock cannot: its root is a Runtime host folder,
+/// admitted on the host, and its second layer confines host reads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PathPolicyUse {
-    /// Not stated: treated as present.
+    /// Not stated: treated as the tool lock.
     #[default]
     Unknown,
     /// No path rules and no tool lock.
     None,
-    /// Path rules or the tool lock apply.
-    Present,
+    /// Path rules (or none), and no tool lock.
+    Rules,
+    /// The tool lock applies.
+    ToolLock,
 }
 
 /// What the user asked for, before platform defaults are applied.
@@ -142,8 +147,8 @@ pub enum PathPolicyUse {
 pub struct SandboxRequest {
     /// Sandbox kind (`sandbox.mode`); `None` means [`LOCAL_SANDBOX_KIND`].
     pub kind: Option<String>,
-    /// Whether host-side path policy (path permission rules, the tool lock)
-    /// applies to the Session. `Unknown` counts as present.
+    /// Which path policy applies to the Session. `Unknown` counts as the
+    /// tool lock.
     pub path_policy: PathPolicyUse,
     /// Explicit isolation, if any.
     pub isolation: Option<KrunIsolation>,
@@ -410,9 +415,10 @@ impl std::error::Error for SandboxBuildError {}
 /// asks for. Capabilities only add restrictions or refuse; they never relax
 /// a setting.
 ///
-/// - A driver whose paths are guest paths is refused unless the caller says
-///   that no host-side path policy (path permission rules, the tool lock)
-///   applies: that policy still reads the host disk (task C2b).
+/// - A driver whose paths are guest paths is refused with the tool lock (or
+///   when the caller does not say): the lock's root and its confined reads
+///   are Runtime host paths. Path rules are fine: the gate checks them
+///   through the Workspace env (task C2b).
 /// - For kinds other than `local` (hosted and remote use), every
 ///   restriction the user set must be enforced. `local` keeps today's
 ///   behaviour (for example Linux does not enforce `sandbox.network` yet).
@@ -428,10 +434,15 @@ fn check_driver(
         setting,
         reason,
     };
-    if caps.path_namespace == PathNamespace::Guest && request.path_policy != PathPolicyUse::None {
+    if caps.path_namespace == PathNamespace::Guest
+        && matches!(
+            request.path_policy,
+            PathPolicyUse::Unknown | PathPolicyUse::ToolLock
+        )
+    {
         return Err(unmet(
-            "path permission rules or the tool lock",
-            "they still check paths on the Runtime host, and this driver's paths are not host paths",
+            "the tool lock",
+            "its root and its confined reads are Runtime host paths, and this driver's paths are not host paths",
         ));
     }
     if kind == LOCAL_SANDBOX_KIND {
@@ -693,24 +704,38 @@ mod tests {
             async move { builder.start(&path, &request).await.map(|_| ()) }
         };
 
-        // A guest-namespace driver with host path policy (unknown counts).
-        let err = start(
-            caps_builder("local", guest_caps()),
-            SandboxRequest::default(),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(&err, SandboxBuildError::Unmet { setting, .. } if setting.contains("tool lock")),
-            "{err}"
-        );
+        // A guest-namespace driver with the tool lock (unknown counts).
+        for policy in [PathPolicyUse::Unknown, PathPolicyUse::ToolLock] {
+            let err = start(
+                caps_builder("local", guest_caps()),
+                SandboxRequest {
+                    path_policy: policy,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "the `fake` workspace driver does not meet the tool lock: its root and its \
+                 confined reads are Runtime host paths, and this driver's paths are not host paths",
+                "{policy:?}"
+            );
+        }
+        // Path rules go through the env (C2b): a guest driver serves them.
+        for policy in [PathPolicyUse::None, PathPolicyUse::Rules] {
+            let request = SandboxRequest {
+                path_policy: policy,
+                ..Default::default()
+            };
+            start(caps_builder("local", guest_caps()), request)
+                .await
+                .unwrap();
+        }
         let no_policy = SandboxRequest {
             path_policy: PathPolicyUse::None,
             ..Default::default()
         };
-        start(caps_builder("local", guest_caps()), no_policy.clone())
-            .await
-            .unwrap();
 
         // Remote kind: every restriction must hold.
         let remote = |r: SandboxRequest| SandboxRequest {

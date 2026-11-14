@@ -564,7 +564,7 @@ impl ToolApprovalBridge {
                 .get("previousPath")
                 .and_then(|v| v.as_str())
             {
-                cleanup_snapshot(Some(Path::new(prev)));
+                self.cleanup_snapshot(Some(Path::new(prev))).await;
             }
             return (None, None);
         }
@@ -588,18 +588,15 @@ impl ToolApprovalBridge {
 
         let _lock = self.gate.lock().await;
         if !self.asks(name, ignore_grants) {
-            cleanup_snapshot(previous_path.as_deref());
+            self.cleanup_snapshot(previous_path.as_deref()).await;
             return (None, None);
         }
         if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
             let _ = self
                 .revert_change(&path, previous_path.as_deref(), &review)
                 .await;
-            let patch = reject_file_patch(
-                "File edit review cancelled",
-                &path,
-                previous_path.as_deref(),
-            );
+            self.cleanup_snapshot(previous_path.as_deref()).await;
+            let patch = reject_file_patch("File edit review cancelled", &path);
             let answer = FileAnswer {
                 accepted: false,
                 escalation: None,
@@ -641,11 +638,11 @@ impl ToolApprovalBridge {
         };
         match decision {
             ApprovalDecision::Accept => {
-                cleanup_snapshot(previous_path.as_deref());
+                self.cleanup_snapshot(previous_path.as_deref()).await;
                 (None, answer(true))
             }
             ApprovalDecision::AcceptSession => {
-                cleanup_snapshot(previous_path.as_deref());
+                self.cleanup_snapshot(previous_path.as_deref()).await;
                 self.grant_and_persist(ApprovalKind::FileEdit.group()).await;
                 (None, answer(true))
             }
@@ -656,12 +653,12 @@ impl ToolApprovalBridge {
                 {
                     tracing::warn!("revert after reject failed: {e}");
                 }
-                cleanup_snapshot(previous_path.as_deref());
+                self.cleanup_snapshot(previous_path.as_deref()).await;
                 let msg = match reason.filter(|r| !r.trim().is_empty()) {
                     Some(r) => format!("User rejected the edit to {}. Reason: {r}", path.display()),
                     None => format!("User rejected the edit to {}.", path.display()),
                 };
-                (Some(reject_file_patch(&msg, &path, None)), answer(false))
+                (Some(reject_file_patch(&msg, &path)), answer(false))
             }
         }
     }
@@ -764,12 +761,26 @@ impl ToolApprovalBridge {
         let Some(prev) = previous_path else {
             return Err("missing previous snapshot".into());
         };
-        let bytes = tokio::fs::read(prev).await.map_err(|e| e.to_string())?;
+        // The snapshot was written through the env (`create_temp_dir`), so
+        // it is read back through it.
+        let bytes = self
+            .env
+            .read_binary_file(prev)
+            .await
+            .map_err(|e| e.to_string())?;
         let target = review.target_path.as_deref().unwrap_or(path);
         self.env
             .write_file(target, &bytes)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Remove a review snapshot. It was written through the env, so it is
+    /// removed through it; a failure leaves it (a temporary file).
+    async fn cleanup_snapshot(&self, path: Option<&Path>) {
+        if let Some(path) = path {
+            let _ = self.env.remove(path).await;
+        }
     }
 
     async fn resolve_editor(&self) -> Option<String> {
@@ -932,12 +943,7 @@ impl FileReview {
     }
 }
 
-fn reject_file_patch(
-    message: &str,
-    path: &Path,
-    previous_path: Option<&Path>,
-) -> AfterToolCallResult {
-    cleanup_snapshot(previous_path);
+fn reject_file_patch(message: &str, path: &Path) -> AfterToolCallResult {
     AfterToolCallResult {
         content: Some(vec![ToolResultContent::Text(TextContent {
             text: message.to_string(),
@@ -950,12 +956,6 @@ fn reject_file_patch(
         is_error: Some(true),
         usage: None,
         terminate: None,
-    }
-}
-
-fn cleanup_snapshot(path: Option<&Path>) {
-    if let Some(p) = path {
-        let _ = std::fs::remove_file(p);
     }
 }
 
