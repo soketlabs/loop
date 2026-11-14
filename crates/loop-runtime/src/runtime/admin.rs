@@ -45,6 +45,14 @@ pub(super) async fn release(generation: Arc<Generation>) {
     if let Some(generation) = Arc::into_inner(generation) {
         generation.released.store(true, Ordering::Release);
         generation.resources.mcp_client.disconnect_all().await;
+        // Nothing uses these resources now and none hands them out again:
+        // their host processes end with them.
+        super::host_cleanup::end_processes(
+            &generation.resources.host_workspace,
+            true,
+            "workspace generation released",
+        )
+        .await;
     }
 }
 
@@ -59,7 +67,7 @@ pub(super) struct PendingSandbox {
     choice: SandboxChoice,
     /// The workspace's shared sandbox when it was chosen, never destroyed
     /// with a Session's own.
-    shared: Option<Arc<dyn loop_agent::harness::Sandbox>>,
+    shared: Option<Arc<dyn loop_agent::harness::sandbox::Workspace>>,
 }
 
 impl PendingSandbox {
@@ -68,7 +76,7 @@ impl PendingSandbox {
         if let SandboxMode::Enabled { sandbox } = self.mode {
             if !self
                 .shared
-                .is_some_and(|shared| loop_agent::harness::sandbox::same_sandbox(&shared, &sandbox))
+                .is_some_and(|shared| Arc::ptr_eq(&shared, &sandbox))
             {
                 let _ = sandbox.destroy().await;
             }
@@ -92,9 +100,7 @@ impl LiveSession {
         let previous = self.opened.harness.replace_sandbox(mode).await;
         // The workspace's own sandbox serves other Sessions; keep it.
         if let SandboxMode::Enabled { sandbox } = previous {
-            if !shared
-                .is_some_and(|shared| loop_agent::harness::sandbox::same_sandbox(&shared, &sandbox))
-            {
+            if !shared.is_some_and(|shared| Arc::ptr_eq(&shared, &sandbox)) {
                 let _ = sandbox.destroy().await;
             }
         }
@@ -247,9 +253,7 @@ impl Runtime {
             .replace_sandbox(SandboxMode::Disabled)
             .await;
         if let SandboxMode::Enabled { sandbox } = own {
-            if !shared
-                .is_some_and(|shared| loop_agent::harness::sandbox::same_sandbox(&shared, &sandbox))
-            {
+            if !shared.is_some_and(|shared| Arc::ptr_eq(&shared, &sandbox)) {
                 let _ = sandbox.destroy().await;
             }
         }
@@ -341,7 +345,7 @@ impl Runtime {
     ) -> BackendResult<(Arc<WorkspaceResources>, u64, Vec<String>, u32)> {
         // Opening Sessions publish under the read side, so none escapes.
         let _publishing = self.reload_gate.write().await;
-        let (fresh, _) = self
+        let (fresh, replaced) = self
             .factory
             .reload_workspace(&self.workspace_opts(cwd))
             .await
@@ -410,6 +414,19 @@ impl Runtime {
                 .replace(Arc::clone(&generation));
             if let Some(used) = used {
                 release(used).await;
+            }
+        }
+        // Resources the factory held that no generation of this Runtime
+        // holds (a Session that failed to open); a generation ends its own
+        // host processes when it is released.
+        if let Some(replaced) = replaced {
+            if !Arc::ptr_eq(&replaced, &previous.resources) {
+                super::host_cleanup::end_processes(
+                    &replaced.host_workspace,
+                    true,
+                    "replaced by a reload",
+                )
+                .await;
             }
         }
         release(previous).await;
@@ -496,9 +513,7 @@ impl Runtime {
             .and_then(|state| state.sandbox.clone());
         let previous = opened.harness.replace_sandbox(mode).await;
         if let SandboxMode::Enabled { sandbox } = previous {
-            if !shared
-                .is_some_and(|shared| loop_agent::harness::sandbox::same_sandbox(&shared, &sandbox))
-            {
+            if !shared.is_some_and(|shared| Arc::ptr_eq(&shared, &sandbox)) {
                 let _ = sandbox.destroy().await;
             }
         }

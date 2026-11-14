@@ -1,4 +1,5 @@
 //! Opening, closing and unloading Sessions, and the Session cap.
+use super::host_cleanup::end_processes;
 use super::leases::OpeningLease;
 use super::publish::{publish, pump};
 use super::*;
@@ -207,6 +208,7 @@ impl Runtime {
         } else {
             self.factory.workspace(&opts).await.map_err(failed)?
         };
+        let workspace_cwd = workspace.cwd.clone();
         let created = existing.is_none();
         let id = match existing {
             Some(session) => session.native_id.clone(),
@@ -555,6 +557,10 @@ impl Runtime {
             self.pauses.wait("open_publishing").await;
             let _publishing = self.reload_gate.read().await;
             self.adopt_generation(&live).await;
+            // The last Session of the folder may have stopped its host
+            // Workspace; it runs again before this one is visible.
+            let _host = self.host_gate.lock().await;
+            self.start_host_workspace(&live).await;
             self.sessions
                 .lock()
                 .unwrap()
@@ -585,6 +591,9 @@ impl Runtime {
         }
         if result.is_err() {
             self.discard_new_row(created, &id).await;
+            // A failed open leaves no Session on the folder, maybe none at all.
+            let _host = self.host_gate.lock().await;
+            self.stop_host_if_unused(&workspace_cwd).await;
         }
         result
     }
@@ -843,7 +852,18 @@ impl Runtime {
             .release_lease(&key.0, &self.identity)
             .await
             .map_err(failed);
-        self.sessions.lock().unwrap().remove(key);
+        {
+            // The last Session of a folder takes its host processes along.
+            let _host = self.host_gate.lock().await;
+            self.sessions.lock().unwrap().remove(key);
+            self.stop_host_if_unused(&live.opened.workspace.cwd).await;
+            // The workspace it was opened with, when a reload or its own
+            // options made that a different one.
+            let opened_with = Arc::clone(&live.opened.workspace.host_workspace);
+            if !Arc::ptr_eq(&opened_with, &Self::host_workspace_of(&live)) {
+                end_processes(&opened_with, true, "Session's own workspace").await;
+            }
+        }
         if let Some(error) = pump_error {
             return Err(error);
         }

@@ -7,7 +7,6 @@ use loop_agent::{
         create_session_repository,
         session::{LeaseIdentity, RuntimeSessionStore, SessionStore},
         types::SessionError,
-        Sandbox,
     },
     native_backend::NATIVE_INSTANCE,
 };
@@ -71,6 +70,7 @@ mod attach;
 mod decisions;
 #[cfg(test)]
 mod gate_tests;
+mod host_cleanup;
 mod leases;
 mod pause;
 mod publish;
@@ -94,6 +94,9 @@ pub struct Runtime {
     workspaces: Mutex<HashMap<PathBuf, WorkspaceState>>,
     recipients: AsyncMutex<HashMap<SessionKey, Recipients>>,
     admission: AsyncMutex<()>,
+    /// Serializes "a Session is published, so its host Workspace runs" with
+    /// "the last Session of a folder closed, so the host Workspace stops".
+    host_gate: AsyncMutex<()>,
     stopped: AtomicBool,
     idle_epoch: std::sync::atomic::AtomicU64,
     /// In-memory only: caller environments must never enter persistent logs or settings.
@@ -249,7 +252,7 @@ fn session_index(
 const CLOSE_GRACE: Duration = Duration::from_secs(10);
 struct WorkspaceState {
     resources: Arc<WorkspaceResources>,
-    sandbox: Option<Arc<dyn Sandbox>>,
+    sandbox: Option<Arc<dyn loop_agent::harness::sandbox::Workspace>>,
     /// The current generation, held while it is current.
     generation: Arc<admin::Generation>,
     /// Counts committed admin changes and reloads of this workspace.
@@ -614,6 +617,7 @@ impl Runtime {
             workspaces: Mutex::new(HashMap::new()),
             recipients: AsyncMutex::new(HashMap::new()),
             admission: AsyncMutex::new(()),
+            host_gate: AsyncMutex::new(()),
             stopped: AtomicBool::new(false),
             idle_epoch: std::sync::atomic::AtomicU64::new(0),
             launch_specs: Mutex::new(HashMap::new()),
@@ -1235,6 +1239,13 @@ impl Runtime {
             .drain()
             .map(|(_, value)| value)
             .collect();
+        // Host processes end before anything else of a workspace does, with
+        // the process-wide kill as the net.
+        let hosts: Vec<_> = workspaces
+            .iter()
+            .map(|workspace| Arc::clone(&workspace.resources.host_workspace))
+            .collect();
+        self.end_all_host_processes(&hosts).await;
         for workspace in workspaces {
             workspace.resources.mcp_client.disconnect_all().await;
             if let Some(sandbox) = workspace.sandbox {

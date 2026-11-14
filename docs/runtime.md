@@ -285,6 +285,11 @@ its pid may now belong to another program.
   lease released, then the socket is removed. It waits up to 10 seconds for
   the socket to go and fails if it is still there. With no Runtime answering
   it prints `No Runtime running at …` and exits 0.
+- Every shutdown also ends the processes that the host workspaces started: each
+  host workspace is destroyed and, as a last net, every host process of the
+  Runtime is killed (each wait is bounded to a few seconds). The same happens
+  to the processes of a folder when its last Session closes or is unloaded, and
+  to those of the old workspace on `workspace/reload`.
 
 ### Remote use and WebSocket clients
 
