@@ -18,7 +18,7 @@ use crate::harness::compaction::{
 };
 use crate::harness::hooks::{HarnessHookEvent, HookRegistry};
 use crate::harness::prompt_templates::format_prompt_template_invocation;
-use crate::harness::sandbox::{Sandbox, SandboxInfo, SandboxMode, SandboxStatus};
+use crate::harness::sandbox::{SandboxInfo, SandboxMode, SandboxStatus, Workspace};
 use crate::harness::session::types::{PendingSessionWrite, Session, SessionTreeEntry};
 use crate::harness::skills::format_skill_invocation;
 use crate::harness::system_prompt::format_skills_for_system_prompt;
@@ -525,7 +525,7 @@ impl AgentHarness {
     /// Ensure sandbox ready when enabled.
     pub async fn ensure_sandbox_ready(
         &self,
-    ) -> Result<Option<Arc<dyn Sandbox>>, AgentHarnessError> {
+    ) -> Result<Option<Arc<dyn Workspace>>, AgentHarnessError> {
         let mode = self.sandbox.read().await.clone();
         match mode {
             SandboxMode::Disabled => Ok(None),

@@ -207,6 +207,7 @@ impl Runtime {
         } else {
             self.factory.workspace(&opts).await.map_err(failed)?
         };
+        let workspace_cwd = workspace.cwd.clone();
         let created = existing.is_none();
         let id = match existing {
             Some(session) => session.native_id.clone(),
@@ -555,6 +556,10 @@ impl Runtime {
             self.pauses.wait("open_publishing").await;
             let _publishing = self.reload_gate.read().await;
             self.adopt_generation(&live).await;
+            // The last Session of the folder may have stopped its host
+            // Workspace; it runs again before this one is visible.
+            let _host = self.host_gates.lock(&live.opened.workspace.cwd).await;
+            self.start_host_workspace(&live).await;
             self.sessions
                 .lock()
                 .unwrap()
@@ -585,6 +590,11 @@ impl Runtime {
         }
         if result.is_err() {
             self.discard_new_row(created, &id).await;
+            // A failed open leaves no Session on the folder, maybe none at
+            // all. Admission is free again before the stop is waited for.
+            drop(_admission);
+            let _host = self.host_gates.lock(&workspace_cwd).await;
+            self.stop_host_if_unused(&workspace_cwd).await;
         }
         result
     }
@@ -661,8 +671,10 @@ impl Runtime {
         self.unloaded.lock().unwrap().contains(key)
     }
     /// Whether nothing needs `live` loaded: no turn, no parked Escalation, no
-    /// attached Surface, no running Subagent below it, and not itself a
-    /// Subagent (its `subagent` call closes it). Call under its lifecycle lock.
+    /// attached Surface, no running Subagent below it, not itself a
+    /// Subagent (its `subagent` call closes it), and not the last Session of
+    /// a folder whose host Workspace runs a process. Call under its
+    /// lifecycle lock.
     pub(super) async fn unloadable(&self, live: &LiveSession) -> bool {
         let key = &live.reference.key;
         if live.busy.load(Ordering::Acquire)
@@ -671,6 +683,7 @@ impl Runtime {
             || live.parent.is_some()
             || *live.waiting.lock().await > 0
             || live.escalations.has_pending().await
+            || self.host_processes_pin(live).await
         {
             return false;
         }
@@ -843,7 +856,20 @@ impl Runtime {
             .release_lease(&key.0, &self.identity)
             .await
             .map_err(failed);
-        self.sessions.lock().unwrap().remove(key);
+        {
+            // Closing the last Session of a folder takes its host processes
+            // along; unloading never does (the last Session of a folder with
+            // a running process is not unloadable). The folder's gate orders
+            // this against a Session opening in the same folder only.
+            let cwd = &live.opened.workspace.cwd;
+            if reason == "unloaded" {
+                self.sessions.lock().unwrap().remove(key);
+            } else {
+                let _host = self.host_gates.lock(cwd).await;
+                self.sessions.lock().unwrap().remove(key);
+                self.stop_host_if_unused(cwd).await;
+            }
+        }
         if let Some(error) = pump_error {
             return Err(error);
         }
