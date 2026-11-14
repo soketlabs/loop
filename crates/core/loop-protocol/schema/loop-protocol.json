@@ -3836,6 +3836,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "detached_terminals_per_session": {
+          "default": 2,
+          "description": "Most terminals of one Session that no connection streams; past it,\nthe ones detached longest are closed.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "terminal_buffer_bytes": {
           "description": "Output kept per terminal for a re-attach, in bytes.",
           "format": "uint64",

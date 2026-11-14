@@ -246,6 +246,7 @@ today; a later change in `loop-store` can name them).
 | Terminals per Session | 4 | `limit` error after |
 | Terminals per caller (whole Runtime) | 8 | `limit` error after |
 | Detached terminal | 10 minutes | A terminal that no connection streams is closed after this time, with a record |
+| Detached terminals per Session | 2 | Past it, the terminals detached longest close, with a record. A client attaches right after it opens |
 | Open uploads per caller | 8 | `limit` error after; the driver also has 16 per Workspace |
 | Upload idle time | 10 minutes | The driver removes it; the Runtime forgets it at the next sweep |
 | Ring buffer | 1 MiB | Per terminal (driver) |
@@ -325,4 +326,4 @@ checks that.
 | Sandbox on: no files, no terminal | C4a and C4b |
 | A transport made outside `loop-wire` (an unbounded channel given to `Transport`) cannot tell its backlog, so back-pressure there uses the connection queue only. `lines` (Unix socket), `memory` and the WebSocket count theirs | — |
 | `DecisionSource` has no named variants for these sources | `loop-store` owner |
-| Limits are not in `settings.json` yet | Settings keys |
+| Limits are not in `settings.json` yet: the settings type is in `config/settings.rs`, which this task does not own | Settings keys (`runtime.terminals.*`) |

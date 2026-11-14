@@ -134,8 +134,16 @@ pub struct SessionWorkspaceLimits {
     pub terminals_per_caller: u32,
     /// A terminal no connection streams is closed after this many seconds.
     pub detached_terminal_secs: u64,
+    /// Most terminals of one Session that no connection streams; past it,
+    /// the ones detached longest are closed.
+    #[serde(default = "default_detached")]
+    pub detached_terminals_per_session: u32,
     /// Output kept per terminal for a re-attach, in bytes.
     pub terminal_buffer_bytes: u64,
+}
+
+fn default_detached() -> u32 {
+    2
 }
 
 impl Default for SessionWorkspaceLimits {
@@ -147,6 +155,7 @@ impl Default for SessionWorkspaceLimits {
             terminals_per_session: 4,
             terminals_per_caller: 8,
             detached_terminal_secs: 600,
+            detached_terminals_per_session: 2,
             terminal_buffer_bytes: 1024 * 1024,
         }
     }

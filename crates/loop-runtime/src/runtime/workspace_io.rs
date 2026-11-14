@@ -1509,6 +1509,31 @@ impl Runtime {
                 self.close_terminal(terminal, &reason).await;
             }
         }
+        // Too many detached terminals in one Session: the ones detached
+        // longest close.
+        let most = self.workspace_limits().detached_terminals_per_session as usize;
+        let mut detached: HashMap<SessionKey, Vec<(Instant, Arc<Terminal>)>> = HashMap::new();
+        for terminal in lock(&self.workspace_io.terminals).values() {
+            if let Some(since) = *lock(&terminal.detached_since) {
+                detached
+                    .entry(terminal.session.clone())
+                    .or_default()
+                    .push((since, Arc::clone(terminal)));
+            }
+        }
+        for (_, mut list) in detached {
+            if list.len() <= most {
+                continue;
+            }
+            list.sort_by_key(|(since, _)| *since);
+            let extra = list.len() - most;
+            for (_, terminal) in list.into_iter().take(extra) {
+                let reason = format!(
+                    "more than {most} terminals of the Session had no client streaming them"
+                );
+                self.close_terminal(terminal, &reason).await;
+            }
+        }
         let gone: Vec<(String, Arc<Upload>)> = lock(&self.workspace_io.uploads)
             .iter()
             .filter(|(_, upload)| {

@@ -715,3 +715,40 @@ async fn a_terminal_gets_the_tool_environment_and_the_users_shell() {
     assert!(seen.text.contains("T=XTERM-256COLOR"), "{}", seen.text);
     finish(f).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detached_terminals_past_the_session_limit_close() {
+    let f = runtime(Options::default()).await;
+    f.rt.set_workspace_limits(SessionWorkspaceLimits {
+        detached_terminals_per_session: 1,
+        ..SessionWorkspaceLimits::default()
+    });
+    let c = client(&f.rt, None).await;
+    let s = new_session(&c, &f.ws).await;
+    let first = open(&c, &s, Some("sleep 300")).await;
+    let streamed = open(&c, &s, Some("sleep 300")).await;
+    let _feed = attach(&c, &s, &streamed, 0).await;
+    let last = open(&c, &s, Some("sleep 300")).await;
+    // Two detached, one streamed: the one detached longest closes.
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let listed = sw(&c)
+                .terminal_list(SessionParams { session: s.clone() })
+                .await
+                .unwrap();
+            let ids: Vec<_> = listed
+                .terminals
+                .iter()
+                .map(|t| t.terminal.clone())
+                .collect();
+            if !ids.contains(&first) {
+                assert!(ids.contains(&streamed) && ids.contains(&last), "{ids:?}");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    finish(f).await;
+}
