@@ -630,7 +630,7 @@ pub mod base64 {
     /// Decode `text`. Padding is required; whitespace is not allowed.
     pub fn decode(text: &str) -> Result<Vec<u8>, InvalidBase64> {
         let bytes = text.as_bytes();
-        if bytes.len() % 4 != 0 {
+        if !bytes.len().is_multiple_of(4) {
             return Err(InvalidBase64);
         }
         let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
