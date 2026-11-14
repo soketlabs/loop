@@ -258,8 +258,10 @@ Limits:
   locked read always fails. Folder listings (`ls`, the names that `grep`
   and `glob` walk) are checked by path only: a folder swapped during one
   call can show the names, not the contents, of what it links to.
-- Any client of the Runtime's socket can use every Session in it. The lock
-  limits what Sessions can do, not who can use them.
+- Any client of the Runtime's socket is the host's user and can use every
+  Session in it. The lock limits what Sessions can do; the access rules
+  (see "Who can reach a Session") limit which Sessions an outside user can
+  use.
 
 ### Check and stop it
 
@@ -391,8 +393,8 @@ it, in the columns `tenant`, `principal_kind`, `principal_issuer`,
   a lost lease, an unload) have the Runtime's own principal
   `{service, local, runtime}`. On one host their tenant is `local`.
 - The row of the opening that created a Session (`session_opened` with
-  `created: true`) names its **owner of record**. Nothing checks the owner
-  yet.
+  `created: true`) names its **owner of record**. The access checks use it
+  (see "Who can reach a Session").
 - Rows written by a Loop version before this change read as tenant `local`
   and the Runtime's principal. Their Sessions have no owner of record.
 - Each read of the Event Log names a tenant. The same Session key in two
@@ -406,16 +408,9 @@ it, in the columns `tenant`, `principal_kind`, `principal_issuer`,
   bytes more per row). A lookup table with a small id per row is to be
   evaluated in step B4, if B4 rewrites rows.
 
-**Rules for the access checks (next step, I3; not in force yet).**
-
-- A Session whose owner of record is `None` (created before this change,
-  or outside the Runtime) is host-only: only the host's own user may use
-  it.
-- A Subagent takes its **parent's** access. Its own owner row (the
-  parent's caller) does not grant access of its own.
-- A copy (fork, clone or import) belongs to the caller that made it.
-  Before a fork or clone, check that the caller may read the **source**
-  Session.
+**Access rules.** The owner of record and the tenant decide who may use a
+Session. See "Who can reach a Session" below for the full rules and the
+table of methods.
 
 ```sh
 sqlite3 ~/.loop/agent/events.db \
@@ -477,42 +472,162 @@ loop runtime start --tool-lock chat --tool-lock-root /srv/loop-users \
   token as private as a root password, and run the gateway on the same host.
   The Runtime does not check the gateway's claims; it trusts the gateway.
 
-**What an edge user can reach.** In this release, an edge user can:
+**Who can reach a Session.** The Runtime checks every request against the
+Session it names. One function in the Runtime (`access::decide`) makes the
+decision, and every entry point calls it. The rules:
 
-- list, create, load, attach to, prompt, cancel, fork, clone, export, import,
-  rename and close **every** Session of this Runtime. This includes the
-  Sessions of the local user and of other tenants. **There is no tenant
-  isolation yet.** The Event Log records each Session's tenant and its owner
-  of record (see above), but the Runtime does not check them.
-- through the agent of a Session: read the files in that Session's folder
-  (any folder in the tool-lock root) and use the web tools. The tool lock
-  turns off the shell, file changes, Subagents, workflows, MCP servers and
-  hooks.
-- read the workspace settings that the tool lock lets a chat client read. The
-  Runtime refuses changes under the lock. The reads return no secrets:
-  - `workspace/settings`: the thinking level, the sandbox settings (mode and
-    paths), the permission mode, the `toolPermissions` rules, the diff editor
-    command, the response timeout, the enabled model names and resource
-    counts. Never provider settings, API keys or MCP server definitions.
-  - `workspace/mcp` (list): each server's name, whether it is on and
-    connected, and its tool count. Never its command, arguments, `env` or
-    headers.
-  - `workspace/web_search` (read): on or off, the provider id and a status
-    line. Never the key.
-  - `workspace/skills`: each skill's name, description and state.
-  - `workspace/templates`: each prompt template's name and description, and
-    with `name`, the template's text. A template is text you wrote for chat
-    clients: do not put a secret in one.
-- answer an Escalation (an approval or a question) **only for a turn that
-  user started**. The Runtime sends an edge user's connection only the
-  Escalations of its own turns, so it never sees or answers the host user's
-  approvals, or another edge user's. The host user's connections get every
-  Escalation, as before. The answer record names who answered
-  (`answered_by`).
+- **Rights.** A request needs one of four rights on its Session:
+  - `List`: the Session shows in `session/list`, `runtime/sessions` and the
+    counts of `runtime/status`.
+  - `Read`: its contents: attach, load, transcript, tree, views, stats,
+    export, the model, effort and mode lists, and a fork or clone of it.
+  - `Write`: act in it: prompt, cancel, the config setters, rename,
+    navigate, compact, skills, workflows, shell commands, and answers to its
+    Escalations.
+  - `Close`: close it (also with `force`).
+- **The host's user** (the Unix socket and the WebSocket with the Runtime
+  token, `is_host_user`) has every right on every Session in the `local`
+  tenant, as before. Nothing changes for a single local user.
+- **The host's user on a Session of another tenant** (the operator) has
+  `List` and `Close` only. It sees the Session in the lists and can close
+  it, but cannot attach to it, read it, prompt it or answer its
+  Escalations. ADR-0009 refuses attach by another principal unless the
+  Session is shared, and the operator must not act as another user in
+  silence. Such a request gets `Forbidden`, because the host's user can
+  see that the Session exists.
+- **A user from outside the host** (an Edge Gateway user) has every right on
+  a Session only when the Session's tenant is the user's tenant AND the
+  user is its owner of record (the same principal: same issuer and id).
+  Two principals of one tenant do not share Sessions. Sharing is later
+  work.
+- **No owner of record** (a Session from before identity was stored, or
+  made outside the Runtime): host-only.
+- **A Subagent** has the access of its root parent Session (the Session that
+  a Surface opened). Its own owner row (the caller of the parent's turn)
+  grants nothing.
+- **A copy** (fork, clone, import) belongs to the caller that made it, in
+  that caller's tenant. A fork or clone first needs `Read` on the source.
+- **No existence oracle.** A request that an outside user may not make on a
+  Session fails exactly as for a Session that does not exist:
+  `SessionNotFound`, from the same check, before any other check (busy,
+  closing, loaded or not). The lists leave such Sessions out.
+- **In-process calls.** A call with no connection (the Runtime's own work:
+  recovery, Subagents, workflows, unloads, and code that links the Runtime)
+  acts with internal authority. A connection always has a caller: the
+  server refuses every request except `initialize` from a remote connection
+  that has no caller.
+
+| Method | Target | Right | Where it is checked |
+|---|---|---|---|
+| `initialize` | the connection | none | server (no Session) |
+| `shutdown` | the connection | none (a Runtime connection does not own the Runtime) | server |
+| `session/new` | a new Session | creates it, owned by the caller in its tenant; the folder rule below | `Runtime::open_as` |
+| `session/load` | a Session | `Read` | `AgentBackend::load_session` |
+| `session/list` | every Session | `List` (filter) | `Runtime::list` |
+| `session/attach` | a Session | `Read` | `attach_watched`, `RuntimeControl::attach` |
+| `session/detach` | a Session | none: it only stops this connection's feed | server |
+| `session/transcript` | a Session | `Read` | `AgentBackend::transcript` |
+| `session/prompt` | a Session | `Write` | `AgentBackend::prompt` |
+| `session/cancel` (notification) | a Session | `Write` | `AgentBackend::cancel` |
+| `session/config` | a Session | `Read` | `RuntimeControl::config` |
+| `session/models`, `session/efforts`, `session/modes` | a Session | `Read` | `ModelControl` |
+| `session/set_model`, `session/set_effort`, `session/set_mode` | a Session | `Write` | `ModelControl` |
+| `session/ttfb` | a Session | `Read` to read, `Write` to change | `ModelControl::ttfb` |
+| `session/compact` | a Session | `Write` | `Runtime::compact` |
+| `session/stats` | a Session | `Read` | `SessionStats::stats` |
+| `session/shell` | a Session | `Write`; never for an outside user | server, then `Runtime::shell` |
+| `session/skill` | a Session | `Write` | `RuntimeControl::skill` |
+| `session/workflow` | a Session | `Write` (refused under a tool lock) | `RuntimeControl::workflow` |
+| `session/tree` | a Session | `Read`; `family` lists only readable Sessions | `Runtime::tree` |
+| `session/view` | a Session | `Read` | `Runtime::view` |
+| `session/navigate` | a Session | `Write` | `Runtime::navigate` |
+| `session/rename` | a Session | `Write` | `Runtime::rename` |
+| `session/fork`, `session/clone` | the source; a new Session | `Read` on the source; the copy is the caller's | `Runtime::fork`, `Runtime::clone_session` |
+| `session/export` | a Session | `Read` | `Runtime::export` |
+| `session/import` | a workspace; a new Session | the workspace rule; the copy is the caller's | `Runtime::import` |
+| `session/close` | a Session | `Close` | `Runtime::close` |
+| `session/sandbox` | a Session | `Read` to read, `Write` to set | `RuntimeAdmin::sandbox` |
+| `session/permission_mode` | a Session | `Read` to read, `Write` to set | `RuntimeAdmin::permission_mode` |
+| `session/update` (to the client) | a Session | `Read`: only Sessions this connection created, loaded or attached | server forwarder |
+| `host/interact`, `host/interact_withdrawn` (to the client) | a Session | `Write` | `register_watch`, `EscalationHost` |
+| `workspace/settings`, `workspace/mcp`, `workspace/web_search`, `workspace/skills`, `workspace/templates`, `workspace/trust` | a workspace | the workspace rule | `resolve_workspace` |
+| `workspace/reload` | a workspace | the workspace rule, and `Write` on every loaded Session in it | `RuntimeAdmin::reload` |
+| `runtime/sessions` | every loaded Session | `List` (filter; the totals count only the rows shown) | `RuntimeAdmin::sessions` |
+| `runtime/status` | the Runtime | for an outside user: no pid, socket, URL or limit sources; counts of its own Sessions only | server |
+| `runtime/stop`, `runtime/stop_empty`, `runtime/usage`, `runtime/defaults`, `runtime/providers`, `runtime/mcp_auth`, `runtime/tracing` | the host | host-only (Unix socket) | server (`HOST_ONLY`) |
+
+A test fails when `rpc.rs` gets a method that this table (in
+`crates/loop-runtime/src/access.rs`) does not classify.
+
+**The workspace rule.** A workspace is a folder, named by an id. The host's
+user reaches every workspace the Runtime knows, as before. An outside user
+reaches a workspace only when it is the folder of a loaded Session that the
+user may read. Any other id gets the same `unknown workspace` error as an id
+that names nothing. Under a tool lock the workspace changes are refused for
+everyone; a reload by an outside user also needs `Write` on every loaded
+Session in that folder.
+
+**The folder rule (outside users).** The tool lock lets a Session read its
+whole folder, subfolders included. So an outside user:
+
+- must name the folder (`cwd`) in `session/new`; the Runtime's own folder is
+  not a default for it;
+- cannot open, load, fork, clone or import a Session in a folder that is
+  the same as, inside, or above the folder of a Session it may not read
+  (another user's, or the host's). The request gets `Forbidden`.
+
+**Operator requirement.** Give each outside user a folder of their own under
+the tool-lock root, for example `/srv/loop-users/<hash of tenant and
+id>/`, and let the gateway choose it. Never use the principal id itself as
+a folder name. Loop does not create these folders.
+
+**Updates and Escalations.** The Runtime sends every update to one channel.
+Each connection forwards only the updates of Sessions that it created,
+loaded or attached, and each of those requests passed the check above. The
+Runtime checks `Read` again when it registers the connection as a watcher,
+and the connection drops the feed when that check fails. An owner and a
+tenant never change, so an access granted once stays true. An Escalation is
+sent to, and accepted from, only a connection whose caller may `Write` the
+Session (for a Subagent: its root). This replaces the earlier rule, which
+used the caller of the turn.
+
+**What an outside user can still observe.**
+
+- That the Runtime is full (`Busy` at `session/new`), and the Runtime's
+  limits in `runtime/status`.
+- That a folder is in use by another user's Session (the folder rule).
+- The time of a refused request: a refusal for another user's Session of the
+  same tenant reads its owner once (then from a cache); a refusal for an
+  unknown Session reads nothing.
+- Escalation ids (`approval-<n>`) count across the whole Runtime.
+- Being dropped for lag: the update channel is shared, so a burst of
+  another user's updates can make a slow connection fall behind. The
+  notice does not say how many updates were missed.
+- Other users' load, through response times.
+
+**What else an edge user can do.** Through the agent of its Session: read
+the files in that Session's folder and use the web tools. The tool lock turns
+off the shell, file changes, Subagents, workflows, MCP servers and hooks. The
+workspace reads that the lock serves return no secrets:
+
+- `workspace/settings`: the thinking level, the sandbox settings (mode and
+  paths), the permission mode, the `toolPermissions` rules, the diff editor
+  command, the response timeout, the enabled model names and resource
+  counts. Never provider settings, API keys or MCP server definitions.
+- `workspace/mcp` (list): each server's name, whether it is on and
+  connected, and its tool count. Never its command, arguments, `env` or
+  headers.
+- `workspace/web_search` (read): on or off, the provider id and a status
+  line. Never the key.
+- `workspace/skills`: each skill's name, description and state.
+- `workspace/templates`: each prompt template's name and description, and
+  with `name`, the template's text. A template is text you wrote for chat
+  clients: do not put a secret in one.
 
 An edge user cannot run `session/shell`, call a host-only method, or change
-the tool lock. Do not turn this option on for users who must not see each
-other's work.
+the tool lock. The edge listener stays unstable (`--unstable-edge-listen`):
+the transport, device pairing and per-user limits are not done. One user
+can still slow down another (shared Runtime limits and update channel).
 
 ### Permissions and trust
 
