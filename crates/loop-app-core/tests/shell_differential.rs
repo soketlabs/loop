@@ -240,9 +240,7 @@ fn stand_ins(dir: &Path) -> Vec<String> {
         let body = match *program {
             // Wrappers run what they are given, as the real ones do, so a
             // program they start shows in the log.
-            "env" => format!(
-                "#!/bin/sh\necho env >> \"$LOOP_DIFF_LOG\"\nwhile case \"$1\" in *=*) true;; *) false;; esac; do shift; done\n[ $# -gt 0 ] && exec \"$@\"\n"
-            ),
+            "env" => "#!/bin/sh\necho env >> \"$LOOP_DIFF_LOG\"\nwhile case \"$1\" in *=*) true;; *) false;; esac; do shift; done\n[ $# -gt 0 ] && exec \"$@\"\n".to_owned(),
             "xargs" | "nohup" => format!(
                 "#!/bin/sh\necho {program} >> \"$LOOP_DIFF_LOG\"\n[ $# -gt 0 ] && exec \"$@\"\n"
             ),
