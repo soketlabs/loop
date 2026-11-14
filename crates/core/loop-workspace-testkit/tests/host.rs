@@ -165,3 +165,27 @@ async fn confined_downloads_follow_the_tool_lock_rule() {
     assert_eq!(chunk.data, b"PAIR");
     ws.destroy().await.expect("destroy");
 }
+
+/// Dropping a host Workspace (as the Runtime does at shutdown) kills its
+/// processes, detached ones too, with their trees.
+#[tokio::test]
+async fn dropping_the_workspace_kills_its_processes() {
+    use loop_agent::harness::sandbox::SpawnRequest;
+    let f = fixture(false);
+    let ws = f.start().await;
+    let marker = ws.root().join("after-drop");
+    let p = ws
+        .spawn(SpawnRequest {
+            command: format!("(sleep 2; touch '{}') & sleep 30", marker.display()),
+            detach: true,
+            ..Default::default()
+        })
+        .await
+        .expect("spawn");
+    drop(p);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(ws);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!marker.exists(), "a process outlived its workspace");
+    assert_no_leaked_processes().await;
+}

@@ -236,13 +236,29 @@ impl FileSystem for HostExecutionEnv {
         let mut rd = tokio::fs::read_dir(&path).await.map_err(Self::map_io)?;
         let mut out = Vec::new();
         while let Some(entry) = rd.next_entry().await.map_err(Self::map_io)? {
-            let meta = entry.metadata().await.map_err(Self::map_io)?;
-            out.push(FileInfo {
-                path: entry.path(),
-                is_dir: meta.is_dir(),
-                is_file: meta.is_file(),
-                size: meta.len(),
-            });
+            match entry.metadata().await {
+                Ok(meta) => out.push(FileInfo {
+                    path: entry.path(),
+                    is_dir: meta.is_dir(),
+                    is_file: meta.is_file(),
+                    size: meta.len(),
+                }),
+                // Removed between the listing and the stat: not there.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // One entry whose metadata cannot be read (a folder without
+                // search permission) does not fail the listing: it is listed
+                // with the kind its directory entry gives and size 0, as
+                // `ls -l` shows such an entry with unknown details.
+                Err(_) => {
+                    let kind = entry.file_type().await.ok();
+                    out.push(FileInfo {
+                        path: entry.path(),
+                        is_dir: kind.is_some_and(|k| k.is_dir()),
+                        is_file: kind.is_some_and(|k| k.is_file()),
+                        size: 0,
+                    });
+                }
+            }
         }
         Ok(out)
     }
@@ -354,7 +370,9 @@ impl FileSystem for HostExecutionEnv {
     }
 }
 
-fn path_metadata(meta: &std::fs::Metadata) -> crate::harness::types::PathMetadata {
+/// Gate facts of `meta` (from `lstat` or `stat`): kind, size, owner, link
+/// count and permission bits.
+pub(crate) fn path_metadata(meta: &std::fs::Metadata) -> crate::harness::types::PathMetadata {
     use crate::harness::types::{PathKind, PathMetadata};
     let kind = if meta.file_type().is_symlink() {
         PathKind::Symlink
@@ -771,6 +789,50 @@ mod tests {
     async fn commands_do_not_read_loops_stdin() {
         let out = run("cat; echo end", Some(5_000), None).await.unwrap();
         assert_eq!(out.stdout.trim(), "end");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod list_tests {
+    use super::*;
+
+    /// In a folder that can be read but not searched, every `stat` fails.
+    /// The listing still names each entry, with the kind from the entry
+    /// and size 0, instead of failing as a whole.
+    #[tokio::test]
+    async fn an_entry_without_metadata_does_not_fail_the_listing() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no arguments or preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores the permission bits
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir_all(locked.join("child")).unwrap();
+        std::fs::write(locked.join("file.txt"), "12345").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let env = HostExecutionEnv::new(dir.path());
+        let listed = env.list_dir(&locked).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut listed: Vec<_> = listed
+            .expect("the listing must not fail")
+            .into_iter()
+            .map(|i| {
+                (
+                    i.path.file_name().unwrap().to_string_lossy().into_owned(),
+                    i.is_dir,
+                    i.size,
+                )
+            })
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed,
+            [
+                ("child".to_owned(), true, 0),
+                ("file.txt".to_owned(), false, 0)
+            ]
+        );
     }
 }
 
