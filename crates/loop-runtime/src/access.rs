@@ -101,6 +101,20 @@ impl Subject {
     pub fn owner(&self) -> Option<&Principal> {
         self.owner.as_ref()
     }
+
+    /// The actor whose folders a Session of this subject may use: the
+    /// outside owner itself, so the folder rule holds for its Subagents
+    /// too; [`Actor::Internal`] for a Session of the host (`local`) or one
+    /// with no owner, which the folder rule does not limit.
+    pub fn folder_actor(&self) -> Actor {
+        match &self.owner {
+            Some(owner) if self.tenant.as_str() != Tenant::LOCAL => {
+                Caller::asserted(owner.clone(), self.tenant.clone())
+                    .map_or(Actor::Internal, Actor::Caller)
+            }
+            _ => Actor::Internal,
+        }
+    }
 }
 
 /// Whether `actor` may do what needs `need` to the Session `subject`

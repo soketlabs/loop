@@ -1512,11 +1512,21 @@ async fn register_recipient(
         runtime.register(session, host.id, attached, recipient),
     )
     .await;
+    registered_ok(registered, attached)
+}
+
+/// Whether a connection may keep its feed after `registered`. Fails closed:
+/// any error of an attaching registration (a refusal, or a failure to read
+/// who may see the Session) drops the feed. Stopping a watch never fails.
+fn registered_ok(registered: BackendResult<()>, attached: bool) -> bool {
     match registered {
         Ok(()) => true,
-        Err(loop_protocol::BackendError::SessionNotFound(_)) if attached => false,
+        Err(error) if attached => {
+            tracing::debug!(%error, "registration refused: the feed is dropped");
+            false
+        }
         Err(error) => {
-            tracing::debug!(%error, "could not register Escalation recipient");
+            tracing::debug!(%error, "could not unregister an Escalation recipient");
             true
         }
     }
@@ -1673,6 +1683,43 @@ mod tests {
         let id = json!("x".repeat(loop_protocol::rpc::SESSION_RESPONSE_LIMIT));
         assert!(export_response_fits(&id, &json!({})).is_err());
         assert!(export_response_fits(&json!(1), &json!({"jsonl":"small"})).is_ok());
+    }
+
+    #[test]
+    fn an_attaching_registration_fails_closed_on_any_error() {
+        use loop_protocol::{BackendError, ErrorCategory};
+        assert!(registered_ok(Ok(()), true));
+        let refused = || Err(BackendError::SessionNotFound("s".into()));
+        let failed = || {
+            Err(BackendError::failed(
+                ErrorCategory::Internal,
+                "log read failed",
+            ))
+        };
+        assert!(!registered_ok(refused(), true));
+        assert!(
+            !registered_ok(failed(), true),
+            "a failure must drop the feed"
+        );
+        assert!(!registered_ok(Err(BackendError::Busy), true));
+        // A detach is never held back by an error.
+        assert!(registered_ok(failed(), false));
+    }
+
+    #[tokio::test]
+    async fn an_outside_user_is_not_told_how_many_updates_it_missed() {
+        let (server, client) = memory();
+        let (conn, _incoming) = Connection::new(server);
+        let (_peer, mut seen) = Connection::new(client);
+        lagged(&conn, &"loop".into(), None);
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), seen.recv())
+            .await
+            .unwrap();
+        let text = format!("{message:?}");
+        assert!(
+            text.contains("fell behind and missed updates; reconnect"),
+            "{text}"
+        );
     }
 
     #[tokio::test]

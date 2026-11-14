@@ -707,10 +707,17 @@ impl RuntimeAdmin for Runtime {
             } else {
                 "idle"
             };
-            let tokens = SessionStats::stats(self, &live.reference)
-                .await
-                .ok()
-                .map(|s| s.total_tokens);
+            // A row the caller may list but not read (the host's user on
+            // another tenant's Session) shows no model and no tokens.
+            let readable = Self::may_live(&actor, &live, Need::Read);
+            let tokens = if readable {
+                SessionStats::stats(self, &live.reference)
+                    .await
+                    .ok()
+                    .map(|s| s.total_tokens)
+            } else {
+                None
+            };
             totals.sessions += 1;
             totals.busy += u32::from(busy);
             match tokens {
@@ -721,7 +728,9 @@ impl RuntimeAdmin for Runtime {
                 session: live.reference.clone(),
                 workspace_id: tree::workspace_id(&live.opened.workspace.cwd),
                 state: state.into(),
-                model: live.announced.lock().unwrap().latest.config.model.clone(),
+                model: readable
+                    .then(|| live.announced.lock().unwrap().latest.config.model.clone())
+                    .flatten(),
                 tokens,
             });
         }

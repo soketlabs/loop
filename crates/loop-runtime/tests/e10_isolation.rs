@@ -49,8 +49,9 @@ fn opts(cwd: &Path) -> BootstrapOpts {
         no_context_files: true,
         interactive: false,
         session_id: None,
-        no_web: true,
-        permission_mode: Some("full-access".into()),
+        // Web tools on and `ask`: a fetch raises an Escalation (approval).
+        no_web: false,
+        permission_mode: Some("ask".into()),
         agent: None,
     }
 }
@@ -60,7 +61,20 @@ async fn runtime(dir: &Path) -> Arc<Runtime> {
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     let responder: FauxResponder = Arc::new(move |context: &loop_ai::Context| {
         let text = format!("{:?}", context.messages);
+        let answered = context
+            .messages
+            .iter()
+            .any(|m| matches!(m, loop_ai::Message::ToolResult(_)));
         Box::pin(async move {
+            // `FETCH`: one web fetch, which asks for approval first.
+            if text.contains("FETCH") && !answered {
+                return FauxResponse::ToolCalls(vec![loop_ai::ToolCall {
+                    id: "call-fetch".into(),
+                    name: "web_fetch".into(),
+                    arguments: json!({"url": "https://example.invalid/e10"}),
+                    thought_signature: None,
+                }]);
+            }
             if text.contains("SLOW") {
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
@@ -71,6 +85,13 @@ async fn runtime(dir: &Path) -> Arc<Runtime> {
     models.set_provider(loop_ai::providers::faux_provider_fn(responder));
     let ws = dir.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
+    // The host's settings ask before every web fetch: an Escalation.
+    std::fs::create_dir_all(dir.join("agent")).unwrap();
+    std::fs::write(
+        dir.join("agent/settings.json"),
+        json!({"toolPermissions": {"web_fetch": "ask"}}).to_string(),
+    )
+    .unwrap();
     let globals = GlobalResources::with_models(dir.join("agent"), models)
         .unwrap()
         .with_tool_lock(Some(
@@ -104,6 +125,9 @@ fn edge(id: &str) -> Caller {
 struct Client {
     conn: Arc<Connection>,
     seen: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Requests from the server (`host/interact`), to answer.
+    asked:
+        tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(loop_wire::PeerRequestId, Value)>>,
 }
 
 async fn connect(rt: &Arc<Runtime>, caller: Caller) -> Client {
@@ -127,6 +151,7 @@ async fn connect(rt: &Arc<Runtime>, caller: Caller) -> Client {
     let resolver = Arc::clone(&conn);
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = seen.clone();
+    let (ask, asked) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(message) = incoming.recv().await {
             match message {
@@ -134,8 +159,9 @@ async fn connect(rt: &Arc<Runtime>, caller: Caller) -> Client {
                 Incoming::Notification { method, params } => {
                     sink.lock().unwrap().push(format!("{method} {params}"))
                 }
-                Incoming::Request { method, params, .. } => {
-                    sink.lock().unwrap().push(format!("{method} {params}"))
+                Incoming::Request { id, method, params } => {
+                    sink.lock().unwrap().push(format!("{method} {params}"));
+                    let _ = ask.send((id, params));
                 }
             }
         }
@@ -147,7 +173,11 @@ async fn connect(rt: &Arc<Runtime>, caller: Caller) -> Client {
     )
     .await
     .unwrap();
-    Client { conn, seen }
+    Client {
+        conn,
+        seen,
+        asked: tokio::sync::Mutex::new(asked),
+    }
 }
 
 fn folder(dir: &Path, name: &str) -> PathBuf {
@@ -204,7 +234,6 @@ struct Found {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "probe: run explicitly"]
 async fn e10_isolation() {
     let started = std::time::Instant::now();
     let found = probe("bob").await;
@@ -226,7 +255,6 @@ async fn e10_isolation() {
 /// The probe must be able to fail: with Alice herself as the attacker,
 /// every attempt reaches her Session, and the probe reports it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "negative control for E10: run explicitly"]
 async fn e10_negative_control() {
     let found = probe("alice").await;
     say(format!(
@@ -417,7 +445,168 @@ async fn probe(attacker: &str) -> Found {
         refused += 1;
     }
 
-    // 5. What Bob can see: lists, counts, everything he received.
+    // 5. Request ids (F2): Bob uses Alice's clone request id for a clone of
+    //    his own Session. It is his own id: no "already used".
+    attempts += 1;
+    match bob
+        .conn
+        .request(
+            methods::SESSION_CLONE,
+            json!({"session": his, "request_id": her_clone}),
+        )
+        .await
+    {
+        Ok(copy) if copy.to_string().contains(&key) => {
+            leaks.push(format!("his clone named her Session: {copy}"))
+        }
+        Ok(_) => refused += 1,
+        Err(error) => leaks.push(format!("her request id blocks his: {error:?}")),
+    }
+
+    // 6. The root (no `cwd`, or the lock root itself) and a load that moves
+    //    his own Session into a free folder: all refused; the free folder
+    //    stays free for its user.
+    let root = alice_folder.parent().unwrap().to_path_buf();
+    let free = folder(dir.path(), "dave");
+    for (what, method, params) in [
+        ("no cwd", methods::SESSION_NEW, json!({})),
+        ("the root", methods::SESSION_NEW, json!({"cwd": root})),
+        (
+            "load into a free folder",
+            methods::SESSION_LOAD,
+            json!({"session": his, "spec": {"cwd": free}}),
+        ),
+    ] {
+        attempts += 1;
+        if what == "load into a free folder" {
+            // Closed first, so the load would really open it again.
+            let _ = bob
+                .conn
+                .request(methods::SESSION_CLOSE, json!({"session": his}))
+                .await;
+        }
+        match bob.conn.request(method, params).await {
+            Err(_) => refused += 1,
+            Ok(v) => leaks.push(format!("{what} answered: {v}")),
+        }
+    }
+    let dave = connect(&rt, edge("dave")).await;
+    if let Err(error) = dave
+        .conn
+        .request(methods::SESSION_NEW, json!({"cwd": free}))
+        .await
+    {
+        leaks.push(format!("Dave is locked out of his folder: {error:?}"));
+    }
+
+    // 7. Escalations over the wire: Alice's turn asks for approval. Bob gets
+    //    nothing, cannot answer it (stray responses on his connection), and
+    //    cannot withdraw it (cancel, close); then Alice answers.
+    attempts += 1;
+    let fetch = {
+        let conn = alice.conn.clone();
+        let hers = hers.clone();
+        tokio::spawn(async move {
+            conn.request(
+                methods::SESSION_PROMPT,
+                json!({"session": hers, "content": [{"type": "text", "text": "FETCH it"}]}),
+            )
+            .await
+        })
+    };
+    let asked = tokio::time::timeout(Duration::from_secs(20), alice.asked.lock().await.recv())
+        .await
+        .ok()
+        .flatten();
+    match asked {
+        None => leaks.push("Alice was never asked: the probe saw no Escalation".into()),
+        Some((id, request)) => {
+            for guess in 0..32u64 {
+                let guess: loop_wire::PeerRequestId = json!(guess);
+                bob.conn.respond(
+                    guess,
+                    Ok(json!({"outcome": "selected", "native_id": "accept"})),
+                );
+            }
+            bob.conn
+                .notify(methods::SESSION_CANCEL, json!({"session": hers}))
+                .unwrap();
+            let _ = bob
+                .conn
+                .request(
+                    methods::SESSION_CLOSE,
+                    json!({"session": hers, "force": true}),
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let withdrawn = alice
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m.starts_with(methods::HOST_INTERACT_WITHDRAWN));
+            if withdrawn || fetch.is_finished() {
+                leaks.push(format!(
+                    "Bob ended her Escalation (withdrawn={withdrawn}): {request}"
+                ));
+            } else {
+                refused += 1;
+            }
+            let reject = serde_json::to_value(loop_protocol::InteractionOutcome::Selected {
+                native_id: "reject".into(),
+                note: None,
+            })
+            .unwrap();
+            alice.conn.respond(id, Ok(reject));
+        }
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(20), fetch).await;
+    if bob
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|m| m.starts_with(methods::HOST_INTERACT))
+    {
+        leaks.push("Bob received a host/interact".into());
+    }
+
+    // 8. The refill path: Bob comes back on a new connection (as after a lag
+    //    disconnect) and attaches with a cursor: only his own Session
+    //    replays; hers is not found.
+    attempts += 1;
+    let back = connect(&rt, edge(attacker)).await;
+    let _ = back
+        .conn
+        .request(methods::SESSION_LOAD, json!({"session": his, "spec": {}}))
+        .await;
+    let _ = back
+        .conn
+        .request(
+            methods::SESSION_ATTACH,
+            json!({"session": his, "after_seq": 0}),
+        )
+        .await;
+    match back
+        .conn
+        .request(
+            methods::SESSION_ATTACH,
+            json!({"session": hers, "after_seq": 1}),
+        )
+        .await
+    {
+        Err(_) => refused += 1,
+        Ok(v) => leaks.push(format!("re-attach to hers answered: {v}")),
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let replayed = back.seen.lock().unwrap().join("\n");
+    for needle in [key.as_str(), SECRET] {
+        if replayed.contains(needle) {
+            leaks.push(format!("the refill replayed {needle:?}"));
+        }
+    }
+
+    // 9. What Bob can see: lists, counts, everything he received.
     let listed = bob
         .conn
         .request(methods::SESSION_LIST, json!({}))
@@ -433,10 +622,16 @@ async fn probe(attacker: &str) -> Found {
         .request(methods::RUNTIME_STATUS, json!({}))
         .await
         .unwrap();
-    if listed.as_array().map(Vec::len) != Some(1) {
+    // His own Sessions only: the first one and his clone (section 5).
+    if listed.as_array().map(Vec::len) != Some(2) || listed.to_string().contains(&key) {
         leaks.push(format!("session/list: {listed}"));
     }
-    if rows["totals"]["sessions"] != 1 || status["loaded"] != 1 || status["pid"] != 0 {
+    let loaded = rows["totals"]["sessions"].as_u64().unwrap_or(99);
+    if loaded > 2
+        || status["loaded"] != loaded
+        || status["pid"] != 0
+        || rows.to_string().contains(&key)
+    {
         leaks.push(format!("counts: {rows} {status}"));
     }
     let seen = bob.seen.lock().unwrap().join("\n");

@@ -574,23 +574,56 @@ Session in that folder.
 **The folder rule (outside users).** The tool lock lets a Session read its
 whole folder, subfolders included. So an outside user:
 
+- must name the folder (`cwd`) in `session/new`, and the folder must be
+  strictly inside the tool-lock root: no `cwd`, and the root itself, are
+  refused with `Forbidden`. (A Session in the root would read every user's
+  folder and, by the rule below, block every other user.)
 - cannot open, load, fork, clone or import a Session in a folder that is
   the same as, inside, or above the folder of a Session it may not read
   (another user's, or the host's). The request gets `Forbidden`.
+- gets the same rule for its Subagents: a child opens only in folders its
+  root Session's owner may use. (Under the tool lock the `subagent` tool is
+  off; the rule holds without it.)
 
-**Operator requirement.** Give each outside user a folder of their own under
-the tool-lock root, for example `/srv/loop-users/<hash of tenant and
-id>/`, and let the gateway choose it and name it (`cwd`) in every `session/new`;
-without one the Session opens in the Runtime's own folder, which the folder
-rule then gives to the first user. Never use the principal id itself as a
-folder name. Loop does not create these folders.
+**A load never moves a Session.** A Session keeps the folder it was created
+in. `session/load` with a `cwd` other than that folder is refused with
+`Unsupported`, for every caller (the host's user too; `loop` never sends a
+`cwd` on a load). So the folder in `session/list` is always the folder the
+Session runs in.
 
-The folder rule counts every Session the Runtime's store knows, also closed
-ones, the host's own and those made before identity was stored. So a host
-Session in the tool-lock root itself refuses every outside user's new
-Session, and a host Session made later in a user's folder makes that user's
-next load of its own Session fail with `Forbidden`. Keep the host's own
-Sessions out of the users' folders.
+**Operator requirement and gateway rules.**
+
+- Give each outside user a folder of their own under the tool-lock root, for
+  example `/srv/loop-users/<hash of tenant and id>/`. Never use the
+  principal id itself as a folder name. Loop does not create these folders.
+- The gateway always sends that explicit per-user `cwd` on `session/new`,
+  and never passes a `cwd` that a client chose, on `session/new` or on
+  `session/load` (a load needs none).
+- A user's folder is that user's once used: the folder rule counts every
+  Session the Runtime's store knows, also closed ones, the host's own and
+  those made before identity was stored. It compares only with Sessions of
+  other owners, so a user's closed Session blocks only its own folder (and
+  the folders above and inside it), never an unrelated one.
+- A host Session made later in a user's folder makes that user's next load
+  of its own Session fail with `Forbidden`. Keep the host's own Sessions out
+  of the users' folders.
+- To find which Session blocks a folder, the host's user runs
+  `loop session list` (`session/list` on the Unix socket): it lists every
+  Session, closed ones and other tenants' included, with its folder.
+  `runtime/sessions` lists only the loaded ones.
+
+**Copy and import request ids are per user.** A receipt of `session/fork`,
+`session/clone` or `session/import` is keyed by the tenant and principal of
+the caller (hashed) and the request id. One user can neither learn that
+another used an id nor take it. Receipts written before this change had no
+user in the key; the host's user still finds them, so a retry across an
+upgrade answers from its receipt.
+
+**Limits are shared.** `max_sessions` and `max_active_turns` count the
+Sessions of all users. A user who opens Sessions up to `max_sessions`
+makes the Runtime unload other users' idle Sessions (they load again on
+their next use), and a full Runtime answers `Busy` to everyone. Per-user
+limits are later work.
 
 **Updates and Escalations.** The Runtime sends every update to one channel.
 Each connection forwards only the updates of Sessions that it created,
@@ -611,10 +644,14 @@ used the caller of the turn.
   same tenant reads its owner once (then from a cache); a refusal for an
   unknown Session reads nothing. The time of `session/list` grows with the
   number of Sessions of all users.
-- A host's user listing another tenant's Sessions sees each one's key,
-  folder id, size, owner kind, times and state, not its title, name or
-  model.
+- A host's user listing another tenant's Sessions (`session/list`,
+  `runtime/sessions`) sees each one's key, folder, size, owner kind, times
+  and state, not its title, name, model or tokens.
 - Escalation ids (`approval-<n>`) count across the whole Runtime.
+- That other users' idle Sessions were unloaded or loaded (the shared
+  limits above), only through timing.
+- Not observable: a detach of a Session the connection does not watch
+  changes nothing (it does not count as activity for the idle check).
 - Being dropped for lag: the update channel is shared, so a burst of
   another user's updates can make a slow connection fall behind. The
   notice does not say how many updates were missed.

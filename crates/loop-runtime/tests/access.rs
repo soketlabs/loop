@@ -57,7 +57,12 @@ async fn runtime(dir: &Path, log: Arc<dyn EventLog>, lock: bool) -> Arc<Runtime>
                 FauxResponse::ToolCalls(vec![loop_ai::ToolCall {
                     id: "call-spawn".into(),
                     name: "subagent".into(),
-                    arguments: json!({"task": "child work"}),
+                    // `SPAWN-BOB` asks for a child in the sibling folder `bob`.
+                    arguments: if text.contains("SPAWN-BOB") {
+                        json!({"task": "child work", "cwd": "../bob"})
+                    } else {
+                        json!({"task": "child work"})
+                    },
                     thought_signature: None,
                 }])
             } else {
@@ -1057,4 +1062,203 @@ async fn access_check_cost() {
     }
     println!("{line}");
     rt.shutdown().await;
+}
+
+/// F1: a load never moves a Session to another folder. Bob closes his
+/// Session and loads it "into" Dave's unused folder: refused, so Dave's
+/// folder stays free and the list shows the folder the Session runs in.
+/// The host's user is refused the same way (the CLI never sends a `cwd` on
+/// a load); the stored folder itself is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_load_never_moves_a_session_to_another_folder() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let world = world(true).await;
+        let rt = &world.rt;
+        let bob = edge("bob", "acme");
+        let b = world.sessions[&Kind::Bob].clone();
+        let dave_folder = folder(world._dir.path(), "dave");
+        bob.clone()
+            .scope(RuntimeControl::close(rt.as_ref(), &b, false))
+            .await
+            .unwrap();
+        let moved = bob
+            .clone()
+            .scope(rt.load_session(&b, spec(&dave_folder)))
+            .await;
+        assert!(
+            matches!(moved, Err(BackendError::Unsupported(_))),
+            "{moved:?}"
+        );
+        // Its own stored folder is fine.
+        bob.clone()
+            .scope(rt.load_session(&b, spec(&world.folders["bob"])))
+            .await
+            .unwrap();
+        let listed = bob.clone().scope(rt.list()).await.unwrap();
+        let row = listed.iter().find(|i| i.r#ref.key == b.key).unwrap();
+        assert_eq!(row.cwd, world.folders["bob"]);
+        // Dave's folder is still his to take.
+        let dave = edge("dave", "acme");
+        dave.scope(rt.new_session(spec(&dave_folder)))
+            .await
+            .unwrap();
+        // The host's user cannot move its Session either.
+        let local = world.sessions[&Kind::Local].clone();
+        host()
+            .scope(RuntimeControl::close(rt.as_ref(), &local, false))
+            .await
+            .unwrap();
+        let moved = host()
+            .scope(rt.load_session(&local, spec(&world.folders["none"])))
+            .await;
+        assert!(
+            matches!(moved, Err(BackendError::Unsupported(_))),
+            "{moved:?}"
+        );
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// An outside user names a folder strictly inside the tool-lock root: no
+/// `cwd`, and the root itself, are refused, so no user can take every
+/// other user's folder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_outside_user_cannot_claim_the_root() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path(), Arc::new(MemoryEventLog::new()), true).await;
+        let carol = edge("carol", "acme");
+        let none = carol
+            .clone()
+            .scope(rt.new_session(SessionSpec::default()))
+            .await;
+        assert!(matches!(none, Err(BackendError::Forbidden(_))), "{none:?}");
+        let root = dir.path().join("ws").canonicalize().unwrap();
+        let at_root = carol.clone().scope(rt.new_session(spec(&root))).await;
+        assert!(
+            matches!(at_root, Err(BackendError::Forbidden(_))),
+            "{at_root:?}"
+        );
+        // Nothing was claimed: users' own folders still open.
+        for who in ["carol", "dan"] {
+            edge(who, "acme")
+                .scope(rt.new_session(spec(&folder(dir.path(), who))))
+                .await
+                .unwrap();
+        }
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// F2: request ids are per user. Bob can reuse Alice's copy request id for
+/// his own copy (no "already used"), and so cannot learn or take hers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copy_request_ids_are_per_user() {
+    use loop_protocol::rpc::CloneParams;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let world = world(true).await;
+        let rt = &world.rt;
+        let clone = |who: Caller, kind: Kind| {
+            let session = world.sessions[&kind].clone();
+            who.scope(RuntimeControl::clone_session(
+                rt.as_ref(),
+                CloneParams {
+                    session,
+                    name: None,
+                    request_id: "shared-id".into(),
+                },
+            ))
+        };
+        // Bob takes the id first; Alice's copy with it still works.
+        let his = clone(edge("bob", "acme"), Kind::Bob).await.unwrap();
+        let hers = clone(edge("alice", "acme"), Kind::Alice).await.unwrap();
+        assert_ne!(his.session.key, hers.session.key);
+        // A retry by Alice answers from her own receipt.
+        let again = clone(edge("alice", "acme"), Kind::Alice).await.unwrap();
+        assert_eq!(again.session.key, hers.session.key);
+        // The host's user has its own namespace too.
+        let mine = clone(host(), Kind::Local).await.unwrap();
+        assert_ne!(mine.session.key, hers.session.key);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// F3: the host's `runtime/sessions` row of another tenant's Session shows
+/// no model and no tokens, and reading it refuses nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_host_rows_of_other_tenants_show_no_model() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let world = world(true).await;
+        let rt = &world.rt;
+        let before = rt.access_refusals();
+        let rows = host()
+            .scope(RuntimeAdmin::sessions(rt.as_ref()))
+            .await
+            .unwrap();
+        assert_eq!(rt.access_refusals(), before, "no refused stats reads");
+        for row in &rows.sessions {
+            let local = row.session.key == world.sessions[&Kind::Local].key;
+            assert_eq!(row.model.is_some(), local, "{row:?}");
+            assert_eq!(row.tokens.is_some(), local, "{row:?}");
+        }
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A Subagent opens only in folders its parent's owner may use: Alice's
+/// agent asks for a child in Bob's folder (inside the same git root), and
+/// no child opens there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subagent_stays_in_its_owner_s_folders() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        // One git root above both users' folders: `resolve_cwd` alone would
+        // let a child go anywhere below it.
+        std::fs::create_dir_all(dir.path().join("ws/.git")).unwrap();
+        let rt = runtime(dir.path(), Arc::new(MemoryEventLog::new()), false).await;
+        let (alice, bob) = (edge("alice", "acme"), edge("bob", "acme"));
+        let hers = alice
+            .clone()
+            .scope(rt.new_session(spec(&folder(dir.path(), "alice"))))
+            .await
+            .unwrap();
+        let bob_folder = folder(dir.path(), "bob");
+        bob.scope(rt.new_session(spec(&bob_folder))).await.unwrap();
+        alice.clone().scope(run_turn(&rt, &hers, "SPAWN-BOB")).await;
+        let children: Vec<_> = rt
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|info| info.parent.is_some())
+            .collect();
+        assert!(
+            children.iter().all(|child| child.cwd != bob_folder),
+            "a child opened in Bob's folder: {children:?}"
+        );
+        // Control: a child in her own folder opens.
+        let again = alice
+            .clone()
+            .scope(rt.new_session(spec(&folder(dir.path(), "alice"))))
+            .await
+            .unwrap();
+        alice.scope(run_turn(&rt, &again, "SPAWN")).await;
+        assert!(rt
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|info| info.parent.as_ref().map(|p| &p.key) == Some(&again.key)));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
 }

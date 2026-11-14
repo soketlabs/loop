@@ -343,7 +343,10 @@ async fn workspace_reads_return_no_secrets() {
         // An outside user names only the folder of a Session it may read.
         caller
             .clone()
-            .scope(rt.new_session(SessionSpec::default()))
+            .scope(rt.new_session(SessionSpec {
+                cwd: Some(dir.path().to_path_buf()),
+                ..SessionSpec::default()
+            }))
             .await
             .unwrap();
         let answers = caller

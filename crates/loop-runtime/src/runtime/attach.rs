@@ -97,8 +97,7 @@ impl Runtime {
         if attached && self.stopped.load(Ordering::Acquire) {
             return false;
         }
-        self.idle_epoch.fetch_add(1, Ordering::AcqRel);
-        if attached {
+        let changed = if attached {
             watchers
                 .entry(session.key.clone())
                 .or_default()
@@ -111,7 +110,13 @@ impl Runtime {
                 watchers.remove(&session.key);
             }
             removed
+        };
+        // Only a real change is activity: a detach of a key this connection
+        // does not watch (any key, from anyone) changes nothing.
+        if changed || attached {
+            self.idle_epoch.fetch_add(1, Ordering::AcqRel);
         }
+        changed
     }
     /// `session/attach` for `connection`: protect the Session from unloading
     /// before taking the snapshot, and load it again first if it was

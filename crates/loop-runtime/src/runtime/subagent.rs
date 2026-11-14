@@ -503,6 +503,11 @@ fn last_output(answer: &str) -> String {
 
 /// The child's cwd: the parent's by default, relative paths from it, and
 /// never outside the parent's workspace.
+/// The child's folder: the parent's, or one below the parent's workspace
+/// root. Not the whole access check: opening the child applies the folder
+/// rule with the parent's access subject (`Subject::folder_actor` in
+/// `open_as`), so a child of an outside user's Session never opens in a
+/// folder of another user's Session.
 fn resolve_cwd(parent: &LiveSession, cwd: Option<&str>) -> Result<PathBuf, String> {
     let base = &parent.opened.workspace.cwd;
     let Some(cwd) = cwd else {

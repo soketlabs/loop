@@ -254,7 +254,7 @@ async fn a_session_keeps_its_tenant_whoever_acts_and_reads_are_scoped() {
         // only other identity that may act in it, I3) uses it.
         let theirs = alice
             .clone()
-            .scope(rt.new_session(SessionSpec::default()))
+            .scope(rt.new_session(own_folder(dir.path(), "alice")))
             .await
             .unwrap();
         assert_eq!(rt.session_tenant(&theirs.key), acme());
@@ -426,7 +426,7 @@ async fn a_subagent_acts_for_its_parent_turn_s_caller_with_the_parent_as_actor()
         let alice = edge("alice");
         let parent = alice
             .clone()
-            .scope(rt.new_session(SessionSpec::default()))
+            .scope(rt.new_session(own_folder(dir.path(), "alice")))
             .await
             .unwrap();
         prompt(&rt, &alice, &parent, "SPAWN").await;
@@ -483,7 +483,7 @@ async fn after_a_restart_a_session_keeps_its_tenant_and_recovery_names_the_runti
             let (rt, _) = runtime(dir.path(), log.clone()).await;
             let session = alice
                 .clone()
-                .scope(rt.new_session(SessionSpec::default()))
+                .scope(rt.new_session(own_folder(dir.path(), "alice")))
                 .await
                 .unwrap();
             let generation = rt.generation();
@@ -951,7 +951,7 @@ async fn a_session_split_across_tenants_by_an_older_binary_is_refused() {
             let (rt, _) = runtime(dir.path(), log).await;
             let session = alice
                 .clone()
-                .scope(rt.new_session(SessionSpec::default()))
+                .scope(rt.new_session(own_folder(dir.path(), "alice")))
                 .await
                 .unwrap();
             prompt(&rt, &alice, &session, "hello").await;

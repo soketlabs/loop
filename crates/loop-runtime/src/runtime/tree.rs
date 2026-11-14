@@ -76,6 +76,23 @@ fn fingerprint(params: &impl serde::Serialize) -> BackendResult<String> {
         Sha256::digest(serde_json::to_vec(params).map_err(failed)?)
     ))
 }
+/// The store key of a copy or import receipt: request ids are per user
+/// (tenant and principal), so one user can neither learn nor take another
+/// user's id. The user part is a hash: an id is never stored as given.
+fn receipt_key(kind: &str, request_id: &str, caller: &loop_protocol::Caller) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for part in [
+        caller.tenant().as_str(),
+        caller.principal().issuer(),
+        caller.principal().id(),
+    ] {
+        digest.update(part.as_bytes());
+        digest.update([0]);
+    }
+    let user = format!("{:x}", digest.finalize());
+    format!("{kind}:{}:{request_id}", &user[..32])
+}
 fn destination_result(id: &str, receipt: &str) -> BackendResult<DestinationResult> {
     let receipt: serde_json::Value = serde_json::from_str(receipt).map_err(failed)?;
     Ok(DestinationResult {
@@ -900,11 +917,23 @@ impl Runtime {
         if request_id.trim().is_empty() || request_id.len() > 256 {
             return Err(failed("request id must contain 1 to 256 bytes"));
         }
-        let result = self
+        let caller = request_caller();
+        let mut found = self
             .store
-            .destination_receipt(&format!("{kind}:{request_id}"), fingerprint)
+            .destination_receipt(&receipt_key(kind, request_id, &caller), fingerprint)
             .await
-            .map_err(failed)?
+            .map_err(failed)?;
+        // A receipt written before request ids were per user had no user in
+        // its key. The host's user (the only user before) still finds it, so
+        // a retry across an upgrade answers from it.
+        if found.is_none() && caller.tenant().as_str() == Tenant::LOCAL {
+            found = self
+                .store
+                .destination_receipt(&format!("{kind}:{request_id}"), fingerprint)
+                .await
+                .map_err(failed)?;
+        }
+        let result = found
             .map(|(id, receipt)| destination_result(&id, &receipt))
             .transpose()?;
         // A receipt answers only a caller that may read its Session: the
@@ -946,10 +975,7 @@ impl Runtime {
             return Err(BackendError::Busy);
         }
         let receipt = json!({"workspace_id":workspace_id(&cwd),"source_branch_revision":revision,"draft":draft}).to_string();
-        let key = format!(
-            "{}:{request_id}",
-            if parent.is_some() { "copy" } else { "import" }
-        );
+        let key = receipt_key(kind, &request_id, &request_caller());
         let created = self
             .store
             .create_destination(

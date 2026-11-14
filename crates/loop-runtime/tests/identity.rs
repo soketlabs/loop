@@ -365,7 +365,7 @@ async fn a_subagent_copies_its_parent_s_loaded_by() {
         let alice = edge("alice", "t-a");
         let parent = alice
             .clone()
-            .scope(rt.new_session(SessionSpec::default()))
+            .scope(rt.new_session(own_folder(dir.path(), "alice")))
             .await
             .unwrap();
         // Prompted with no caller in scope (and the turn runs on the
