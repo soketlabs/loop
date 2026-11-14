@@ -57,6 +57,7 @@ fn chunk(session: &str, text: String) -> Event {
                 content: ContentBlock::Text { text },
             },
         ),
+        loop_store::Identity::unrecorded(),
     )
 }
 
@@ -116,7 +117,11 @@ async fn append_latency_during_large_replay() {
 
     // One replay alone, for scale.
     let replay_start = Instant::now();
-    let replayed = log.read_after(&"big".into(), 0).await.unwrap().len();
+    let replayed = log
+        .read_after(&loop_store::Tenant::local(), &"big".into(), 0)
+        .await
+        .unwrap()
+        .len();
     let replay_ms = replay_start.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(replayed, events);
 
@@ -131,7 +136,10 @@ async fn append_latency_during_large_replay() {
         let replays = replays.clone();
         tasks.push(tokio::spawn(async move {
             while !stop.load(Ordering::Acquire) {
-                let records = log.read_after(&"big".into(), 0).await.unwrap();
+                let records = log
+                    .read_after(&loop_store::Tenant::local(), &"big".into(), 0)
+                    .await
+                    .unwrap();
                 assert!(records.len() >= events);
                 replays.fetch_add(1, Ordering::AcqRel);
             }
@@ -196,7 +204,9 @@ async fn wal_size_during_replay_and_appends() {
         let stop = stop.clone();
         tasks.push(tokio::spawn(async move {
             while !stop.load(Ordering::Acquire) {
-                log.read_after(&"big".into(), 0).await.unwrap();
+                log.read_after(&loop_store::Tenant::local(), &"big".into(), 0)
+                    .await
+                    .unwrap();
             }
         }));
     }
@@ -231,7 +241,10 @@ async fn wal_size_during_replay_and_appends() {
         task.await.unwrap();
     }
     let latencies = appender.await.unwrap();
-    let appended = log.latest_seq(&"small".into()).await.unwrap();
+    let appended = log
+        .latest_seq(&loop_store::Tenant::local(), &"small".into())
+        .await
+        .unwrap();
     let mib = |b: u64| b as f64 / 1048576.0;
     println!(
         "PROBE|WAL| {secs} s: max {:.1} MiB, last {:.1} MiB, median {:.1} MiB; {appended} small events appended; append p50 {:.2} ms p95 {:.2} ms p99 {:.2} ms max {:.2} ms",

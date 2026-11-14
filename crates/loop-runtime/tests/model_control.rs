@@ -231,7 +231,10 @@ async fn two_watchers_see_each_committed_change_at_the_setters_sequence() {
             assert_eq!(changed.config.model.as_deref(), Some("faux/second"));
         }
         // Committed before the reply: the Event Log already has it.
-        let logged = log.read_after(&session.key, 0).await.unwrap();
+        let logged = log
+            .read_after(&loop_store::Tenant::local(), &session.key, 0)
+            .await
+            .unwrap();
         assert!(logged.iter().any(|r| matches!(
             &r.event.kind,
             EventKind::Update(e) if e.seq == result.seq
@@ -386,7 +389,10 @@ async fn during_a_turn_the_model_and_the_effort_wait_for_the_next_turn() {
             .unwrap();
         loop {
             let raised = log
-                .read_runtime_after(0)
+                .read_runtime_after(
+                    loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                    0,
+                )
                 .await
                 .unwrap()
                 .iter()
@@ -564,19 +570,25 @@ impl EventLog for GatedLog {
     }
     async fn read_after(
         &self,
+        tenant: &loop_store::Tenant,
         key: &SessionKey,
         seq: u64,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
-        self.inner.read_after(key, seq).await
+        self.inner.read_after(tenant, key, seq).await
     }
     async fn read_runtime_after(
         &self,
+        scope: loop_store::Scope<'_>,
         seq: u64,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
-        self.inner.read_runtime_after(seq).await
+        self.inner.read_runtime_after(scope, seq).await
     }
-    async fn latest_seq(&self, key: &SessionKey) -> loop_runtime::log::Result<u64> {
-        self.inner.latest_seq(key).await
+    async fn latest_seq(
+        &self,
+        tenant: &loop_store::Tenant,
+        key: &SessionKey,
+    ) -> loop_runtime::log::Result<u64> {
+        self.inner.latest_seq(tenant, key).await
     }
     async fn allocate_generation(
         &self,
@@ -594,29 +606,32 @@ impl EventLog for GatedLog {
     }
     async fn read_session_page(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
         after_seq: u64,
         through_seq: Option<u64>,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
         self.inner
-            .read_session_page(session, after_seq, through_seq, limit)
+            .read_session_page(tenant, session, after_seq, through_seq, limit)
             .await
     }
     async fn session_summary(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
     ) -> loop_runtime::log::Result<Option<loop_runtime::log::SessionSummary>> {
-        self.inner.session_summary(session).await
+        self.inner.session_summary(tenant, session).await
     }
     async fn recovery_page(
         &self,
+        scope: loop_store::Scope<'_>,
         from_generation: u64,
         after_global: u64,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
         self.inner
-            .recovery_page(from_generation, after_global, limit)
+            .recovery_page(scope, from_generation, after_global, limit)
             .await
     }
 }
@@ -710,7 +725,10 @@ async fn a_change_acknowledged_during_a_turn_survives_a_crash() {
             .unwrap();
         loop {
             let raised = log
-                .read_runtime_after(0)
+                .read_runtime_after(
+                    loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                    0,
+                )
                 .await
                 .unwrap()
                 .iter()
@@ -776,19 +794,25 @@ impl EventLog for FailingLog {
     }
     async fn read_after(
         &self,
+        tenant: &loop_store::Tenant,
         key: &SessionKey,
         seq: u64,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
-        self.inner.read_after(key, seq).await
+        self.inner.read_after(tenant, key, seq).await
     }
     async fn read_runtime_after(
         &self,
+        scope: loop_store::Scope<'_>,
         seq: u64,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
-        self.inner.read_runtime_after(seq).await
+        self.inner.read_runtime_after(scope, seq).await
     }
-    async fn latest_seq(&self, key: &SessionKey) -> loop_runtime::log::Result<u64> {
-        self.inner.latest_seq(key).await
+    async fn latest_seq(
+        &self,
+        tenant: &loop_store::Tenant,
+        key: &SessionKey,
+    ) -> loop_runtime::log::Result<u64> {
+        self.inner.latest_seq(tenant, key).await
     }
     async fn allocate_generation(
         &self,
@@ -806,29 +830,32 @@ impl EventLog for FailingLog {
     }
     async fn read_session_page(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
         after_seq: u64,
         through_seq: Option<u64>,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
         self.inner
-            .read_session_page(session, after_seq, through_seq, limit)
+            .read_session_page(tenant, session, after_seq, through_seq, limit)
             .await
     }
     async fn session_summary(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
     ) -> loop_runtime::log::Result<Option<loop_runtime::log::SessionSummary>> {
-        self.inner.session_summary(session).await
+        self.inner.session_summary(tenant, session).await
     }
     async fn recovery_page(
         &self,
+        scope: loop_store::Scope<'_>,
         from_generation: u64,
         after_global: u64,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
         self.inner
-            .recovery_page(from_generation, after_global, limit)
+            .recovery_page(scope, from_generation, after_global, limit)
             .await
     }
 }
@@ -868,11 +895,20 @@ async fn an_unannounced_change_is_announced_on_reopen() {
         assert_eq!(changed.config.effort.as_deref(), Some("low"));
         // Announced once: opening again adds nothing.
         rt.close(&session.key, false).await.unwrap();
-        let before = inner.latest_seq(&session.key).await.unwrap();
+        let before = inner
+            .latest_seq(&loop_store::Tenant::local(), &session.key)
+            .await
+            .unwrap();
         rt.load_session(&session, SessionSpec::default())
             .await
             .unwrap();
-        assert_eq!(inner.latest_seq(&session.key).await.unwrap(), before);
+        assert_eq!(
+            inner
+                .latest_seq(&loop_store::Tenant::local(), &session.key)
+                .await
+                .unwrap(),
+            before
+        );
         rt.shutdown().await;
     })
     .await
@@ -913,7 +949,7 @@ async fn many_setters_waiting_on_a_stalled_log_each_get_their_receipt() {
         assert_eq!(revisions, (1..=100).collect::<Vec<_>>());
         assert!(receipts.windows(2).all(|w| w[0].1 < w[1].1));
         // Each receipt names the update that announced that revision.
-        let logged = log.inner.read_after(&session.key, 0).await.unwrap();
+        let logged = log.inner.read_after(&loop_store::Tenant::local(), &session.key, 0).await.unwrap();
         for (revision, seq) in receipts {
             assert!(logged.iter().any(|r| matches!(
                 &r.event.kind,
@@ -1003,7 +1039,12 @@ async fn rename_between_config_changes_keeps_both_in_the_snapshot() {
             assert_eq!(snapshot.config.model.as_deref(), Some("faux/second"));
             assert_eq!(snapshot.config.effort.as_deref(), Some("high"));
             assert_eq!(snapshot.revision, effort.revision);
-            assert_eq!(snapshot.at_seq, log.latest_seq(&session.key).await.unwrap());
+            assert_eq!(
+                snapshot.at_seq,
+                log.latest_seq(&loop_store::Tenant::local(), &session.key)
+                    .await
+                    .unwrap()
+            );
         }
         rt.shutdown().await;
     })
@@ -1145,7 +1186,10 @@ async fn ttfb_waits_for_the_turn_and_never_changes_the_default() {
             .unwrap();
         loop {
             let raised = log
-                .read_runtime_after(0)
+                .read_runtime_after(
+                    loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                    0,
+                )
                 .await
                 .unwrap()
                 .iter()

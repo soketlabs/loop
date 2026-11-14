@@ -4,6 +4,7 @@
 //! turn and Escalation ids are process-local counters that repeat.
 use crate::log::{EventKind, LoggedEvent};
 use loop_protocol::{SessionKey, SessionUpdate, TurnId};
+use loop_store::{Tenant, TenantSession};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -26,6 +27,8 @@ pub struct Recovery {
 /// An Escalation still open, identified by the generation that raised it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OpenEscalation {
+    /// The Session's tenant: recovery's withdrawal goes in it.
+    pub tenant: Tenant,
     pub session: SessionKey,
     pub generation: u64,
     pub id: Value,
@@ -34,6 +37,8 @@ pub(crate) struct OpenEscalation {
 /// A turn recovery must end as `runtime_restarted`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpenTurn {
+    /// The Session's tenant: recovery's turn end goes in it.
+    pub tenant: Tenant,
     pub session: SessionKey,
     pub turn_id: TurnId,
     /// The log has no `turn_started` for it: only a `prompt_sent`. Its tools
@@ -69,12 +74,14 @@ pub(crate) fn unfinished(
 #[derive(Debug)]
 pub(crate) struct Unfinished {
     current: u64,
-    turns: HashMap<(SessionKey, TurnId), (u64, bool, bool)>,
+    /// Sessions are `(tenant, key)`: the same key in two tenants is two
+    /// Sessions.
+    turns: HashMap<(TenantSession, TurnId), (u64, bool, bool)>,
     /// Per Session: the last prompt with no turn start yet (seq, generation).
-    prompts: HashMap<SessionKey, (u64, u64)>,
+    prompts: HashMap<TenantSession, (u64, u64)>,
     /// Generations with a clean stop.
     stopped: HashSet<u64>,
-    escalations: HashMap<(SessionKey, u64, String), (u64, Option<Value>)>,
+    escalations: HashMap<(TenantSession, u64, String), (u64, Option<Value>)>,
 }
 
 impl Unfinished {
@@ -95,9 +102,10 @@ impl Unfinished {
         if matches!(event.kind, EventKind::RuntimeStopped(_)) {
             self.stopped.insert(event.generation);
         }
-        let Some(session) = &event.session_key else {
+        let Some(key) = &event.session_key else {
             return;
         };
+        let session = &(event.identity.tenant.clone(), key.clone());
         match &event.kind {
             // The prompt never started a turn.
             EventKind::PromptSettled(_) => {
@@ -178,10 +186,11 @@ impl Unfinished {
         let mut turns: Vec<_> = turns
             .into_iter()
             .filter(|(_, (_, open, _))| *open)
-            .map(|((session, turn_id), (seq, _, unstarted))| {
+            .map(|(((tenant, session), turn_id), (seq, _, unstarted))| {
                 (
                     seq,
                     OpenTurn {
+                        tenant,
                         session,
                         turn_id,
                         unstarted,
@@ -192,11 +201,12 @@ impl Unfinished {
         turns.sort_by_key(|(seq, _)| *seq);
         let mut escalations: Vec<_> = escalations
             .into_iter()
-            .filter_map(|((session, generation, _), (seq, id))| {
+            .filter_map(|(((tenant, session), generation, _), (seq, id))| {
                 id.map(|id| {
                     (
                         seq,
                         OpenEscalation {
+                            tenant,
                             session,
                             generation,
                             id,
@@ -218,6 +228,7 @@ mod tests {
     use super::*;
     use crate::log::Event;
     use loop_protocol::{StopReason, UpdateEnvelope};
+    use loop_store::Identity;
 
     fn turn(global_seq: u64, generation: u64, update: SessionUpdate) -> LoggedEvent {
         LoggedEvent {
@@ -234,6 +245,7 @@ mod tests {
                     0,
                     update,
                 ),
+                Identity::unrecorded(),
             ),
         }
     }
@@ -271,6 +283,7 @@ mod tests {
                 turn: None,
                 ts_ms: 0,
                 kind: EventKind::PromptSent(serde_json::json!({})),
+                identity: Identity::unrecorded(),
             },
         }
     }
@@ -323,9 +336,34 @@ mod tests {
                 turn: None,
                 ts_ms: 0,
                 kind: EventKind::RuntimeStopped(serde_json::json!({})),
+                identity: Identity::unrecorded(),
             },
         });
         assert!(unfinished(&records, 2).0.is_empty());
+    }
+
+    /// The same Session key in two tenants is two Sessions: a turn end in
+    /// one tenant does not close the other's turn, and each open turn keeps
+    /// its tenant for recovery's own records.
+    #[test]
+    fn open_work_is_per_tenant() {
+        let acme = Tenant::new("acme").unwrap();
+        let in_acme = |mut record: LoggedEvent| {
+            record.event.identity.tenant = acme.clone();
+            record
+        };
+        let started = SessionUpdate::TurnStarted {
+            turn_id: TurnId("turn-1".into()),
+        };
+        let records = vec![
+            turn(1, 1, started.clone()),
+            in_acme(turn(2, 1, started)),
+            turn(3, 1, ended(StopReason::EndTurn)),
+        ];
+        let (turns, _) = unfinished(&records, 2);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tenant, acme);
+        assert_eq!(turns[0].session, SessionKey::from("s"));
     }
 
     #[test]
@@ -349,6 +387,7 @@ mod tests {
                 turn: None,
                 ts_ms: 0,
                 kind,
+                identity: Identity::unrecorded(),
             },
         };
         let raised = || EventKind::EscalationRaised(serde_json::json!({"id": "i1", "request": {}}));

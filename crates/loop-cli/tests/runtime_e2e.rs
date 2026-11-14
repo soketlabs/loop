@@ -609,7 +609,12 @@ impl Fixture {
         SqliteEventLog::open(&self.agent)
             .await
             .unwrap()
-            .read_runtime_after(0)
+            .read_runtime_after(
+                loop_runtime::log::Scope::System(
+                    &loop_runtime::log::SystemScope::for_runtime_startup(),
+                ),
+                0,
+            )
             .await
             .unwrap()
     }

@@ -23,14 +23,15 @@
 //! - [`error`]: `StoreError` (was `EventLogError`) and `Result`.
 //! - [`records`]: the typed `policy_decision` record (S4 §12), which the
 //!   Runtime writes as `EventKind::PolicyDecision`.
-//! - [`identity`]: `Tenant`, `Principal`, `PrincipalKind` and `Via`, the
-//!   protocol's own types re-exported, so there is one definition of each.
+//! - [`identity`]: `Tenant`, `Principal`, `PrincipalKind`, `Via` and
+//!   `Caller`, the protocol's own types re-exported, so there is one
+//!   definition of each. From step B3 also `Identity` (on every `Event`),
+//!   `Scope`, `SystemScope` and `Deployment`.
 //!
 //! `loop_runtime::log` re-exports all of these at their old paths.
 //!
 //! # Defined for later steps, not used yet
 //!
-//! - [`identity`]: `Identity`, `SystemScope` (B3).
 //! - [`lease`]: `Generation`, `OwnerInfo`, `Fence` (B4, chain D).
 //! - [`append`]: `Append` (B4, B5).
 //! - [`records`]: payloads of `tree`, `session_deleted`, and the
@@ -59,10 +60,13 @@ pub mod tree;
 pub use append::Append;
 pub use error::{Result, StoreError};
 pub use event::{
-    is_recovery_record, stamp, validate_batch, Committed, Event, EventKind, LoggedEvent,
-    MAX_BATCH_EVENTS, WRITER_QUEUE_CAPACITY,
+    is_recovery_record, opened_creates, stamp, validate_batch, Committed, Event, EventKind,
+    LoggedEvent, MAX_BATCH_EVENTS, SESSION_CREATED_KEY, WRITER_QUEUE_CAPACITY,
 };
-pub use identity::{Identity, Principal, PrincipalKind, SystemScope, Tenant, Via};
+pub use identity::{
+    ActorError, Caller, Deployment, Identity, Principal, PrincipalKind, Scope, SystemScope, Tenant,
+    Via,
+};
 pub use lease::{Fence, Generation, OwnerInfo};
 pub use log::{record_bytes, EventLog};
 pub use page::{Cursor, Page, PageLimit};
@@ -72,6 +76,7 @@ pub use records::{
 };
 pub use store::{
     summarize, EventReader, EventWriter, LeaseStore, ProjectionAdmin, RebuildReport,
-    SessionSummary, Store, StoreCapabilities, SummaryDelta, TreeReader, VerifyReport,
+    SessionSummary, Store, StoreCapabilities, SummaryDelta, TenantSession, TreeReader,
+    VerifyReport,
 };
 pub use tree::{SessionMetadata, SessionTreeEntry};

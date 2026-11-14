@@ -25,6 +25,8 @@ impl Runtime {
             let _lifecycle = live.lifecycle.lock().await;
             self.check_tree_live(&live)?;
             self.reserve(&live).await?;
+            // The command's records are its caller's.
+            live.set_turn_caller(caller.clone());
         }
         // Owned by the Runtime: a dropped request still clears `busy`.
         let session = session.clone();

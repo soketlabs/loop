@@ -22,6 +22,8 @@ use loop_protocol::{
     SessionStats, SessionUpdate, ShellResult, StatsSummary, TurnHandle, TurnOutcome,
     UpdateEnvelope,
 };
+use loop_protocol::{Caller, Principal};
+use loop_store::{Deployment, Identity, Scope, SystemScope, Tenant};
 use loop_wire::control::EscalationRecipient;
 use publish::{barrier, fail};
 use serde_json::json;
@@ -99,6 +101,20 @@ pub struct Runtime {
     sandbox_starter: Mutex<Option<admin::SandboxStarter>>,
     log: Arc<dyn EventLog>,
     generation: u64,
+    /// Decides the tenant of the Runtime's own records. One place for the
+    /// later cell work to change (`Deployment::SharedCell`).
+    deployment: Deployment,
+    /// The cross-tenant read permission, made once here at startup. Only
+    /// recovery, the start-up activity and tenant index, and the Subagent
+    /// keys of the Session list use it; every other read names a tenant.
+    system: SystemScope,
+    /// The tenant of each Session the Event Log knows, read once at start
+    /// (system scope) and kept as Sessions open. A Session key is unique in
+    /// this Runtime's Session store, so one key has one tenant here.
+    tenants: Mutex<HashMap<SessionKey, Tenant>>,
+    /// Session keys with records in more than one tenant, found at start:
+    /// readable in their creating tenant, never loaded.
+    split: HashMap<SessionKey, SplitSessionError>,
     limits: RuntimeLimits,
     turns: Arc<Semaphore>,
     store: Arc<dyn RuntimeSessionStore>,
@@ -151,6 +167,75 @@ fn touch(activity: &Activity, key: &SessionKey, ts_ms: i64) {
     let mut map = activity.lock().unwrap();
     let slot = map.entry(key.clone()).or_insert(ts_ms);
     *slot = (*slot).max(ts_ms);
+}
+/// A Session key with records in more than one tenant. Only a downgrade
+/// makes one: a Loop from before step B3 writes every row as `local`, also
+/// a row of another tenant's Session. Such a Session is not loaded.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "Session {session} has records in more than one tenant ({tenants}): an older Loop \
+     wrote some of them. It is readable in tenant {creator} but cannot be loaded"
+)]
+pub struct SplitSessionError {
+    /// The Session key.
+    pub session: String,
+    /// The tenants that hold its records.
+    pub tenants: String,
+    /// The tenant its reads use: the one of its creating record.
+    pub creator: Tenant,
+}
+
+/// The start-up index of the Sessions the Event Log knows (all tenants).
+#[derive(Debug, Default, PartialEq)]
+struct SessionIndex {
+    /// Newest activity of each key.
+    activity: HashMap<SessionKey, i64>,
+    /// The tenant each key's reads use.
+    tenants: HashMap<SessionKey, Tenant>,
+    /// Keys with records in more than one tenant.
+    split: HashMap<SessionKey, SplitSessionError>,
+}
+
+/// Build the index from the start-up activity read. A key in more than one
+/// tenant reads in the tenant of its creating record (`creators`: the
+/// tenants whose summary of the key has an owner of record); with none or
+/// several of those, the smallest tenant name. It is reported, and the
+/// Runtime refuses to load it.
+fn session_index(
+    read: HashMap<(Tenant, SessionKey), i64>,
+    creators: &HashMap<SessionKey, Vec<Tenant>>,
+) -> SessionIndex {
+    let mut index = SessionIndex::default();
+    let mut all: HashMap<SessionKey, Vec<Tenant>> = HashMap::new();
+    for ((tenant, key), ts) in read {
+        let slot = index.activity.entry(key.clone()).or_insert(ts);
+        *slot = (*slot).max(ts);
+        all.entry(key).or_default().push(tenant);
+    }
+    for (key, mut tenants) in all {
+        tenants.sort();
+        if tenants.len() == 1 {
+            index.tenants.insert(key, tenants.remove(0));
+            continue;
+        }
+        let creator = match creators.get(&key).map(Vec::as_slice) {
+            Some([one]) => one.clone(),
+            _ => tenants[0].clone(),
+        };
+        let error = SplitSessionError {
+            session: key.0.clone(),
+            tenants: tenants
+                .iter()
+                .map(Tenant::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            creator: creator.clone(),
+        };
+        eprintln!("Runtime: {error}");
+        index.tenants.insert(key.clone(), creator);
+        index.split.insert(key, error);
+    }
+    index
 }
 /// How long a close waits for each settling step before giving up on a stuck turn.
 const CLOSE_GRACE: Duration = Duration::from_secs(10);
@@ -217,6 +302,143 @@ struct LiveSession {
     /// authorization: another caller's reload replaces it. Ownership comes
     /// from a record stored when the Session is created (later work).
     loaded_by: Option<loop_protocol::Caller>,
+    /// The Session's tenant: the creator's, fixed for its life. Every record
+    /// of the Session is in it, whoever acts (ADR-0009).
+    tenant: Tenant,
+    /// The `actor` of every record of this Session: a Subagent's parent
+    /// Session key; `None` for a Session a Surface opened.
+    actor: Option<String>,
+    /// Who the pump stamps on the updates it commits (step B3).
+    acting: Mutex<Acting>,
+}
+/// Who caused the updates a Session's backend sends to its pump. The pump
+/// commits them without a request in scope, so the cause is recorded here
+/// first, and each identity is built once, not per update.
+///
+/// - An update with a turn id is the turn's caller's. A turn's caller cannot
+///   change while its updates are in flight: the next prompt is admitted
+///   only after the turn's barrier.
+/// - A `config_changed` is stamped by its revision: the caller that made the
+///   change, recorded under the lifecycle lock before the setter runs
+///   ([`LiveSession::claim_changes`]). So a change waiting in the pump's
+///   queue keeps its caller, also when another caller's prompt is admitted
+///   meanwhile, and a deferred change that takes effect at a turn's end
+///   (same revision) is still its setter's.
+/// - What remains: an update with no turn id that is not a `config_changed`
+///   (a notice, a command's output) is the caller of the last turn or
+///   command. If such an update still waits in the pump's queue when the
+///   next turn is admitted, it gets the next turn's caller. A
+///   `config_changed` whose revision no request claimed (the opening config,
+///   or more than [`CHANGES_KEPT`] changes ago) also falls back to that
+///   caller. The per-Session sequencer (A0) can carry the caller with every
+///   update.
+struct Acting {
+    turn_caller: Caller,
+    turn: Identity,
+    request: Identity,
+    /// Who made each Session revision, newest [`CHANGES_KEPT`].
+    changes: std::collections::BTreeMap<u64, Identity>,
+    /// A setter running now: revisions after the first value are the
+    /// second's, until the claim ends.
+    claim: Option<(u64, Identity)>,
+}
+/// How many revisions [`Acting::changes`] remembers.
+const CHANGES_KEPT: usize = 256;
+impl Acting {
+    fn new(caller: Caller, identity: Identity) -> Self {
+        Self {
+            turn_caller: caller,
+            turn: identity.clone(),
+            request: identity,
+            changes: std::collections::BTreeMap::new(),
+            claim: None,
+        }
+    }
+}
+/// The revisions a setter makes while this lives are its caller's. Ends
+/// (and records them) on drop.
+struct ChangeClaim<'a> {
+    live: &'a LiveSession,
+}
+impl Drop for ChangeClaim<'_> {
+    fn drop(&mut self) {
+        let after = self.live.opened.native.config().revision;
+        let mut acting = self
+            .live
+            .acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((before, identity)) = acting.claim.take() {
+            for revision in before.saturating_add(1)..=after {
+                acting.changes.insert(revision, identity.clone());
+            }
+            while acting.changes.len() > CHANGES_KEPT {
+                acting.changes.pop_first();
+            }
+        }
+    }
+}
+impl LiveSession {
+    /// `caller` acting on this Session, in its tenant.
+    fn identity(&self, caller: &Caller) -> Identity {
+        Identity::acting(caller, self.tenant.clone()).with_actor(self.actor.clone())
+    }
+    /// The Runtime acting on its own on this Session.
+    fn runtime_identity(&self) -> Identity {
+        Identity::runtime_in(self.tenant.clone()).with_actor(self.actor.clone())
+    }
+    /// The identity of an update the pump commits (see [`Acting`]).
+    fn update_identity(&self, envelope: &UpdateEnvelope) -> Identity {
+        let acting = self
+            .acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if envelope.turn.is_some() {
+            return acting.turn.clone();
+        }
+        if let SessionUpdate::ConfigChanged(changed) = &envelope.update {
+            if let Some(identity) = acting.changes.get(&changed.revision) {
+                return identity.clone();
+            }
+            if let Some((before, identity)) = &acting.claim {
+                if changed.revision > *before {
+                    return identity.clone();
+                }
+            }
+        }
+        acting.request.clone()
+    }
+    /// A turn or command of `caller` starts: it causes the updates that follow.
+    fn set_turn_caller(&self, caller: Caller) {
+        let identity = self.identity(&caller);
+        let mut acting = self
+            .acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        acting.turn_caller = caller;
+        acting.turn = identity.clone();
+        acting.request = identity;
+    }
+    /// Claim the revisions the next setter makes for `caller`. Call under
+    /// the lifecycle lock, which serializes setters; keep the claim until
+    /// the setter returns.
+    fn claim_changes(&self, caller: &Caller) -> ChangeClaim<'_> {
+        let identity = self.identity(caller);
+        let before = self.opened.native.config().revision;
+        self.acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .claim = Some((before, identity));
+        ChangeClaim { live: self }
+    }
+    /// The caller of the current (or last) turn.
+    fn turn_caller(&self) -> Caller {
+        self.acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .turn_caller
+            .clone()
+    }
 }
 /// What the pump has committed and published of one Session. The pump is
 /// the only writer of a loaded Session's updates, so `published` and
@@ -266,8 +488,14 @@ impl Drop for Receipt<'_> {
     }
 }
 enum Command {
-    Cancel,
-    Publish(Box<SessionUpdate>, oneshot::Sender<BackendResult<()>>),
+    /// Cancel the turn; the caller is who cancelled.
+    Cancel(Caller),
+    /// Commit an update the Runtime made for a request, as `Identity`.
+    Publish(
+        Box<SessionUpdate>,
+        Identity,
+        oneshot::Sender<BackendResult<()>>,
+    ),
     Barrier(oneshot::Sender<()>),
     Stop(oneshot::Sender<()>),
 }
@@ -277,6 +505,16 @@ pub(crate) fn now() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+/// The caller of work no connection asked for: an in-process call, or work
+/// the Runtime started itself. The Runtime's own principal, host-local.
+pub(crate) fn in_process_caller() -> Caller {
+    Caller::host(Principal::runtime())
+}
+/// The caller of the request served on this task, read at a request's entry
+/// (it does not cross a spawn); an in-process call acts as the Runtime.
+pub(crate) fn request_caller() -> Caller {
+    Caller::current().unwrap_or_else(in_process_caller)
 }
 fn failed(error: impl std::fmt::Display) -> BackendError {
     BackendError::failed(ErrorCategory::Internal, error.to_string())
@@ -316,16 +554,46 @@ impl Runtime {
             generation: i64::try_from(generation).map_err(failed)?,
         };
         globals.repository = create_session_repository(store.for_lease(identity.clone()), None);
+        let deployment = Deployment::SingleNode;
         log.append_batch(vec![Event {
             generation,
             session_key: None,
             turn: None,
             ts_ms: now(),
             kind: EventKind::RuntimeStarted(json!({"pid": std::process::id()})),
+            identity: deployment.runtime_identity(),
         }])
         .await
         .map_err(failed)?;
-        let activity = Arc::new(Mutex::new(log.last_activity_ms().await.map_err(failed)?));
+        // The one cross-tenant read permission, made at startup.
+        let system = SystemScope::for_runtime_startup();
+        let read = log
+            .last_activity_ms(Scope::System(&system))
+            .await
+            .map_err(failed)?;
+        // Keys in more than one tenant (a downgrade wrote them): which
+        // tenant holds the creating record.
+        let mut seen: HashMap<&SessionKey, usize> = HashMap::new();
+        for (_, key) in read.keys() {
+            *seen.entry(key).or_default() += 1;
+        }
+        let mut creators: HashMap<SessionKey, Vec<Tenant>> = HashMap::new();
+        for (tenant, key) in read.keys() {
+            if seen[key] > 1
+                && log
+                    .session_owner(tenant, key)
+                    .await
+                    .map_err(failed)?
+                    .is_some()
+            {
+                creators
+                    .entry(key.clone())
+                    .or_default()
+                    .push(tenant.clone());
+            }
+        }
+        let index = session_index(read, &creators);
+        let activity = Arc::new(Mutex::new(index.activity));
         let (updates, _) = broadcast::channel(4096);
         Ok(Self {
             instance: NATIVE_INSTANCE.into(),
@@ -342,6 +610,10 @@ impl Runtime {
             sandbox_starter: Mutex::new(None),
             log,
             generation,
+            deployment,
+            system,
+            tenants: Mutex::new(index.tenants),
+            split: index.split,
             limits,
             turns: Arc::new(Semaphore::new(limits.max_active_turns)),
             store,
@@ -411,14 +683,23 @@ impl Runtime {
                 )));
             }
         }
-        let from = self.log.last_recovered_generation().await.map_err(failed)?;
+        let from = self
+            .log
+            .last_recovered_generation(&self.system)
+            .await
+            .map_err(failed)?;
         // Page through the records; the fold keeps only the open work.
         let mut open = Unfinished::new(self.generation);
         let mut after = 0;
         loop {
             let page = self
                 .log
-                .recovery_page(from, after, loop_store::PageLimit::DEFAULT)
+                .recovery_page(
+                    Scope::System(&self.system),
+                    from,
+                    after,
+                    loop_store::PageLimit::DEFAULT,
+                )
                 .await
                 .map_err(failed)?;
             for record in &page.items {
@@ -433,6 +714,8 @@ impl Runtime {
         let ts_ms = now();
         let mut events = Vec::with_capacity(2 * turns.len() + escalations.len());
         for turn in &turns {
+            // The Runtime ends the turn, in the tenant of the Session.
+            let identity = Identity::runtime_in(turn.tenant.clone());
             let update = |update| {
                 Event::update(
                     self.generation,
@@ -445,6 +728,7 @@ impl Runtime {
                         0,
                         update,
                     ),
+                    identity.clone(),
                 )
             };
             // A prompt whose turn start never committed may still have run
@@ -469,6 +753,7 @@ impl Runtime {
                 kind: EventKind::EscalationWithdrawn(
                     json!({"id": open.id, "generation": open.generation, "reason": REASON}),
                 ),
+                identity: Identity::runtime_in(open.tenant.clone()),
             });
         }
         for chunk in events.chunks(crate::log::MAX_BATCH_EVENTS) {
@@ -550,6 +835,35 @@ impl Runtime {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+    /// The tenant of Session `key`: a loaded Session's own, else the one the
+    /// Event Log recorded, else `local` (a Session that has no record yet
+    /// was made on this host, by `loop` or an older Runtime). Reads of the
+    /// Session's records use it. It does not decide access (task I3).
+    pub fn session_tenant(&self, key: &SessionKey) -> Tenant {
+        if let Some(live) = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+        {
+            return live.tenant.clone();
+        }
+        self.tenants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
+            .unwrap_or_else(Tenant::local)
+    }
+    /// The owner of record of Session `key` (step B3): the identity of the
+    /// `session_opened` that created it, read from the Session summary in
+    /// the Session's tenant. `None` for a Session created before step B3 or
+    /// outside the Runtime. Groundwork for access checks (task I3); nothing
+    /// uses it to decide access yet.
+    pub async fn session_owner(&self, key: &SessionKey) -> BackendResult<Option<Identity>> {
+        let tenant = self.session_tenant(key);
+        self.log.session_owner(&tenant, key).await.map_err(failed)
     }
     /// This process, its limits and how many Sessions are loaded and busy.
     /// `socket` is empty: the process serving the Runtime fills it in.
@@ -691,7 +1005,15 @@ impl Runtime {
         if let Some(keys) = known.as_ref() {
             return Ok(keys.clone());
         }
-        let keys = self.log.subagent_sessions().await.map_err(failed)?;
+        // Runtime-wide: the Session list shows every tenant's Sessions.
+        let keys: HashSet<SessionKey> = self
+            .log
+            .subagent_sessions(Scope::System(&self.system))
+            .await
+            .map_err(failed)?
+            .into_iter()
+            .map(|(_, key)| key)
+            .collect();
         *known = Some(keys.clone());
         Ok(keys)
     }
@@ -877,6 +1199,7 @@ impl Runtime {
                 turn: None,
                 ts_ms: now(),
                 kind: EventKind::RuntimeStopped(json!({})),
+                identity: self.deployment.runtime_identity(),
             }])
             .await
         {
@@ -918,6 +1241,7 @@ impl loop_wire::RuntimeControl for Runtime {
             self.reserve(&live).await?;
             live.escalations
                 .set_turn_caller(loop_protocol::Caller::current());
+            live.set_turn_caller(request_caller());
             match live.opened.native.workflow(p).await {
                 Ok(result) => result,
                 Err(error) => {
@@ -1096,7 +1420,12 @@ impl Runtime {
             None => {
                 // An append abandoned while queued must count before `at_seq`.
                 self.log.sync().await.map_err(failed)?;
-                let at_seq = self.log.latest_seq(&session.key).await.map_err(failed)?;
+                let tenant = self.session_tenant(&session.key);
+                let at_seq = self
+                    .log
+                    .latest_seq(&tenant, &session.key)
+                    .await
+                    .map_err(failed)?;
                 (at_seq, self.recorded_config(session).await?)
             }
         };
@@ -1204,8 +1533,12 @@ impl Runtime {
     /// The newest Session revision the Event Log announced for `key`: the
     /// revision of its last `config_changed` or `branch_reset`, from the
     /// Session summary (no read of the Session's history).
-    async fn logged_revision(&self, key: &SessionKey) -> BackendResult<u64> {
-        let summary = self.log.session_summary(key).await.map_err(failed)?;
+    async fn logged_revision(&self, tenant: &Tenant, key: &SessionKey) -> BackendResult<u64> {
+        let summary = self
+            .log
+            .session_summary(tenant, key)
+            .await
+            .map_err(failed)?;
         Ok(summary.map_or(0, |summary| summary.last_revision))
     }
     /// The loaded Session, loading it again when it was unloaded to make room.
@@ -1243,6 +1576,8 @@ impl Runtime {
             if refuse_busy && live.busy.load(Ordering::Acquire) {
                 return Err(BackendError::Busy);
             }
+            // The revisions the setter makes are this caller's.
+            let _claim = live.claim_changes(&request_caller());
             set(Arc::clone(&live)).await?
         };
         let receipt = Receipt {
@@ -1519,7 +1854,12 @@ impl AgentBackend for Runtime {
                 .cloned()?;
             parent.escalations.turn_caller()
         });
+        // Stamped on the turn's records: the connection's caller, else the
+        // parent turn's, else (in process) the Runtime.
+        let acting = caller.clone().unwrap_or_else(in_process_caller);
         live.escalations.set_turn_caller(caller);
+        live.set_turn_caller(acting.clone());
+        let identity = live.identity(&acting);
         let (done, handle) = TurnHandle::channel();
         let log = self.log.clone();
         let generation = self.generation;
@@ -1543,6 +1883,7 @@ impl AgentBackend for Runtime {
                     turn: None,
                     ts_ms,
                     kind: EventKind::PromptSent(json!({"content": input})),
+                    identity: identity.clone(),
                 }])
                 .await
                 .map_err(failed)?;
@@ -1588,6 +1929,7 @@ impl AgentBackend for Runtime {
                         turn: None,
                         ts_ms: now(),
                         kind: EventKind::PromptSettled(json!({})),
+                        identity,
                     }])
                     .await;
                 if let Err(error) = settled {
@@ -1622,7 +1964,7 @@ impl AgentBackend for Runtime {
     }
     fn cancel(&self, session: &SessionRef) {
         if let Ok(live) = self.route(session) {
-            let _ = live.commands.send(Command::Cancel);
+            let _ = live.commands.send(Command::Cancel(request_caller()));
         }
     }
     fn is_busy(&self, session: &SessionRef) -> bool {
@@ -1666,6 +2008,34 @@ mod tests {
         .await
         .ok();
         (end, calls.load(Ordering::Acquire))
+    }
+
+    /// A key in two tenants reads in the tenant of its creating record and
+    /// is marked split; with no single creating tenant, the smallest name.
+    #[test]
+    fn session_index_prefers_the_creating_tenant_and_marks_splits() {
+        let local = Tenant::local();
+        let acme = Tenant::new("acme").unwrap();
+        let zeta = Tenant::new("zeta").unwrap();
+        let key = |k: &str| SessionKey::from(k);
+        let read = HashMap::from([
+            ((local.clone(), key("only")), 5),
+            ((local.clone(), key("split")), 9),
+            ((zeta.clone(), key("split")), 7),
+            ((local.clone(), key("unowned")), 1),
+            ((acme.clone(), key("unowned")), 2),
+        ]);
+        // "split" was created in zeta: the larger name wins by its owner row.
+        let creators = HashMap::from([(key("split"), vec![zeta.clone()])]);
+        let index = session_index(read, &creators);
+        assert_eq!(index.tenants[&key("only")], local);
+        assert_eq!(index.tenants[&key("split")], zeta);
+        assert_eq!(index.activity[&key("split")], 9);
+        assert_eq!(index.tenants[&key("unowned")], acme);
+        assert!(!index.split.contains_key(&key("only")));
+        assert_eq!(index.split[&key("split")].creator, zeta);
+        assert_eq!(index.split[&key("split")].tenants, "local, zeta");
+        assert!(index.split.contains_key(&key("unowned")));
     }
 
     #[tokio::test]
@@ -1739,7 +2109,13 @@ mod tests {
             .unwrap()
             .outcome()
             .await;
-        let before = log.read_runtime_after(0).await.unwrap();
+        let before = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         let tail = rt.tail(&session).unwrap();
         let mut updates = rt.subscribe();
         let live = rt.route(&session).unwrap();
@@ -1749,7 +2125,15 @@ mod tests {
             .await
             .unwrap();
         barrier(&live).await.unwrap();
-        assert_eq!(log.read_runtime_after(0).await.unwrap(), before);
+        assert_eq!(
+            log.read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0
+            )
+            .await
+            .unwrap(),
+            before
+        );
         assert_eq!(rt.tail(&session).unwrap(), tail);
         assert!(updates.try_recv().is_err());
         rt.shutdown().await;

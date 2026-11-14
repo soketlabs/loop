@@ -157,7 +157,10 @@ async fn basic_flows_run_over_memory_stores_without_sqlite() {
 
         // Prompt with faux: the turn commits to the log and the tree.
         completed(&rt, &a, "hello").await;
-        let seq = log.latest_seq(&a.key).await.unwrap();
+        let seq = log
+            .latest_seq(&loop_store::Tenant::local(), &a.key)
+            .await
+            .unwrap();
         assert!(seq > 0);
         let entries = store
             .load(&a.native_id)
@@ -195,11 +198,22 @@ async fn basic_flows_run_over_memory_stores_without_sqlite() {
         assert_eq!(list[0].name.as_deref(), Some("renamed"));
 
         // Reload continues the same sequence (the rename committed one more).
-        let seq = log.latest_seq(&a.key).await.unwrap();
+        let seq = log
+            .latest_seq(&loop_store::Tenant::local(), &a.key)
+            .await
+            .unwrap();
         rt.load_session(&a, SessionSpec::default()).await.unwrap();
-        assert_eq!(log.latest_seq(&a.key).await.unwrap(), seq);
+        assert_eq!(
+            log.latest_seq(&loop_store::Tenant::local(), &a.key)
+                .await
+                .unwrap(),
+            seq
+        );
         completed(&rt, &a, "again").await;
-        let after = log.read_after(&a.key, seq).await.unwrap();
+        let after = log
+            .read_after(&loop_store::Tenant::local(), &a.key, seq)
+            .await
+            .unwrap();
         assert_eq!(after[0].session_seq, Some(seq + 1));
 
         // Unload: with room for one Session, opening B unloads idle A.
@@ -231,6 +245,7 @@ fn update(generation: u64, session: &SessionKey, turn: &str, update: SessionUpda
             0,
             update,
         ),
+        loop_store::Identity::unrecorded(),
     )
 }
 
@@ -312,7 +327,10 @@ async fn recovery_over_memory_stores_ends_turns_and_reclaims_and_sweeps_leases()
                 leases_swept: 1,
             }
         );
-        let ended = log.read_after(&a, 0).await.unwrap();
+        let ended = log
+            .read_after(&loop_store::Tenant::local(), &a, 0)
+            .await
+            .unwrap();
         assert!(matches!(
             &ended.last().unwrap().event.kind,
             EventKind::Update(e) if matches!(

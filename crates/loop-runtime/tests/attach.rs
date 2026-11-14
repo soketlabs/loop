@@ -143,7 +143,10 @@ async fn attaching_mid_turn_is_contiguous_without_gaps_or_duplicates_body() {
         watchers.push((watcher, served, rx, attached));
     }
     producer.await.unwrap();
-    let last = log.latest_seq(&session.key).await.unwrap();
+    let last = log
+        .latest_seq(&loop_store::Tenant::local(), &session.key)
+        .await
+        .unwrap();
     let mut mixed = 0;
     for (_w, _s, mut rx, attached) in watchers {
         let got = collect(&mut rx, &session.key, last).await;
@@ -174,7 +177,10 @@ async fn reattach_from_a_saved_cursor_after_the_runtime_restarts_body() {
     say(&client, &session, "before").await;
     let saved = 3;
     let old_generation = rt.generation();
-    let before = log.latest_seq(&session.key).await.unwrap();
+    let before = log
+        .latest_seq(&loop_store::Tenant::local(), &session.key)
+        .await
+        .unwrap();
     assert!(before > saved);
     drop(client);
     rt.shutdown().await;
@@ -199,7 +205,10 @@ async fn reattach_from_a_saved_cursor_after_the_runtime_restarts_body() {
         .await
         .unwrap();
     say(&client, &session, "after").await;
-    let last = log.latest_seq(&session.key).await.unwrap();
+    let last = log
+        .latest_seq(&loop_store::Tenant::local(), &session.key)
+        .await
+        .unwrap();
     let live = collect(&mut rx, &session.key, last).await;
     assert_contiguous(&live, before);
     assert!(live.iter().all(|e| e.origin == Origin::Live));
@@ -295,19 +304,30 @@ async fn detach_stops_updates_and_close_unloads_the_session_body() {
     say(&client, &session, "one").await;
     client.detach(&session).await.unwrap();
     while rx.try_recv().is_ok() {}
-    let before = log.latest_seq(&session.key).await.unwrap();
+    let before = log
+        .latest_seq(&loop_store::Tenant::local(), &session.key)
+        .await
+        .unwrap();
     // Detach does not cancel work: the Runtime keeps committing.
     rt.prompt(&session, vec![ContentBlock::text("two")])
         .await
         .unwrap()
         .outcome()
         .await;
-    assert!(log.latest_seq(&session.key).await.unwrap() > before);
+    assert!(
+        log.latest_seq(&loop_store::Tenant::local(), &session.key)
+            .await
+            .unwrap()
+            > before
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(rx.try_recv().is_err(), "detached client still got updates");
     // Re-attach picks up exactly what it missed.
     let attached = client.attach(&session, before).await.unwrap();
-    let last = log.latest_seq(&session.key).await.unwrap();
+    let last = log
+        .latest_seq(&loop_store::Tenant::local(), &session.key)
+        .await
+        .unwrap();
     assert_eq!(attached.latest_seq, last);
     let got = collect(&mut rx, &session.key, last).await;
     assert_contiguous(&got, before);
@@ -572,7 +592,11 @@ async fn overlapping_attaches_both_get_a_typed_answer_body() {
     // One may be superseded, but none may answer with a non-attach result.
     assert!(a.is_ok() || b.is_ok());
     say(&owner, &session, "b").await;
-    let last = rt.event_log().latest_seq(&session.key).await.unwrap();
+    let last = rt
+        .event_log()
+        .latest_seq(&loop_store::Tenant::local(), &session.key)
+        .await
+        .unwrap();
     let got = collect(&mut rx, &session.key, last).await;
     assert!(got.last().unwrap().seq == last);
 }
@@ -665,7 +689,7 @@ async fn tree_wire_reset_detaches_only_legacy_session_and_rename_is_metadata() {
         let _capable_server = serve_with_control(rt.clone(), rt.clone(), server, info(), ServeOptions { owns_backend: false, authority: loop_wire::Authority::HostLocal });
         let capable = RemoteBackend::connect_with_capabilities(client,info(),Arc::new(Reject),ClientCapabilities { interact:true,branch_reset:true }).await.unwrap();
         let mut capable_rx = capable.subscribe();
-        let attached = capable.attach(&source,log.latest_seq(&source.key).await.unwrap()).await.unwrap();
+        let attached = capable.attach(&source,log.latest_seq(&loop_store::Tenant::local(), &source.key).await.unwrap()).await.unwrap();
         let snapshot = attached.snapshot.unwrap();
         let original_view = snapshot.view_id.clone().unwrap();
         let mut legacy_rx = legacy.subscribe();
@@ -698,7 +722,7 @@ async fn tree_wire_reset_detaches_only_legacy_session_and_rename_is_metadata() {
         assert!(!old_view.updates.is_empty(),"old snapshot must stay immutable");
         legacy.attach(&source,reset.seq).await.unwrap();
         say(&capable,&source,"after reset").await;
-        let end = log.latest_seq(&source.key).await.unwrap();
+        let end = log.latest_seq(&loop_store::Tenant::local(), &source.key).await.unwrap();
         assert!(!collect(&mut legacy_rx,&source.key,end).await.is_empty());
         let payload = capable.export(SessionParams { session:source.clone() }).await.unwrap();
         let imported = capable.import(ImportParams { workspace_id:fork.workspace_id,jsonl:payload.jsonl,request_id:"wire-import".into() }).await.unwrap();
@@ -760,7 +784,12 @@ async fn a_legacy_reattach_recovers_the_current_branch() {
         .await
         .unwrap();
         capable
-            .attach(&source, log.latest_seq(&source.key).await.unwrap())
+            .attach(
+                &source,
+                log.latest_seq(&loop_store::Tenant::local(), &source.key)
+                    .await
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let tree = capable
@@ -797,7 +826,9 @@ async fn a_legacy_reattach_recovers_the_current_branch() {
         let events = collect(
             &mut legacy_rx,
             &source.key,
-            log.latest_seq(&source.key).await.unwrap(),
+            log.latest_seq(&loop_store::Tenant::local(), &source.key)
+                .await
+                .unwrap(),
         )
         .await;
         let seen = texts(&events);
@@ -818,7 +849,9 @@ async fn a_legacy_reattach_recovers_the_current_branch() {
         let events = collect(
             &mut fresh_rx,
             &source.key,
-            log.latest_seq(&source.key).await.unwrap(),
+            log.latest_seq(&loop_store::Tenant::local(), &source.key)
+                .await
+                .unwrap(),
         )
         .await;
         let seen = texts(&events);
@@ -876,7 +909,12 @@ async fn compaction_resets_capable_watchers_and_detaches_legacy_ones() {
         .await
         .unwrap();
         capable
-            .attach(&source, log.latest_seq(&source.key).await.unwrap())
+            .attach(
+                &source,
+                log.latest_seq(&loop_store::Tenant::local(), &source.key)
+                    .await
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let mut legacy_rx = legacy.subscribe();

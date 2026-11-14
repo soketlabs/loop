@@ -1,10 +1,13 @@
 use super::*;
 use async_trait::async_trait;
 use loop_protocol::{SessionKey, TurnId};
-use loop_store::{Cursor, Page, PageLimit, SessionSummary, StoreCapabilities, SummaryDelta};
+use loop_store::{
+    Cursor, Identity, Page, PageLimit, Principal, PrincipalKind, Scope, SessionSummary,
+    StoreCapabilities, SummaryDelta, SystemScope, Tenant, TenantSession, Via,
+};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -339,23 +342,33 @@ impl SqliteEventLog {
     /// the first page, so a fast writer cannot keep the loop going.
     async fn read_session_all(
         &self,
+        tenant: &Tenant,
         session: &SessionKey,
         after_seq: u64,
     ) -> Result<Vec<LoggedEvent>> {
-        let key = session.clone();
+        let (first_tenant, key) = (tenant.clone(), session.clone());
         let (through, first) = self
             .read(move |conn| {
-                let through = latest(conn, &key)?;
-                let page = session_page(conn, &key, after_seq, through, PageLimit::DEFAULT)?;
+                let through = latest(conn, &first_tenant, &key)?;
+                let page = session_page(
+                    conn,
+                    &first_tenant,
+                    &key,
+                    after_seq,
+                    through,
+                    PageLimit::DEFAULT,
+                )?;
                 Ok((through, page))
             })
             .await?;
         let mut records = first.items;
         let mut next = first.next;
         while let Some(Cursor(after)) = next {
-            let key = session.clone();
+            let (tenant, key) = (tenant.clone(), session.clone());
             let page = self
-                .read(move |conn| session_page(conn, &key, after, through, PageLimit::DEFAULT))
+                .read(move |conn| {
+                    session_page(conn, &tenant, &key, after, through, PageLimit::DEFAULT)
+                })
                 .await?;
             records.extend(page.items);
             next = page.next;
@@ -370,81 +383,113 @@ impl EventLog for SqliteEventLog {
         validate(&events)?;
         self.request(|reply| Command::Append(events, reply)).await
     }
-    async fn read_after(&self, session: &SessionKey, after_seq: u64) -> Result<Vec<LoggedEvent>> {
-        self.read_session_all(session, after_seq).await
+    async fn read_after(
+        &self,
+        tenant: &Tenant,
+        session: &SessionKey,
+        after_seq: u64,
+    ) -> Result<Vec<LoggedEvent>> {
+        self.read_session_all(tenant, session, after_seq).await
     }
-    async fn read_runtime_after(&self, global_seq: u64) -> Result<Vec<LoggedEvent>> {
+    async fn read_runtime_after(
+        &self,
+        scope: Scope<'_>,
+        global_seq: u64,
+    ) -> Result<Vec<LoggedEvent>> {
+        let only = scope_tenant(scope);
+        let first_only = only.clone();
         let (through, first) = self
             .read(move |conn| {
                 let through: u64 = conn.query_row(MAX_GLOBAL_SQL, [], |row| row.get(0))?;
-                let page = global_page(conn, global_seq, through, PageLimit::DEFAULT)?;
+                let page = global_page(
+                    conn,
+                    first_only.as_deref(),
+                    global_seq,
+                    through,
+                    PageLimit::DEFAULT,
+                )?;
                 Ok((through, page))
             })
             .await?;
         let mut records = first.items;
         let mut next = first.next;
         while let Some(Cursor(after)) = next {
+            let only = only.clone();
             let page = self
-                .read(move |conn| global_page(conn, after, through, PageLimit::DEFAULT))
+                .read(move |conn| {
+                    global_page(conn, only.as_deref(), after, through, PageLimit::DEFAULT)
+                })
                 .await?;
             records.extend(page.items);
             next = page.next;
         }
         Ok(records)
     }
-    async fn latest_seq(&self, session: &SessionKey) -> Result<u64> {
-        let key = session.clone();
-        self.read(move |conn| latest(conn, &key)).await
+    async fn latest_seq(&self, tenant: &Tenant, session: &SessionKey) -> Result<u64> {
+        let (tenant, key) = (tenant.clone(), session.clone());
+        self.read(move |conn| latest(conn, &tenant, &key)).await
     }
     fn capabilities(&self) -> StoreCapabilities {
         StoreCapabilities {
             paged_reads: true,
             reader_pool: true,
+            tenant_scoped: true,
             ..StoreCapabilities::EVENT_LOG_V1
         }
     }
     async fn read_session_page(
         &self,
+        tenant: &Tenant,
         session: &SessionKey,
         after_seq: u64,
         through_seq: Option<u64>,
         limit: PageLimit,
     ) -> Result<Page<LoggedEvent>> {
-        let key = session.clone();
+        let (tenant, key) = (tenant.clone(), session.clone());
         let through = through_seq.unwrap_or(u64::MAX);
-        self.read(move |conn| session_page(conn, &key, after_seq, through, limit))
+        self.read(move |conn| session_page(conn, &tenant, &key, after_seq, through, limit))
             .await
     }
-    async fn session_summary(&self, session: &SessionKey) -> Result<Option<SessionSummary>> {
-        let key = session.clone();
-        self.read(move |conn| summary(conn, &key)).await
+    async fn session_summary(
+        &self,
+        tenant: &Tenant,
+        session: &SessionKey,
+    ) -> Result<Option<SessionSummary>> {
+        let (tenant, key) = (tenant.clone(), session.clone());
+        self.read(move |conn| summary(conn, &tenant, &key)).await
     }
     async fn recovery_page(
         &self,
+        scope: Scope<'_>,
         from_generation: u64,
         after_global: u64,
         limit: PageLimit,
     ) -> Result<Page<LoggedEvent>> {
-        self.read(move |conn| recovery_page(conn, from_generation, after_global, limit))
+        let only = scope_tenant(scope);
+        self.read(move |conn| {
+            recovery_page(conn, only.as_deref(), from_generation, after_global, limit)
+        })
+        .await
+    }
+    async fn subagent_sessions(&self, scope: Scope<'_>) -> Result<HashSet<TenantSession>> {
+        let only = scope_tenant(scope);
+        self.read(move |conn| subagents(conn, only.as_deref()))
             .await
     }
-    async fn subagent_sessions(&self) -> Result<HashSet<SessionKey>> {
-        self.read(subagents).await
-    }
-    async fn prompts_sent(&self, session: &SessionKey) -> Result<u64> {
-        let key = session.clone();
+    async fn prompts_sent(&self, tenant: &Tenant, session: &SessionKey) -> Result<u64> {
+        let (tenant, key) = (tenant.clone(), session.clone());
         self.read(move |conn| {
             Ok(conn
                 .prepare_cached(PROMPTS_SQL)?
-                .query_row([key.as_str()], |row| row.get(0))
+                .query_row([tenant.as_str(), key.as_str()], |row| row.get(0))
                 .optional()?
                 .unwrap_or(0))
         })
         .await
     }
-    async fn turn_ids(&self, session: &SessionKey) -> Result<Vec<TurnId>> {
-        let key = session.clone();
-        self.read(move |conn| turn_ids(conn, &key)).await
+    async fn turn_ids(&self, tenant: &Tenant, session: &SessionKey) -> Result<Vec<TurnId>> {
+        let (tenant, key) = (tenant.clone(), session.clone());
+        self.read(move |conn| turn_ids(conn, &tenant, &key)).await
     }
     async fn allocate_generation(&self, owner: &str, pid: u32, started_ms: i64) -> Result<u64> {
         self.request(|reply| Command::Allocate(owner.into(), pid, started_ms, reply))
@@ -454,15 +499,20 @@ impl EventLog for SqliteEventLog {
         self.request(|reply| Command::Finish(generation, stopped_ms, reply))
             .await
     }
-    async fn last_activity_ms(&self) -> Result<HashMap<SessionKey, i64>> {
-        self.read(activity).await
+    async fn last_activity_ms(&self, scope: Scope<'_>) -> Result<HashMap<TenantSession, i64>> {
+        let only = scope_tenant(scope);
+        self.read(move |conn| activity(conn, only.as_deref())).await
     }
-    async fn recovery_records(&self, from_generation: u64) -> Result<Vec<LoggedEvent>> {
+    async fn recovery_records(
+        &self,
+        scope: Scope<'_>,
+        from_generation: u64,
+    ) -> Result<Vec<LoggedEvent>> {
         let mut records = Vec::new();
         let mut after = 0;
         loop {
             let page = self
-                .recovery_page(from_generation, after, PageLimit::DEFAULT)
+                .recovery_page(scope, from_generation, after, PageLimit::DEFAULT)
                 .await?;
             records.extend(page.items);
             match page.next {
@@ -471,7 +521,7 @@ impl EventLog for SqliteEventLog {
             }
         }
     }
-    async fn last_recovered_generation(&self) -> Result<u64> {
+    async fn last_recovered_generation(&self, _scope: &SystemScope) -> Result<u64> {
         self.read(|conn| {
             Ok(conn
                 .prepare_cached(
@@ -506,6 +556,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "004_session_summary.sql",
         include_str!("migrations/004_session_summary.sql"),
+    ),
+    (
+        "005_identity.sql",
+        include_str!("migrations/005_identity.sql"),
     ),
 ];
 fn migrate(conn: &mut Connection) -> SqlResult<()> {
@@ -641,20 +695,29 @@ fn append_group(
     }
 }
 
-/// Last Update sequence of one Session. `session_seq IS NOT NULL` changes no
-/// result (`MAX` skips NULL), but it lets the planner use the partial index
-/// `events_session_seq`. Without it each call scans the whole table, once per
-/// appended Update.
-const LATEST_SEQ_SQL: &str =
-    "SELECT COALESCE(MAX(session_seq),0) FROM events WHERE session_key=?1 AND session_seq IS NOT NULL";
+/// Last Update sequence of one tenant's Session. `session_seq IS NOT NULL`
+/// changes no result (`MAX` skips NULL), but it lets the planner use the
+/// partial index `events_tenant_session_seq`. Without it each call scans the
+/// whole table, once per appended Update.
+const LATEST_SEQ_SQL: &str = "SELECT COALESCE(MAX(session_seq),0) FROM events \
+    WHERE session_key=?1 AND tenant=?2 AND session_seq IS NOT NULL";
 
-fn latest(conn: &Connection, session: &SessionKey) -> SqlResult<u64> {
+fn latest(conn: &Connection, tenant: &Tenant, session: &SessionKey) -> SqlResult<u64> {
     Ok(conn
         .prepare_cached(LATEST_SEQ_SQL)?
-        .query_row([session.as_str()], |row| row.get(0))?)
+        .query_row([session.as_str(), tenant.as_str()], |row| row.get(0))?)
 }
 
-const INSERT_SQL: &str = "INSERT INTO events (global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)";
+/// The tenant of a scope as owned text, for a read closure; `None` for a
+/// system scope.
+fn scope_tenant(scope: Scope<'_>) -> Option<String> {
+    scope.tenant().map(|tenant| tenant.as_str().to_owned())
+}
+
+const INSERT_SQL: &str = "INSERT INTO events \
+    (global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload,\
+    tenant,principal_kind,principal_issuer,principal_id,via,actor) \
+    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)";
 
 fn append(conn: &mut Connection, events: Vec<Event>) -> SqlResult<Vec<LoggedEvent>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -663,34 +726,43 @@ fn append(conn: &mut Connection, events: Vec<Event>) -> SqlResult<Vec<LoggedEven
         .query_row([], |r| r.get(0))?;
     let mut records = Vec::with_capacity(events.len());
     let mut rows = Vec::with_capacity(events.len());
-    {
-        // Session sequences of this transaction: one index read per Session.
-        let mut seqs: HashMap<SessionKey, u64> = HashMap::new();
-        let mut insert = tx.prepare_cached(INSERT_SQL)?;
-        for event in events {
-            global = global
-                .checked_add(1)
-                .ok_or_else(|| EventLogError::Storage("global sequence exhausted".into()))?;
-            let seq = if matches!(event.kind, EventKind::Update(_)) {
-                let key = event
-                    .session_key
-                    .as_ref()
-                    .ok_or_else(|| EventLogError::Invalid("Update without a Session".into()))?;
-                let next = match seqs.get_mut(key) {
-                    Some(seq) => {
-                        *seq += 1;
-                        *seq
+    // Session sequences of this transaction: one index read per Session.
+    // A batch holds few Sessions, so a short list beats hashing the keys.
+    let mut sessions: Vec<(&Tenant, &SessionKey, u64)> = Vec::new();
+    let mut assigned = Vec::with_capacity(events.len());
+    for event in &events {
+        assigned.push(match (&event.kind, &event.session_key) {
+            (EventKind::Update(_), Some(key)) => {
+                let tenant = event.tenant();
+                let at = sessions
+                    .iter()
+                    .position(|(t, k, _)| *k == key && *t == tenant);
+                let seq = match at {
+                    Some(at) => {
+                        sessions[at].2 += 1;
+                        sessions[at].2
                     }
                     None => {
-                        let seq = latest(&tx, key)? + 1;
-                        seqs.insert(key.clone(), seq);
+                        let seq = latest(&tx, tenant, key)? + 1;
+                        sessions.push((tenant, key, seq));
                         seq
                     }
                 };
-                Some(next)
-            } else {
-                None
-            };
+                Some(seq)
+            }
+            (EventKind::Update(_), None) => {
+                return Err(EventLogError::Invalid("Update without a Session".into()).into())
+            }
+            _ => None,
+        });
+    }
+    drop(sessions);
+    {
+        let mut insert = tx.prepare_cached(INSERT_SQL)?;
+        for (event, seq) in events.into_iter().zip(assigned) {
+            global = global
+                .checked_add(1)
+                .ok_or_else(|| EventLogError::Storage("global sequence exhausted".into()))?;
             let record = stamp(event, global, seq);
             let raw = serde_json::to_value(&record.event.kind)?;
             let kind = raw
@@ -698,6 +770,7 @@ fn append(conn: &mut Connection, events: Vec<Event>) -> SqlResult<Vec<LoggedEven
                 .and_then(Value::as_str)
                 .ok_or_else(|| EventLogError::Invalid("Unknown must retain its kind".into()))?;
             let payload = serde_json::to_string(&serde_json::json!({"v":1,"event":raw}))?;
+            let identity = &record.event.identity;
             insert.execute(params![
                 sql_seq(global)?,
                 sql_seq(record.event.generation)?,
@@ -706,7 +779,13 @@ fn append(conn: &mut Connection, events: Vec<Event>) -> SqlResult<Vec<LoggedEven
                 kind,
                 record.event.turn.as_ref().map(TurnId::as_str),
                 record.event.ts_ms,
-                payload
+                payload,
+                identity.tenant.as_str(),
+                identity.principal.kind().as_str(),
+                identity.principal.issuer(),
+                identity.principal.id(),
+                identity.via.as_ref().map(Via::as_str),
+                identity.actor.as_deref(),
             ])?;
             rows.push(ProjectionRow::of(&record, kind));
             records.push(record);
@@ -719,33 +798,52 @@ fn append(conn: &mut Connection, events: Vec<Event>) -> SqlResult<Vec<LoggedEven
 
 // ---------------------------------------------------------------- projection
 
-const PROJECTION: &str = "session_summary";
+/// The `projection_state` row of the tenant-keyed projection (migration
+/// 005). The 004 row `session_summary` belongs to older binaries.
+const PROJECTION: &str = "tenant_session_summary";
 const MARK_SQL: &str = "SELECT applied_global_seq FROM projection_state WHERE name=?1";
 const SET_MARK_SQL: &str = "UPDATE projection_state SET applied_global_seq=?2 WHERE name=?1";
-const SUMMARY_SQL: &str = "SELECT session_key,last_seq,last_revision,last_activity_ms,prompts_sent,turn_count,parent FROM session_summary WHERE session_key=?1";
-const PROMPTS_SQL: &str = "SELECT prompts_sent FROM session_summary WHERE session_key=?1";
-const TURNS_SQL: &str =
-    "SELECT turn FROM session_turns WHERE session_key=?1 ORDER BY first_global_seq";
-const SUBAGENTS_SQL: &str = "SELECT session_key FROM session_summary WHERE parent IS NOT NULL";
-const ACTIVITY_SQL: &str = "SELECT session_key,last_activity_ms FROM session_summary";
-const INSERT_TURN_SQL: &str =
-    "INSERT OR IGNORE INTO session_turns (session_key,turn,first_global_seq) VALUES (?1,?2,?3)";
+const SUMMARY_SQL: &str = "SELECT tenant,session_key,last_seq,last_revision,last_activity_ms,\
+    prompts_sent,turn_count,parent,owner_seq,owner_kind,owner_issuer,owner_id,owner_via,owner_actor \
+    FROM tenant_session_summary WHERE tenant=?1 AND session_key=?2";
+const PROMPTS_SQL: &str =
+    "SELECT prompts_sent FROM tenant_session_summary WHERE tenant=?1 AND session_key=?2";
+const TURNS_SQL: &str = "SELECT turn FROM tenant_session_turns \
+    WHERE tenant=?1 AND session_key=?2 ORDER BY first_global_seq";
+const SUBAGENTS_SQL: &str =
+    "SELECT tenant,session_key FROM tenant_session_summary WHERE parent IS NOT NULL";
+/// `INDEXED BY`: without statistics the planner would walk all of the
+/// tenant's Sessions by primary key; the partial index holds Subagents only.
+const SUBAGENTS_TENANT_SQL: &str = "SELECT tenant,session_key FROM tenant_session_summary \
+    INDEXED BY tenant_session_summary_subagents WHERE tenant=?1 AND parent IS NOT NULL";
+const ACTIVITY_SQL: &str = "SELECT tenant,session_key,last_activity_ms FROM tenant_session_summary";
+const ACTIVITY_TENANT_SQL: &str =
+    "SELECT tenant,session_key,last_activity_ms FROM tenant_session_summary WHERE tenant=?1";
+const INSERT_TURN_SQL: &str = "INSERT OR IGNORE INTO tenant_session_turns \
+    (tenant,session_key,turn,first_global_seq) VALUES (?1,?2,?3,?4)";
 /// Merge one commit group's fold of a Session into its row. The rules equal
 /// `SessionSummary::apply` in log order: sequences and activity take the
 /// maximum, the revision of the group's last revision record wins, counts
-/// add, and the first parent stays.
-const UPSERT_SUMMARY_SQL: &str = "INSERT INTO session_summary \
-    (session_key,last_seq,last_revision,last_activity_ms,prompts_sent,turn_count,parent) \
-    VALUES (?1,?2,?3,?4,?5,?6,?7) \
-    ON CONFLICT(session_key) DO UPDATE SET \
+/// add, and the first parent and the first owner stay. In `DO UPDATE`,
+/// a bare column is the row's value before the update.
+const UPSERT_SUMMARY_SQL: &str = "INSERT INTO tenant_session_summary \
+    (tenant,session_key,last_seq,last_revision,last_activity_ms,prompts_sent,turn_count,parent) \
+    VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
+    ON CONFLICT(tenant,session_key) DO UPDATE SET \
     last_seq=MAX(last_seq,excluded.last_seq), \
-    last_revision=CASE WHEN ?8 THEN excluded.last_revision ELSE last_revision END, \
+    last_revision=CASE WHEN ?9 THEN excluded.last_revision ELSE last_revision END, \
     last_activity_ms=MAX(last_activity_ms,excluded.last_activity_ms), \
     prompts_sent=prompts_sent+excluded.prompts_sent, \
     turn_count=turn_count+excluded.turn_count, \
     parent=COALESCE(parent,excluded.parent)";
+/// Set the owner of record once: only a group with a creating
+/// `session_opened` runs it, after the upsert, so the common commit keeps
+/// the upsert of step B2.
+const SET_OWNER_SQL: &str = "UPDATE tenant_session_summary SET owner_seq=?3, owner_kind=?4, \
+    owner_issuer=?5, owner_id=?6, owner_via=?7, owner_actor=?8 \
+    WHERE tenant=?1 AND session_key=?2 AND owner_seq IS NULL";
 
-/// What the projection needs of stored rows, read from the columns and two
+/// What the projection needs of stored rows, read from the columns and three
 /// JSON paths; the payload is never decoded. The text test `instr` keeps
 /// JSON parsing to the few rows that can hold a revision. It relies on the
 /// compact form that `serde_json` writes (`"type":"config_changed"`, no
@@ -754,7 +852,8 @@ const UPSERT_SUMMARY_SQL: &str = "INSERT INTO session_summary \
 /// needed JSON is not valid gives NULL for that field and 1 in `bad`.
 /// The rules equal the queries before step B2: prompts by the `kind`
 /// column, a parent by `json_extract` of `session_opened`, turns and
-/// activity by their columns.
+/// activity by their columns. Step B3 adds the identity columns and the
+/// `created` mark of a `session_opened` (the owner of record).
 const PROJECTION_ROWS_SQL: &str = "SELECT global_seq, session_key, session_seq, kind, turn, ts_ms, \
     CASE WHEN kind='update' AND (instr(payload,'\"type\":\"config_changed\"')>0 \
         OR instr(payload,'\"type\":\"branch_reset\"')>0) AND json_valid(payload) \
@@ -764,13 +863,55 @@ const PROJECTION_ROWS_SQL: &str = "SELECT global_seq, session_key, session_seq, 
         THEN payload -> '$.event.payload.parent' END, \
     CASE WHEN kind='session_opened' OR (kind='update' AND (instr(payload,'\"type\":\"config_changed\"')>0 \
         OR instr(payload,'\"type\":\"branch_reset\"')>0)) \
-        THEN NOT COALESCE(json_valid(payload),0) ELSE 0 END \
+        THEN NOT COALESCE(json_valid(payload),0) ELSE 0 END, \
+    tenant, principal_kind, principal_issuer, principal_id, via, actor, \
+    CASE WHEN kind='session_opened' AND json_valid(payload) \
+        THEN json_extract(payload,'$.event.payload.created') IS 1 ELSE 0 END \
     FROM events WHERE global_seq>?1 AND global_seq<=?2 ORDER BY global_seq LIMIT ?3";
+
+/// The identity of a stored row. A row written before step B3 has NULL
+/// principal columns and reads as [`Identity::unrecorded`] in tenant
+/// `tenant` (the column default `local`). Text this binary did not write
+/// is checked by the identity types; a value they refuse is an error.
+fn identity_of(
+    tenant: String,
+    kind: Option<String>,
+    issuer: Option<String>,
+    id: Option<String>,
+    via: Option<String>,
+    actor: Option<String>,
+) -> SqlResult<Identity> {
+    let bad = |what: &str, error: &dyn std::fmt::Display| {
+        SqlError::Store(EventLogError::Storage(format!(
+            "stored {what} is not valid: {error}"
+        )))
+    };
+    let tenant: Tenant =
+        serde_json::from_value(Value::String(tenant)).map_err(|e| bad("tenant", &e))?;
+    let principal = match (kind, issuer, id) {
+        (Some(kind), Some(issuer), Some(id)) => {
+            let kind = PrincipalKind::parse(&kind).map_err(|e| bad("principal kind", &e))?;
+            Principal::new(kind, issuer, id).map_err(|e| bad("principal", &e))?
+        }
+        _ => Identity::unrecorded().principal,
+    };
+    let via = via
+        .map(|via| serde_json::from_value::<Via>(Value::String(via)))
+        .transpose()
+        .map_err(|e| bad("via", &e))?;
+    Ok(Identity {
+        tenant,
+        principal,
+        via,
+        actor,
+    })
+}
 
 /// One record as the projection sees it.
 #[derive(Debug, Clone, PartialEq)]
 struct ProjectionRow {
     global_seq: u64,
+    tenant: Tenant,
     session: Option<SessionKey>,
     seq: Option<u64>,
     kind: String,
@@ -780,6 +921,10 @@ struct ProjectionRow {
     parent: Option<SessionKey>,
     /// A JSON field the projection needs could not be read.
     malformed: bool,
+    /// The row's identity, when it is the `session_opened` that created the
+    /// Session. Only this binary writes the `created` mark, so such a row
+    /// always has its identity columns.
+    owner: Option<Identity>,
 }
 
 impl ProjectionRow {
@@ -790,18 +935,22 @@ impl ProjectionRow {
         let delta = SummaryDelta::of(record);
         Self {
             global_seq: record.global_seq,
+            tenant: record.event.identity.tenant.clone(),
             session: record.event.session_key.clone(),
             seq: record.session_seq,
             kind: kind.to_owned(),
             turn: record.event.turn.clone(),
             ts_ms: record.event.ts_ms,
             revision: delta.as_ref().and_then(|d| d.revision),
+            owner: delta.as_ref().and_then(|d| d.owner.clone()),
             parent: delta.and_then(|d| d.parent),
             malformed: false,
         }
     }
 
-    /// The column path. Never fails on the content of a payload.
+    /// The column path. Never fails on the content of a payload. An
+    /// identity that does not read leaves the row without an owner and
+    /// marks it malformed.
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         use rusqlite::types::Value as Sql;
         let mut malformed = row.get::<_, Option<bool>>(8)?.unwrap_or(true);
@@ -834,8 +983,29 @@ impl ProjectionRow {
                 }
             },
         };
+        let tenant_text: String = row.get(9)?;
+        let created = row.get::<_, Option<bool>>(15)?.unwrap_or(false);
+        let identity = identity_of(
+            tenant_text.clone(),
+            row.get(10)?,
+            row.get(11)?,
+            row.get(12)?,
+            row.get(13)?,
+            row.get(14)?,
+        );
+        let (tenant, owner) = match identity {
+            Ok(identity) => (identity.tenant.clone(), created.then_some(identity)),
+            Err(_) => {
+                malformed = true;
+                // The key still groups the row with its tenant's Session.
+                let tenant = serde_json::from_value(Value::String(tenant_text))
+                    .unwrap_or_else(|_| Tenant::local());
+                (tenant, None)
+            }
+        };
         Ok(Self {
             global_seq: row.get(0)?,
+            tenant,
             session: row.get::<_, Option<String>>(1)?.map(SessionKey::from),
             seq: row.get(2)?,
             kind: row.get(3)?,
@@ -844,6 +1014,7 @@ impl ProjectionRow {
             revision,
             parent,
             malformed,
+            owner,
         })
     }
 }
@@ -940,53 +1111,78 @@ fn catch_up(conn: &Connection, mut after: u64, through: u64) -> SqlResult<Malfor
 }
 
 /// One commit group's change to one Session.
-struct GroupFold {
+struct GroupFold<'a> {
     summary: SessionSummary,
     revised: bool,
-    turns: Vec<(TurnId, u64)>,
+    turns: Vec<(&'a TurnId, u64)>,
+    /// The `global_seq` of the group's first creating `session_opened`.
+    owner_seq: Option<u64>,
 }
 
-/// Fold the rows per Session, then write one upsert per Session.
+/// Fold the rows per `(tenant, Session)`, then write one upsert per Session.
 fn apply<'a>(conn: &Connection, rows: impl Iterator<Item = &'a ProjectionRow>) -> SqlResult<()> {
-    let mut groups: BTreeMap<SessionKey, GroupFold> = BTreeMap::new();
+    // A commit group holds few Sessions: a short list keyed by borrowed
+    // keys, so no key is copied per row.
+    let mut groups: Vec<(&'a Tenant, &'a SessionKey, GroupFold<'a>)> = Vec::new();
     for row in rows {
         let Some(session) = &row.session else {
             continue;
         };
-        let delta = SummaryDelta {
-            session: session.clone(),
-            seq: row.seq,
-            ts_ms: row.ts_ms,
-            revision: row.revision,
-            prompt: row.kind == "prompt_sent",
-            turn: row.turn.clone(),
-            parent: row.parent.clone(),
+        let at = match groups
+            .iter()
+            .position(|(t, k, _)| *k == session && *t == &row.tenant)
+        {
+            Some(at) => at,
+            None => {
+                groups.push((
+                    &row.tenant,
+                    session,
+                    GroupFold {
+                        summary: SessionSummary::empty(row.tenant.clone(), session.clone()),
+                        revised: false,
+                        turns: Vec::new(),
+                        owner_seq: None,
+                    },
+                ));
+                groups.len() - 1
+            }
         };
-        let group = groups.entry(session.clone()).or_insert_with(|| GroupFold {
-            summary: SessionSummary::empty(session.clone()),
-            revised: false,
-            turns: Vec::new(),
-        });
-        group.revised |= delta.revision.is_some();
-        if let Some(turn) = &delta.turn {
-            if !group.turns.iter().any(|(seen, _)| seen == turn) {
-                group.turns.push((turn.clone(), row.global_seq));
+        let group = &mut groups[at].2;
+        group.revised |= row.revision.is_some();
+        if row.owner.is_some() && group.owner_seq.is_none() {
+            group.owner_seq = Some(row.global_seq);
+        }
+        if let Some(turn) = &row.turn {
+            if !group.turns.iter().any(|(seen, _)| *seen == turn) {
+                group.turns.push((turn, row.global_seq));
             }
         }
         // Turns are counted against the table below, not in the group.
-        group.summary.apply(&delta, false);
+        group.summary.apply_parts(
+            row.seq,
+            row.ts_ms,
+            row.revision,
+            row.kind == "prompt_sent",
+            false,
+            row.parent.as_ref(),
+            row.owner.as_ref(),
+        );
     }
     let mut insert_turn = conn.prepare_cached(INSERT_TURN_SQL)?;
     let mut upsert = conn.prepare_cached(UPSERT_SUMMARY_SQL)?;
-    for (session, group) in groups {
+    for (tenant, session, group) in groups {
         let mut new_turns: u64 = 0;
         for (turn, global) in &group.turns {
-            new_turns +=
-                insert_turn.execute(params![session.as_str(), turn.as_str(), sql_seq(*global)?])?
-                    as u64;
+            new_turns += insert_turn.execute(params![
+                tenant.as_str(),
+                session.as_str(),
+                turn.as_str(),
+                sql_seq(*global)?
+            ])? as u64;
         }
         let summary = group.summary;
         upsert.execute(params![
+            tenant.as_str(),
             session.as_str(),
             sql_seq(summary.last_seq)?,
             sql_seq(summary.last_revision)?,
@@ -996,6 +1192,18 @@ fn apply<'a>(conn: &Connection, rows: impl Iterator<Item = &'a ProjectionRow>) -
             summary.parent.as_ref().map(SessionKey::as_str),
             group.revised,
         ])?;
+        if let (Some(owner_seq), Some(owner)) = (group.owner_seq, summary.owner.as_ref()) {
+            conn.prepare_cached(SET_OWNER_SQL)?.execute(params![
+                tenant.as_str(),
+                session.as_str(),
+                sql_seq(owner_seq)?,
+                owner.principal.kind().as_str(),
+                owner.principal.issuer(),
+                owner.principal.id(),
+                owner.via.as_ref().map(Via::as_str),
+                owner.actor.as_deref(),
+            ])?;
+        }
     }
     Ok(())
 }
@@ -1092,49 +1300,133 @@ fn bound_wal(conn: &Connection, wal: &Path, permits: &Arc<Semaphore>, runtime: &
     }
 }
 
-fn summary(conn: &Connection, session: &SessionKey) -> SqlResult<Option<SessionSummary>> {
-    Ok(conn
+fn summary(
+    conn: &Connection,
+    tenant: &Tenant,
+    session: &SessionKey,
+) -> SqlResult<Option<SessionSummary>> {
+    let row = conn
         .prepare_cached(SUMMARY_SQL)?
-        .query_row([session.as_str()], summary_row)
-        .optional()?)
+        .query_row([tenant.as_str(), session.as_str()], |row| {
+            Ok((
+                SummaryRow {
+                    tenant: row.get(0)?,
+                    session: row.get(1)?,
+                    last_seq: row.get(2)?,
+                    last_revision: row.get(3)?,
+                    last_activity_ms: row.get(4)?,
+                    prompts_sent: row.get(5)?,
+                    turn_count: row.get(6)?,
+                    parent: row.get(7)?,
+                },
+                row.get::<_, Option<i64>>(8)?,
+                (
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                ),
+            ))
+        })
+        .optional()?;
+    let Some((row, owner_seq, (kind, issuer, id, via, actor))) = row else {
+        return Ok(None);
+    };
+    // An owner of record needs its creating row.
+    let owner = match owner_seq {
+        Some(_) => Some(identity_of(
+            row.tenant.clone(),
+            kind,
+            issuer,
+            id,
+            via,
+            actor,
+        )?),
+        None => None,
+    };
+    let tenant = identity_of(row.tenant, None, None, None, None, None)?.tenant;
+    Ok(Some(SessionSummary {
+        tenant,
+        session: SessionKey::from(row.session),
+        last_seq: row.last_seq,
+        last_revision: row.last_revision,
+        last_activity_ms: row.last_activity_ms,
+        prompts_sent: row.prompts_sent,
+        turn_count: row.turn_count,
+        parent: row.parent.map(SessionKey::from),
+        owner,
+    }))
 }
 
-fn summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
-    Ok(SessionSummary {
-        session: SessionKey::from(row.get::<_, String>(0)?),
-        last_seq: row.get(1)?,
-        last_revision: row.get(2)?,
-        last_activity_ms: row.get(3)?,
-        prompts_sent: row.get(4)?,
-        turn_count: row.get(5)?,
-        parent: row.get::<_, Option<String>>(6)?.map(SessionKey::from),
-    })
+/// The plain columns of a summary row.
+struct SummaryRow {
+    tenant: String,
+    session: String,
+    last_seq: u64,
+    last_revision: u64,
+    last_activity_ms: i64,
+    prompts_sent: u64,
+    turn_count: u64,
+    parent: Option<String>,
 }
 
-fn activity(conn: &Connection) -> SqlResult<HashMap<SessionKey, i64>> {
-    let mut stmt = conn.prepare_cached(ACTIVITY_SQL)?;
-    let rows = stmt.query_map([], |row| {
+/// A `(tenant, session_key)` pair from two text columns.
+fn tenant_session(tenant: String, session: String) -> SqlResult<TenantSession> {
+    let tenant = identity_of(tenant, None, None, None, None, None)?.tenant;
+    Ok((tenant, SessionKey::from(session)))
+}
+
+fn activity(conn: &Connection, only: Option<&str>) -> SqlResult<HashMap<TenantSession, i64>> {
+    let mut stmt = match only {
+        Some(_) => conn.prepare_cached(ACTIVITY_TENANT_SQL)?,
+        None => conn.prepare_cached(ACTIVITY_SQL)?,
+    };
+    let read = |row: &rusqlite::Row<'_>| {
         Ok((
-            SessionKey::from(row.get::<_, String>(0)?),
-            row.get::<_, i64>(1)?,
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
         ))
-    })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
+    };
+    let rows = match only {
+        Some(tenant) => stmt
+            .query_map([tenant], read)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        None => stmt
+            .query_map([], read)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    };
+    rows.into_iter()
+        .map(|(tenant, session, ts)| Ok((tenant_session(tenant, session)?, ts)))
+        .collect()
 }
 
-fn subagents(conn: &Connection) -> SqlResult<HashSet<SessionKey>> {
-    let mut statement = conn.prepare_cached(SUBAGENTS_SQL)?;
-    let keys = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .map(|key| key.map(SessionKey::from))
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(keys)
+fn subagents(conn: &Connection, only: Option<&str>) -> SqlResult<HashSet<TenantSession>> {
+    let mut statement = match only {
+        Some(_) => conn.prepare_cached(SUBAGENTS_TENANT_SQL)?,
+        None => conn.prepare_cached(SUBAGENTS_SQL)?,
+    };
+    let read = |row: &rusqlite::Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+    let rows = match only {
+        Some(tenant) => statement
+            .query_map([tenant], read)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        None => statement
+            .query_map([], read)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    };
+    rows.into_iter()
+        .map(|(tenant, session)| tenant_session(tenant, session))
+        .collect()
 }
 
-fn turn_ids(conn: &Connection, session: &SessionKey) -> SqlResult<Vec<TurnId>> {
+fn turn_ids(conn: &Connection, tenant: &Tenant, session: &SessionKey) -> SqlResult<Vec<TurnId>> {
     let mut statement = conn.prepare_cached(TURNS_SQL)?;
     let turns = statement
-        .query_map([session.as_str()], |row| row.get::<_, String>(0))?
+        .query_map([tenant.as_str(), session.as_str()], |row| {
+            row.get::<_, String>(0)
+        })?
         .map(|turn| turn.map(TurnId))
         .collect::<rusqlite::Result<_>>()?;
     Ok(turns)
@@ -1142,11 +1434,38 @@ fn turn_ids(conn: &Connection, session: &SessionKey) -> SqlResult<Vec<TurnId>> {
 
 // ---------------------------------------------------------------- pages
 
-const SESSION_PAGE_SQL: &str = "SELECT global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload FROM events WHERE session_key=?1 AND session_seq>?2 AND session_seq<=?3 ORDER BY session_seq LIMIT ?4";
-const GLOBAL_PAGE_SQL: &str = "SELECT global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload FROM events WHERE global_seq>?1 AND global_seq<=?2 ORDER BY global_seq LIMIT ?3";
+/// The columns of a record, in the order [`decode`] reads them.
+macro_rules! record_columns {
+    () => {
+        "global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload,\
+         tenant,principal_kind,principal_issuer,principal_id,via,actor"
+    };
+}
+const SESSION_PAGE_SQL: &str = concat!(
+    "SELECT ",
+    record_columns!(),
+    " FROM events WHERE session_key=?1 AND tenant=?2 AND session_seq>?3 AND session_seq<=?4 \
+     ORDER BY session_seq LIMIT ?5"
+);
+const GLOBAL_PAGE_SQL: &str = concat!(
+    "SELECT ",
+    record_columns!(),
+    " FROM events WHERE global_seq>?1 AND global_seq<=?2 ORDER BY global_seq LIMIT ?3"
+);
+/// One tenant's rows: the primary key walk, filtered by tenant. It reads
+/// every tenant's rows in the range (O(all rows)). Only tests use a tenant
+/// scope today; fix it (an index or a partition per tenant) before
+/// shared-cell use. A test pins this plan.
+const GLOBAL_TENANT_PAGE_SQL: &str = concat!(
+    "SELECT ",
+    record_columns!(),
+    " FROM events WHERE global_seq>?1 AND global_seq<=?2 AND tenant=?4 \
+     ORDER BY global_seq LIMIT ?3"
+);
 
 fn session_page(
     conn: &Connection,
+    tenant: &Tenant,
     session: &SessionKey,
     after: u64,
     through: u64,
@@ -1161,6 +1480,7 @@ fn session_page(
         SESSION_PAGE_SQL,
         params![
             session.as_str(),
+            tenant.as_str(),
             after as i64,
             bound(through),
             page_rows_limit(limit)
@@ -1172,6 +1492,7 @@ fn session_page(
 
 fn global_page(
     conn: &Connection,
+    only: Option<&str>,
     after: u64,
     through: u64,
     limit: PageLimit,
@@ -1179,13 +1500,22 @@ fn global_page(
     if after >= through || after > i64::MAX as u64 {
         return Ok(Page::last(Vec::new()));
     }
-    page(
-        conn,
-        GLOBAL_PAGE_SQL,
-        params![after as i64, bound(through), page_rows_limit(limit)],
-        limit,
-        |r| r.global_seq,
-    )
+    match only {
+        None => page(
+            conn,
+            GLOBAL_PAGE_SQL,
+            params![after as i64, bound(through), page_rows_limit(limit)],
+            limit,
+            |r| r.global_seq,
+        ),
+        Some(tenant) => page(
+            conn,
+            GLOBAL_TENANT_PAGE_SQL,
+            params![after as i64, bound(through), page_rows_limit(limit), tenant],
+            limit,
+            |r| r.global_seq,
+        ),
+    }
 }
 
 /// The first generation at or after `from` and its first `global_seq`, then
@@ -1216,12 +1546,15 @@ fn recovery_floor(conn: &Connection, from: i64) -> SqlResult<Option<i64>> {
 /// The read walks the primary key from the page's cursor (`+generation`
 /// keeps the planner off the generation index, whose order is not
 /// `global_seq` order), so a page stops after its limit.
+///
+/// `?4` is a tenant, or NULL for every tenant (a system scope).
 const RECOVERY_PAGE_SQL: &str =
     "SELECT global_seq,generation,session_key,session_seq,kind,turn,ts_ms,\
      CASE WHEN kind='prompt_sent' \
      THEN '{\"v\":1,\"event\":{\"kind\":\"prompt_sent\",\"payload\":{}}}' \
-     ELSE payload END \
-     FROM events WHERE global_seq>?2 AND +generation>=?1 AND (\
+     ELSE payload END,\
+     tenant,principal_kind,principal_issuer,principal_id,via,actor \
+     FROM events WHERE global_seq>?2 AND +generation>=?1 AND (?4 IS NULL OR tenant=?4) AND (\
      kind IN ('prompt_sent','prompt_settled','runtime_stopped',\
      'escalation_raised','escalation_answered','escalation_withdrawn') \
      OR (kind='update' AND json_extract(payload,'$.event.payload.update.type') \
@@ -1229,6 +1562,7 @@ const RECOVERY_PAGE_SQL: &str =
 
 fn recovery_page(
     conn: &Connection,
+    only: Option<&str>,
     from_generation: u64,
     after_global: u64,
     limit: PageLimit,
@@ -1249,7 +1583,7 @@ fn recovery_page(
     page(
         conn,
         RECOVERY_PAGE_SQL,
-        params![from_generation as i64, after, page_rows_limit(limit)],
+        params![from_generation as i64, after, page_rows_limit(limit), only],
         limit,
         |r| r.global_seq,
     )
@@ -1294,6 +1628,15 @@ fn decode(row: &rusqlite::Row<'_>, payload: &str) -> SqlResult<LoggedEvent> {
     } else {
         EventKind::Unknown(raw)
     };
+    // Rows from before step B3 have NULL principal columns: see `identity_of`.
+    let identity = identity_of(
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+    )?;
     Ok(LoggedEvent {
         global_seq: row.get(0)?,
         session_seq: row.get(3)?,
@@ -1303,6 +1646,7 @@ fn decode(row: &rusqlite::Row<'_>, payload: &str) -> SqlResult<LoggedEvent> {
             turn: row.get::<_, Option<String>>(5)?.map(Into::into),
             ts_ms: row.get(6)?,
             kind,
+            identity,
         },
     })
 }
@@ -1327,7 +1671,7 @@ mod tests {
     use super::*;
     use loop_store::summarize;
     use loop_store_testkit::event_log as kit;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// Rows of `EXPLAIN QUERY PLAN`, with every parameter left NULL.
     fn plan(conn: &Connection, sql: &str) -> Vec<String> {
@@ -1349,23 +1693,38 @@ mod tests {
     }
 
     /// The per-append sequence query must read the partial index, not scan.
-    /// The old text (no `IS NOT NULL`) shows why: the planner cannot prove
-    /// the index predicate, so it scans `events`.
+    /// The text before step B2 (no `IS NOT NULL`) shows why: the planner
+    /// cannot prove the index predicate, so it scans `events`. The query of
+    /// a binary from before step B3 (no tenant) still reads the new index,
+    /// so an older binary that opens a new database does not scan per append.
     #[test]
     fn latest_seq_uses_the_session_seq_index() {
         let conn = migrated();
         let old = "SELECT COALESCE(MAX(session_seq),0) FROM events WHERE session_key=?1";
         let before = plan(&conn, old);
         let after = plan(&conn, LATEST_SEQ_SQL);
+        let pre_b3 = plan(&conn, OLD_LATEST_SEQ_SQL);
         println!("old plan: {before:?}");
         println!("new plan: {after:?}");
+        println!("pre-B3 plan: {pre_b3:?}");
         assert!(
-            !before.iter().any(|row| row.contains("events_session_seq")),
+            !before
+                .iter()
+                .any(|row| row.contains("events_tenant_session_seq")),
             "old query should not use the partial index: {before:?}"
         );
+        for rows in [&after, &pre_b3] {
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("events_tenant_session_seq")),
+                "latest() must use events_tenant_session_seq: {rows:?}"
+            );
+        }
         assert!(
-            after.iter().any(|row| row.contains("events_session_seq")),
-            "latest() must use events_session_seq: {after:?}"
+            after
+                .iter()
+                .any(|row| row.contains("session_key=? AND tenant=?")),
+            "the new query seeks key and tenant: {after:?}"
         );
     }
 
@@ -1409,9 +1768,14 @@ mod tests {
             (
                 "session page",
                 SESSION_PAGE_SQL,
-                "USING INDEX events_session_seq",
+                "USING INDEX events_tenant_session_seq (session_key=? AND tenant=? AND session_seq>? AND session_seq<?)",
             ),
             ("global page", GLOBAL_PAGE_SQL, "USING INTEGER PRIMARY KEY"),
+            (
+                "global page of one tenant",
+                GLOBAL_TENANT_PAGE_SQL,
+                "USING INTEGER PRIMARY KEY",
+            ),
             (
                 "recovery page",
                 RECOVERY_PAGE_SQL,
@@ -1428,26 +1792,38 @@ mod tests {
                 "USING COVERING INDEX events_generation",
             ),
             ("max global_seq", MAX_GLOBAL_SQL, "SEARCH events"),
+            // The summary tables are WITHOUT ROWID: a primary key search is
+            // index-only, on the full key (tenant, session_key).
             (
                 "summary",
                 SUMMARY_SQL,
-                "SEARCH session_summary USING PRIMARY KEY",
+                "SEARCH tenant_session_summary USING PRIMARY KEY (tenant=? AND session_key=?)",
             ),
             (
                 "prompts sent",
                 PROMPTS_SQL,
-                "SEARCH session_summary USING PRIMARY KEY",
+                "SEARCH tenant_session_summary USING PRIMARY KEY (tenant=? AND session_key=?)",
             ),
             (
                 "turn ids",
                 TURNS_SQL,
-                "SEARCH session_turns USING PRIMARY KEY",
+                "SEARCH tenant_session_turns USING PRIMARY KEY (tenant=? AND session_key=?)",
             ),
             (
                 // The partial index holds only Subagents: O(Subagents).
-                "subagents",
+                "subagents of all tenants",
                 SUBAGENTS_SQL,
-                "USING INDEX session_summary_subagents",
+                "USING INDEX tenant_session_summary_subagents",
+            ),
+            (
+                "subagents of one tenant",
+                SUBAGENTS_TENANT_SQL,
+                "USING INDEX tenant_session_summary_subagents (tenant=?)",
+            ),
+            (
+                "activity of one tenant",
+                ACTIVITY_TENANT_SQL,
+                "SEARCH tenant_session_summary USING PRIMARY KEY (tenant=?)",
             ),
             (
                 "projection mark",
@@ -1471,9 +1847,25 @@ mod tests {
         let rows = plan(&conn, ACTIVITY_SQL);
         println!("last activity: {rows:?}");
         assert!(
-            rows.iter().all(|row| row.contains("session_summary")),
+            rows.iter()
+                .all(|row| row.contains("tenant_session_summary")),
             "{rows:?}"
         );
+        // The queries of a binary from before step B3 on the new schema:
+        // the per-append and page queries still read an index.
+        for (name, old) in [
+            ("pre-B3 latest seq", OLD_LATEST_SEQ_SQL),
+            ("pre-B3 session page", OLD_SESSION_PAGE_SQL),
+        ] {
+            let rows = plan(&conn, old);
+            println!("{name}: {rows:?}");
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("events_tenant_session_seq")),
+                "{name}: {rows:?}"
+            );
+            assert!(!rows.iter().any(|row| row.starts_with("SCAN events")));
+        }
         for (name, old) in [
             ("old last activity", "SELECT session_key, MAX(ts_ms) FROM events WHERE session_key IS NOT NULL GROUP BY session_key"),
             ("old subagents", "SELECT DISTINCT session_key FROM events WHERE kind='session_opened' AND session_key IS NOT NULL AND json_extract(payload,'$.event.payload.parent') IS NOT NULL"),
@@ -1484,7 +1876,44 @@ mod tests {
         }
     }
 
-    /// Insert events the way the code before step B2 did: no projection.
+    /// The tenant-scoped Runtime-wide reads walk the primary key and filter
+    /// by tenant: O(all rows after the cursor). Pinned here so the cost
+    /// stays visible; it must be fixed before shared-cell use.
+    #[test]
+    fn tenant_scoped_runtime_reads_walk_the_whole_primary_key() {
+        let conn = migrated();
+        for (name, sql) in [
+            ("global page of one tenant", GLOBAL_TENANT_PAGE_SQL),
+            ("recovery page", RECOVERY_PAGE_SQL),
+        ] {
+            let rows = plan(&conn, sql);
+            println!("{name}: {rows:?}");
+            assert_eq!(rows.len(), 1, "{name}: {rows:?}");
+            assert!(
+                rows[0].starts_with("SEARCH events USING INTEGER PRIMARY KEY (rowid>?"),
+                "{name}: {rows:?}"
+            );
+            assert!(
+                !rows[0].contains("tenant"),
+                "{name} now seeks the tenant: {rows:?}"
+            );
+        }
+    }
+
+    /// The insert of the code before step B3: no identity columns.
+    const OLD_INSERT_SQL: &str = "INSERT INTO events (global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)";
+    /// The per-append sequence query of the code before step B3 (one key
+    /// space for all tenants).
+    const OLD_LATEST_SEQ_SQL: &str =
+        "SELECT COALESCE(MAX(session_seq),0) FROM events WHERE session_key=?1 AND session_seq IS NOT NULL";
+
+    fn old_latest(conn: &Connection, session: &str) -> u64 {
+        conn.query_row(OLD_LATEST_SEQ_SQL, [session], |row| row.get(0))
+            .expect("latest")
+    }
+
+    /// Insert events the way the code before step B2 did: no projection
+    /// and (before B3) no identity.
     fn insert_old(conn: &Connection, events: Vec<Event>) {
         let mut global: u64 = conn
             .query_row(MAX_GLOBAL_SQL, [], |row| row.get(0))
@@ -1492,15 +1921,19 @@ mod tests {
         for event in events {
             global += 1;
             let seq = match (&event.kind, &event.session_key) {
-                (EventKind::Update(_), Some(key)) => Some(latest(conn, key).expect("latest") + 1),
+                (EventKind::Update(_), Some(key)) => Some(old_latest(conn, key.as_str()) + 1),
                 _ => None,
             };
             let record = stamp(event, global, seq);
-            let raw = serde_json::to_value(&record.event.kind).expect("json");
+            let mut raw = serde_json::to_value(&record.event.kind).expect("json");
+            // Older binaries never wrote the `created` mark.
+            if let Some(payload) = raw.get_mut("payload").and_then(Value::as_object_mut) {
+                payload.remove(loop_store::SESSION_CREATED_KEY);
+            }
             let kind = raw["kind"].as_str().expect("kind").to_owned();
             let payload = serde_json::json!({"v":1,"event":raw}).to_string();
             conn.execute(
-                INSERT_SQL,
+                OLD_INSERT_SQL,
                 params![
                     global as i64,
                     record.event.generation as i64,
@@ -1542,21 +1975,34 @@ mod tests {
         }
     }
 
-    /// The projection rows, in key order.
+    /// The projection rows (summaries with their tenant and owner, and
+    /// turns as `(tenant, session, turn, first_global_seq)`), in key order.
+    #[allow(clippy::type_complexity)]
     fn projection_rows_table(
         conn: &Connection,
-    ) -> (Vec<SessionSummary>, Vec<(String, String, i64)>) {
-        let summaries = conn
-            .prepare("SELECT session_key,last_seq,last_revision,last_activity_ms,prompts_sent,turn_count,parent FROM session_summary ORDER BY session_key")
+    ) -> (Vec<SessionSummary>, Vec<(String, String, String, i64)>) {
+        let keys = conn
+            .prepare(
+                "SELECT tenant,session_key FROM tenant_session_summary ORDER BY tenant,session_key",
+            )
             .expect("prepare")
-            .query_map([], summary_row)
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .expect("query")
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("rows");
+        let summaries = keys
+            .into_iter()
+            .map(|(tenant, key)| {
+                let (tenant, key) = tenant_session(tenant, key).expect("key");
+                summary(conn, &tenant, &key).expect("summary").expect("row")
+            })
+            .collect();
         let turns = conn
-            .prepare("SELECT session_key,turn,first_global_seq FROM session_turns ORDER BY session_key,turn")
+            .prepare("SELECT tenant,session_key,turn,first_global_seq FROM tenant_session_turns ORDER BY tenant,session_key,turn")
             .expect("prepare")
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
             .expect("query")
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("rows");
@@ -1566,26 +2012,30 @@ mod tests {
     /// Delete the projection and build it again from the events.
     fn rebuild(conn: &mut Connection) {
         conn.execute_batch(
-            "DELETE FROM session_summary; DELETE FROM session_turns; \
-             UPDATE projection_state SET applied_global_seq=0;",
+            "DELETE FROM tenant_session_summary; DELETE FROM tenant_session_turns; \
+             UPDATE projection_state SET applied_global_seq=0 WHERE name='tenant_session_summary';",
         )
         .expect("clear");
         assert!(backfill(conn, 7, None).expect("rebuild"));
     }
 
     async fn assert_matches_fold(log: &SqliteEventLog) {
-        let records = log.read_runtime_after(0).await.expect("read");
+        let records = log.read_runtime_after(kit::all(), 0).await.expect("read");
         let expected = summarize(&records);
         assert!(!expected.is_empty());
-        for (session, (summary, turns)) in &expected {
+        for ((tenant, session), (summary, turns)) in &expected {
             assert_eq!(
-                log.session_summary(session)
+                log.session_summary(tenant, session)
                     .await
                     .expect("summary")
                     .as_ref(),
                 Some(summary)
             );
-            assert_eq!(&log.turn_ids(session).await.expect("turns"), turns);
+            assert_eq!(&log.turn_ids(tenant, session).await.expect("turns"), turns);
+            assert_eq!(
+                log.session_owner(tenant, session).await.expect("owner"),
+                summary.owner
+            );
         }
     }
 
@@ -1686,7 +2136,12 @@ mod tests {
         log.append_batch(vec![kit::update("s")])
             .await
             .expect("append");
-        assert_eq!(log.latest_seq(&"s".into()).await.expect("latest"), 2);
+        assert_eq!(
+            log.latest_seq(&loop_store::Tenant::local(), &"s".into())
+                .await
+                .expect("latest"),
+            2
+        );
         assert!(log
             .readers
             .idle
@@ -1721,7 +2176,8 @@ mod tests {
         }
         let big = SessionKey::from("big");
         for _ in 0..16 {
-            let read = log.read_after(&big, 0);
+            let local = loop_store::Tenant::local();
+            let read = log.read_after(&local, &big, 0);
             let _ = tokio::time::timeout(std::time::Duration::from_millis(1), read).await;
         }
         assert!(log.readers.permits.available_permits() <= READER_POOL_SIZE);
@@ -1732,7 +2188,10 @@ mod tests {
         }
         assert!(log.readers.idle.lock().expect("pool").len() <= READER_POOL_SIZE);
         assert_eq!(
-            log.read_after(&"big".into(), 0).await.expect("read").len(),
+            log.read_after(&loop_store::Tenant::local(), &"big".into(), 0)
+                .await
+                .expect("read")
+                .len(),
             2048
         );
     }
@@ -1841,8 +2300,8 @@ mod tests {
             );
             let turns: Vec<String> = turn_rows
                 .iter()
-                .filter(|(s, _, _)| *s == key)
-                .map(|(_, t, g)| (g, t.clone()))
+                .filter(|(_, s, _, _)| *s == key)
+                .map(|(_, _, t, g)| (g, t.clone()))
                 .collect::<BTreeMap<_, _>>()
                 .into_values()
                 .collect();
@@ -1869,14 +2328,12 @@ mod tests {
                        payload: &str| {
             global += 1;
             conn.execute(
-                INSERT_SQL,
+                OLD_INSERT_SQL,
                 params![global, 1, session, seq, kind, turn, ts, payload],
             )
             .expect("insert");
         };
-        let next = |session: &str| -> i64 {
-            latest(conn, &SessionKey::from(session)).expect("latest") as i64 + 1
-        };
+        let next = |session: &str| -> i64 { old_latest(conn, session) as i64 + 1 };
         // Broken JSON in each kind that the summary reads JSON from.
         let s = next("bad");
         raw(
@@ -1934,7 +2391,7 @@ mod tests {
             .await
             .expect("open with bad rows");
         let summary = log
-            .session_summary(&"bad".into())
+            .session_summary(&loop_store::Tenant::local(), &"bad".into())
             .await
             .expect("summary")
             .expect("bad");
@@ -1969,7 +2426,7 @@ mod tests {
             .await
             .expect("append after bad rows");
         let summary = log
-            .session_summary(&"a".into())
+            .session_summary(&loop_store::Tenant::local(), &"a".into())
             .await
             .expect("summary")
             .expect("a");
@@ -2001,6 +2458,7 @@ mod tests {
             turn: Some("turn-1".into()),
             ts_ms: 5,
             kind: EventKind::SessionOpened(serde_json::json!({"parent": parent, "z": 1, "a": [1]})),
+            identity: loop_store::Identity::unrecorded(),
         };
         log.append_batch(vec![
             opened(serde_json::json!({"b": 2, "a": "x"})),
@@ -2013,7 +2471,8 @@ mod tests {
         .expect("append");
         let conn = Connection::open(dir.path().join("events.db")).expect("open");
         let column = projection_rows(&conn, 0, u64::MAX, 100_000).expect("rows");
-        let stored = global_page(&conn, 0, u64::MAX, PageLimit::events(100_000)).expect("records");
+        let stored =
+            global_page(&conn, None, 0, u64::MAX, PageLimit::events(100_000)).expect("records");
         assert_eq!(column.len(), stored.items.len());
         for (row, record) in column.iter().zip(&stored.items) {
             assert_eq!(
@@ -2171,7 +2630,9 @@ mod tests {
         let _ = queued.await;
         // A reader does not see the queued append yet.
         assert_eq!(
-            log.turn_ids(&session).await.expect("turns"),
+            log.turn_ids(&loop_store::Tenant::local(), &session)
+                .await
+                .expect("turns"),
             vec![TurnId::from("turn-1")]
         );
         let sync = {
@@ -2184,7 +2645,9 @@ mod tests {
         sync.await.expect("join").expect("sync");
         // After sync, the abandoned append is visible: no turn id is reused.
         assert_eq!(
-            log.turn_ids(&session).await.expect("turns"),
+            log.turn_ids(&loop_store::Tenant::local(), &session)
+                .await
+                .expect("turns"),
             vec![TurnId::from("turn-1"), TurnId::from("turn-2")]
         );
     }
@@ -2232,7 +2695,7 @@ mod tests {
         }
         let tx = conn.transaction().expect("tx");
         {
-            let mut insert = tx.prepare(INSERT_SQL).expect("prepare");
+            let mut insert = tx.prepare(OLD_INSERT_SQL).expect("prepare");
             let mut seqs: HashMap<String, u64> = HashMap::new();
             let mut global = 0u64;
             let mut turn = 0u64;
@@ -2256,6 +2719,7 @@ mod tests {
                         turn: None,
                         ts_ms: turn as i64,
                         kind: EventKind::PromptSent(serde_json::json!({"content": []})),
+                        identity: loop_store::Identity::unrecorded(),
                     },
                 );
                 for _ in 0..100 {
@@ -2326,7 +2790,13 @@ mod tests {
         let start = std::time::Instant::now();
         let log = SqliteEventLog::open(dir.path()).await.expect("open");
         println!("open with backfill: {:?}", start.elapsed());
-        let records = log.read_runtime_after(0).await.expect("read");
+        let records = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .expect("read");
         println!("events: {}", records.len());
         assert_matches_fold(&log).await;
         drop(log);
@@ -2335,5 +2805,371 @@ mod tests {
         println!("sessions: {}", live.0.len());
         rebuild(&mut conn);
         assert_eq!(projection_rows_table(&conn), live);
+    }
+
+    // ------------------------------------------------------------ step B3
+
+    /// The statements of the binary before step B3 (staging 344dee4) that
+    /// touch the events and the 004 projection. An older binary that opens
+    /// a database of this version runs exactly these.
+    const OLD_SESSION_PAGE_SQL: &str = "SELECT global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload FROM events WHERE session_key=?1 AND session_seq>?2 AND session_seq<=?3 ORDER BY session_seq LIMIT ?4";
+    const OLD_GLOBAL_PAGE_SQL: &str = "SELECT global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload FROM events WHERE global_seq>?1 AND global_seq<=?2 ORDER BY global_seq LIMIT ?3";
+    const OLD_UPSERT_SUMMARY_SQL: &str = "INSERT INTO session_summary \
+        (session_key,last_seq,last_revision,last_activity_ms,prompts_sent,turn_count,parent) \
+        VALUES (?1,?2,?3,?4,?5,?6,?7) \
+        ON CONFLICT(session_key) DO UPDATE SET \
+        last_seq=MAX(last_seq,excluded.last_seq), \
+        last_revision=CASE WHEN ?8 THEN excluded.last_revision ELSE last_revision END, \
+        last_activity_ms=MAX(last_activity_ms,excluded.last_activity_ms), \
+        prompts_sent=prompts_sent+excluded.prompts_sent, \
+        turn_count=turn_count+excluded.turn_count, \
+        parent=COALESCE(parent,excluded.parent)";
+    const OLD_INSERT_TURN_SQL: &str =
+        "INSERT OR IGNORE INTO session_turns (session_key,turn,first_global_seq) VALUES (?1,?2,?3)";
+    const OLD_PROJECTION_ROWS_SQL: &str = "SELECT global_seq, session_key, session_seq, kind, turn, ts_ms, \
+        CASE WHEN kind='update' AND (instr(payload,'\"type\":\"config_changed\"')>0 \
+            OR instr(payload,'\"type\":\"branch_reset\"')>0) AND json_valid(payload) \
+            AND json_extract(payload,'$.event.payload.update.type') IN ('config_changed','branch_reset') \
+            THEN json_extract(payload,'$.event.payload.update.revision') END, \
+        CASE WHEN kind='session_opened' AND json_valid(payload) \
+            THEN payload -> '$.event.payload.parent' END, \
+        CASE WHEN kind='session_opened' OR (kind='update' AND (instr(payload,'\"type\":\"config_changed\"')>0 \
+            OR instr(payload,'\"type\":\"branch_reset\"')>0)) \
+            THEN NOT COALESCE(json_valid(payload),0) ELSE 0 END \
+        FROM events WHERE global_seq>?1 AND global_seq<=?2 ORDER BY global_seq LIMIT ?3";
+
+    /// Decode a row the way the binary before step B3 did: eight columns,
+    /// the kind from the payload.
+    fn old_decode(row: &rusqlite::Row<'_>) -> rusqlite::Result<(u64, Option<u64>, EventKind)> {
+        let payload: String = row.get(7)?;
+        let payload: Value = serde_json::from_str(&payload).expect("payload json");
+        let kind: EventKind = serde_json::from_value(payload["event"].clone()).expect("kind");
+        Ok((row.get(0)?, row.get(3)?, kind))
+    }
+
+    /// The 004 projection as the binary before step B3 kept it, from the
+    /// events (the old queries are its reference).
+    fn fill_004_projection(conn: &Connection) {
+        let old = old_queries(conn);
+        for (key, activity) in &old.activity {
+            conn.execute(
+                "INSERT INTO session_summary (session_key,last_seq,last_revision,last_activity_ms,prompts_sent,turn_count,parent) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    key,
+                    old.last_seq.get(key).copied().unwrap_or(0) as i64,
+                    old.revision.get(key).copied().unwrap_or(0) as i64,
+                    activity,
+                    old.prompts.get(key).copied().unwrap_or(0) as i64,
+                    old.turns.get(key).map_or(0, Vec::len) as i64,
+                    first_parent(conn, key),
+                ],
+            )
+            .expect("summary row");
+        }
+        conn.execute_batch(
+            "INSERT INTO session_turns (session_key,turn,first_global_seq) \
+             SELECT session_key, turn, MIN(global_seq) FROM events \
+             WHERE session_key IS NOT NULL AND turn IS NOT NULL GROUP BY session_key, turn; \
+             UPDATE projection_state SET applied_global_seq=(SELECT MAX(global_seq) FROM events) \
+             WHERE name='session_summary';",
+        )
+        .expect("turns and mark");
+    }
+
+    /// The first parent a `session_opened` of `key` recorded.
+    fn first_parent(conn: &Connection, key: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT json_extract(payload,'$.event.payload.parent') FROM events \
+             WHERE session_key=?1 AND kind='session_opened' AND json_valid(payload) \
+             AND json_extract(payload,'$.event.payload.parent') IS NOT NULL \
+             ORDER BY global_seq LIMIT 1",
+            [key],
+            |r| r.get(0),
+        )
+        .optional()
+        .expect("parent")
+    }
+
+    fn table_rows(conn: &Connection, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut statement = conn.prepare(sql).expect("prepare");
+        let width = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..width)
+                    .map(|i| row.get(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("rows")
+    }
+
+    /// A database of the binary before step B3 (migrations 001 to 004, its
+    /// projection built, then more rows past its mark) opens with this
+    /// binary: no row is rewritten; old rows read as tenant `local` and the
+    /// Runtime principal; the 004 projection is copied in tenant `local`
+    /// and caught up; the 004 tables are left as they were; new appends of
+    /// the same key in another tenant get their own sequence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_database_from_before_b3_upgrades_without_a_rewrite() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("events.db");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL; \
+                 CREATE TABLE migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);",
+            )
+            .expect("schema");
+            for (id, sql) in &MIGRATIONS[..4] {
+                conn.execute_batch(sql).expect("old migration");
+                conn.execute(
+                    "INSERT INTO migrations (id, applied_at) VALUES (?1, 0)",
+                    [id],
+                )
+                .expect("record");
+            }
+            for _ in 0..5 {
+                for batch in kit::workload() {
+                    insert_old(&conn, batch);
+                }
+            }
+            fill_004_projection(&conn);
+            // Rows an older binary wrote after its projection, past the mark.
+            insert_old(&conn, kit::workload().remove(0));
+        }
+        let (old_summary, old_turns, old_rows) =
+            {
+                let conn = Connection::open(&path).expect("open");
+                (
+                table_rows(&conn, "SELECT * FROM session_summary ORDER BY session_key"),
+                table_rows(&conn, "SELECT * FROM session_turns ORDER BY session_key, turn"),
+                table_rows(
+                    &conn,
+                    "SELECT global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload \
+                     FROM events ORDER BY global_seq",
+                ),
+            )
+            };
+        let log = SqliteEventLog::open(dir.path()).await.expect("open");
+        let records = log.read_runtime_after(kit::all(), 0).await.expect("read");
+        assert_eq!(records.len(), old_rows.len());
+        for record in &records {
+            assert_eq!(
+                record.event.identity,
+                loop_store::Identity::unrecorded(),
+                "an old row reads as tenant local and the Runtime principal"
+            );
+        }
+        assert_matches_fold(&log).await;
+        let a = SessionKey::from("a");
+        let summary = log
+            .session_summary(&kit::local(), &a)
+            .await
+            .expect("summary")
+            .expect("row");
+        assert_eq!(summary.owner, None, "no owner of record before B3");
+        let local_seq = summary.last_seq;
+        // The same key in another tenant: its own sequence from 1.
+        let mut update = kit::update("a");
+        update.identity = kit::edge_user(kit::acme());
+        let committed = log.append_batch(vec![update]).await.expect("append");
+        assert_eq!(committed[0].session_seq, Some(1));
+        assert_eq!(
+            log.latest_seq(&kit::local(), &a).await.expect("latest"),
+            local_seq
+        );
+        drop(log);
+        let mut conn = Connection::open(&path).expect("open");
+        // Stored rows are unchanged; new columns hold defaults or NULL.
+        assert_eq!(
+            table_rows(
+                &conn,
+                "SELECT global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload \
+                 FROM events WHERE global_seq<=(SELECT MAX(global_seq)-1 FROM events) \
+                 ORDER BY global_seq",
+            ),
+            old_rows
+        );
+        let unset: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE tenant='local' AND principal_kind IS NULL \
+                 AND principal_issuer IS NULL AND principal_id IS NULL AND via IS NULL AND actor IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(unset as usize, old_rows.len());
+        // The 004 tables are as the older binary left them.
+        assert_eq!(
+            table_rows(&conn, "SELECT * FROM session_summary ORDER BY session_key"),
+            old_summary
+        );
+        assert_eq!(
+            table_rows(
+                &conn,
+                "SELECT * FROM session_turns ORDER BY session_key, turn"
+            ),
+            old_turns
+        );
+        let indexes = table_rows(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='events' ORDER BY name",
+        );
+        let names: Vec<String> = indexes
+            .into_iter()
+            .map(|row| match &row[0] {
+                rusqlite::types::Value::Text(name) => name.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(names.contains(&"events_tenant_session_seq".to_owned()));
+        assert!(!names.contains(&"events_session_seq".to_owned()));
+        // The copied and caught-up projection equals a rebuild from events.
+        let live = projection_rows_table(&conn);
+        rebuild(&mut conn);
+        assert_eq!(projection_rows_table(&conn), live);
+    }
+
+    /// An older binary (before step B3) still works on a database of this
+    /// version, as far as it did: its migrations are all applied, its reads,
+    /// appends and 004 projection statements run, it reads every row of
+    /// this version, and its appends read back here as tenant `local`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_older_binary_works_on_a_new_database() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("events.db");
+        let log = SqliteEventLog::open(dir.path()).await.expect("open");
+        for batch in kit::workload() {
+            log.append_batch(batch).await.expect("append");
+        }
+        let mut acme = kit::update("only-acme");
+        acme.identity = kit::edge_user(kit::acme());
+        log.append_batch(vec![acme]).await.expect("append");
+        drop(log);
+        {
+            let conn = Connection::open(&path).expect("open");
+            // Its migrations 001 to 004 are recorded as applied.
+            for (id, _) in &MIGRATIONS[..4] {
+                let applied: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM migrations WHERE id=?1", [id], |r| {
+                        r.get(0)
+                    })
+                    .expect("migration");
+                assert_eq!(applied, 1, "{id}");
+            }
+            // Its reads: every row decodes; a Session page uses its query.
+            let all: Vec<_> = conn
+                .prepare(OLD_GLOBAL_PAGE_SQL)
+                .expect("prepare")
+                .query_map(params![0, i64::MAX, i64::MAX], old_decode)
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows");
+            assert_eq!(all.len(), 23);
+            let page: Vec<_> = conn
+                .prepare(OLD_SESSION_PAGE_SQL)
+                .expect("prepare")
+                .query_map(params!["a", 0, i64::MAX, 100], old_decode)
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows");
+            assert_eq!(
+                page.iter()
+                    .map(|(_, seq, _)| seq.expect("seq"))
+                    .collect::<Vec<_>>(),
+                (1..=page.len() as u64).collect::<Vec<_>>()
+            );
+            // Its projection catch-up and writes.
+            let rows: i64 = conn
+                .prepare(OLD_PROJECTION_ROWS_SQL)
+                .expect("prepare")
+                .query_map(params![0, i64::MAX, 10_000], |_| Ok(()))
+                .expect("query")
+                .count() as i64;
+            assert_eq!(rows, 23);
+            conn.execute(
+                OLD_UPSERT_SUMMARY_SQL,
+                params!["a", 9, 0, 1, 1, 1, None::<String>, false],
+            )
+            .expect("old upsert");
+            conn.execute(OLD_INSERT_TURN_SQL, params!["a", "turn-old", 99])
+                .expect("old turn");
+        }
+        // An append of the older binary, read by this one.
+        {
+            let conn = Connection::open(&path).expect("open");
+            insert_old(&conn, vec![kit::update("a")]);
+        }
+        let log = SqliteEventLog::open(dir.path()).await.expect("open");
+        let a = SessionKey::from("a");
+        let records = log.read_after(&kit::local(), &a, 0).await.expect("read");
+        let last = records.last().expect("records");
+        assert_eq!(last.event.identity, loop_store::Identity::unrecorded());
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.session_seq.expect("seq"))
+                .collect::<Vec<_>>(),
+            (1..=records.len() as u64).collect::<Vec<_>>(),
+            "contiguous in tenant local"
+        );
+        assert_matches_fold(&log).await;
+        assert_eq!(
+            log.latest_seq(&kit::acme(), &"only-acme".into())
+                .await
+                .expect("latest"),
+            1
+        );
+    }
+
+    /// The cost of migration 005 on a large database of the code before
+    /// step B3 whose 004 projection is current: the time of `migrate` and
+    /// the file size before and after. `LOOP_B3_EVENTS` rows (1,000,000).
+    #[test]
+    #[ignore = "measurement; run by hand"]
+    fn identity_migration_cost() {
+        let total: u64 = std::env::var("LOOP_B3_EVENTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000);
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("events.db");
+        old_database_rows(&path, total);
+        let mut conn = Connection::open(&path).expect("open");
+        conn.execute_batch(MIGRATIONS[3].1).expect("004");
+        conn.execute(
+            "INSERT INTO migrations (id, applied_at) VALUES (?1, 0)",
+            [MIGRATIONS[3].0],
+        )
+        .expect("record");
+        fill_004_projection(&conn);
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint");
+        let size = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT page_count*page_size FROM pragma_page_count(), pragma_page_size()",
+                [],
+                |r| r.get(0),
+            )
+            .expect("size")
+        };
+        let before = size(&conn);
+        let start = std::time::Instant::now();
+        migrate(&mut conn).expect("migrate");
+        let migrated = start.elapsed();
+        let start = std::time::Instant::now();
+        assert!(backfill(&mut conn, BACKFILL_CHUNK, None).expect("backfill"));
+        let caught_up = start.elapsed();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint");
+        let after = size(&conn);
+        println!(
+            "B3MIGRATION| {total} events: migrate {:.2} s, backfill {:.3} s, \
+             file {before} -> {after} bytes ({:+.1} bytes per event)",
+            migrated.as_secs_f64(),
+            caught_up.as_secs_f64(),
+            (after - before) as f64 / total as f64
+        );
     }
 }

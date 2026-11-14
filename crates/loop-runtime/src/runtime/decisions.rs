@@ -23,6 +23,10 @@ pub(super) struct LogDecisions {
     log: Arc<dyn EventLog>,
     generation: u64,
     session: SessionKey,
+    /// The Session's tenant: the row's tenant (the record keeps its own).
+    tenant: Tenant,
+    /// The `actor` of the Session's records.
+    actor: Option<String>,
     escalations: crate::EscalationHost,
     native: std::sync::Weak<loop_agent::native_backend::NativeBackend>,
     /// The live Session, once it exists, for its pump barrier.
@@ -34,6 +38,8 @@ impl LogDecisions {
         log: Arc<dyn EventLog>,
         generation: u64,
         session: SessionKey,
+        tenant: Tenant,
+        actor: Option<String>,
         escalations: crate::EscalationHost,
         native: &Arc<loop_agent::native_backend::NativeBackend>,
     ) -> Arc<Self> {
@@ -41,6 +47,8 @@ impl LogDecisions {
             log,
             generation,
             session,
+            tenant,
+            actor,
             escalations,
             native: Arc::downgrade(native),
             live: std::sync::OnceLock::new(),
@@ -87,12 +95,23 @@ impl DecisionSink for LogDecisions {
                 .await
                 .map_err(|e| DecisionError::Write(e.to_string()))?;
         }
+        // One source for who acted: the record's principal and `via`. The
+        // row is in the Session's tenant. The record's own `tenant` is the
+        // caller's; the two differ only when a caller of another tenant uses
+        // the Session, which access checks (task I3) will refuse.
+        let identity = Identity {
+            tenant: self.tenant.clone(),
+            principal: record.principal.clone(),
+            via: record.via.clone(),
+            actor: self.actor.clone(),
+        };
         let event = Event {
             generation: self.generation,
             session_key: Some(self.session.clone()),
             turn: record.turn.clone().map(TurnId),
             ts_ms: record.ts_ms,
             kind: EventKind::PolicyDecision(serde_json::to_value(record)?),
+            identity,
         };
         self.log
             .append_batch(vec![event])

@@ -23,6 +23,13 @@ const STRICTER_OK: &[&str] = &["|$DEEP"];
 #[tokio::test]
 async fn gate_path_decisions_match_the_recorded_ones() {
     let tree = gate_matrix::tree();
+    if !gate_matrix::recorded_layout(&tree) {
+        eprintln!(
+            "the golden file was recorded in the macOS temp folder; this tree is at {}",
+            tree.raw.display()
+        );
+        return;
+    }
     let lines = gate_matrix::all_lines(&tree).await;
     assert!(lines.len() > 5000, "{} lines", lines.len());
     let changed = gate_matrix::check_golden(&lines, STRICTER_OK);

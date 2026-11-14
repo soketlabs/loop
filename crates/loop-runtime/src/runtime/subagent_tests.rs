@@ -272,7 +272,13 @@ async fn parallel_children_complete_and_the_parent_gets_both_answers() {
             assert!(lease.is_none(), "a finished child releases its lease");
         }
 
-        let events = log.read_runtime_after(0).await.unwrap();
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         let parent = kinds(&events, &root.key);
         assert_eq!(
             parent.iter().filter(|k| *k == "subagent_started").count(),
@@ -513,7 +519,13 @@ async fn logged(
 ) -> SessionKey {
     loop {
         if let Some(key) = session(&rt.list().await.unwrap()) {
-            let events = log.read_runtime_after(0).await.unwrap();
+            let events = log
+                .read_runtime_after(
+                    loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                    0,
+                )
+                .await
+                .unwrap();
             if events.iter().any(|e| {
                 e.event.session_key.as_ref() == Some(&key)
                     && serde_json::to_string(&e.event.kind)
@@ -641,8 +653,16 @@ async fn cancelling_the_parent_cancels_its_descendants() {
         rt.cancel(&root);
         assert!(matches!(turn.outcome().await, TurnOutcome::Cancelled));
         loop {
-            let ended = kinds(&log.read_runtime_after(0).await.unwrap(), &root.key)
-                .contains(&"subagent_ended".to_owned());
+            let ended = kinds(
+                &log.read_runtime_after(
+                    loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                    0,
+                )
+                .await
+                .unwrap(),
+                &root.key,
+            )
+            .contains(&"subagent_ended".to_owned());
             if ended && rt.sessions.lock().unwrap().len() == 1 {
                 break;
             }
@@ -653,7 +673,13 @@ async fn cancelling_the_parent_cancels_its_descendants() {
             "{:?}",
             started.elapsed()
         );
-        let events = log.read_runtime_after(0).await.unwrap();
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         for key in [&middle, &leaf] {
             let kinds = kinds(&events, key);
             assert!(kinds.contains(&"cancelled".to_owned()), "{kinds:?}");
@@ -702,7 +728,15 @@ async fn ask_mode_spawns_without_asking_and_cancel_withdraws_child_escalations()
         rt.cancel(&other);
         assert!(matches!(turn.outcome().await, TurnOutcome::Cancelled));
         loop {
-            let kinds = kinds(&log.read_runtime_after(0).await.unwrap(), &asker);
+            let kinds = kinds(
+                &log.read_runtime_after(
+                    loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                    0,
+                )
+                .await
+                .unwrap(),
+                &asker,
+            );
             if kinds.contains(&"session_closed".to_owned()) {
                 assert!(
                     kinds.contains(&"escalation_withdrawn".to_owned()),
@@ -1052,7 +1086,13 @@ async fn only_subagent_children_list_a_parent_and_their_end_says_they_closed() {
             "the task names the child"
         );
 
-        let events = log.read_runtime_after(0).await.unwrap();
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         let ended = payload(&events, &root.key, "subagent_ended").unwrap();
         // `closed` keeps its original meaning: the close error, or null.
         assert_eq!(ended["closed"], json!(null), "{ended}");
@@ -1155,7 +1195,13 @@ async fn a_grandchilds_escalation_reaches_surfaces_watching_any_ancestor() {
         assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
         assert_eq!(seen.results("root"), vec!["middle done".to_owned()]);
 
-        let events = log.read_runtime_after(0).await.unwrap();
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         let kinds = kinds(&events, &asker.key);
         assert!(kinds.contains(&"escalation_raised".to_owned()), "{kinds:?}");
         assert!(
@@ -1330,7 +1376,10 @@ async fn a_subagent_s_decisions_are_recorded_for_the_parent_s_caller() {
             .unwrap();
         assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
         let records: Vec<(SessionKey, loop_store::PolicyDecisionRecord)> = log
-            .read_runtime_after(0)
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
             .await
             .unwrap()
             .into_iter()

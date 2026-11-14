@@ -338,16 +338,25 @@ impl EventLog for SlowLog {
     }
     async fn read_after(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
         after_seq: u64,
     ) -> LogResult<Vec<LoggedEvent>> {
-        self.inner.read_after(session, after_seq).await
+        self.inner.read_after(tenant, session, after_seq).await
     }
-    async fn read_runtime_after(&self, global_seq: u64) -> LogResult<Vec<LoggedEvent>> {
-        self.inner.read_runtime_after(global_seq).await
+    async fn read_runtime_after(
+        &self,
+        scope: loop_store::Scope<'_>,
+        global_seq: u64,
+    ) -> LogResult<Vec<LoggedEvent>> {
+        self.inner.read_runtime_after(scope, global_seq).await
     }
-    async fn latest_seq(&self, session: &loop_protocol::SessionKey) -> LogResult<u64> {
-        self.inner.latest_seq(session).await
+    async fn latest_seq(
+        &self,
+        tenant: &loop_store::Tenant,
+        session: &loop_protocol::SessionKey,
+    ) -> LogResult<u64> {
+        self.inner.latest_seq(tenant, session).await
     }
     async fn allocate_generation(&self, owner: &str, pid: u32, started_ms: i64) -> LogResult<u64> {
         self.inner.allocate_generation(owner, pid, started_ms).await
@@ -360,29 +369,32 @@ impl EventLog for SlowLog {
     }
     async fn read_session_page(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
         after_seq: u64,
         through_seq: Option<u64>,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
         self.inner
-            .read_session_page(session, after_seq, through_seq, limit)
+            .read_session_page(tenant, session, after_seq, through_seq, limit)
             .await
     }
     async fn session_summary(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
     ) -> loop_runtime::log::Result<Option<loop_runtime::log::SessionSummary>> {
-        self.inner.session_summary(session).await
+        self.inner.session_summary(tenant, session).await
     }
     async fn recovery_page(
         &self,
+        scope: loop_store::Scope<'_>,
         from_generation: u64,
         after_global: u64,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
         self.inner
-            .recovery_page(from_generation, after_global, limit)
+            .recovery_page(scope, from_generation, after_global, limit)
             .await
     }
 }
@@ -1270,7 +1282,14 @@ async fn run_schedule(sched: Schedule, dir: PathBuf) -> Outcome {
         if rt.status().loaded != 0 {
             violations.push(format!("LOADED_AFTER_SHUTDOWN {}", rt.status().loaded));
         }
-        let records = log.inner.read_runtime_after(0).await.unwrap_or_default();
+        let records = log
+            .inner
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap_or_default();
         let facts = account_log(&records);
         violations.extend(facts.errors.iter().map(|e| format!("LOG_ACCOUNTING {e}")));
         {

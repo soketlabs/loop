@@ -6,11 +6,18 @@
 //! Escalations of a turn it started. The caller that started the turn is
 //! captured when the Runtime admits the prompt ([`EscalationHost::set_turn_caller`]).
 //! The `escalation_answered` record names the caller that answered.
+//!
+//! Who each record names (step B3): `escalation_raised` the caller that
+//! started the turn; `escalation_answered` the caller that answered;
+//! `escalation_withdrawn` the caller whose cancel or close withdrew it, or
+//! the Runtime when it withdraws on its own. Every record is in the
+//! Session's tenant.
 use crate::log::{Event, EventKind, EventLog};
 use async_trait::async_trait;
 use loop_protocol::{
     rpc::InteractParams, Caller, HostServices, InteractionOutcome, InteractionRequest, SessionRef,
 };
+use loop_store::{Identity, Tenant};
 use loop_wire::control::EscalationRecipient;
 use serde_json::json;
 use std::{collections::HashMap, sync::Arc};
@@ -23,6 +30,10 @@ struct Inner {
     session: SessionRef,
     log: Arc<dyn EventLog>,
     generation: u64,
+    /// The Session's tenant, fixed when it was created.
+    tenant: Tenant,
+    /// The `actor` of every record of this Session (a Subagent's parent).
+    actor: Option<String>,
     state: Mutex<State>,
     interrupted: watch::Sender<bool>,
     /// The caller that started the current turn (or command), carried
@@ -88,10 +99,15 @@ impl Drop for WaitingTool {
         tokio::spawn(async move {
             let mut state = host.0.state.lock().await;
             if let Some(pending) = state.pending.remove(&ticket) {
+                // The Runtime withdraws it on its own: the waiting tool went.
+                let by = crate::runtime::in_process_caller();
                 if let Err(error) = host
-                    .record(EventKind::EscalationWithdrawn(
-                        json!({"id": pending.request.id(), "reason":"waiting tool cancelled"}),
-                    ))
+                    .record(
+                        EventKind::EscalationWithdrawn(
+                            json!({"id": pending.request.id(), "reason":"waiting tool cancelled"}),
+                        ),
+                        &by,
+                    )
                     .await
                 {
                     eprintln!("Runtime: could not log Escalation withdrawal: {error}");
@@ -104,12 +120,22 @@ impl Drop for WaitingTool {
     }
 }
 impl EscalationHost {
-    /// Create the host before exposing the Session to prompts.
-    pub fn new(session: SessionRef, log: Arc<dyn EventLog>, generation: u64) -> Self {
+    /// Create the host before exposing the Session to prompts. `tenant` is
+    /// the Session's tenant and `actor` the `actor` of its records (a
+    /// Subagent's parent Session); every record the host writes has them.
+    pub fn new(
+        session: SessionRef,
+        log: Arc<dyn EventLog>,
+        generation: u64,
+        tenant: Tenant,
+        actor: Option<String>,
+    ) -> Self {
         Self(Arc::new(Inner {
             session,
             log,
             generation,
+            tenant,
+            actor,
             state: Mutex::new(State::default()),
             interrupted: watch::channel(false).0,
             turn_caller: std::sync::Mutex::new(None),
@@ -159,7 +185,11 @@ impl EscalationHost {
     pub(crate) fn interrupt_decisions(&self) {
         self.0.interrupted.send_replace(true);
     }
-    async fn record(&self, kind: EventKind) -> crate::log::Result<()> {
+    /// `by` acting on this Session, in the Session's tenant.
+    fn identity(&self, by: &Caller) -> Identity {
+        Identity::acting(by, self.0.tenant.clone()).with_actor(self.0.actor.clone())
+    }
+    async fn record(&self, kind: EventKind, by: &Caller) -> crate::log::Result<()> {
         let decision = matches!(
             kind,
             EventKind::EscalationRaised(_) | EventKind::EscalationAnswered(_)
@@ -170,6 +200,7 @@ impl EscalationHost {
             turn: None,
             ts_ms: crate::runtime::now(),
             kind,
+            identity: self.identity(by),
         }];
         let mut interrupted = self.0.interrupted.subscribe();
         tokio::select! {
@@ -298,11 +329,18 @@ impl EscalationHost {
             ),
             _ => None,
         };
+        // An in-process recipient answers as the Runtime.
+        let by = answered_by
+            .clone()
+            .unwrap_or_else(crate::runtime::in_process_caller);
         let result = self
-            .record(EventKind::EscalationAnswered(json!({
-                "id": pending.request.id(), "answer": answer, "grant": grant,
-                "answered_by": answered_by,
-            })))
+            .record(
+                EventKind::EscalationAnswered(json!({
+                    "id": pending.request.id(), "answer": answer, "grant": grant,
+                    "answered_by": answered_by,
+                })),
+                &by,
+            )
             .await;
         if result.is_ok() {
             self.remember_answer(pending.request.id().to_string(), answered_by);
@@ -326,17 +364,27 @@ impl EscalationHost {
         }
         let _ = pending.answer.send(outcome);
     }
-    /// Withdraw on cancellation; closing also refuses future requests.
-    pub async fn withdraw(&self, reason: &str, closing: bool) -> crate::log::Result<()> {
+    /// Withdraw on cancellation; closing also refuses future requests. `by`
+    /// is the caller whose cancel or close withdraws them (the Runtime's own
+    /// caller when it acts on its own); the records name it.
+    pub async fn withdraw(
+        &self,
+        reason: &str,
+        closing: bool,
+        by: &Caller,
+    ) -> crate::log::Result<()> {
         let mut state = self.0.state.lock().await;
         state.closed |= closing;
         let pending = std::mem::take(&mut state.pending);
         let mut error = None;
         for (_, pending) in pending {
             if let Err(e) = self
-                .record(EventKind::EscalationWithdrawn(
-                    json!({"id": pending.request.id(), "reason": reason}),
-                ))
+                .record(
+                    EventKind::EscalationWithdrawn(
+                        json!({"id": pending.request.id(), "reason": reason}),
+                    ),
+                    by,
+                )
                 .await
             {
                 error = Some(e);
@@ -400,10 +448,16 @@ impl HostServices for EscalationHost {
                 host: self.clone(),
                 ticket,
             };
+            // Raised for the caller that started the turn; an in-process
+            // turn is the Runtime's.
+            let by = self
+                .turn_caller()
+                .unwrap_or_else(crate::runtime::in_process_caller);
             if let Err(e) = self
-                .record(EventKind::EscalationRaised(
-                    json!({"id": request.id(), "request": request}),
-                ))
+                .record(
+                    EventKind::EscalationRaised(json!({"id": request.id(), "request": request})),
+                    &by,
+                )
                 .await
             {
                 if !*self.0.interrupted.borrow() {

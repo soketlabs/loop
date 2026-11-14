@@ -101,10 +101,18 @@ async fn park(rt: &Runtime, log: &MemoryEventLog, session: &SessionRef) -> TurnH
         .await
         .unwrap();
     loop {
-        let raised = log.read_runtime_after(0).await.unwrap().iter().any(|e| {
-            matches!(e.event.kind, EventKind::EscalationRaised(_))
-                && e.event.session_key.as_ref() == Some(&session.key)
-        });
+        let raised = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| {
+                matches!(e.event.kind, EventKind::EscalationRaised(_))
+                    && e.event.session_key.as_ref() == Some(&session.key)
+            });
         if raised {
             break turn;
         }
