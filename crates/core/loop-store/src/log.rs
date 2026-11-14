@@ -59,6 +59,11 @@ pub trait EventLog: Send + Sync {
     ) -> Result<Vec<LoggedEvent>>;
     /// All activity in `scope` with global_seq strictly greater than the
     /// supplied cursor.
+    ///
+    /// Cost: the SQLite store walks the primary key from the cursor and
+    /// filters by tenant, so a tenant scope reads every tenant's rows after
+    /// the cursor. Production reads use a system scope today. This must be
+    /// fixed (an index or a partition per tenant) before shared-cell use.
     async fn read_runtime_after(
         &self,
         scope: Scope<'_>,
@@ -141,7 +146,9 @@ pub trait EventLog: Send + Sync {
             .and_then(|summary| summary.owner))
     }
     /// One page of [`EventLog::recovery_records`] with `global_seq` strictly
-    /// greater than `after_global`. `next` is a `global_seq`.
+    /// greater than `after_global`. `next` is a `global_seq`. A tenant scope
+    /// has the cost of [`EventLog::read_runtime_after`]: it must be fixed
+    /// before shared-cell use.
     ///
     /// The default cuts the page from a whole `recovery_records` read.
     async fn recovery_page(

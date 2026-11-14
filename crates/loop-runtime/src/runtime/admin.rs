@@ -361,14 +361,14 @@ impl Runtime {
             .collect();
         let mut notices: Vec<String> = Vec::new();
         let mut pending = 0;
-        // The reload's config updates are this request's.
         let by = request_caller();
         for live in live {
             let _lifecycle = live.lifecycle.lock().await;
             if live.closing.load(Ordering::Acquire) {
                 continue;
             }
-            live.set_request_caller(by.clone());
+            // The reload's config changes are this request's.
+            let _claim = live.claim_changes(&by);
             if live.busy.load(Ordering::Acquire) {
                 pending += 1;
                 // A generation it was only going to switch to is not in use.

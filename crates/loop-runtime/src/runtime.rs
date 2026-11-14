@@ -112,6 +112,9 @@ pub struct Runtime {
     /// (system scope) and kept as Sessions open. A Session key is unique in
     /// this Runtime's Session store, so one key has one tenant here.
     tenants: Mutex<HashMap<SessionKey, Tenant>>,
+    /// Session keys with records in more than one tenant, found at start:
+    /// readable in their creating tenant, never loaded.
+    split: HashMap<SessionKey, SplitSessionError>,
     limits: RuntimeLimits,
     turns: Arc<Semaphore>,
     store: Arc<dyn RuntimeSessionStore>,
@@ -165,35 +168,74 @@ fn touch(activity: &Activity, key: &SessionKey, ts_ms: i64) {
     let slot = map.entry(key.clone()).or_insert(ts_ms);
     *slot = (*slot).max(ts_ms);
 }
-/// Split the start-up activity read (all tenants) into the activity of each
-/// Session key and the tenant of each key. A key in two tenants (only a
-/// database shared by two Runtimes can have one) keeps the smaller tenant
-/// name and is reported.
+/// A Session key with records in more than one tenant. Only a downgrade
+/// makes one: a Loop from before step B3 writes every row as `local`, also
+/// a row of another tenant's Session. Such a Session is not loaded.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "Session {session} has records in more than one tenant ({tenants}): an older Loop \
+     wrote some of them. It is readable in tenant {creator} but cannot be loaded"
+)]
+pub struct SplitSessionError {
+    /// The Session key.
+    pub session: String,
+    /// The tenants that hold its records.
+    pub tenants: String,
+    /// The tenant its reads use: the one of its creating record.
+    pub creator: Tenant,
+}
+
+/// The start-up index of the Sessions the Event Log knows (all tenants).
+#[derive(Debug, Default, PartialEq)]
+struct SessionIndex {
+    /// Newest activity of each key.
+    activity: HashMap<SessionKey, i64>,
+    /// The tenant each key's reads use.
+    tenants: HashMap<SessionKey, Tenant>,
+    /// Keys with records in more than one tenant.
+    split: HashMap<SessionKey, SplitSessionError>,
+}
+
+/// Build the index from the start-up activity read. A key in more than one
+/// tenant reads in the tenant of its creating record (`creators`: the
+/// tenants whose summary of the key has an owner of record); with none or
+/// several of those, the smallest tenant name. It is reported, and the
+/// Runtime refuses to load it.
 fn session_index(
     read: HashMap<(Tenant, SessionKey), i64>,
-) -> (HashMap<SessionKey, i64>, HashMap<SessionKey, Tenant>) {
-    let mut activity: HashMap<SessionKey, i64> = HashMap::new();
-    let mut tenants: HashMap<SessionKey, Tenant> = HashMap::new();
+    creators: &HashMap<SessionKey, Vec<Tenant>>,
+) -> SessionIndex {
+    let mut index = SessionIndex::default();
+    let mut all: HashMap<SessionKey, Vec<Tenant>> = HashMap::new();
     for ((tenant, key), ts) in read {
-        let slot = activity.entry(key.clone()).or_insert(ts);
+        let slot = index.activity.entry(key.clone()).or_insert(ts);
         *slot = (*slot).max(ts);
-        match tenants.get_mut(&key) {
-            Some(known) if *known != tenant => {
-                eprintln!(
-                    "Runtime: Session {} has records in tenants {known} and {tenant}",
-                    key.0
-                );
-                if tenant < *known {
-                    *known = tenant;
-                }
-            }
-            Some(_) => {}
-            None => {
-                tenants.insert(key, tenant);
-            }
-        }
+        all.entry(key).or_default().push(tenant);
     }
-    (activity, tenants)
+    for (key, mut tenants) in all {
+        tenants.sort();
+        if tenants.len() == 1 {
+            index.tenants.insert(key, tenants.remove(0));
+            continue;
+        }
+        let creator = match creators.get(&key).map(Vec::as_slice) {
+            Some([one]) => one.clone(),
+            _ => tenants[0].clone(),
+        };
+        let error = SplitSessionError {
+            session: key.0.clone(),
+            tenants: tenants
+                .iter()
+                .map(Tenant::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            creator: creator.clone(),
+        };
+        eprintln!("Runtime: {error}");
+        index.tenants.insert(key.clone(), creator);
+        index.split.insert(key, error);
+    }
+    index
 }
 /// How long a close waits for each settling step before giving up on a stuck turn.
 const CLOSE_GRACE: Duration = Duration::from_secs(10);
@@ -270,18 +312,71 @@ struct LiveSession {
     acting: Mutex<Acting>,
 }
 /// Who caused the updates a Session's backend sends to its pump. The pump
-/// commits them without a request in scope, so the request that causes them
-/// sets these first. Updates of a turn (with a turn id) are the turn's
-/// caller's; other updates (config changes, a command's output) are the
-/// caller of the last request that acted on the Session.
+/// commits them without a request in scope, so the cause is recorded here
+/// first, and each identity is built once, not per update.
 ///
-/// A turn's caller cannot change while its updates are in flight: the next
-/// prompt is admitted only after the turn's barrier. Two config changes by
-/// different callers at once can be stamped with the later caller; the
-/// per-Session sequencer (A0) can carry the caller with each update.
+/// - An update with a turn id is the turn's caller's. A turn's caller cannot
+///   change while its updates are in flight: the next prompt is admitted
+///   only after the turn's barrier.
+/// - A `config_changed` is stamped by its revision: the caller that made the
+///   change, recorded under the lifecycle lock before the setter runs
+///   ([`LiveSession::claim_changes`]). So a change waiting in the pump's
+///   queue keeps its caller, also when another caller's prompt is admitted
+///   meanwhile, and a deferred change that takes effect at a turn's end
+///   (same revision) is still its setter's.
+/// - What remains: an update with no turn id that is not a `config_changed`
+///   (a notice, a command's output) is the caller of the last turn or
+///   command. If such an update still waits in the pump's queue when the
+///   next turn is admitted, it gets the next turn's caller. A
+///   `config_changed` whose revision no request claimed (the opening config,
+///   or more than [`CHANGES_KEPT`] changes ago) also falls back to that
+///   caller. The per-Session sequencer (A0) can carry the caller with every
+///   update.
 struct Acting {
-    turn: Caller,
-    request: Caller,
+    turn_caller: Caller,
+    turn: Identity,
+    request: Identity,
+    /// Who made each Session revision, newest [`CHANGES_KEPT`].
+    changes: std::collections::BTreeMap<u64, Identity>,
+    /// A setter running now: revisions after the first value are the
+    /// second's, until the claim ends.
+    claim: Option<(u64, Identity)>,
+}
+/// How many revisions [`Acting::changes`] remembers.
+const CHANGES_KEPT: usize = 256;
+impl Acting {
+    fn new(caller: Caller, identity: Identity) -> Self {
+        Self {
+            turn_caller: caller,
+            turn: identity.clone(),
+            request: identity,
+            changes: std::collections::BTreeMap::new(),
+            claim: None,
+        }
+    }
+}
+/// The revisions a setter makes while this lives are its caller's. Ends
+/// (and records them) on drop.
+struct ChangeClaim<'a> {
+    live: &'a LiveSession,
+}
+impl Drop for ChangeClaim<'_> {
+    fn drop(&mut self) {
+        let after = self.live.opened.native.config().revision;
+        let mut acting = self
+            .live
+            .acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((before, identity)) = acting.claim.take() {
+            for revision in before.saturating_add(1)..=after {
+                acting.changes.insert(revision, identity.clone());
+            }
+            while acting.changes.len() > CHANGES_KEPT {
+                acting.changes.pop_first();
+            }
+        }
+    }
 }
 impl LiveSession {
     /// `caller` acting on this Session, in its tenant.
@@ -292,41 +387,56 @@ impl LiveSession {
     fn runtime_identity(&self) -> Identity {
         Identity::runtime_in(self.tenant.clone()).with_actor(self.actor.clone())
     }
-    /// The identity of an update the pump commits.
+    /// The identity of an update the pump commits (see [`Acting`]).
     fn update_identity(&self, envelope: &UpdateEnvelope) -> Identity {
         let acting = self
             .acting
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let caller = if envelope.turn.is_some() {
-            &acting.turn
-        } else {
-            &acting.request
-        };
-        self.identity(caller)
+        if envelope.turn.is_some() {
+            return acting.turn.clone();
+        }
+        if let SessionUpdate::ConfigChanged(changed) = &envelope.update {
+            if let Some(identity) = acting.changes.get(&changed.revision) {
+                return identity.clone();
+            }
+            if let Some((before, identity)) = &acting.claim {
+                if changed.revision > *before {
+                    return identity.clone();
+                }
+            }
+        }
+        acting.request.clone()
     }
     /// A turn or command of `caller` starts: it causes the updates that follow.
     fn set_turn_caller(&self, caller: Caller) {
+        let identity = self.identity(&caller);
         let mut acting = self
             .acting
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        acting.turn = caller.clone();
-        acting.request = caller;
+        acting.turn_caller = caller;
+        acting.turn = identity.clone();
+        acting.request = identity;
     }
-    /// A request of `caller` that changes the Session outside a turn.
-    fn set_request_caller(&self, caller: Caller) {
+    /// Claim the revisions the next setter makes for `caller`. Call under
+    /// the lifecycle lock, which serializes setters; keep the claim until
+    /// the setter returns.
+    fn claim_changes(&self, caller: &Caller) -> ChangeClaim<'_> {
+        let identity = self.identity(caller);
+        let before = self.opened.native.config().revision;
         self.acting
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .request = caller;
+            .claim = Some((before, identity));
+        ChangeClaim { live: self }
     }
     /// The caller of the current (or last) turn.
     fn turn_caller(&self) -> Caller {
         self.acting
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .turn
+            .turn_caller
             .clone()
     }
 }
@@ -457,12 +567,33 @@ impl Runtime {
         .map_err(failed)?;
         // The one cross-tenant read permission, made at startup.
         let system = SystemScope::for_runtime_startup();
-        let (activity, tenants) = session_index(
-            log.last_activity_ms(Scope::System(&system))
-                .await
-                .map_err(failed)?,
-        );
-        let activity = Arc::new(Mutex::new(activity));
+        let read = log
+            .last_activity_ms(Scope::System(&system))
+            .await
+            .map_err(failed)?;
+        // Keys in more than one tenant (a downgrade wrote them): which
+        // tenant holds the creating record.
+        let mut seen: HashMap<&SessionKey, usize> = HashMap::new();
+        for (_, key) in read.keys() {
+            *seen.entry(key).or_default() += 1;
+        }
+        let mut creators: HashMap<SessionKey, Vec<Tenant>> = HashMap::new();
+        for (tenant, key) in read.keys() {
+            if seen[key] > 1
+                && log
+                    .session_owner(tenant, key)
+                    .await
+                    .map_err(failed)?
+                    .is_some()
+            {
+                creators
+                    .entry(key.clone())
+                    .or_default()
+                    .push(tenant.clone());
+            }
+        }
+        let index = session_index(read, &creators);
+        let activity = Arc::new(Mutex::new(index.activity));
         let (updates, _) = broadcast::channel(4096);
         Ok(Self {
             instance: NATIVE_INSTANCE.into(),
@@ -481,7 +612,8 @@ impl Runtime {
             generation,
             deployment,
             system,
-            tenants: Mutex::new(tenants),
+            tenants: Mutex::new(index.tenants),
+            split: index.split,
             limits,
             turns: Arc::new(Semaphore::new(limits.max_active_turns)),
             store,
@@ -1444,8 +1576,8 @@ impl Runtime {
             if refuse_busy && live.busy.load(Ordering::Acquire) {
                 return Err(BackendError::Busy);
             }
-            // The change the setter makes is this caller's.
-            live.set_request_caller(request_caller());
+            // The revisions the setter makes are this caller's.
+            let _claim = live.claim_changes(&request_caller());
             set(Arc::clone(&live)).await?
         };
         let receipt = Receipt {
@@ -1876,6 +2008,34 @@ mod tests {
         .await
         .ok();
         (end, calls.load(Ordering::Acquire))
+    }
+
+    /// A key in two tenants reads in the tenant of its creating record and
+    /// is marked split; with no single creating tenant, the smallest name.
+    #[test]
+    fn session_index_prefers_the_creating_tenant_and_marks_splits() {
+        let local = Tenant::local();
+        let acme = Tenant::new("acme").unwrap();
+        let zeta = Tenant::new("zeta").unwrap();
+        let key = |k: &str| SessionKey::from(k);
+        let read = HashMap::from([
+            ((local.clone(), key("only")), 5),
+            ((local.clone(), key("split")), 9),
+            ((zeta.clone(), key("split")), 7),
+            ((local.clone(), key("unowned")), 1),
+            ((acme.clone(), key("unowned")), 2),
+        ]);
+        // "split" was created in zeta: the larger name wins by its owner row.
+        let creators = HashMap::from([(key("split"), vec![zeta.clone()])]);
+        let index = session_index(read, &creators);
+        assert_eq!(index.tenants[&key("only")], local);
+        assert_eq!(index.tenants[&key("split")], zeta);
+        assert_eq!(index.activity[&key("split")], 9);
+        assert_eq!(index.tenants[&key("unowned")], acme);
+        assert!(!index.split.contains_key(&key("only")));
+        assert_eq!(index.split[&key("split")].creator, zeta);
+        assert_eq!(index.split[&key("split")].tenants, "local, zeta");
+        assert!(index.split.contains_key(&key("unowned")));
     }
 
     #[tokio::test]

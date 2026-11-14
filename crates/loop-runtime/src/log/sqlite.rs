@@ -1441,7 +1441,10 @@ const GLOBAL_PAGE_SQL: &str = concat!(
     record_columns!(),
     " FROM events WHERE global_seq>?1 AND global_seq<=?2 ORDER BY global_seq LIMIT ?3"
 );
-/// One tenant's rows: the primary key walk, filtered by tenant.
+/// One tenant's rows: the primary key walk, filtered by tenant. It reads
+/// every tenant's rows in the range (O(all rows)). Only tests use a tenant
+/// scope today; fix it (an index or a partition per tenant) before
+/// shared-cell use. A test pins this plan.
 const GLOBAL_TENANT_PAGE_SQL: &str = concat!(
     "SELECT ",
     record_columns!(),
@@ -1859,6 +1862,30 @@ mod tests {
             ("old prompts sent", "SELECT COUNT(*) FROM events WHERE session_key=?1 AND kind='prompt_sent'"),
         ] {
             println!("{name}: {:?}", plan(&conn, old));
+        }
+    }
+
+    /// The tenant-scoped Runtime-wide reads walk the primary key and filter
+    /// by tenant: O(all rows after the cursor). Pinned here so the cost
+    /// stays visible; it must be fixed before shared-cell use.
+    #[test]
+    fn tenant_scoped_runtime_reads_walk_the_whole_primary_key() {
+        let conn = migrated();
+        for (name, sql) in [
+            ("global page of one tenant", GLOBAL_TENANT_PAGE_SQL),
+            ("recovery page", RECOVERY_PAGE_SQL),
+        ] {
+            let rows = plan(&conn, sql);
+            println!("{name}: {rows:?}");
+            assert_eq!(rows.len(), 1, "{name}: {rows:?}");
+            assert!(
+                rows[0].starts_with("SEARCH events USING INTEGER PRIMARY KEY (rowid>?"),
+                "{name}: {rows:?}"
+            );
+            assert!(
+                !rows[0].contains("tenant"),
+                "{name} now seeks the tenant: {rows:?}"
+            );
         }
     }
 

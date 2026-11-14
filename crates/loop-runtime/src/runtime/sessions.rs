@@ -61,6 +61,9 @@ impl Runtime {
             }
         };
         if let Some(session) = existing {
+            if let Some(split) = self.split.get(&session.key).filter(|_| !fresh) {
+                return Err(failed(split));
+            }
             if let Some(parent) = self.subagent_parent(session).await? {
                 // Reopened alone it would lose its parent's ceiling and depth.
                 return Err(failed(format!(
@@ -357,6 +360,7 @@ impl Runtime {
                 payload[loop_store::SESSION_CREATED_KEY] = json!(true);
             }
             let opened_by = Identity::acting(&acting, tenant.clone()).with_actor(actor.clone());
+            let opened_identity = opened_by.clone();
             self.log
                 .append_batch(vec![Event {
                     generation: self.generation,
@@ -437,10 +441,7 @@ impl Runtime {
                 loaded_by,
                 tenant,
                 actor,
-                acting: Mutex::new(Acting {
-                    turn: acting.clone(),
-                    request: acting,
-                }),
+                acting: Mutex::new(Acting::new(acting, opened_identity)),
             });
             decisions.bind(&live);
             if unannounced {

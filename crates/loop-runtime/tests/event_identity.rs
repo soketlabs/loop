@@ -597,38 +597,431 @@ async fn a_command_a_clone_and_an_unload_name_who_acted() {
     .unwrap();
 }
 
-/// Only the Runtime's startup code makes a `SystemScope`: outside tests,
-/// `SystemScope::for_runtime_startup` appears once in this crate's source,
-/// in `Runtime::new`.
+/// An Event Log whose appends wait while it is closed.
+struct GatedLog {
+    inner: MemoryEventLog,
+    open: tokio::sync::watch::Sender<bool>,
+    waiting: std::sync::atomic::AtomicUsize,
+}
+impl GatedLog {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryEventLog::new(),
+            open: tokio::sync::watch::channel(true).0,
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+    fn set_open(&self, open: bool) {
+        self.open.send_replace(open);
+    }
+    fn waiting(&self) -> usize {
+        self.waiting.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+#[async_trait::async_trait]
+impl EventLog for GatedLog {
+    async fn append_batch(
+        &self,
+        events: Vec<Event>,
+    ) -> loop_runtime::log::Result<Vec<LoggedEvent>> {
+        let mut open = self.open.subscribe();
+        if !*open.borrow() {
+            self.waiting
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let _ = open.wait_for(|open| *open).await;
+            self.waiting
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        self.inner.append_batch(events).await
+    }
+    async fn read_after(
+        &self,
+        tenant: &Tenant,
+        session: &SessionKey,
+        after_seq: u64,
+    ) -> loop_runtime::log::Result<Vec<LoggedEvent>> {
+        self.inner.read_after(tenant, session, after_seq).await
+    }
+    async fn read_runtime_after(
+        &self,
+        scope: Scope<'_>,
+        global_seq: u64,
+    ) -> loop_runtime::log::Result<Vec<LoggedEvent>> {
+        self.inner.read_runtime_after(scope, global_seq).await
+    }
+    async fn latest_seq(
+        &self,
+        tenant: &Tenant,
+        session: &SessionKey,
+    ) -> loop_runtime::log::Result<u64> {
+        self.inner.latest_seq(tenant, session).await
+    }
+    async fn allocate_generation(
+        &self,
+        owner: &str,
+        pid: u32,
+        started_ms: i64,
+    ) -> loop_runtime::log::Result<u64> {
+        self.inner.allocate_generation(owner, pid, started_ms).await
+    }
+    async fn finish_generation(
+        &self,
+        generation: u64,
+        stopped_ms: i64,
+    ) -> loop_runtime::log::Result<()> {
+        self.inner.finish_generation(generation, stopped_ms).await
+    }
+}
+
+/// The interleaving of the review: A's config change waits in the pump's
+/// queue behind an earlier update while B's prompt is admitted. The change
+/// is still A's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_config_change_keeps_its_caller_when_another_caller_prompts() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = GatedLog::new();
+        let (rt, _) = runtime(dir.path(), log.clone()).await;
+        let (me, alice) = (host(), edge("alice"));
+        let session = me
+            .clone()
+            .scope(rt.new_session(SessionSpec::default()))
+            .await
+            .unwrap();
+        log.set_open(false);
+        // Alice's first change: the pump blocks on its commit.
+        let first = tokio::spawn({
+            let (rt, session, alice) = (rt.clone(), session.clone(), alice.clone());
+            async move {
+                alice
+                    .scope(rt.set_model(&session, "faux/second", None))
+                    .await
+            }
+        });
+        while log.waiting() == 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // Alice's second change waits in the pump's queue.
+        let second = tokio::spawn({
+            let (rt, session, alice) = (rt.clone(), session.clone(), alice.clone());
+            async move {
+                alice
+                    .scope(rt.set_model(&session, "faux/second", None))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The host user's prompt is admitted meanwhile.
+        let turn = me
+            .clone()
+            .scope(rt.prompt(&session, vec![ContentBlock::text("go")]))
+            .await
+            .unwrap();
+        log.set_open(true);
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        let changes: Vec<_> = records_of(&log.inner, &session.key)
+            .await
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    update_of(r).map(|e| &e.update),
+                    Some(SessionUpdate::ConfigChanged(c)) if c.revision > 0
+                )
+            })
+            .collect();
+        assert!(changes.len() >= 2, "{changes:?}");
+        for change in &changes {
+            assert_eq!(
+                change.event.identity,
+                acting(&alice, Tenant::local()),
+                "a config change is its setter's"
+            );
+        }
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_rename_navigate_compact_and_an_edge_decision_name_their_callers() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let (rt, script) = runtime(dir.path(), log.clone()).await;
+        let (me, alice) = (host(), edge("alice"));
+        let session = me
+            .clone()
+            .scope(rt.new_session(SessionSpec::default()))
+            .await
+            .unwrap();
+        // The host user's turn, cancelled by Alice.
+        let turn = me
+            .clone()
+            .scope(rt.prompt(&session, vec![ContentBlock::text("HOLD")]))
+            .await
+            .unwrap();
+        script.held.notified().await;
+        alice.clone().scope(async { rt.cancel(&session) }).await;
+        script.release.notify_one();
+        let _ = turn.outcome().await;
+        let alice_local = acting(&alice, Tenant::local());
+        let records = records_of(log.as_ref(), &session.key).await;
+        let cancelled = records
+            .iter()
+            .find(|r| matches!(r.event.kind, EventKind::Cancelled(_)))
+            .expect("a cancel row");
+        assert_eq!(cancelled.event.identity, alice_local);
+        prompt(&rt, &me, &session, "after").await;
+
+        // Rename, navigate and compact by Alice.
+        let renamed: loop_protocol::MutationResult = alice
+            .clone()
+            .scope(rt.rename(loop_protocol::rpc::RenameParams {
+                session: session.clone(),
+                name: "named".into(),
+                expected_revision: None,
+            }))
+            .await
+            .unwrap();
+        prompt(&rt, &me, &session, "more").await;
+        alice
+            .clone()
+            .scope(rt.compact(&session, None))
+            .await
+            .unwrap();
+        let before = log.read_runtime_after(all(), 0).await.unwrap().len();
+        alice
+            .clone()
+            .scope(rt.navigate(loop_protocol::rpc::NavigateParams {
+                session: session.clone(),
+                target_entry_id: None,
+                summarize: false,
+                expected_revision: None,
+            }))
+            .await
+            .unwrap();
+        let navigated = log.read_runtime_after(all(), 0).await.unwrap()[before..].to_vec();
+        let records = records_of(log.as_ref(), &session.key).await;
+        let resets: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    update_of(r).map(|e| &e.update),
+                    Some(SessionUpdate::BranchReset { .. })
+                )
+            })
+            .collect();
+        assert_eq!(resets.len(), 2, "navigate and compact");
+        assert!(resets.iter().all(|r| r.event.identity == alice_local));
+        assert!(navigated.iter().any(|r| matches!(
+            update_of(r).map(|e| &e.update),
+            Some(SessionUpdate::BranchReset { .. })
+        )));
+        let rename = records
+            .iter()
+            .find(|r| {
+                matches!(
+                    update_of(r).map(|e| &e.update),
+                    Some(SessionUpdate::ConfigChanged(c)) if c.revision == renamed.revision
+                )
+            })
+            .expect("the rename's update");
+        assert_eq!(rename.event.identity, alice_local);
+
+        // A decision of Alice's command on the host user's Session: the row
+        // is in the Session's tenant; the record keeps Alice's tenant.
+        alice
+            .clone()
+            .scope(loop_protocol::LocalShell::run(
+                rt.as_ref(),
+                &session,
+                "echo hi",
+                None,
+            ))
+            .await
+            .unwrap();
+        let decision = records_of(log.as_ref(), &session.key)
+            .await
+            .into_iter()
+            .rfind(|r| matches!(r.event.kind, EventKind::PolicyDecision(_)))
+            .expect("a decision");
+        assert_eq!(decision.event.identity, alice_local);
+        let EventKind::PolicyDecision(payload) = &decision.event.kind else {
+            unreachable!()
+        };
+        assert_eq!(payload["tenant"], "acme");
+        assert_eq!(payload["principal"]["id"], "alice");
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A downgrade wrote a row of a Session of tenant acme as `local` (an older
+/// binary has no tenant). The Runtime reads the Session in its creating
+/// tenant and refuses to load it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_split_across_tenants_by_an_older_binary_is_refused() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events");
+        let alice = edge("alice");
+        let session = {
+            let log = Arc::new(loop_runtime::log::SqliteEventLog::open(&events).await.unwrap());
+            let (rt, _) = runtime(dir.path(), log).await;
+            let session = alice
+                .clone()
+                .scope(rt.new_session(SessionSpec::default()))
+                .await
+                .unwrap();
+            prompt(&rt, &alice, &session, "hello").await;
+            rt.shutdown().await;
+            session
+        };
+        {
+            // The append of a binary from before step B3: no identity
+            // columns, its sequence over the key in all tenants.
+            let conn = rusqlite::Connection::open(events.join("events.db")).unwrap();
+            let (global, seq): (i64, i64) = conn
+                .query_row(
+                    "SELECT (SELECT MAX(global_seq) FROM events), \
+                     (SELECT COALESCE(MAX(session_seq),0) FROM events WHERE session_key=?1 AND session_seq IS NOT NULL)",
+                    [session.key.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            let payload = serde_json::json!({"v": 1, "event": {"kind": "update", "payload":
+                serde_json::to_value(UpdateEnvelope::live("native".into(), 1, session.key.clone(), None, (seq + 1) as u64,
+                    SessionUpdate::Notice { level: loop_protocol::NoticeLevel::Info, text: "old".into() })).unwrap()}});
+            conn.execute(
+                "INSERT INTO events (global_seq,generation,session_key,session_seq,kind,turn,ts_ms,payload) VALUES (?1,1,?2,?3,'update',NULL,1,?4)",
+                rusqlite::params![global + 1, session.key.as_str(), seq + 1, payload.to_string()],
+            )
+            .unwrap();
+        }
+        let log = Arc::new(loop_runtime::log::SqliteEventLog::open(&events).await.unwrap());
+        let (rt, _) = runtime(dir.path(), log).await;
+        assert_eq!(rt.session_tenant(&session.key), acme(), "the creating tenant");
+        let refused = host()
+            .scope(rt.load_session(&session, SessionSpec::default()))
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("more than one tenant"), "{refused}");
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(feature = "orchestration")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_s_records_are_its_caller_s() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let (rt, _) = runtime(dir.path(), log.clone()).await;
+        let (me, alice) = (host(), edge("alice"));
+        let session = me
+            .clone()
+            .scope(rt.new_session(SessionSpec::default()))
+            .await
+            .unwrap();
+        let before = log.read_runtime_after(all(), 0).await.unwrap().len();
+        let started = alice
+            .clone()
+            .scope(loop_wire::RuntimeControl::workflow(
+                rt.as_ref(),
+                loop_protocol::session_services::WorkflowParams {
+                    session: session.clone(),
+                    goal: "say done".into(),
+                    concurrency: None,
+                    request_id: "wf-1".into(),
+                },
+            ))
+            .await;
+        if started.is_ok() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while rt.is_busy(&session) && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        let after: Vec<_> = log.read_runtime_after(all(), 0).await.unwrap()[before..]
+            .iter()
+            .filter(|r| r.event.session_key.as_ref() == Some(&session.key))
+            .cloned()
+            .collect();
+        assert!(!after.is_empty(), "the workflow left records");
+        for record in &after {
+            assert_eq!(
+                record.event.identity,
+                acting(&alice, Tenant::local()),
+                "{:?}",
+                record.event.kind
+            );
+        }
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Only the Runtime's startup code makes a `SystemScope`. Rust cannot
+/// limit the constructor to one other crate, so this scans the whole
+/// workspace: outside test code, `for_runtime_startup` appears only at its
+/// definition in loop-store and once in loop-runtime's `Runtime::new`, and
+/// no code renames the type or the constructor.
 #[test]
 fn only_runtime_startup_makes_a_system_scope() {
-    fn walk(dir: &std::path::Path, found: &mut Vec<(String, usize)>) {
+    fn walk(dir: &std::path::Path, found: &mut Vec<(String, usize)>, aliases: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
+            let name = path.to_string_lossy().into_owned();
             if path.is_dir() {
-                walk(&path, found);
+                let base = path.file_name().unwrap().to_string_lossy().into_owned();
+                if base == "tests" || base == "target" || base == "loop-store-testkit" {
+                    continue;
+                }
+                walk(&path, found, aliases);
                 continue;
             }
-            let name = path.to_string_lossy().into_owned();
             if !name.ends_with(".rs") || name.ends_with("_tests.rs") {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
             let code = text.split("#[cfg(test)]\nmod tests").next().unwrap();
-            let count = code.matches("SystemScope::for_runtime_startup").count();
+            let count = code.matches("for_runtime_startup").count();
             if count > 0 {
-                found.push((name, count));
+                found.push((name.clone(), count));
+            }
+            if code.contains("SystemScope as ") || code.contains("for_runtime_startup as ") {
+                aliases.push(name);
             }
         }
     }
-    let mut found = Vec::new();
-    walk(
-        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut found,
-    );
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert!(
-        found[0].0.ends_with("src/runtime.rs") && found[0].1 == 1,
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let (mut found, mut aliases) = (Vec::new(), Vec::new());
+    walk(&crates, &mut found, &mut aliases);
+    found.sort();
+    assert!(aliases.is_empty(), "renamed: {aliases:?}");
+    let places: Vec<_> = found
+        .iter()
+        .map(|(name, count)| {
+            let short = name.split("/crates/").last().unwrap().to_owned();
+            (short, *count)
+        })
+        .collect();
+    assert_eq!(
+        places,
+        vec![
+            ("core/loop-store/src/identity.rs".to_owned(), 1),
+            ("loop-runtime/src/runtime.rs".to_owned(), 1),
+        ],
         "{found:?}"
     );
 }

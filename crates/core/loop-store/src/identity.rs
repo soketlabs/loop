@@ -145,14 +145,16 @@ impl Deployment {
 
 /// Permission to read across tenants: recovery, audit and projection rebuild.
 ///
-/// Not `Clone`: the Runtime makes one at startup and lends it. This crate
-/// cannot stop other code from calling the constructor; the Runtime crate
-/// has a test that only its startup code does.
+/// Not `Clone`: the Runtime makes one at startup and lends it. Rust cannot
+/// limit a constructor to one other crate (this crate must not depend on
+/// the Runtime), so the Runtime crate has a test that scans the whole
+/// workspace: outside test code, only `Runtime::new` calls it.
 #[derive(Debug)]
 pub struct SystemScope(());
 
 impl SystemScope {
     /// For the Runtime startup code only.
+    #[doc(hidden)]
     pub fn for_runtime_startup() -> Self {
         Self(())
     }
