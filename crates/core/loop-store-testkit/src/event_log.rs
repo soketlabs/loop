@@ -1250,14 +1250,24 @@ pub async fn identity_round_trip_on(log: &dyn EventLog) {
         loop_store::Deployment::SharedCell.runtime_identity(),
     ] {
         appended.extend(
-            log.append_batch(vec![Event::new(
-                1,
-                None,
-                None,
-                1,
-                EventKind::RuntimeStarted(json!({"pid": 1})),
-                identity,
-            )])
+            log.append_batch(vec![
+                Event::new(
+                    1,
+                    None,
+                    None,
+                    1,
+                    EventKind::RuntimeStarted(json!({"pid": 1})),
+                    identity.clone(),
+                ),
+                Event::new(
+                    1,
+                    None,
+                    None,
+                    2,
+                    EventKind::RuntimeStopped(json!({})),
+                    identity,
+                ),
+            ])
             .await
             .unwrap(),
         );

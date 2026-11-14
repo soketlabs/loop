@@ -90,17 +90,28 @@ impl Identity {
 
     /// Check the fields that the types do not check: `actor` is 1 to
     /// [`MAX_ACTOR_BYTES`] bytes with no control character.
-    pub fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), ActorError> {
         if let Some(actor) = &self.actor {
             if actor.is_empty() || actor.len() > MAX_ACTOR_BYTES {
-                return Err("actor must be 1 to 512 bytes");
+                return Err(ActorError::Length);
             }
             if actor.chars().any(char::is_control) {
-                return Err("actor must not hold a control character");
+                return Err(ActorError::Control);
             }
         }
         Ok(())
     }
+}
+
+/// Why an [`Identity::actor`] is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ActorError {
+    /// Empty, or longer than [`MAX_ACTOR_BYTES`].
+    #[error("actor must be 1 to {MAX_ACTOR_BYTES} bytes")]
+    Length,
+    /// Holds a control character.
+    #[error("actor must not hold a control character")]
+    Control,
 }
 
 /// How a Runtime is deployed, which decides the tenant of its own records

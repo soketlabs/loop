@@ -105,8 +105,8 @@ pub struct Runtime {
     /// later cell work to change (`Deployment::SharedCell`).
     deployment: Deployment,
     /// The cross-tenant read permission, made once here at startup. Only
-    /// start-up reads (recovery, activity, Subagent keys) and the tenant
-    /// lookup of a Session use it; every other read names a tenant.
+    /// recovery, the start-up activity and tenant index, and the Subagent
+    /// keys of the Session list use it; every other read names a tenant.
     system: SystemScope,
     /// The tenant of each Session the Event Log knows, read once at start
     /// (system scope) and kept as Sessions open. A Session key is unique in

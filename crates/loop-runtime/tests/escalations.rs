@@ -1045,6 +1045,11 @@ async fn an_edge_user_cannot_answer_an_escalation_of_a_turn_it_did_not_start() {
             panic!("missing answer")
         };
         assert_eq!(payload["answered_by"]["principal"]["id"], "uid:501");
+        // Raised for the turn's caller; answered by the answerer; both in
+        // the Session's tenant.
+        let host_identity = loop_store::Identity::acting(&host_user, loop_store::Tenant::local());
+        assert_eq!(events[0].event.identity, host_identity);
+        assert_eq!(events[1].event.identity, host_identity);
         let id = payload["id"].as_str().unwrap();
         assert_eq!(host.take_answered_by(id), Some(host_user.clone()));
 
@@ -1070,6 +1075,12 @@ async fn an_edge_user_cannot_answer_an_escalation_of_a_turn_it_did_not_start() {
         };
         assert_eq!(payload["answered_by"]["principal"]["id"], "alice");
         assert_eq!(payload["answered_by"]["via"], "edge");
+        // Alice's answer row: her principal and `via`, in the Session's
+        // tenant (local), not hers.
+        assert_eq!(
+            events.last().unwrap().event.identity,
+            loop_store::Identity::acting(&edge("alice"), loop_store::Tenant::local())
+        );
 
         // Another edge user is not asked about Alice's turn.
         let (bob, mut bob_rx) = connection(Some(edge("bob")));
@@ -1127,6 +1138,82 @@ async fn a_reconnected_edge_user_answers_its_own_turn() {
             panic!("missing answer")
         };
         assert_eq!(payload["answered_by"]["principal"]["id"], "alice");
+    })
+    .await
+    .unwrap();
+}
+
+/// Every record of an Escalation host is in its Session's tenant and has the
+/// Session's `actor`; a withdrawal names who withdrew, and a waiting tool
+/// that goes is withdrawn by the Runtime.
+#[tokio::test]
+async fn escalation_records_are_in_the_session_tenant_and_name_who_acted() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let log = Arc::new(MemoryEventLog::new());
+        let session = SessionRef {
+            instance: "loop".into(),
+            key: "s".into(),
+            native_id: "s".into(),
+        };
+        let acme = loop_store::Tenant::new("acme").unwrap();
+        let host = EscalationHost::new(
+            session,
+            log.clone(),
+            1,
+            acme.clone(),
+            Some("parent-key".into()),
+        );
+        host.set_turn_caller(Some(edge("alice")));
+        let asking = tokio::spawn({
+            let host = host.clone();
+            async move { host.interact(request()).await }
+        });
+        // The request is pending once its record is in the log.
+        while log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let host_user = loop_protocol::Caller::host(loop_protocol::Principal::local_uid(501));
+        host.withdraw("turn cancelled", false, &host_user)
+            .await
+            .unwrap();
+        assert_eq!(asking.await.unwrap(), InteractionOutcome::Cancelled);
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
+        let actor = Some("parent-key".to_owned());
+        assert!(matches!(
+            events[0].event.kind,
+            EventKind::EscalationRaised(_)
+        ));
+        assert_eq!(
+            events[0].event.identity,
+            loop_store::Identity::acting(&edge("alice"), acme.clone()).with_actor(actor.clone())
+        );
+        assert!(matches!(
+            events[1].event.kind,
+            EventKind::EscalationWithdrawn(_)
+        ));
+        assert_eq!(
+            events[1].event.identity,
+            loop_store::Identity::acting(&host_user, acme.clone()).with_actor(actor)
+        );
+        assert!(log
+            .read_runtime_after(loop_store::Scope::Tenant(&loop_store::Tenant::local()), 0)
+            .await
+            .unwrap()
+            .is_empty());
     })
     .await
     .unwrap();

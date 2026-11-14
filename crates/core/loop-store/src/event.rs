@@ -206,7 +206,7 @@ pub fn validate_batch(events: &[Event]) -> Result<()> {
         event
             .identity
             .validate()
-            .map_err(|reason| StoreError::Invalid(reason.into()))?;
+            .map_err(|error| StoreError::Invalid(error.to_string()))?;
         if matches!(
             event.kind,
             EventKind::RuntimeStarted(_) | EventKind::RuntimeStopped(_)

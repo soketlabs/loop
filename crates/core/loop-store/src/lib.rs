@@ -64,7 +64,8 @@ pub use event::{
     LoggedEvent, MAX_BATCH_EVENTS, SESSION_CREATED_KEY, WRITER_QUEUE_CAPACITY,
 };
 pub use identity::{
-    Caller, Deployment, Identity, Principal, PrincipalKind, Scope, SystemScope, Tenant, Via,
+    ActorError, Caller, Deployment, Identity, Principal, PrincipalKind, Scope, SystemScope, Tenant,
+    Via,
 };
 pub use lease::{Fence, Generation, OwnerInfo};
 pub use log::{record_bytes, EventLog};

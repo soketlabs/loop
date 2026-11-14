@@ -56,6 +56,14 @@ struct Script {
 }
 
 async fn runtime(dir: &std::path::Path, log: Arc<dyn EventLog>) -> (Arc<Runtime>, Arc<Script>) {
+    runtime_with(dir, log, RuntimeLimits::default()).await
+}
+
+async fn runtime_with(
+    dir: &std::path::Path,
+    log: Arc<dyn EventLog>,
+    limits: RuntimeLimits,
+) -> (Arc<Runtime>, Arc<Script>) {
     let script = Arc::new(Script {
         release: tokio::sync::Notify::new(),
         held: tokio::sync::Notify::new(),
@@ -97,7 +105,7 @@ async fn runtime(dir: &std::path::Path, log: Arc<dyn EventLog>) -> (Arc<Runtime>
     std::fs::create_dir_all(&ws).unwrap();
     let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
     let store = globals.open_runtime_session_store().unwrap();
-    let rt = Runtime::new(globals, opts(&ws), log, store, RuntimeLimits::default())
+    let rt = Runtime::new(globals, opts(&ws), log, store, limits)
         .await
         .unwrap()
         .into_shared();
@@ -500,6 +508,89 @@ async fn after_a_restart_a_session_keeps_its_tenant_and_recovery_names_the_runti
             Some(acting(&alice, acme())),
             "a reload does not change the owner of record"
         );
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_a_clone_and_an_unload_name_who_acted() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let limits = RuntimeLimits {
+            max_sessions: 2,
+            max_active_turns: 2,
+        };
+        let (rt, _) = runtime_with(dir.path(), log.clone(), limits).await;
+        let (me, alice) = (host(), edge("alice"));
+        // A second host-user connection, over the token WebSocket.
+        let token = Caller::local_token(Principal::local_uid(501));
+        let session = me
+            .clone()
+            .scope(rt.new_session(SessionSpec::default()))
+            .await
+            .unwrap();
+        prompt(&rt, &me, &session, "hello").await;
+
+        // `session/shell`: its decision record and any update are its caller's.
+        token
+            .clone()
+            .scope(loop_protocol::LocalShell::run(
+                rt.as_ref(),
+                &session,
+                "echo hi",
+                None,
+            ))
+            .await
+            .unwrap();
+        let decisions: Vec<_> = records_of(log.as_ref(), &session.key)
+            .await
+            .into_iter()
+            .filter(|r| matches!(r.event.kind, EventKind::PolicyDecision(_)))
+            .collect();
+        let shell = decisions.last().expect("a decision of the command");
+        assert_eq!(shell.event.identity, acting(&token, Tenant::local()));
+
+        // Alice clones the host user's Session: the copy is hers, in acme.
+        let copy = alice
+            .clone()
+            .scope(rt.clone_session(loop_protocol::rpc::CloneParams {
+                session: session.clone(),
+                name: None,
+                request_id: "copy-1".into(),
+            }))
+            .await
+            .unwrap()
+            .session;
+        assert_eq!(rt.session_tenant(&copy.key), acme());
+        assert_eq!(
+            rt.session_owner(&copy.key).await.unwrap(),
+            Some(acting(&alice, acme()))
+        );
+        assert!(records_of(log.as_ref(), &copy.key)
+            .await
+            .iter()
+            .all(|r| r.event.identity == acting(&alice, acme())));
+
+        // A third Session makes room by unloading the oldest idle one: the
+        // Runtime's own record, in that Session's tenant.
+        me.clone()
+            .scope(rt.new_session(SessionSpec::default()))
+            .await
+            .unwrap();
+        let unloaded = log
+            .read_runtime_after(all(), 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| {
+                matches!(&r.event.kind, EventKind::SessionClosed(p) if p["reason"] == "unloaded")
+            })
+            .expect("an unload");
+        let tenant = rt.session_tenant(unloaded.event.session_key.as_ref().unwrap());
+        assert_eq!(unloaded.event.identity, Identity::runtime_in(tenant));
         rt.shutdown().await;
     })
     .await
