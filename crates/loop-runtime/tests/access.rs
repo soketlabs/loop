@@ -289,6 +289,160 @@ async fn world(lock: bool) -> World {
 
 fn ok<T>(_: T) {}
 
+/// A file or terminal call with a bad path, a root path, an unknown id or a
+/// zero size: refused after the access check, with no effect.
+async fn files_or_terminal(r: &Runtime, method: &str, session: SessionRef) -> BackendResult<()> {
+    use loop_protocol::rpc::methods;
+    use loop_protocol::session_workspace as sw;
+    use loop_wire::SessionWorkspace as W;
+    let bad = || sw::FilePathParams {
+        session: session.clone(),
+        path: "../outside".into(),
+    };
+    let upload = || sw::UploadParams {
+        session: session.clone(),
+        upload: "up-none".into(),
+    };
+    let terminal = || sw::TerminalParams {
+        session: session.clone(),
+        terminal: "term-none".into(),
+    };
+    match method {
+        methods::SESSION_FILES_LIST => W::list(
+            r,
+            sw::FilesListParams {
+                session: session.clone(),
+                path: "../outside".into(),
+                cursor: None,
+                limit: None,
+            },
+        )
+        .await
+        .map(ok),
+        methods::SESSION_FILES_STAT => W::stat(r, bad()).await.map(ok),
+        methods::SESSION_FILES_READ => W::read(
+            r,
+            sw::FilesReadParams {
+                session: session.clone(),
+                path: "../outside".into(),
+                offset: 0,
+                length: None,
+                if_match: None,
+            },
+        )
+        .await
+        .map(ok),
+        methods::SESSION_FILES_MKDIR => W::mkdir(r, bad()).await,
+        methods::SESSION_FILES_DELETE => {
+            W::delete(
+                r,
+                sw::FilesDeleteParams {
+                    session: session.clone(),
+                    path: "../outside".into(),
+                    recursive: false,
+                },
+            )
+            .await
+        }
+        methods::SESSION_FILES_RENAME => {
+            W::rename(
+                r,
+                sw::FilesRenameParams {
+                    session: session.clone(),
+                    from: "../a".into(),
+                    to: "../b".into(),
+                },
+            )
+            .await
+        }
+        methods::SESSION_FILES_UPLOAD_BEGIN => W::upload_begin(
+            r,
+            sw::UploadBeginParams {
+                session: session.clone(),
+                path: "../outside".into(),
+                size: 1,
+                sha256: None,
+                if_match: None,
+                overwrite: false,
+            },
+        )
+        .await
+        .map(ok),
+        methods::SESSION_FILES_UPLOAD_WRITE => W::upload_write(
+            r,
+            sw::UploadWriteParams {
+                session: session.clone(),
+                upload: "up-none".into(),
+                offset: 0,
+                data: String::new(),
+            },
+        )
+        .await
+        .map(ok),
+        methods::SESSION_FILES_UPLOAD_STATUS => W::upload_status(r, upload()).await.map(ok),
+        methods::SESSION_FILES_UPLOAD_COMMIT => W::upload_commit(r, upload()).await.map(ok),
+        methods::SESSION_FILES_UPLOAD_ABORT => W::upload_abort(r, upload()).await,
+        methods::SESSION_TERMINAL_OPEN => W::terminal_open(
+            r,
+            sw::TerminalOpenParams {
+                session: session.clone(),
+                cols: 0,
+                rows: 0,
+                command: None,
+            },
+        )
+        .await
+        .map(ok),
+        methods::SESSION_TERMINAL_ATTACH => W::terminal_attach(
+            r,
+            sw::TerminalAttachParams {
+                session: session.clone(),
+                terminal: "term-none".into(),
+                after_seq: 0,
+            },
+        )
+        .await
+        .map(|_| ()),
+        methods::SESSION_TERMINAL_DETACH => W::terminal_detach(r, terminal()).await,
+        methods::SESSION_TERMINAL_CLOSE => W::terminal_close(r, terminal()).await.map(ok),
+        methods::SESSION_TERMINAL_INPUT => {
+            W::terminal_input(
+                r,
+                sw::TerminalInputParams {
+                    session: session.clone(),
+                    terminal: "term-none".into(),
+                    data: String::new(),
+                },
+            )
+            .await
+        }
+        methods::SESSION_TERMINAL_RESIZE => {
+            W::terminal_resize(
+                r,
+                sw::TerminalResizeParams {
+                    session: session.clone(),
+                    terminal: "term-none".into(),
+                    cols: 1,
+                    rows: 1,
+                },
+            )
+            .await
+        }
+        methods::SESSION_TERMINAL_SIGNAL => {
+            W::terminal_signal(
+                r,
+                sw::TerminalSignalParams {
+                    session: session.clone(),
+                    terminal: "term-none".into(),
+                    signal: sw::TerminalSignal::Kill,
+                },
+            )
+            .await
+        }
+        other => panic!("the matrix has no call for {other}: add one"),
+    }
+}
+
 /// Call `method` on `session` for the caller in scope. `write` picks the
 /// changing form of a method that reads or writes.
 async fn call(rt: &Arc<Runtime>, method: &str, s: &SessionRef, write: bool) -> BackendResult<()> {
@@ -451,6 +605,21 @@ async fn call(rt: &Arc<Runtime>, method: &str, s: &SessionRef, write: bool) -> B
         )
         .await
         .map(ok),
+        // Files and terminals: params that fail after the access check, so
+        // an allowed call changes nothing and starts no process.
+        m if m == methods::SESSION_WORKSPACE || m == methods::SESSION_TERMINAL_LIST => {
+            let p = SessionParams { session };
+            if m == methods::SESSION_WORKSPACE {
+                loop_wire::SessionWorkspace::info(r, p).await.map(ok)
+            } else {
+                loop_wire::SessionWorkspace::terminal_list(r, p)
+                    .await
+                    .map(ok)
+            }
+        }
+        m if m.starts_with("session/files/") || m.starts_with("session/terminal/") => {
+            files_or_terminal(r, m, session).await
+        }
         other => panic!("the matrix has no call for {other}: add one"),
     }
 }
