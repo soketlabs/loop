@@ -34,6 +34,11 @@
 //! LOAD_TURNS [2]            turns per Session, one after another
 //! LOAD_CHUNKS [100]         text deltas per model call
 //! LOAD_CHUNK_BYTES [16]     bytes per delta
+//! LOAD_TOOL_LINES [0]       when > 0, each turn first runs one `bash` call
+//!                           that prints this many 1 KiB lines, 10 ms apart,
+//!                           so the tool streams non-terminal
+//!                           `tool_call_update`s of growing output (the
+//!                           shell tool sends at most one each 50 ms)
 //! LOAD_SUBSCRIBERS [4]      fast broadcast subscribers
 //! LOAD_SLOW_SUBSCRIBERS [0] subscribers that sleep per update
 //! LOAD_SLOW_MS [5]          sleep of a slow subscriber, per update
@@ -342,11 +347,32 @@ fn faux_model() -> Model {
 }
 
 /// A model call that streams `chunks` text deltas of `bytes` bytes each.
-fn streaming_responder(chunks: usize, bytes: usize) -> FauxResponder {
+/// With `tool_lines`, the first model call of a turn asks for a `bash` call
+/// that streams that many lines of output.
+fn streaming_responder(chunks: usize, bytes: usize, tool_lines: usize) -> FauxResponder {
     let model = faux_model();
-    Arc::new(move |_context| {
+    Arc::new(move |context| {
         let model = model.clone();
+        let after_tool = matches!(
+            context.messages.last(),
+            Some(loop_ai::Message::ToolResult(_))
+        );
         Box::pin(async move {
+            if tool_lines > 0 && !after_tool {
+                // About 1 KiB per line and 10 ms between lines. The shell
+                // tool sends its whole output so far at most every 50 ms,
+                // so each update is larger than the one before.
+                let command = format!(
+                    "pad=$(printf '%01000d' 0); i=0; while [ $i -lt {tool_lines} ]; do \
+                     echo \"$i $pad\"; i=$((i+1)); sleep 0.01; done"
+                );
+                return FauxResponse::ToolCalls(vec![loop_ai::ToolCall {
+                    id: "load-bash".into(),
+                    name: "bash".into(),
+                    arguments: json!({ "command": command }),
+                    thought_signature: None,
+                }]);
+            }
             let delta = "x".repeat(bytes);
             let mut partial = AssistantMessage::pending(&model);
             let mut events = vec![AssistantMessageEvent::Start {
@@ -504,6 +530,7 @@ async fn load_baseline() {
     let turns = env_u64("LOAD_TURNS", 2) as usize;
     let chunks = env_u64("LOAD_CHUNKS", 100) as usize;
     let chunk_bytes = env_u64("LOAD_CHUNK_BYTES", 16) as usize;
+    let tool_lines = env_u64("LOAD_TOOL_LINES", 0) as usize;
     let fast = env_u64("LOAD_SUBSCRIBERS", 4) as usize;
     let slow_count = env_u64("LOAD_SLOW_SUBSCRIBERS", 0) as usize;
     let slow_ms = env_u64("LOAD_SLOW_MS", 5);
@@ -536,7 +563,11 @@ async fn load_baseline() {
     let log = CountingLog::new(inner);
 
     let models = Arc::new(loop_ai::Models::create(Default::default()));
-    models.set_provider(faux_provider_fn(streaming_responder(chunks, chunk_bytes)));
+    models.set_provider(faux_provider_fn(streaming_responder(
+        chunks,
+        chunk_bytes,
+        tool_lines,
+    )));
     let globals = GlobalResources::with_models(dir.path().join("agent"), models).unwrap();
     let rt = {
         let store = globals.open_runtime_session_store().unwrap();
@@ -686,7 +717,7 @@ async fn load_baseline() {
     let result = json!({
         "config": {
             "sessions": sessions, "active_clients": active, "turns_per_session": turns,
-            "chunks": chunks, "chunk_bytes": chunk_bytes,
+            "chunks": chunks, "chunk_bytes": chunk_bytes, "tool_lines": tool_lines,
             "fast_subscribers": fast, "slow_subscribers": slow_count, "slow_ms": slow_ms,
             "max_sessions": limits.max_sessions, "max_active_turns": limits.max_active_turns,
             "store": store, "close_after": close_after,

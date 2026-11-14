@@ -1030,3 +1030,30 @@ fn cost_of_one_chunk() {
         message.bytes
     );
 }
+
+/// The hot-path cost of streamed tool output: one non-terminal update that
+/// carries the whole output so far (as the shell tool sends it), growing
+/// to 100 KiB. Ignored; run it in an optimised profile.
+#[test]
+#[ignore]
+fn cost_of_one_tool_update() {
+    let mut seq = Sequencer::new(0, who(1));
+    feed(&mut seq, &[turn_started("turn-1"), call("t")]);
+    let line = "x".repeat(1024);
+    let updates: Vec<SessionUpdate> = (1..=100)
+        .map(|n| progress("t", &line.repeat(n)))
+        .collect();
+    let rounds = 200;
+    let start = std::time::Instant::now();
+    for _ in 0..rounds {
+        for update in &updates {
+            let next = seq.through_seq() + 1;
+            std::hint::black_box(seq.committed(next, update));
+        }
+    }
+    let per = start.elapsed().as_nanos() as f64 / (rounds * updates.len()) as f64;
+    eprintln!(
+        "SEQ|COST| committed per tool update (50 KiB mean output) {per:.0} ns; held {} B",
+        seq.open_bytes()
+    );
+}
