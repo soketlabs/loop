@@ -163,6 +163,14 @@ impl From<SandboxStatus> for WorkspaceStatus {
 pub struct SnapshotId(pub String);
 
 /// Identity of a file version (an ETag): changes when the file changes.
+///
+/// The text is owned by the driver; compare tags only for equality. The
+/// host driver uses `v1-<dev>-<ino>-<size>-<mtime ns>-<ctime ns>` from
+/// `fstat` on the open file: a new file at the path (an atomic replace), a
+/// size change or a write with a new time stamp all give a new tag. Not
+/// seen: a rewrite in place that keeps the size within one tick of the
+/// file system clock, or a process that sets both time stamps back (only
+/// root can set the change time).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileTag(pub String);
 
@@ -198,8 +206,9 @@ pub struct UploadRequest {
     pub sha256: Option<String>,
     /// Commit only when the destination still has this tag (`None`: any).
     pub if_match: Option<FileTag>,
-    /// Unix mode for a new file; an existing file keeps its mode. `None`
-    /// is the driver default (0644).
+    /// Unix mode for a new file (permission bits, `0o7777`); an existing
+    /// file keeps its mode. `None` is the driver default (0644). The umask
+    /// does not apply.
     pub mode: Option<u32>,
 }
 
@@ -314,8 +323,11 @@ pub trait Workspace: Sandbox {
     }
 
     /// Write `data` at `offset`. `offset` must not be beyond the committed
-    /// offset (a resend of bytes already stored is allowed). Returns the new
-    /// committed offset.
+    /// offset (a resend of bytes already stored is allowed; the new bytes
+    /// replace them). A write after the committed offset is refused with
+    /// `WorkspaceError::UploadOffset` and changes nothing: chunks arrive in
+    /// order, and a client resumes from `upload_committed_offset`. Data past
+    /// the declared size is `TooLarge`. Returns the new committed offset.
     async fn upload_write(
         &self,
         upload: &UploadId,

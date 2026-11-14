@@ -3,31 +3,41 @@
 //! `Shell::exec` runs one command to the end and returns its output. A
 //! terminal and long commands need more: input, live output, a window size,
 //! signals, an exit event, and a way back after a lost connection.
-//! [`crate::Workspace::spawn`] returns a [`WorkspaceProcess`] for that. No
-//! driver in this repository implements it yet; the default returns
+//! [`crate::Workspace::spawn`] returns a [`WorkspaceProcess`] for that. The
+//! `host` driver implements it; the default returns
 //! `WorkspaceError::Unsupported`.
 //!
 //! # Contract
 //!
-//! - **Events.** Each event has a `seq` that grows by one for each event of
-//!   the process, starting at 1, and a [`StreamId`].
+//! - **Events.** Each event has a `seq` and a [`StreamId`]. The first event
+//!   has `seq` 1 and each next event has one more, for a reader that keeps
+//!   up. Order is kept within a stream; stdout and stderr are two pipes, so
+//!   their relative order is only approximate.
 //! - **Ring buffer.** The driver keeps the newest events of each process in
-//!   a bounded buffer (`SpawnRequest::output_buffer_bytes`, default 1 MiB of
-//!   output data). When it must evict events that no reader took, it puts
-//!   one [`ProcessEventKind::Dropped`] event in their place, with the number
-//!   of bytes lost. A process never waits for a slow reader: output is not
+//!   a bounded buffer (`SpawnRequest::output_buffer_bytes`, default
+//!   [`DEFAULT_OUTPUT_BUFFER_BYTES`], clamped to
+//!   [`MIN_OUTPUT_BUFFER_BYTES`]..=[`MAX_OUTPUT_BUFFER_BYTES`]). When it must
+//!   evict events that a reader did not take, that reader gets one
+//!   [`ProcessEventKind::Dropped`] event in their place, on
+//!   [`StreamId::Control`], with the `seq` of the last evicted event (so
+//!   the next event has the next `seq`) and the number of output bytes it
+//!   lost. A process never waits for a slow reader: output is not
 //!   back-pressure. Input (`write_stdin`) is back-pressure: it waits while
-//!   the pipe or PTY is full.
+//!   the pipe or PTY is full. The `Exited` event is never evicted.
 //! - **Attach.** `Workspace::attach_process(id, after_seq)` gives the events
 //!   with `seq > after_seq` that are still in the buffer. If some were
-//!   evicted, the first event is `Dropped`.
+//!   evicted, the first event is `Dropped`. Its `bytes` is exact for a live
+//!   handle and for `after_seq` 0; when `after_seq` itself was evicted, it
+//!   counts every evicted byte (an upper bound).
 //! - **Kill tree.** `signal(Kill)`, a timeout and a cancel stop the process
-//!   and every descendant, including one that called `setsid` (the driver
-//!   uses a PID namespace, a cgroup, a container or a tracked tree, not only
-//!   the process group).
-//! - **Drop.** When the handle is dropped and `detach` is `false`, the
+//!   and every descendant. Each driver says what it cannot reach (the host
+//!   driver: a descendant that starts its own session with `setsid`).
+//! - **Drop.** When the last handle is dropped and `detach` is `false`, the
 //!   driver kills the tree. With `detach` `true` the process keeps running
 //!   and `attach_process` finds it.
+//! - **Stdin of a PTY.** `close_stdin` sends the end-of-file character
+//!   (Ctrl-D) once and refuses later writes; the PTY stays open, because
+//!   closing it hangs up the terminal.
 //! - **Lost.** When the driver cannot know how a process ended (the
 //!   Workspace restarted, the connection broke), the exit is
 //!   [`ExitState::Lost`], never a guessed code.
@@ -40,6 +50,20 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::WorkspaceError;
 use crate::path::WorkspacePath;
+
+/// Default size of a process's event buffer: 1 MiB of output.
+pub const DEFAULT_OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
+/// Smallest event buffer a driver uses; a smaller request gets this.
+pub const MIN_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
+/// Largest event buffer a driver uses; a larger request gets this.
+pub const MAX_OUTPUT_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
+/// The buffer size for `requested` (see [`SpawnRequest::output_buffer_bytes`]).
+pub fn output_buffer_bytes(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(DEFAULT_OUTPUT_BUFFER_BYTES)
+        .clamp(MIN_OUTPUT_BUFFER_BYTES, MAX_OUTPUT_BUFFER_BYTES)
+}
 
 /// Terminal window size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +101,7 @@ pub struct SpawnRequest {
     /// Keep running when the handle is dropped.
     pub detach: bool,
     /// Size of the event ring buffer in bytes of output; `None` is 1 MiB.
+    /// Clamped to 64 KiB..=16 MiB ([`output_buffer_bytes`]).
     pub output_buffer_bytes: Option<usize>,
 }
 
@@ -135,7 +160,8 @@ pub enum StreamId {
 pub enum ProcessEventKind {
     /// Output bytes. Bytes, not text: a PTY sends raw bytes.
     Output(Vec<u8>),
-    /// The ring buffer dropped this many bytes before this event.
+    /// The ring buffer evicted this many output bytes that this reader did
+    /// not get. The event has the `seq` of the last evicted event.
     Dropped {
         /// Bytes lost.
         bytes: u64,

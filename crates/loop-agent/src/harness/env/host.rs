@@ -74,6 +74,20 @@ async fn read_confined(path: PathBuf, folder: PathBuf) -> Result<Vec<u8>, FileEr
 
 fn read_confined_now(path: &Path, folder: &Path) -> Result<Vec<u8>, FileError> {
     use std::io::Read;
+    let (mut file, meta) = open_confined(path, folder)?;
+    let mut bytes = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(HostExecutionEnv::map_io)?;
+    Ok(bytes)
+}
+
+/// Open `path` for reading only if the file actually opened is a regular
+/// file with one link inside `folder` (the tool lock's rule). Returns the
+/// file and its metadata from `fstat`. Blocking.
+pub(crate) fn open_confined(
+    path: &Path,
+    folder: &Path,
+) -> Result<(std::fs::File, std::fs::Metadata), FileError> {
     let outside = || {
         FileError::new(
             FileErrorCode::PermissionDenied,
@@ -91,7 +105,7 @@ fn read_confined_now(path: &Path, folder: &Path) -> Result<Vec<u8>, FileError> {
         // A FIFO or device must not block the read.
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let mut file = options.open(path).map_err(HostExecutionEnv::map_io)?;
+    let file = options.open(path).map_err(HostExecutionEnv::map_io)?;
     let meta = file.metadata().map_err(HostExecutionEnv::map_io)?;
     if !meta.is_file() {
         return Err(outside());
@@ -107,15 +121,12 @@ fn read_confined_now(path: &Path, folder: &Path) -> Result<Vec<u8>, FileError> {
         Some(real) if real.starts_with(folder) => {}
         _ => return Err(outside()),
     }
-    let mut bytes = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
-    file.read_to_end(&mut bytes)
-        .map_err(HostExecutionEnv::map_io)?;
-    Ok(bytes)
+    Ok((file, meta))
 }
 
 /// The path of the file `file` has open, as the kernel names it.
 #[cfg(target_os = "macos")]
-fn opened_path(file: &std::fs::File) -> Option<PathBuf> {
+pub(crate) fn opened_path(file: &std::fs::File) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::AsRawFd;
     let mut buf = vec![0u8; libc::PATH_MAX as usize + 1];
@@ -131,14 +142,14 @@ fn opened_path(file: &std::fs::File) -> Option<PathBuf> {
 
 /// The path of the file `file` has open, as the kernel names it.
 #[cfg(target_os = "linux")]
-fn opened_path(file: &std::fs::File) -> Option<PathBuf> {
+pub(crate) fn opened_path(file: &std::fs::File) -> Option<PathBuf> {
     use std::os::unix::io::AsRawFd;
     std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
 }
 
 /// Loop cannot name an open file's path here, so a confined read fails.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn opened_path(_file: &std::fs::File) -> Option<PathBuf> {
+pub(crate) fn opened_path(_file: &std::fs::File) -> Option<PathBuf> {
     None
 }
 

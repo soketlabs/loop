@@ -115,6 +115,18 @@ pub enum WorkspaceError {
     /// No such upload (never begun, committed, aborted or expired).
     #[error("unknown upload {0}")]
     UnknownUpload(String),
+    /// An upload write starts after the committed offset (a gap), or the
+    /// upload is not complete at commit. Nothing was written; resume from
+    /// `committed` (see `Workspace::upload_committed_offset`).
+    #[error("upload {upload}: offset {offset} does not match the committed offset {committed}")]
+    UploadOffset {
+        /// Upload id.
+        upload: String,
+        /// Offset of the refused write, or the size at commit.
+        offset: u64,
+        /// Bytes stored so far.
+        committed: u64,
+    },
     /// The uploaded bytes do not match the declared SHA-256.
     #[error("upload {0}: checksum mismatch")]
     ChecksumMismatch(String),

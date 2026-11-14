@@ -4,7 +4,7 @@ mod host;
 
 pub use host::HostExecutionEnv;
 
-pub(crate) use host::exec_command;
+pub(crate) use host::{exec_command, open_confined, opened_path};
 
 #[cfg(target_os = "macos")]
 mod process_tree;

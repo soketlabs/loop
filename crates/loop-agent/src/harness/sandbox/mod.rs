@@ -1,6 +1,8 @@
 //! Pluggable sandbox execution environments.
 
 mod drivers;
+#[cfg(unix)]
+mod host_ws;
 mod krun;
 mod podman;
 mod protect;
@@ -15,6 +17,8 @@ pub use drivers::{
     seatbelt_capabilities, HostWorkspace, HostWorkspaceDriver, HOST_DRIVER_ID, HOST_KIND,
     PODMAN_DRIVER_ID, SEATBELT_DRIVER_ID,
 };
+#[cfg(unix)]
+pub use host_ws::leaked_host_processes;
 pub use krun::{
     KrunExecutionEnv, KrunIsolation, KrunSandbox, KrunSandboxFactory, LocalSandboxRuntime,
     KRUN_DEFAULT_IMAGE, KRUN_DEFAULT_RUNTIME, LOCAL_DEFAULT_RUNTIME,
