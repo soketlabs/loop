@@ -137,6 +137,9 @@ pub enum Applied {
         /// 0, 1, 2 ... with no gaps, per item.
         part: u32,
     },
+    /// A non-terminal `tool_call_update` for a call that already ended in
+    /// this turn. It changes nothing.
+    Late,
 }
 
 /// The turn in progress.
@@ -184,6 +187,9 @@ pub struct OpenTool {
     pub bytes: usize,
     /// A limit was reached: `state` is not complete.
     pub overflowed: bool,
+    /// Bytes of each sized field of `state` (see [`field_bytes`]), so an
+    /// update is sized from its own fields only.
+    sizes: [usize; FIELDS],
 }
 
 /// A tool call that the model is writing (`tool_call_preparing`).
@@ -238,6 +244,11 @@ pub struct Sequencer {
     limits: Limits,
     /// Commits whose `seq` was not `H + 1` (another writer of the Session).
     unexpected: u64,
+    /// Content bytes held by the open items (the sum of their `bytes`).
+    held: usize,
+    /// Tool calls that ended in the current turn: a late update of one
+    /// does not open it again.
+    ended_tools: Vec<ToolCallId>,
 }
 
 impl Sequencer {
@@ -260,6 +271,8 @@ impl Sequencer {
             claim: None,
             limits,
             unexpected: 0,
+            held: 0,
+            ended_tools: Vec::new(),
         }
     }
 
@@ -403,6 +416,7 @@ impl Sequencer {
                 }
             }
             SessionUpdate::ToolCall(call) => {
+                self.ended_tools.retain(|id| id != &call.id);
                 self.open.preparing.retain(|p| p.id != call.id);
                 self.end_tool(&call.id);
                 if !terminal(Some(call.status)) {
@@ -414,7 +428,13 @@ impl Sequencer {
             SessionUpdate::ToolCallUpdate(change) if terminal(change.status) => {
                 self.open.preparing.retain(|p| p.id != change.id);
                 self.end_tool(&change.id);
+                if !self.ended_tools.contains(&change.id) {
+                    self.ended_tools.push(change.id.clone());
+                }
                 Applied::Durable
+            }
+            SessionUpdate::ToolCallUpdate(change) if self.ended_tools.contains(&change.id) => {
+                Applied::Late
             }
             SessionUpdate::ToolCallUpdate(change) => self.merge_tool(anchor, change),
             SessionUpdate::ConfigChanged(changed) => {
@@ -434,7 +454,7 @@ impl Sequencer {
 
     /// Content bytes held by the open items.
     pub fn open_bytes(&self) -> usize {
-        self.open.bytes()
+        self.held
     }
 
     /// The Session failed: nothing is in progress any more. `H` stays.
@@ -443,6 +463,8 @@ impl Sequencer {
     }
 
     fn clear(&mut self) {
+        self.held = 0;
+        self.ended_tools.clear();
         self.open.turn = None;
         self.open.messages.clear();
         self.open.tools.clear();
@@ -451,15 +473,29 @@ impl Sequencer {
 
     fn room(&self, held: usize, more: usize) -> bool {
         held.saturating_add(more) <= self.limits.item_bytes
-            && self.open_bytes().saturating_add(more) <= self.limits.session_bytes
+            && self.held.saturating_add(more) <= self.limits.session_bytes
     }
 
     fn end_message(&mut self, id: &MessageId) {
-        self.open.messages.retain(|m| &m.id != id);
+        let held = &mut self.held;
+        self.open.messages.retain(|m| {
+            let keep = &m.id != id;
+            if !keep {
+                *held -= m.bytes;
+            }
+            keep
+        });
     }
 
     fn end_tool(&mut self, id: &ToolCallId) {
-        self.open.tools.retain(|t| &t.state.id != id);
+        let held = &mut self.held;
+        self.open.tools.retain(|t| {
+            let keep = &t.state.id != id;
+            if !keep {
+                *held -= t.bytes;
+            }
+            keep
+        });
     }
 
     fn append(
@@ -502,6 +538,7 @@ impl Sequencer {
             };
             join(blocks, block);
             message.bytes += size;
+            self.held += size;
         } else {
             message.overflowed = true;
         }
@@ -517,13 +554,18 @@ impl Sequencer {
     }
 
     fn open_tool(&mut self, anchor_seq: u64, state: ToolCallUpdate) {
-        let size = tool_bytes(&state);
+        let sizes = field_bytes(&state);
+        let size = sizes.iter().sum();
         let fits = self.room(0, size);
+        if fits {
+            self.held += size;
+        }
         self.open.tools.push(OpenTool {
             anchor_seq,
             parts: 0,
             bytes: if fits { size } else { 0 },
             overflowed: !fits,
+            sizes: if fits { sizes } else { [0; FIELDS] },
             state: if fits {
                 state
             } else {
@@ -553,29 +595,31 @@ impl Sequencer {
                 self.open.tools.len() - 1
             }
         };
+        // Sized from the fields that the update sets: O(update), not
+        // O(state), under the Session's mutex.
         let tool = &self.open.tools[index];
-        let fits = if tool.overflowed {
-            false
-        } else {
-            let mut merged = tool.state.clone();
-            merge(&mut merged, change);
-            let size = tool_bytes(&merged);
-            let others = self.open_bytes() - tool.bytes;
-            if size <= self.limits.item_bytes
-                && others.saturating_add(size) <= self.limits.session_bytes
-            {
+        let fits = !tool.overflowed && {
+            let mut sizes = tool.sizes;
+            update_sizes(&mut sizes, change);
+            let size: usize = sizes.iter().sum();
+            let others = self.held - tool.bytes;
+            let fits = size <= self.limits.item_bytes
+                && others.saturating_add(size) <= self.limits.session_bytes;
+            if fits {
                 let tool = &mut self.open.tools[index];
-                tool.state = merged;
+                merge(&mut tool.state, change);
+                tool.sizes = sizes;
                 tool.bytes = size;
-                true
-            } else {
-                false
+                self.held = others + size;
             }
+            fits
         };
         let tool = &mut self.open.tools[index];
         if !fits && !tool.overflowed {
+            self.held -= tool.bytes;
             tool.overflowed = true;
             tool.bytes = 0;
+            tool.sizes = [0; FIELDS];
             tool.state = ToolCallUpdate::new(tool.state.id.clone());
         }
         let part = tool.parts;
@@ -652,9 +696,42 @@ fn block_bytes(block: &ContentBlock) -> usize {
     }
 }
 
-/// Approximate payload bytes of a tool call's state.
-fn tool_bytes(state: &ToolCallUpdate) -> usize {
-    let content = state.content.iter().flatten().map(|c| match c {
+/// The sized fields of a tool call's state: name, title, content,
+/// locations, raw input, raw output.
+const FIELDS: usize = 6;
+
+/// Approximate payload bytes of each sized field of `state`.
+fn field_bytes(state: &ToolCallUpdate) -> [usize; FIELDS] {
+    let mut sizes = [0; FIELDS];
+    update_sizes(&mut sizes, state);
+    sizes
+}
+
+/// Replace the size of each field that `change` sets.
+fn update_sizes(sizes: &mut [usize; FIELDS], change: &ToolCallUpdate) {
+    if let Some(name) = &change.name {
+        sizes[0] = name.len();
+    }
+    if let Some(title) = &change.title {
+        sizes[1] = title.len();
+    }
+    if let Some(content) = &change.content {
+        sizes[2] = content.iter().map(content_bytes).sum();
+    }
+    if let Some(locations) = &change.locations {
+        sizes[3] = locations.iter().map(|l| l.path.len() + 4).sum();
+    }
+    if let Some(raw_input) = &change.raw_input {
+        sizes[4] = value_bytes(raw_input);
+    }
+    if let Some(raw_output) = &change.raw_output {
+        sizes[5] = value_bytes(raw_output);
+    }
+}
+
+/// Approximate payload bytes of one piece of tool output.
+fn content_bytes(content: &ToolContent) -> usize {
+    match content {
         ToolContent::Content { content } => block_bytes(content),
         ToolContent::Diff {
             path,
@@ -664,14 +741,7 @@ fn tool_bytes(state: &ToolCallUpdate) -> usize {
         ToolContent::UnifiedDiff { path, diff } => path.len() + diff.len(),
         ToolContent::Terminal { terminal_id } => terminal_id.len(),
         ToolContent::Unknown(value) => value_bytes(value),
-    });
-    let locations = state.locations.iter().flatten().map(|l| l.path.len() + 4);
-    content.sum::<usize>()
-        + locations.sum::<usize>()
-        + state.name.as_ref().map_or(0, String::len)
-        + state.title.as_ref().map_or(0, String::len)
-        + state.raw_input.as_ref().map_or(0, value_bytes)
-        + state.raw_output.as_ref().map_or(0, value_bytes)
+    }
 }
 
 /// Approximate bytes of a JSON value, without serializing it.

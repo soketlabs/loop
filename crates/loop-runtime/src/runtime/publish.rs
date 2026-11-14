@@ -58,7 +58,7 @@ pub(super) async fn publish(
     let event = live
         .announced
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .seq
         .record(envelope, cause, generation, ts_ms);
     // Replayed history is never stored again, nor published.
@@ -67,13 +67,25 @@ pub(super) async fn publish(
     };
     let committed = log.append_batch(vec![event]).await.map_err(failed)?;
     touch(&live.activity, &live.reference.key, ts_ms);
-    if let Some(error) = live.failure.lock().unwrap().clone() {
-        return Err(failed(error));
-    }
+    live.pauses.wait("publish_committed").await;
     for record in committed {
         if let EventKind::Update(envelope) = record.event.kind {
             {
-                let mut announced = live.announced.lock().unwrap();
+                let mut announced = live
+                    .announced
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Checked under this lock: `fail()` sets the failure, then
+                // resets the sequencer under this lock. So either it is seen
+                // here, or the reset comes after this update.
+                let failure = live
+                    .failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(error) = failure {
+                    return Err(failed(error));
+                }
                 announced.seq.committed(envelope.seq, &envelope.update);
                 match &envelope.update {
                     SessionUpdate::ConfigChanged(changed) => {
@@ -210,7 +222,11 @@ pub(super) async fn pump(
                         // Everything the backend sent before the switch keeps
                         // the caller it was sent under.
                         let result = drain(&live, &mut receiver, log.as_ref(), generation, &updates).await;
-                        live.announced.lock().unwrap().seq.act(identity);
+                        live.announced
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .seq
+                            .act(identity);
                         if let Err(error) = &result { fail(&live, error); }
                         let _ = tx.send(());
                         result

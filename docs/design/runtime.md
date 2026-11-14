@@ -156,8 +156,11 @@ Text and thought of one message share one part counter. An item opens at
 `message_started` or `tool_call`. A part with no start opens its item at the
 last durable record. An item ends at `message_ended`, at a terminal
 `tool_call_update`, at `turn_ended` (also of a cancelled or failed turn) and
-when the Session fails. A `branch_reset`, a `config_changed` and an unknown
-kind do not change the open items.
+when the Session fails. A non-terminal `tool_call_update` for a call that
+already ended in the turn is ignored (`Applied::Late`). A `branch_reset`, a
+`config_changed` and an unknown kind do not change the open items. A tool
+update is sized from the fields that it sets (the sizes of the other fields
+are kept), so streamed tool output costs O(update) under the mutex.
 
 `H` and the accumulators are in one mutex (`Announced::seq`). The pump
 changes both in one critical section after each commit and before the
@@ -165,6 +168,10 @@ broadcast. So a snapshot (`Runtime::in_progress`) holds exactly the updates
 with `seq <= H`. A reader that subscribes first, then takes `H` and the
 snapshot, then reads the log up to `H`, gets each part exactly once
 (ADR-0007 §2.3). No client gets the snapshot yet.
+
+The pump checks the Session's failure inside the same critical section. A
+`fail()` that runs between a commit and that section is seen there, or its
+reset comes after the update. So a failed Session never keeps an open item.
 
 **Limits.** One open message or tool call holds at most 8 MiB of content.
 All open items of a Session hold at most 32 MiB. An item that would go above
@@ -180,7 +187,10 @@ it records it:
   opening config) carries its own identity.
 - Otherwise it is the acting caller. A turn or a `session/shell` command
   changes the acting caller with `act()` in its own task, before the
-  backend starts. The pump first commits everything the backend sent
+  backend starts. A turn does it right after `prompt_sent`, before it
+  waits for a turn permit: no permit is held while the pump drains, and a
+  turn that is cancelled in the permit queue has switched too, so the
+  acting identity and `turn_caller` agree. The pump first commits everything the backend sent
   before, then switches. So an update keeps its caller also when it waits
   in the queue while the next caller's turn is admitted. Prompt and
   command admission do not wait for the pump. The one exception is a
@@ -200,12 +210,24 @@ it records it:
 
 | Step | Uses | Still needs |
 |---|---|---|
-| A1, per-Session channels and refill | `H` and the snapshot under one lock; the commit-then-broadcast point | a channel for each Session in place of the global broadcast; refill from the log after `last_sent` |
+| A1, per-Session channels and refill | `H` and the snapshot under one lock; the commit-then-broadcast point | a channel for each Session in place of the global broadcast; refill from the log after `last_sent`; a snapshot that is cheap to take (see below) |
 | A2, `message_ended` content | the accumulated `content` and `thought`, the merged tool state | fill the record in `record()` before the commit; a rule for an `overflowed` item (for example: keep its chunk rows and send `message_ended` with no `content`, the old format) |
 | A3, `session/delta` | `Applied::Part { item, part }` from `committed()` | the wire types and the capability |
 | A4, live-only chunks | the durability class of each update (`loop_store::class`), the snapshot for attach | do not commit live-only parts; pipeline durable records that are not barriers |
 | A5, write-ahead barrier | `barrier()` and `act()` are still "commit everything before this point" | `tool_call` and `policy_decision` in one batch |
 | B8, embedded owners | the durable half has no Runtime type | move it to `loop-agent`; a writer for embedded owners |
+
+**Requirements before many readers and shared cells.**
+
+- `snapshot()` clones the open content (up to 32 MiB) under the mutex that
+  the pump needs for each commit. Before A1 lets many readers attach to one
+  busy Session, the snapshot must be cheap: for example, accumulated text
+  as shared, append-only chunks (`Arc<str>` pieces) or copy-on-write. Then
+  a reader copies pointers under the lock and the text after it. Many
+  readers of one busy Session must not stall its pump.
+- The limits are per Session. The worst case is 32 MiB × loaded Sessions.
+  A Runtime-wide memory budget for the accumulators is required before a
+  shared cell uses this.
 
 The backend-to-pump hop is still a `broadcast` channel of 4096 items. A lag
 there fails the Session ("pump lost activity"). ADR-0007 §3.3 replaces it

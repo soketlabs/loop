@@ -1239,7 +1239,10 @@ impl loop_wire::RuntimeControl for Runtime {
                 .set_turn_caller(loop_protocol::Caller::current());
             live.set_turn_caller(request_caller());
             // Under the lifecycle lock: the Session is idle, so this waits
-            // only for updates still queued in the pump.
+            // only for updates still queued in the pump. A stalled Event
+            // Log holds the lock meanwhile, as it does for the barriers
+            // that already run under it: attach (`attach.rs`) and the tree
+            // changes (`tree.rs`: navigate, rename, compaction).
             let acted = act(&live, live.identity(&request_caller())).await;
             if let Err(error) = acted {
                 live.busy.store(false, Ordering::Release);
@@ -1909,6 +1912,13 @@ impl AgentBackend for Runtime {
                 .map_err(failed)?;
                 unsettled = true;
                 touch(&live.activity, &live.reference.key, ts_ms);
+                // From here the backend's updates are this turn's caller's;
+                // what it sent before keeps its own caller. Before the
+                // permit: no turn permit waits on the pump, and a turn
+                // cancelled in the queue has switched too, so the acting
+                // identity and `turn_caller` agree.
+                live.pauses.signal("turn_acting");
+                act(&live, identity.clone()).await?;
                 let permit = tokio::select! {
                     p = turns.acquire_owned() => p.map_err(failed)?,
                     _ = cancelled.changed() => return Ok(TurnOutcome::Cancelled),
@@ -1920,9 +1930,6 @@ impl AgentBackend for Runtime {
                 if cancelled.has_changed().unwrap_or(true) || live.closing.load(Ordering::Acquire) {
                     return Ok(TurnOutcome::Cancelled);
                 }
-                // From here the backend's updates are this turn's caller's;
-                // what it sent before keeps its own caller.
-                act(&live, identity.clone()).await?;
                 let turn = live.opened.native.prompt(&live.reference, input).await?;
                 unsettled = false;
                 // A cancel that raced the turn's registration hit an idle backend.

@@ -1,5 +1,6 @@
 //! The pump's sequencer inside a Runtime (step A0): who caused a queued
 //! update, and the in-progress snapshot under concurrent publishing.
+use super::publish::publish;
 use super::*;
 use crate::log::{LoggedEvent, MemoryEventLog};
 use crate::sequencer::{Sequencer, Snapshot};
@@ -85,6 +86,15 @@ async fn runtime(
     log: Arc<dyn EventLog>,
     responder: Responder,
 ) -> Arc<Runtime> {
+    runtime_with(dir, log, responder, 16).await
+}
+
+async fn runtime_with(
+    dir: &std::path::Path,
+    log: Arc<dyn EventLog>,
+    responder: Responder,
+    max_active_turns: usize,
+) -> Arc<Runtime> {
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(faux_provider_fn(responder));
     let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
@@ -110,7 +120,7 @@ async fn runtime(
         store,
         RuntimeLimits {
             max_sessions: 32,
-            max_active_turns: 16,
+            max_active_turns,
         },
     )
     .await
@@ -501,6 +511,147 @@ async fn the_snapshot_and_h_give_every_character_once_under_concurrent_publishin
             mid_message > 0,
             "no reader attached in the middle of a message"
         );
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// F1 of the review: `fail()` can run between an update's commit and the
+/// pump's critical section. The failure is checked under the same lock as
+/// the reset, so a failed Session never opens an item after its reset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failure_between_commit_and_apply_leaves_nothing_open() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = runtime(dir.path(), log, text_responder()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let live = rt.route(&session).unwrap();
+        let (reached, release) = rt.pauses.arm("publish_committed");
+        let publishing = tokio::spawn({
+            let (rt, live) = (rt.clone(), live.clone());
+            async move {
+                let envelope = UpdateEnvelope::live(
+                    rt.instance.clone(),
+                    rt.generation,
+                    live.reference.key.clone(),
+                    None,
+                    0,
+                    SessionUpdate::MessageStarted {
+                        message_id: loop_protocol::MessageId("msg-x".into()),
+                        role: loop_protocol::Role::Agent,
+                    },
+                );
+                let identity = live.runtime_identity();
+                publish(
+                    &live,
+                    envelope,
+                    Some(identity),
+                    rt.log.as_ref(),
+                    rt.generation,
+                    &rt.updates,
+                )
+                .await
+            }
+        });
+        reached.notified().await;
+        // The lease task fails the Session while the update is committed
+        // and not yet applied.
+        fail(&live, "lease lost (test)");
+        let _ = release.send(false);
+        assert!(publishing.await.unwrap().is_err());
+        let snapshot = rt.in_progress(&session).unwrap();
+        assert!(snapshot.messages.is_empty(), "{snapshot:?}");
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+fn holding(held: Arc<tokio::sync::Notify>, release: Arc<tokio::sync::Notify>) -> Responder {
+    Arc::new(move |context: &Context| {
+        let text = format!("{:?}", context.messages);
+        let answered = context
+            .messages
+            .iter()
+            .any(|m| matches!(m, loop_ai::Message::Assistant(_)));
+        let (held, release) = (held.clone(), release.clone());
+        Box::pin(async move {
+            if text.contains("HOLD") && !answered {
+                held.notify_one();
+                release.notified().await;
+            }
+            FauxResponse::Text("done".into())
+        })
+    })
+}
+
+/// F2 of the review: the caller switches before the turn waits for a turn
+/// permit. So no permit waits on the pump, and a turn cancelled in the
+/// permit queue leaves the acting identity and `turn_caller` in agreement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_caller_switches_before_the_turn_permit_also_for_a_cancelled_turn() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let (held, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let rt = runtime_with(dir.path(), log, holding(held.clone(), release.clone()), 1).await;
+        let (me, alice) = (host(501), Caller::local_token(Principal::local_uid(502)));
+        // One turn holds the only turn permit.
+        let busy = me
+            .clone()
+            .scope(rt.new_session(SessionSpec::default()))
+            .await
+            .unwrap();
+        let first = me
+            .clone()
+            .scope(rt.prompt(&busy, vec![ContentBlock::text("HOLD")]))
+            .await
+            .unwrap();
+        held.notified().await;
+        assert_eq!(rt.turns.available_permits(), 0);
+        // Alice's turn on another Session waits for the permit.
+        let session = me
+            .clone()
+            .scope(rt.new_session(SessionSpec::default()))
+            .await
+            .unwrap();
+        let live = rt.route(&session).unwrap();
+        let hers = Identity::acting(&alice, Tenant::local());
+        let waiting = alice
+            .clone()
+            .scope(rt.prompt(&session, vec![ContentBlock::text("queued")]))
+            .await
+            .unwrap();
+        let acting = || {
+            live.announced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .seq
+                .acting()
+                .clone()
+        };
+        // The switch does not need the permit.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while acting() != hers {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the caller did not switch while the turn waits for a permit"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(rt.turns.available_permits(), 0, "still waiting");
+        // Cancelled in the permit queue: the two still agree.
+        alice.clone().scope(async { rt.cancel(&session) }).await;
+        assert!(matches!(waiting.outcome().await, TurnOutcome::Cancelled));
+        assert_eq!(acting(), hers);
+        assert_eq!(live.turn_caller(), alice);
+        release.notify_one();
+        assert!(matches!(first.outcome().await, TurnOutcome::Completed(_)));
         rt.shutdown().await;
     })
     .await

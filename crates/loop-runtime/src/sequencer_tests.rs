@@ -228,7 +228,7 @@ fn text_and_thought_interleave_and_share_one_part_counter() {
                 );
                 Some(*part)
             }
-            Applied::Durable => None,
+            Applied::Durable | Applied::Late => None,
         })
         .collect();
     assert_eq!(parts, vec![0, 1, 2, 3]);
@@ -624,6 +624,52 @@ fn a_tool_call_above_its_limit_overflows() {
 }
 
 #[test]
+fn a_late_update_of_an_ended_tool_call_changes_nothing() {
+    let mut seq = Sequencer::new(0, who(1));
+    let applied = feed(
+        &mut seq,
+        &[
+            turn_started("turn-1"),
+            call("t"),
+            progress("t", "a"),
+            finish("t", ToolCallStatus::Completed),
+            progress("t", "late"),
+        ],
+    );
+    assert_eq!(applied[4], Applied::Late);
+    assert!(seq.snapshot().tools.is_empty());
+    assert_eq!(seq.open_bytes(), 0);
+    // A new `tool_call` with the same id is a new call; a new turn forgets.
+    feed(&mut seq, &[call("t"), progress("t", "again")]);
+    assert_eq!(seq.snapshot().tools.len(), 1);
+    feed(
+        &mut seq,
+        &[
+            finish("t", ToolCallStatus::Failed),
+            turn_ended("turn-1", StopReason::EndTurn),
+            progress("t", "next turn"),
+        ],
+    );
+    assert_eq!(seq.snapshot().tools.len(), 1);
+}
+
+#[test]
+fn a_tool_update_is_sized_from_its_own_fields() {
+    let mut seq = Sequencer::new(0, who(1));
+    feed(&mut seq, &[call("t"), progress("t", "0123456789")]);
+    let first = seq.open_bytes();
+    // Only the title changes: the content keeps its size.
+    let mut retitle = ToolCallUpdate::new(tid("t"));
+    retitle.title = Some("read t!".into());
+    feed(&mut seq, &[SessionUpdate::ToolCallUpdate(retitle)]);
+    assert_eq!(seq.open_bytes(), first + 1);
+    assert_eq!(seq.open_bytes(), seq.snapshot().bytes());
+    // Longer output replaces the old size.
+    feed(&mut seq, &[progress("t", "0123456789abcdef")]);
+    assert_eq!(seq.open_bytes(), first + 1 + 6);
+}
+
+#[test]
 fn the_fixed_cost_of_one_open_message_is_small() {
     // For the memory report: bytes held per open message besides its text.
     let fixed = std::mem::size_of::<OpenMessage>();
@@ -817,6 +863,8 @@ fn property_snapshot_at_any_cut_plus_the_live_tail_rebuilds_every_item_once() {
             }
             applied.push(a);
             items.push(item);
+            // The running byte count equals the sum over the open items.
+            assert_eq!(seq.open_bytes(), seq.snapshot().bytes(), "case {case}");
             snapshots.push(seq.snapshot());
         }
         assert_eq!(seq.unexpected_seqs(), 0);

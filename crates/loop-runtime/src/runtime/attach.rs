@@ -199,7 +199,7 @@ impl Runtime {
             .route(session)?
             .announced
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .seq
             .snapshot())
     }
