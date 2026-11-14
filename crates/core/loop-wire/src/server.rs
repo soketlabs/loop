@@ -1459,16 +1459,22 @@ fn lagged(conn: &Connection, instance: &BackendInstanceId, missed: Option<u64>) 
         0,
         SessionUpdate::Notice {
             level: NoticeLevel::Error,
-            text: match missed {
-                Some(missed) => format!(
-                    "this client fell behind and missed {missed} updates; reconnect to continue"
-                ),
-                None => "this client fell behind and missed updates; reconnect to continue".into(),
-            },
+            text: lag_text(missed),
         },
     );
     let _ = conn.notify(methods::SESSION_UPDATE, to_value(&notice));
     conn.close();
+}
+
+/// The lag notice. `None` (an outside user) leaves out the count: the
+/// channel is shared, so the count would tell of other users' updates.
+fn lag_text(missed: Option<u64>) -> String {
+    match missed {
+        Some(missed) => {
+            format!("this client fell behind and missed {missed} updates; reconnect to continue")
+        }
+        None => "this client fell behind and missed updates; reconnect to continue".into(),
+    }
 }
 
 async fn sleep_until(deadline: Option<tokio::time::Instant>) {
@@ -1706,20 +1712,12 @@ mod tests {
         assert!(registered_ok(failed(), false));
     }
 
-    #[tokio::test]
-    async fn an_outside_user_is_not_told_how_many_updates_it_missed() {
-        let (server, client) = memory();
-        let (conn, _incoming) = Connection::new(server);
-        let (_peer, mut seen) = Connection::new(client);
-        lagged(&conn, &"loop".into(), None);
-        let message = tokio::time::timeout(std::time::Duration::from_secs(5), seen.recv())
-            .await
-            .unwrap();
-        let text = format!("{message:?}");
-        assert!(
-            text.contains("fell behind and missed updates; reconnect"),
-            "{text}"
-        );
+    #[test]
+    fn an_outside_user_is_not_told_how_many_updates_it_missed() {
+        let outside = lag_text(None);
+        assert!(!outside.chars().any(|c| c.is_ascii_digit()), "{outside}");
+        assert!(outside.contains("fell behind"), "{outside}");
+        assert!(lag_text(Some(4096)).contains("missed 4096 updates"));
     }
 
     #[tokio::test]
