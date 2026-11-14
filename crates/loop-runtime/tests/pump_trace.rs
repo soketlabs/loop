@@ -103,7 +103,9 @@
 //! are in a fixed order): Session keys and native ids (`$SESSION1` root,
 //! `$SESSION2` child), the backend instance (`$INSTANCE`), the test's temp
 //! folder in its `/var` and `/private/var` forms (`$TMP`), the system temp
-//! folder (`$SYSTMP`), the write tool's review folders (`$REVIEW1`...),
+//! folder (`$SYSTMP`), the write tool's review folders as whole paths, with
+//! the folder they are in (`$REVIEW1`...; that folder is the platform's or a
+//! sandbox's temp folder), the home folder (`$HOME`),
 //! branch view ids (`$VIEW1`...), interaction and Escalation ids
 //! (`$INTERACTION1`...), policy decision ids (`$DECISION1`...) and the
 //! Runtime generation (`$GEN`). The number of any JSON field whose name
@@ -810,15 +812,18 @@ fn numbered(text: &str, values: Vec<String>, prefix: &str, masks: &mut Vec<(Stri
     }
 }
 
-/// The names of the write tool's review folders (`.loop-file-review-<id>`).
+/// The write tool's review folders (`<base>/.loop-file-review-<id>`), as
+/// whole paths: the base is the system temp folder of the platform (or of
+/// a sandbox), so it is masked with the folder.
 fn review_folders(text: &str) -> Vec<String> {
     const PREFIX: &str = ".loop-file-review-";
     let mut out = Vec::new();
     let mut rest = text;
     while let Some(at) = rest.find(PREFIX) {
+        let start = rest[..at].rfind(['"', ' ']).map_or(0, |q| q + 1);
         let tail = &rest[at..];
         let end = tail.find(['/', '"']).unwrap_or(tail.len());
-        out.push(tail[..end].to_string());
+        out.push(rest[start..at + end].to_string());
         rest = &tail[end..];
     }
     out
@@ -882,6 +887,8 @@ fn trace(
     let text = raw.join("\n");
 
     let mut masks: Vec<(String, String)> = Vec::new();
+    // Whole review-folder paths first, before any folder they are in.
+    numbered(&text, review_folders(&text), "REVIEW", &mut masks);
     // Temp folder, longest form first.
     let tmp = dir.to_string_lossy().to_string();
     let canonical = std::fs::canonicalize(dir)
@@ -899,6 +906,13 @@ fn trace(
     for path in [format!("/private{system}"), system] {
         if !masks.iter().any(|(raw, _)| raw == &path) {
             masks.push((path, "$SYSTMP".into()));
+        }
+    }
+    // The home folder, if a path under it shows (none does today).
+    if let Ok(home) = std::env::var("HOME") {
+        let home = home.trim_end_matches('/').to_string();
+        if home.len() > 1 && !masks.iter().any(|(raw, _)| raw == &home) {
+            masks.push((home, "$HOME".into()));
         }
     }
     masks.sort_by_key(|(raw, _)| std::cmp::Reverse(raw.len()));
@@ -947,7 +961,6 @@ fn trace(
     numbered(&text, views, "VIEW", &mut masks);
     numbered(&text, interactions, "INTERACTION", &mut masks);
     numbered(&text, decisions, "DECISION", &mut masks);
-    numbered(&text, review_folders(&text), "REVIEW", &mut masks);
     let masks = Masks(masks);
     raw.iter().map(|line| masks.apply(line)).collect()
 }
