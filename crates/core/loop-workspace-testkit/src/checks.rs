@@ -146,7 +146,12 @@ where
         );
         unsupported(&id, "list_processes", ws.list_processes().await.map(|_| ()));
     }
-    if caps.chunked_transfer {
+    let mut committed_tag = None;
+    if caps.upload {
+        assert!(
+            caps.chunked_transfer,
+            "`{id}`: upload without chunked_transfer"
+        );
         let upload = ws
             .begin_upload(UploadRequest {
                 path: file.clone(),
@@ -167,30 +172,16 @@ where
         ws.upload_write(&upload, 3, b"def")
             .await
             .expect("upload_write");
-        let tag = ws.upload_commit(&upload).await.expect("upload_commit");
-        let chunk = ws
-            .read_chunk(&file, 2, 3, Some(&tag))
-            .await
-            .unwrap_or_else(|e| panic!("`{id}`: read_chunk: {e}"));
-        assert_eq!(chunk.data, b"cde", "`{id}`: chunk data");
-        assert_eq!(chunk.total_size, 6, "`{id}`: chunk total size");
-        assert_eq!(chunk.tag, tag, "`{id}`: chunk tag");
-        ws.env()
-            .write_file(&ws.resolve(&file), b"changed")
-            .await
-            .expect("rewrite");
-        let changed = ws.read_chunk(&file, 0, 3, Some(&tag)).await;
-        assert!(
-            matches!(changed, Err(WorkspaceError::Changed { .. })),
-            "`{id}`: a changed file must fail the download: {changed:?}"
-        );
+        committed_tag = Some(ws.upload_commit(&upload).await.expect("upload_commit"));
     } else {
+        if caps.chunked_transfer {
+            // Downloads still need a file: write it through the env.
+            ws.env()
+                .write_file(&ws.resolve(&file), b"abcdef")
+                .await
+                .expect("write the download file");
+        }
         let upload = UploadId("none".into());
-        unsupported(
-            &id,
-            "read_chunk",
-            ws.read_chunk(&file, 0, 16, None).await.map(|_| ()),
-        );
         unsupported(
             &id,
             "begin_upload",
@@ -220,6 +211,44 @@ where
             ws.upload_commit(&upload).await.map(|_| ()),
         );
         unsupported(&id, "upload_abort", ws.upload_abort(&upload).await);
+    }
+    if caps.chunked_transfer {
+        let first = ws
+            .read_chunk(&file, 0, 1, None)
+            .await
+            .unwrap_or_else(|e| panic!("`{id}`: read_chunk: {e}"));
+        let tag = first.tag;
+        if let Some(committed) = &committed_tag {
+            assert_eq!(committed, &tag, "`{id}`: the commit tag is the file's tag");
+        }
+        let chunk = ws
+            .read_chunk(&file, 2, 3, Some(&tag))
+            .await
+            .unwrap_or_else(|e| panic!("`{id}`: read_chunk: {e}"));
+        assert_eq!(chunk.data, b"cde", "`{id}`: chunk data");
+        assert_eq!(chunk.total_size, 6, "`{id}`: chunk total size");
+        assert_eq!(chunk.tag, tag, "`{id}`: chunk tag");
+        assert!(!chunk.eof, "`{id}`: eof before the end");
+        let last = ws
+            .read_chunk(&file, 5, 10, Some(&tag))
+            .await
+            .expect("last chunk");
+        assert!(last.eof && last.data == b"f", "`{id}`: last chunk");
+        ws.env()
+            .write_file(&ws.resolve(&file), b"changed")
+            .await
+            .expect("rewrite");
+        let changed = ws.read_chunk(&file, 0, 3, Some(&tag)).await;
+        assert!(
+            matches!(changed, Err(WorkspaceError::Changed { .. })),
+            "`{id}`: a changed file must fail the download: {changed:?}"
+        );
+    } else {
+        unsupported(
+            &id,
+            "read_chunk",
+            ws.read_chunk(&file, 0, 16, None).await.map(|_| ()),
+        );
     }
     if caps.snapshot {
         ws.snapshot()

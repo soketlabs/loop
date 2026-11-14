@@ -486,3 +486,40 @@ async fn compaction_settings_reach_the_harness_and_follow_a_reload() {
     assert_eq!(settings.reserve_tokens, 2_000);
     assert_eq!(settings.keep_recent_tokens, 3_000);
 }
+
+/// Every workspace gets its Workspace from the `host` driver, and its host
+/// env is that Workspace's env: with reads confined under the tool lock
+/// (and no process or upload then), open otherwise.
+#[tokio::test]
+async fn the_host_env_is_the_host_drivers_workspace() {
+    use loop_app_core::permissions::tool_lock::{RuntimeToolLock, ToolLock};
+    for locked in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let ws_dir = dir.path().join("ws");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let models = Arc::new(loop_ai::Models::create(Default::default()));
+        models.set_provider(loop_ai::providers::faux_provider(Default::default()));
+        let globals = GlobalResources::with_models(agent_dir.clone(), models)
+            .unwrap()
+            .with_tool_lock(locked.then(|| RuntimeToolLock::new(ToolLock::Chat, &ws_dir).unwrap()));
+        let factory = SessionFactory::new(Arc::new(globals));
+        let workspace = factory.workspace(&opts(&ws_dir)).await.unwrap();
+        let host = &workspace.host_workspace;
+        assert_eq!(host.driver_id(), "host");
+        assert_eq!(
+            host.workspace_status(),
+            loop_agent::harness::sandbox::WorkspaceStatus::Ready
+        );
+        assert!(std::ptr::addr_eq(
+            Arc::as_ptr(&host.env()),
+            Arc::as_ptr(&workspace.host)
+        ));
+        let caps = host.capabilities();
+        assert_eq!(caps.confines_reads, locked);
+        assert_eq!(caps.streaming_exec, cfg!(unix) && !locked);
+        assert_eq!(caps.upload, cfg!(unix) && !locked);
+        assert_eq!(host.root(), ws_dir.canonicalize().unwrap());
+    }
+}
