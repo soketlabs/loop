@@ -176,6 +176,10 @@ pub struct WorkspaceResources {
     pub append_system_prompt: Option<String>,
     pub context_files: Vec<ContextFile>,
     pub host: Arc<dyn ExecutionEnv>,
+    /// The `host` driver's Workspace of this folder; `host` is its env.
+    /// Every Session has it, with the sandbox on or off, for the Workspace
+    /// methods (processes, transfer) that later protocol methods expose.
+    pub host_workspace: Arc<dyn loop_agent::harness::sandbox::Workspace>,
     pub mcp_client: Arc<loop_mcp::McpClientManager>,
     pub startup_notices: Vec<String>,
     // Standalone prompts retain the caller's spelling and lexical ancestors;
@@ -187,6 +191,31 @@ pub struct WorkspaceResources {
     // Shared with the workspace's reloads, so a reload never starts a second sandbox.
     sandbox: Arc<OnceCell<Execution>>,
     standalone: bool,
+}
+
+/// The started Workspace of the `host` driver for `cwd`, with reads confined
+/// under the tool lock.
+async fn host_workspace(
+    cwd: &Path,
+    confine_reads: bool,
+) -> anyhow::Result<Arc<dyn loop_agent::harness::sandbox::Workspace>> {
+    use loop_agent::harness::sandbox::{WorkspaceSource, WorkspaceSpec, HOST_DRIVER_ID};
+    let driver = crate::sandbox_builder::platform_registry()
+        .driver(HOST_DRIVER_ID)
+        .ok_or_else(|| anyhow::anyhow!("the `{HOST_DRIVER_ID}` workspace driver is missing"))?;
+    let workspace = driver
+        .create(WorkspaceSpec {
+            source: WorkspaceSource::HostFolder(cwd.to_path_buf()),
+            options: serde_json::json!({ "confineReads": confine_reads }),
+            ..WorkspaceSpec::default()
+        })
+        .await?;
+    // A replaced host driver must still confine reads under the lock.
+    if confine_reads && !workspace.capabilities().confines_reads {
+        bail!("the `{HOST_DRIVER_ID}` workspace driver does not confine reads for the tool lock");
+    }
+    workspace.start().await?;
+    Ok(workspace)
 }
 
 fn absolute_workspace(cwd: &Path) -> anyhow::Result<PathBuf> {
@@ -250,14 +279,12 @@ impl WorkspaceResources {
         // The workspace env exists before the loaders run: project resources
         // (skills, prompts, context files, system prompt files) are read
         // through it, global ones stay host reads.
-        let host: Arc<dyn ExecutionEnv> = if globals.tool_lock().is_some() {
-            // Each file read is checked on the opened file itself, so a path
-            // changed into a link between the gate's check and the open is
-            // refused.
-            Arc::new(HostExecutionEnv::new(&cwd).confine_reads(cwd.clone()))
-        } else {
-            Arc::new(HostExecutionEnv::new(&cwd))
-        };
+        // Under the tool lock the host Workspace confines reads: each file
+        // read is checked on the opened file itself, so a path changed into
+        // a link between the gate's check and the open is refused. It also
+        // starts no process and takes no upload.
+        let host_workspace = host_workspace(&cwd, globals.tool_lock().is_some()).await?;
+        let host: Arc<dyn ExecutionEnv> = host_workspace.env();
         let mut resources =
             load_resources_in(&*host, &globals.agent_dir, &cwd, project_trusted, &settings).await;
         let mut locked_notices = Vec::new();
@@ -321,6 +348,7 @@ impl WorkspaceResources {
             append_system_prompt,
             context_files,
             host,
+            host_workspace,
             web,
             mcp_client,
             startup_notices,
