@@ -49,9 +49,43 @@ pub async fn discover(agent_dir: &Path) -> anyhow::Result<Vec<Target>> {
     .await
     .map_err(|_| {
         anyhow::anyhow!("Runtime discovery handshake timed out; check the socket or use --connect")
-    })??;
+    })?;
+    let remote = match remote {
+        Ok(remote) => remote,
+        // The probe connected, then the peer went away before it answered: a
+        // Runtime that just exited, or a stale socket whose listener closed
+        // while the connection sat in its backlog. No live Runtime is here.
+        Err(error) if peer_is_gone(&error) => return Ok(vec![]),
+        Err(error) => return Err(error),
+    };
     remote.disconnect();
     Ok(vec![target])
+}
+
+/// True when the peer refused, reset or closed the connection before it sent
+/// any reply. A reply (even an error), a silent peer and a bad message are not.
+fn peer_is_gone(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::{
+        BrokenPipe, ConnectionAborted, ConnectionRefused, ConnectionReset, NotFound, UnexpectedEof,
+    };
+    if let Some(io) = error.downcast_ref::<std::io::Error>() {
+        return matches!(
+            io.kind(),
+            NotFound
+                | ConnectionRefused
+                | ConnectionReset
+                | ConnectionAborted
+                | BrokenPipe
+                | UnexpectedEof
+        );
+    }
+    // The client reports a closed connection as a Network failure; a reply
+    // with an error, or a bad one, is never Network.
+    matches!(
+        error.downcast_ref::<loop_protocol::BackendError>(),
+        Some(loop_protocol::BackendError::Failed(info))
+            if info.category == loop_protocol::ErrorCategory::Network
+    )
 }
 
 pub fn select(
