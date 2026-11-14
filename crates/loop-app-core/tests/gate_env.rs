@@ -40,6 +40,7 @@ fn tree() -> tempfile::TempDir {
     symlink(r("home/.secret"), r("repo/sec")).unwrap();
     symlink(r("home/.secret/new"), r("repo/dangling")).unwrap();
     symlink(r("repo/src"), r("sys/link")).unwrap();
+    symlink(r("home/.secret"), r("plink")).unwrap();
     std::fs::hard_link(r("outside/hard-src"), r("repo/hard")).unwrap();
     dir
 }
@@ -110,6 +111,24 @@ async fn the_gate_resolves_links_and_the_git_root_through_the_env() {
     assert!(calls
         .iter()
         .any(|c| c.starts_with("read_link /loop-virtual-workspace/repo/dangling")));
+}
+
+/// A deny pattern whose fixed prefix is a link: only the env can say where
+/// it leads (the virtual prefix is not on the host).
+#[tokio::test]
+async fn a_deny_pattern_prefix_resolves_through_the_env() {
+    let dir = tree();
+    let env = Arc::new(VirtualEnv::new(dir.path()).at("repo"));
+    let deny = rules(&[(format!("read({}/**)", virt("plink").display()), "deny")]);
+    let gate = gate(env.clone(), deny).await;
+    assert!(is_deny(
+        &gate.decide("read", &json!({"path": "sec/key"})).await
+    ));
+    assert_eq!(
+        gate.decide("read", &json!({"path": "src/a.rs"})).await,
+        Decision::Allow
+    );
+    env.assert_no_leaks();
 }
 
 /// Owner and mode bits of a folder decide whether an allow rule follows a

@@ -184,14 +184,19 @@ fn protected(paths: &super::paths::PathFacts, path: &str, workspace: &std::path:
     if check(written.strip_prefix(workspace).unwrap_or(written)) {
         return true;
     }
+    use super::policy::Resolved;
     match super::policy::resolve(paths, &workspace.join(written)) {
         // Only the part below the workspace counts: a workspace that
         // itself sits under a `.git` directory is not protected.
-        Some(real) => {
-            let root = super::policy::resolve(paths, workspace).unwrap_or_default();
+        Resolved::Path(real) => {
+            let root = match super::policy::resolve(paths, workspace) {
+                Resolved::Path(root) => root,
+                Resolved::Gone => std::path::PathBuf::new(),
+                Resolved::Unknown => return true,
+            };
             check(real.strip_prefix(&root).unwrap_or(&real))
         }
-        None => true,
+        Resolved::Gone | Resolved::Unknown => true,
     }
 }
 
@@ -258,16 +263,19 @@ mod tests {
             std::fs::create_dir_all(&ws).unwrap();
             let abs = ws.join("src/main.rs");
             assert!(
-                !protected(&PathFacts::host(), &abs.to_string_lossy(), &ws),
+                !protected(&PathFacts::runtime_host(), &abs.to_string_lossy(), &ws),
                 "{dir}"
             );
-            assert!(!protected(&PathFacts::host(), "src/main.rs", &ws), "{dir}");
+            assert!(
+                !protected(&PathFacts::runtime_host(), "src/main.rs", &ws),
+                "{dir}"
+            );
             assert!(protected(
-                &PathFacts::host(),
+                &PathFacts::runtime_host(),
                 &ws.join(".git/config").to_string_lossy(),
                 &ws
             ));
-            assert!(protected(&PathFacts::host(), ".env", &ws));
+            assert!(protected(&PathFacts::runtime_host(), ".env", &ws));
         }
     }
 

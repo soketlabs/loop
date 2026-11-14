@@ -57,7 +57,8 @@ pub struct Call {
     /// when it opened ([`super::tool_lock::Confinement`]).
     pub confinement: Option<std::sync::Arc<super::tool_lock::Confinement>>,
     /// Where the path checks of this call get their facts: the Runtime
-    /// host by default, the Session's Workspace env in the gate.
+    /// host for [`Call::new`] and [`Call::resolve`] (the sync API), the
+    /// Session's Workspace env in the gate ([`Call::resolve_with`]).
     pub paths: PathFacts,
 }
 
@@ -75,7 +76,7 @@ impl Call {
             home: None,
             inside_workspace: false,
             confinement: None,
-            paths: PathFacts::default(),
+            paths: PathFacts::runtime_host(),
         }
     }
 
@@ -94,7 +95,7 @@ impl Call {
         workspace: &Path,
         cwd: &Path,
     ) -> Self {
-        Self::resolve_with(&PathFacts::host(), tool, kind, args, workspace, cwd)
+        Self::resolve_with(&PathFacts::runtime_host(), tool, kind, args, workspace, cwd)
     }
 
     /// [`Call::resolve_in`] with path facts from `paths`; the call keeps
@@ -114,9 +115,12 @@ impl Call {
                 .is_some_and(|path| {
                     inside_workspace_in(paths, &cwd.join(path).to_string_lossy(), workspace)
                 });
+        // A guest env's home is not the Runtime's: `~` stays unexpanded and
+        // `~` rules fail closed (`Lookup::home_known`).
+        let home = paths.lookup().home_known().then(dirs::home_dir).flatten();
         Self {
             kind,
-            home: dirs::home_dir(),
+            home,
             inside_workspace,
             cwd: cwd.to_path_buf(),
             paths: paths.clone(),
@@ -278,31 +282,61 @@ fn off_reason(mode: PermissionMode, capability: &Capability, tool: &str) -> Stri
 /// `workspace`, following symlinks of the parts that exist, on the Runtime
 /// host.
 pub fn inside_workspace(path: &str, workspace: &Path) -> bool {
-    inside_workspace_in(&PathFacts::host(), path, workspace)
+    inside_workspace_in(&PathFacts::runtime_host(), path, workspace)
 }
 
 /// [`inside_workspace`] with facts from `paths`.
 pub(crate) fn inside_workspace_in(paths: &PathFacts, path: &str, workspace: &Path) -> bool {
     let joined = workspace.join(path);
-    let (Some(target), Some(root)) = (resolve(paths, &joined), resolve(paths, workspace)) else {
+    let (Some(target), Some(root)) = (
+        resolve(paths, &joined).path(),
+        resolve(paths, workspace).path(),
+    ) else {
         return false;
     };
     target.starts_with(root)
 }
 
+/// A path as [`resolve`] found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Resolved {
+    /// Resolved: the longest existing ancestor canonical, the rest as
+    /// written.
+    Path(PathBuf),
+    /// Cannot be resolved, and the kernel could not open it either: a link
+    /// loop, or `..` below a missing part.
+    Gone,
+    /// A fact was unknown (an env error, or a limit). Fails closed: a deny
+    /// or ask rule that needed this form counts as matching.
+    Unknown,
+}
+
+impl Resolved {
+    /// The path, when it resolved.
+    pub(crate) fn path(self) -> Option<PathBuf> {
+        match self {
+            Self::Path(path) => Some(path),
+            _ => None,
+        }
+    }
+}
+
 /// Canonicalise the longest existing ancestor of `path` and append the
 /// rest, rejecting `..` in the part that does not exist yet. A dangling
 /// symlink is followed to its target, so a write through it lands where
-/// the result says. `None` when it cannot be resolved: a link loop, or a
-/// fact `paths` does not know.
-pub(crate) fn resolve(paths: &PathFacts, path: &Path) -> Option<PathBuf> {
+/// the result says. See [`Resolved`] for the other answers.
+pub(crate) fn resolve(paths: &PathFacts, path: &Path) -> Resolved {
     resolve_at(paths.lookup(), path, 0)
 }
 
 /// Symlinks followed before giving up (the kernel's own limit is 40).
 const MAX_LINKS: usize = 40;
 
-fn resolve_at(lookup: &dyn Lookup, path: &Path, links: usize) -> Option<PathBuf> {
+fn resolve_at(lookup: &dyn Lookup, path: &Path, links: usize) -> Resolved {
+    if path.components().count() > super::paths::MAX_COMPONENTS {
+        lookup.note_limit();
+        return Resolved::Unknown;
+    }
     let mut existing = path.to_path_buf();
     let mut rest = Vec::new();
     loop {
@@ -312,32 +346,40 @@ fn resolve_at(lookup: &dyn Lookup, path: &Path, links: usize) -> Option<PathBuf>
                 for part in rest.iter().rev() {
                     out.push(part);
                 }
-                return Some(out);
+                return Resolved::Path(out);
             }
-            Got::Unknown => return None,
+            Got::Unknown => return Resolved::Unknown,
             Got::No => {}
         }
         // A symlink whose target does not exist: resolve the target.
         match lookup.read_link(&existing) {
             Got::Yes(target) => {
                 if links >= MAX_LINKS {
-                    return None;
+                    return Resolved::Gone;
                 }
-                let mut next = existing.parent()?.join(target);
+                let Some(parent) = existing.parent() else {
+                    return Resolved::Gone;
+                };
+                let mut next = parent.join(target);
                 for part in rest.iter().rev() {
                     next.push(part);
                 }
                 return resolve_at(lookup, &next, links + 1);
             }
-            Got::Unknown => return None,
+            Got::Unknown => return Resolved::Unknown,
             Got::No => {}
         }
-        let name = existing.file_name()?.to_owned();
+        let Some(name) = existing.file_name().map(|n| n.to_owned()) else {
+            return Resolved::Gone;
+        };
         if name == ".." {
-            return None;
+            return Resolved::Gone;
         }
         rest.push(name);
-        existing = existing.parent()?.to_path_buf();
+        let Some(parent) = existing.parent() else {
+            return Resolved::Gone;
+        };
+        existing = parent.to_path_buf();
     }
 }
 

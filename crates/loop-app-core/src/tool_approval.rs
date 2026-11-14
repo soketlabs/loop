@@ -776,9 +776,14 @@ impl ToolApprovalBridge {
     }
 
     /// Remove a review snapshot. It was written through the env, so it is
-    /// removed through it; a failure leaves it (a temporary file).
+    /// removed through it, and only while it is a regular file (`remove`
+    /// would also take a folder tree); a failure leaves it (a temporary
+    /// file).
     async fn cleanup_snapshot(&self, path: Option<&Path>) {
-        if let Some(path) = path {
+        let Some(path) = path else {
+            return;
+        };
+        if let Ok(Some(_)) = self.env.file_identity(path).await {
             let _ = self.env.remove(path).await;
         }
     }

@@ -155,12 +155,88 @@ pub fn production_code(text: &str) -> String {
     b.into_iter().collect()
 }
 
+/// The `impl` and `trait` blocks of `code`, as `(start offset, end offset,
+/// type name)`: `impl<T> Trait for path::Type<T>` names `Type`.
+fn blocks(b: &[char]) -> Vec<(usize, usize, String)> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 6 <= b.len() {
+        let word = |w: &str| {
+            let n = w.len();
+            i + n < b.len()
+                && b[i..i + n].iter().copied().eq(w.chars())
+                && (i == 0 || !ident(b[i - 1]))
+                && (b[i + n] == ' ' || b[i + n] == '<')
+        };
+        let skip = if word("impl") {
+            4
+        } else if word("trait") {
+            5
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some(open) = (i..b.len()).find(|&k| b[k] == '{' || b[k] == ';') else {
+            break;
+        };
+        if b[open] == ';' {
+            i = open + 1;
+            continue;
+        }
+        let mut header: String = b[i + skip..open].iter().collect();
+        // Leading generics: `impl<T: X>`.
+        if header.trim_start().starts_with('<') {
+            let mut depth = 0;
+            let mut cut = 0;
+            for (k, c) in header.char_indices() {
+                match c {
+                    '<' => depth += 1,
+                    '>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            cut = k + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            header = header[cut..].to_string();
+        }
+        let header = header.split(" where").next().unwrap_or("").to_string();
+        let ty = header.rsplit(" for ").next().unwrap_or("").trim();
+        let ty = ty.split('<').next().unwrap_or("").trim();
+        let name = ty.rsplit("::").next().unwrap_or("").to_string();
+        let mut depth = 0usize;
+        let mut end = open;
+        while end < b.len() {
+            match b[end] {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            end += 1;
+        }
+        out.push((open, end, name));
+        i = open + 1;
+    }
+    out
+}
+
 /// The functions of `code` (production code from [`production_code`]), as
-/// `(first line, last line, name)`, 1-based. A function without a body is
-/// left out.
+/// `(first line, last line, name)`, 1-based. A function in an `impl` or
+/// `trait` block is named `Type::name`. A function without a body is left
+/// out.
 pub fn functions(code: &str) -> Vec<(usize, usize, String)> {
     let b: Vec<char> = code.chars().collect();
     let line_of = |at: usize| b[..at].iter().filter(|&&c| c == '\n').count() + 1;
+    let blocks = blocks(&b);
     let ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut out = Vec::new();
     let mut i = 0;
@@ -204,6 +280,15 @@ pub fn functions(code: &str) -> Vec<(usize, usize, String)> {
             }
             end += 1;
         }
+        let owner = blocks
+            .iter()
+            .filter(|(start, stop, _)| *start < i && i < *stop)
+            .max_by_key(|(start, _, _)| *start)
+            .map(|(_, _, ty)| ty.as_str());
+        let name = match owner {
+            Some(ty) if !ty.is_empty() => format!("{ty}::{name}"),
+            _ => name,
+        };
         out.push((
             line_of(i),
             line_of(end.min(b.len().saturating_sub(1))),

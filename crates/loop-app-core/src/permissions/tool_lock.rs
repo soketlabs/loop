@@ -217,14 +217,14 @@ impl Confinement {
     /// them, or a folder above, was replaced by a link. Every call of the
     /// Session is then refused. Resolved on the Runtime host.
     pub fn moved(&self) -> bool {
-        self.moved_in(&PathFacts::host())
+        self.moved_in(&PathFacts::runtime_host())
     }
 
     /// [`Self::moved`] with facts from `paths`. A folder that cannot be
     /// resolved counts as moved.
     pub fn moved_in(&self, paths: &PathFacts) -> bool {
-        resolve_path(paths, &self.folder).as_deref() != Some(self.folder.as_path())
-            || resolve_path(paths, &self.root).as_deref() != Some(self.root.as_path())
+        resolve_path(paths, &self.folder).path().as_deref() != Some(self.folder.as_path())
+            || resolve_path(paths, &self.root).path().as_deref() != Some(self.root.as_path())
     }
 
     /// Whether a locked read of `path` stays inside the folder: the folder
@@ -232,7 +232,7 @@ impl Confinement {
     /// the stored folder and root and is not a hard-linked file. Resolved
     /// on the Runtime host.
     pub fn allows(&self, path: &Path) -> bool {
-        self.allows_in(&PathFacts::host(), path)
+        self.allows_in(&PathFacts::runtime_host(), path)
     }
 
     /// [`Self::allows`] with facts from `paths`.
@@ -240,7 +240,7 @@ impl Confinement {
         if self.moved_in(paths) {
             return false;
         }
-        let Some(real) = resolve_path(paths, path) else {
+        let Some(real) = resolve_path(paths, path).path() else {
             return false;
         };
         real.starts_with(&self.folder) && real.starts_with(&self.root) && !hard_linked(paths, &real)
@@ -253,12 +253,15 @@ impl Confinement {
 /// like a file inside it, so every hard-linked file is refused). Resolved
 /// on the Runtime host.
 pub fn inside_folder(path: &Path, folder: &Path) -> bool {
-    inside_folder_in(&PathFacts::host(), path, folder)
+    inside_folder_in(&PathFacts::runtime_host(), path, folder)
 }
 
 /// [`inside_folder`] with facts from `paths`.
 pub(crate) fn inside_folder_in(paths: &PathFacts, path: &Path, folder: &Path) -> bool {
-    let (Some(real), Some(root)) = (resolve_path(paths, path), resolve_path(paths, folder)) else {
+    let (Some(real), Some(root)) = (
+        resolve_path(paths, path).path(),
+        resolve_path(paths, folder).path(),
+    ) else {
         return false;
     };
     real.starts_with(&root) && !hard_linked(paths, &real)

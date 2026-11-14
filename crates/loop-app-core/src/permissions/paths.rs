@@ -13,7 +13,7 @@
 //!   runs it, fetches the first fact it missed through the env, and runs it
 //!   again until nothing is missing. Facts are kept for one decision only:
 //!   links can change between decisions.
-//! - [`PathFacts::host`]: the Runtime host disk, for callers outside a
+//! - [`PathFacts::runtime_host`]: the Runtime host disk, for callers outside a
 //!   Session's decision: the sync API (`decide`, `Call::resolve`,
 //!   `search_may_show`), external agents (they run on the Runtime host),
 //!   and the sync search filter of a Session whose paths are host paths.
@@ -24,8 +24,14 @@
 //! An answer is [`Got::Yes`], [`Got::No`] (no such path, or not a link) or
 //! [`Got::Unknown`] (the env could not say). Unknown fails closed in every
 //! check: a path that cannot be resolved is not inside the workspace, is
-//! protected, is outside the tool lock's folder, and only deny and ask
-//! rules apply to it.
+//! protected, is outside the tool lock's folder, no allow rule applies to
+//! it, and a deny or ask path rule that could not be compared with it
+//! counts as matching.
+//!
+//! Limits: one decision makes at most [`MAX_ENV_CALLS`] env calls and
+//! resolves no path of more than [`MAX_COMPONENTS`] components. Past a
+//! limit [`GatePaths::run`] returns [`PathLimit`] and the gate refuses the
+//! call, whatever the rules say. No real project path comes near them.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,9 +41,18 @@ use loop_agent::harness::sandbox::PathNamespace;
 use loop_agent::harness::types::{FileError, FileErrorCode, FileSystem, PathKind, PathMetadata};
 use parking_lot::Mutex;
 
-/// Env calls one decision may make. After that every missing fact is
-/// unknown, which fails closed.
-pub const MAX_ENV_CALLS: usize = 1024;
+/// Env calls one decision may make. A decision on a real path makes fewer
+/// than ten (one or two per missing path component, one per dangling link).
+pub const MAX_ENV_CALLS: usize = 128;
+
+/// Components of one path the gate resolves (a link's target included).
+pub const MAX_COMPONENTS: usize = 256;
+
+/// A decision went past a limit: the path is too deep, or has too many
+/// links, to check. The gate refuses the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the path is too deep or has too many links to check")]
+pub struct PathLimit;
 
 /// One answer about a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,28 +94,33 @@ pub(crate) trait Lookup: Send + Sync {
     fn read_link(&self, path: &Path) -> Got<PathBuf>;
     /// Metadata of `path` without following a final link.
     fn lstat(&self, path: &Path) -> Got<Meta>;
+    /// Whether `~` names a known home folder. A guest env's home is not the
+    /// Runtime's, so a `~` rule cannot be compared there (fails closed).
+    fn home_known(&self) -> bool {
+        true
+    }
+    /// The decision went past a limit ([`MAX_COMPONENTS`]).
+    fn note_limit(&self) {}
 }
 
-/// Where a decision's path facts come from. The default is the Runtime
-/// host ([`PathFacts::host`]).
-#[derive(Clone, Default)]
+/// Where a decision's path facts come from. There is no default: a caller
+/// names the source ([`PathFacts::runtime_host`] only on the Runtime side).
+#[derive(Clone)]
 pub struct PathFacts(Source);
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 enum Source {
-    #[default]
     Host,
     Unknown,
     Probe(Arc<Probe>),
-    /// Another source (tests count the host calls with it).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Another source: the search memo (tests also count host calls).
     Other(Arc<dyn Lookup>),
 }
 
 impl PathFacts {
     /// Facts from the Runtime host disk. Only for callers outside a
     /// Session's decision (see the module notes).
-    pub fn host() -> Self {
+    pub fn runtime_host() -> Self {
         Self(Source::Host)
     }
 
@@ -219,6 +239,74 @@ impl Lookup for UnknownLookup {
     fn lstat(&self, _path: &Path) -> Got<Meta> {
         Got::Unknown
     }
+    fn home_known(&self) -> bool {
+        false
+    }
+}
+
+/// Host facts remembered across the calls of one search (the sync search
+/// filter checks every walked file against the same cwd, bases and rule
+/// prefixes). The memory is dropped when no call came for [`Self::GAP`]:
+/// the next call belongs to another search, and links may have changed.
+pub struct SearchMemo {
+    state: Mutex<(std::time::Instant, HashMap<Query, Answer>)>,
+}
+
+impl Default for SearchMemo {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new((std::time::Instant::now(), HashMap::new())),
+        }
+    }
+}
+
+impl SearchMemo {
+    /// A pause longer than this ends a search.
+    pub const GAP: std::time::Duration = std::time::Duration::from_millis(100);
+    /// Facts kept at most (walked files are asked about once each).
+    const MAX: usize = 4096;
+
+    fn get(&self, query: Query, fetch: impl FnOnce() -> Answer) -> Answer {
+        let mut state = self.state.lock();
+        let now = std::time::Instant::now();
+        if now.duration_since(state.0) > Self::GAP || state.1.len() > Self::MAX {
+            state.1.clear();
+        }
+        state.0 = now;
+        if let Some(answer) = state.1.get(&query) {
+            return answer.clone();
+        }
+        let answer = fetch();
+        state.1.insert(query, answer.clone());
+        answer
+    }
+}
+
+impl Lookup for SearchMemo {
+    fn canonical(&self, path: &Path) -> Got<PathBuf> {
+        match self.get(Query::Canonical(path.to_path_buf()), || {
+            Answer::Path(host_canonical(path))
+        }) {
+            Answer::Path(got) => got,
+            Answer::Meta(_) => Got::Unknown,
+        }
+    }
+    fn read_link(&self, path: &Path) -> Got<PathBuf> {
+        match self.get(Query::ReadLink(path.to_path_buf()), || {
+            Answer::Path(host_read_link(path))
+        }) {
+            Answer::Path(got) => got,
+            Answer::Meta(_) => Got::Unknown,
+        }
+    }
+    fn lstat(&self, path: &Path) -> Got<Meta> {
+        match self.get(Query::Lstat(path.to_path_buf()), || {
+            Answer::Meta(host_lstat(path))
+        }) {
+            Answer::Meta(got) => got,
+            Answer::Path(_) => Got::Unknown,
+        }
+    }
 }
 
 /// One fact a decision asked for.
@@ -242,6 +330,10 @@ struct Probe {
     miss: Mutex<Option<Query>>,
     /// No more env calls: a missing fact is unknown.
     full: Mutex<bool>,
+    /// A limit was reached in this round.
+    limited: Mutex<bool>,
+    /// `~` names a home folder the facts can check (host namespace).
+    home_known: bool,
 }
 
 impl Probe {
@@ -249,7 +341,9 @@ impl Probe {
         if let Some(answer) = self.facts.lock().get(&query) {
             return Some(answer.clone());
         }
-        if !*self.full.lock() {
+        if *self.full.lock() {
+            *self.limited.lock() = true;
+        } else {
             self.miss.lock().get_or_insert(query);
         }
         None
@@ -276,6 +370,12 @@ impl Lookup for Probe {
             _ => Got::Unknown,
         }
     }
+    fn home_known(&self) -> bool {
+        self.home_known
+    }
+    fn note_limit(&self) {
+        *self.limited.lock() = true;
+    }
 }
 
 /// How much one decision cost.
@@ -286,6 +386,8 @@ pub struct LookupStats {
     /// Times the decision code ran (one more than the env calls, unless
     /// the limit was reached).
     pub rounds: usize,
+    /// A limit was reached ([`PathLimit`]).
+    pub limited: bool,
 }
 
 /// The gate's path-resolution service: path facts from a Session's
@@ -337,20 +439,30 @@ impl GatePaths {
 
     /// Run `decide` with facts from the env: run it, fetch the first fact
     /// it missed, and run it again until nothing is missing. `decide` must
-    /// depend only on its facts (it runs more than once).
-    pub async fn run<T>(&self, decide: impl Fn(&PathFacts) -> T) -> T {
-        self.run_counted(decide).await.0
+    /// depend only on its facts (it runs more than once). Past a limit the
+    /// result is [`PathLimit`]: the caller must refuse.
+    pub async fn run<T>(&self, decide: impl Fn(&PathFacts) -> T) -> Result<T, PathLimit> {
+        match self.run_counted(decide).await {
+            (_, stats) if stats.limited => Err(PathLimit),
+            (out, _) => Ok(out),
+        }
     }
 
-    /// [`Self::run`], and what it cost.
+    /// [`Self::run`], and what it cost; `stats.limited` says whether a
+    /// limit was reached (then the result must not be used).
     pub async fn run_counted<T>(&self, decide: impl Fn(&PathFacts) -> T) -> (T, LookupStats) {
-        let probe = Arc::new(Probe::default());
+        let probe = Arc::new(Probe {
+            home_known: self.namespace == PathNamespace::Host,
+            ..Probe::default()
+        });
         let facts = PathFacts(Source::Probe(Arc::clone(&probe)));
         let mut stats = LookupStats::default();
         loop {
             stats.rounds += 1;
+            *probe.limited.lock() = false;
             let out = decide(&facts);
             let Some(query) = probe.miss.lock().take() else {
+                stats.limited = *probe.limited.lock();
                 return (out, stats);
             };
             let answer = self.fetch(&query).await;
@@ -363,11 +475,12 @@ impl GatePaths {
     }
 
     /// Facts for code that cannot wait for the env (the sync search
-    /// filter): the Runtime host for a host-namespace env, none for a
-    /// guest one, so the host is never read for a guest path.
-    pub fn sync_facts(&self) -> PathFacts {
+    /// filter): the Runtime host for a host-namespace env, remembered for
+    /// one search in `memo`; none for a guest one, so the host is never
+    /// read for a guest path.
+    pub fn sync_facts(&self, memo: &Arc<SearchMemo>) -> PathFacts {
         match self.namespace {
-            PathNamespace::Host => PathFacts::host(),
+            PathNamespace::Host => PathFacts(Source::Other(memo.clone())),
             _ => PathFacts::unknown(),
         }
     }
@@ -559,13 +672,15 @@ pub(crate) mod tests {
 
             let started = std::time::Instant::now();
             for _ in 0..RUNS {
-                decide(&PathFacts::host(), rules, mode, tool, path, &ws);
+                decide(&PathFacts::runtime_host(), rules, mode, tool, path, &ws);
             }
             let sync = started.elapsed() / RUNS;
             let started = std::time::Instant::now();
             for _ in 0..RUNS {
-                env.run(|facts| decide(facts, rules, mode, tool, path, &ws))
-                    .await;
+                assert!(env
+                    .run(|facts| decide(facts, rules, mode, tool, path, &ws))
+                    .await
+                    .is_ok());
             }
             let through_env = started.elapsed() / RUNS;
             eprintln!(
@@ -601,7 +716,8 @@ pub(crate) mod tests {
             stats,
             LookupStats {
                 env_calls: 0,
-                rounds: 1
+                rounds: 1,
+                limited: false,
             }
         );
     }

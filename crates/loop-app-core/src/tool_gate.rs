@@ -42,6 +42,7 @@ use crate::permissions::decision::{
     self, DecidedBy, DecisionAnswer, DecisionOutcome, DecisionSink, DecisionSource,
     PolicyDecisionRecord,
 };
+use crate::permissions::paths::PathLimit;
 use crate::permissions::{
     Call, Decision, GatePaths, LayerSource, PathFacts, PermissionMode, Policy, Verdict,
 };
@@ -523,23 +524,33 @@ impl ToolGate {
             policy.decide_why(mode, &rules, call)
         })
         .await
+        .unwrap_or_else(|limit| Verdict {
+            // Whatever the rules say: the gate could not check the path.
+            decision: Decision::Deny(format!("`{tool}` is refused: {limit}.")),
+            by: DecidedBy::Unreadable,
+            rule: None,
+            layer: None,
+        })
     }
 
-    /// Whether a Policy layer's "ask" holds for the call.
+    /// Whether a Policy layer's "ask" holds for the call. A path the gate
+    /// cannot check asks (fail closed).
     async fn requires_ask(&self, tool: &str, args: &serde_json::Value) -> bool {
         let policy = self.effective_policy();
         self.with_call(tool, args, |call| policy.requires_ask(call))
             .await
+            .unwrap_or(true)
     }
 
     /// Run `decide` on the call, with its path facts from the Session's
     /// Workspace env ([`GatePaths::run`]). `decide` may run more than once.
+    /// Past a limit the result is [`PathLimit`]: the caller refuses.
     async fn with_call<T>(
         &self,
         tool: &str,
         args: &serde_json::Value,
         decide: impl Fn(&Call) -> T,
-    ) -> T {
+    ) -> Result<T, PathLimit> {
         let workspace = self.workspace();
         let cwd = self.cwd(&workspace);
         let kind = self.kind(tool).await;
@@ -606,7 +617,7 @@ impl ToolGate {
         let workspace = self.workspace();
         // An external agent runs on the Runtime host, in its own folder
         // there: its paths are host paths.
-        let host = PathFacts::host();
+        let host = PathFacts::runtime_host();
         tools.iter().find_map(|tool| {
             let call = Call {
                 rule_bases: self.rule_bases.lock().clone(),
@@ -670,6 +681,7 @@ impl ToolGate {
     pub fn search_filter(self: &Arc<Self>) -> SearchFilter {
         let gate = Arc::downgrade(self);
         let home = dirs::home_dir();
+        let memo = Arc::new(crate::permissions::paths::SearchMemo::default());
         Arc::new(move |tool: &str, path: &std::path::Path| {
             let Some(gate) = gate.upgrade() else {
                 return true;
@@ -679,7 +691,7 @@ impl ToolGate {
             // The filter cannot wait for the env (`SearchFilter` is sync):
             // host facts for a host-namespace Session, none (fail closed)
             // for a guest one.
-            let facts = gate.paths().sync_facts();
+            let facts = gate.paths().sync_facts(&memo);
             // Under a tool lock every walked entry must resolve inside the
             // Session's folder: a symlink or hard link out is hidden, and a
             // walk never enters a linked folder outside.

@@ -47,6 +47,6 @@ pub use policy::{
     available, decide, decide_why, inside_workspace, workspace_root, Call, Decision, Verdict,
 };
 pub use rules::{
-    read_only_command, rule_and_key, rule_for, search_may_show, search_may_show_in,
+    has_path_rules, read_only_command, rule_and_key, rule_for, search_may_show, search_may_show_in,
     search_may_show_with, split_command, Rule, ToolPermission,
 };

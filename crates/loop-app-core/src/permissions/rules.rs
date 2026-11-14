@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 
 use super::paths::{Got, PathFacts};
-use super::policy::resolve;
+use super::policy::{resolve, Resolved};
 use super::Call;
 use crate::hooks_load::glob_match;
 pub use loop_agent::harness::tools::shell::split_command;
@@ -99,6 +99,17 @@ fn subject(tool: &str, args: &Value) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+/// Whether `rules` has a path pattern rule: a `tool(pattern)` key whose
+/// tool part names `read`, `write`, `edit` or a search tool.
+pub fn has_path_rules(rules: &BTreeMap<String, ToolPermission>) -> bool {
+    rules.keys().any(|key| match split_key(key) {
+        (tool, Some(_)) => ["read", "write", "edit", "grep", "glob", "ls"]
+            .iter()
+            .any(|name| glob_match(tool, name)),
+        _ => false,
+    })
+}
+
 /// Loop's read-only search tools, whose patterns match a path.
 fn is_search(tool: &str) -> bool {
     matches!(tool, "grep" | "glob" | "ls")
@@ -132,7 +143,7 @@ pub fn search_may_show_in(
     bases: &[PathBuf],
     home: Option<&Path>,
 ) -> bool {
-    let paths = PathFacts::host();
+    let paths = PathFacts::runtime_host();
     search_may_show_with(&paths, rules, tool, path, workspace, cwd, bases, home)
 }
 
@@ -344,6 +355,9 @@ pub(crate) struct PathForms {
     /// Names only `deny` and `ask` see: the tools do not expand `~`, so
     /// `~/x` also names `cwd/~/x`.
     literal: Vec<Names>,
+    /// Some form could not be worked out (an unknown fact, a `~` with an
+    /// unknown home): every deny and ask rule applies, no allow rule does.
+    unknown: bool,
 }
 
 /// One name of a path, absolute and relative.
@@ -370,15 +384,26 @@ impl PathForms {
         let cwd = call.cwd.as_path();
         let home = call.home.as_deref();
         let paths = &call.paths;
+        // A form that `resolve` could not work out leaves a name out; then
+        // the rules that name it must still apply (fail closed).
+        let unknown = std::cell::Cell::new(path.starts_with('~') && !paths.lookup().home_known());
+        let known = |resolved: Resolved| match resolved {
+            Resolved::Path(path) => Some(path),
+            Resolved::Gone => None,
+            Resolved::Unknown => {
+                unknown.set(true);
+                None
+            }
+        };
         let expanded = expand_home(path, home);
         let joined = cwd.join(&expanded);
         // Components drop `.` parts, so `.` is the cwd itself.
         let absolute: PathBuf = joined.components().collect();
-        let real_cwd = resolve(paths, cwd);
+        let real_cwd = known(resolve(paths, cwd));
         // Bases only `deny` and `ask` see, each as given and resolved.
         let loose: Vec<PathBuf> = std::iter::once(&call.workspace)
             .chain(&call.rule_bases)
-            .flat_map(|base| std::iter::once(base.clone()).chain(resolve(paths, base)))
+            .flat_map(|base| std::iter::once(base.clone()).chain(known(resolve(paths, base))))
             .collect();
         let relative = |p: &Path, base: &Path| {
             p.strip_prefix(base)
@@ -402,13 +427,13 @@ impl PathForms {
         let mut written = names(&absolute);
         written.push(expanded);
         let lexical = normalise_path(&joined);
-        let resolved = resolve(paths, &lexical).map(|real| {
+        let resolved = known(resolve(paths, &lexical)).map(|real| {
             let mut groups = vec![names(&lexical), names(&real)];
             // `resolve` refuses `..` below a missing part; the kernel would
             // not open such a path either. With no `..` in the path, this
             // is the same file as `real`.
             if lexical != absolute {
-                if let Some(kernel) = resolve(paths, &joined) {
+                if let Some(kernel) = known(resolve(paths, &joined)) {
                     if kernel != real {
                         groups.push(names(&kernel));
                     }
@@ -419,13 +444,14 @@ impl PathForms {
         let mut literal = Vec::new();
         if path.starts_with('~') && home.is_some() {
             let opened = normalise_path(&cwd.join(path));
-            literal.extend(resolve(paths, &opened).map(|real| names(&real)));
+            literal.extend(known(resolve(paths, &opened)).map(|real| names(&real)));
             literal.push(names(&opened));
         }
         Self {
             written,
             resolved,
             literal,
+            unknown: unknown.get(),
         }
     }
 
@@ -439,13 +465,14 @@ impl PathForms {
                 .any(|name| patterns.iter().any(|p| glob_match(p, name)))
         };
         if permission == ToolPermission::Allow {
-            return any(allow, &self.written.strict)
+            return !self.unknown
+                && any(allow, &self.written.strict)
                 && self
                     .resolved
                     .as_ref()
                     .is_some_and(|groups| groups.iter().all(|g| any(allow, &g.strict)));
         }
-        let Some(groups) = &self.resolved else {
+        let Some(groups) = self.resolved.as_ref().filter(|_| !self.unknown) else {
             return true;
         };
         std::iter::once(&self.written)
@@ -458,27 +485,36 @@ impl PathForms {
 /// A `deny` or `ask` path pattern as written (`~` expanded) and, when its
 /// fixed directory part is absolute, with that part resolved through
 /// symlinks, so that `/var/x/*` also names `/private/var/x/*` and a home
-/// behind a link still matches. Resolving can only widen a deny.
-fn pattern_forms(pattern: &str, home: Option<&Path>, paths: &PathFacts) -> Vec<String> {
+/// behind a link still matches. Resolving can only widen a deny. `None`
+/// when the pattern cannot be compared (its prefix has an unknown fact, or
+/// `~` names an unknown home): the rule then counts as matching.
+fn pattern_forms(pattern: &str, home: Option<&Path>, paths: &PathFacts) -> Option<Vec<String>> {
+    if pattern.starts_with('~') && !paths.lookup().home_known() {
+        return None;
+    }
     let pattern = expand_home(pattern, home);
     let mut forms = vec![pattern.clone()];
     let (prefix, rest) = match pattern.find(['*', '?']) {
         None => (pattern.as_str(), ""),
         Some(cut) => match pattern[..cut].rfind(['/', '\\']) {
             Some(end) => pattern.split_at(end),
-            None => return forms,
+            None => return Some(forms),
         },
     };
     if !Path::new(prefix).is_absolute() {
-        return forms;
+        return Some(forms);
     }
-    if let Some(real) = resolve(paths, &normalise_path(Path::new(prefix))) {
-        let real = format!("{}{rest}", real.display());
-        if real != pattern {
-            forms.push(real);
+    match resolve(paths, &normalise_path(Path::new(prefix))) {
+        Resolved::Path(real) => {
+            let real = format!("{}{rest}", real.display());
+            if real != pattern {
+                forms.push(real);
+            }
         }
+        Resolved::Gone => {}
+        Resolved::Unknown => return None,
     }
-    forms
+    Some(forms)
 }
 
 /// An `allow` path pattern as written (`~` expanded), and with links in
@@ -493,6 +529,9 @@ fn pattern_forms(pattern: &str, home: Option<&Path>, paths: &PathFacts) -> Vec<S
 /// No other link is followed: a link inside an allowed directory must not
 /// allow what it points to.
 fn allow_pattern_forms(pattern: &str, call: &Call) -> Vec<String> {
+    if pattern.starts_with('~') && !call.paths.lookup().home_known() {
+        return Vec::new();
+    }
     let home = call.home.as_deref();
     let pattern = expand_home(pattern, home);
     let mut forms = vec![pattern.clone()];
@@ -510,7 +549,10 @@ fn allow_pattern_forms(pattern: &str, call: &Call) -> Vec<String> {
         let Ok(rest) = Path::new(&pattern).strip_prefix(base) else {
             continue;
         };
-        let Some(real) = resolve(&call.paths, base).filter(|real| real != base) else {
+        let Some(real) = resolve(&call.paths, base)
+            .path()
+            .filter(|real| real != base)
+        else {
             continue;
         };
         let rest = rest.to_string_lossy();
@@ -581,8 +623,8 @@ fn system_prefix(paths: &PathFacts, path: &Path) -> (PathBuf, usize) {
                 };
                 real = if is_link {
                     match resolve(paths, &next) {
-                        Some(target) => target,
-                        None => break,
+                        Resolved::Path(target) => target,
+                        Resolved::Gone | Resolved::Unknown => break,
                     }
                 } else {
                     next
@@ -678,7 +720,11 @@ fn rule_with_key(
             if *permission == ToolPermission::Allow {
                 forms.hit(&[], &allow_pattern_forms(pattern, call), *permission)
             } else {
-                forms.hit(&pattern_forms(pattern, home, &call.paths), &[], *permission)
+                match pattern_forms(pattern, home, &call.paths) {
+                    Some(patterns) => forms.hit(&patterns, &[], *permission),
+                    // A deny or ask pattern that cannot be compared matches.
+                    None => true,
+                }
             }
         } else {
             glob_match(pattern, subject)

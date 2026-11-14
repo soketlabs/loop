@@ -349,10 +349,18 @@ impl WorkspaceResources {
                                     Ok(mut request) => {
                                         // A locked workspace never starts a
                                         // sandbox (`lock_workspace` sets the
-                                        // mode off), so only path rules apply;
-                                        // the gate checks them through the env.
+                                        // mode off): path rules are the only
+                                        // path policy that can apply here.
+                                        use crate::sandbox_builder::PathPolicyUse;
+                                        let rules = crate::tool_approval::permissions_from_settings(
+                                            &settings.tool_permissions,
+                                        );
                                         request.path_policy =
-                                            crate::sandbox_builder::PathPolicyUse::Rules;
+                                            if crate::permissions::has_path_rules(&rules) {
+                                                PathPolicyUse::Rules
+                                            } else {
+                                                PathPolicyUse::None
+                                            };
                                         builder.start(&self.cwd, &request).await
                                     }
                                     Err(e) => Err(e),

@@ -52,8 +52,15 @@ const FORBIDDEN: &[&str] = &[
     "std::process::Command",
     "tokio::process",
     "Command::new",
+    // Other host facts: the home folder, the temp folder, system calls.
+    "dirs::home_dir",
+    "std::env::temp_dir",
+    "libc::",
     // The gate's host fallbacks: only the functions below may pick them.
-    "PathFacts::host(",
+    "PathFacts::runtime_host(",
+    "host_canonical(",
+    "host_read_link(",
+    "host_lstat(",
     "permissions::workspace_root(",
     "HostExecutionEnv",
 ];
@@ -62,6 +69,7 @@ const FORBIDDEN: &[&str] = &[
 /// `tool_gate.rs` and `tool_approval.rs`: a gate decision uses the
 /// `_with` / `_in` forms with facts from `GatePaths`.
 const HOST_WRAPPERS: &[&str] = &[
+    "Call::new(",
     "Call::resolve(",
     "Call::resolve_in(",
     "search_may_show(",
@@ -73,39 +81,72 @@ const HOST_WRAPPERS: &[&str] = &[
 ];
 
 /// Runtime-side functions that may use host calls: `(file, function,
-/// reason)`. A gate decision on a Workspace path never runs them.
+/// reason)`. A function in an `impl` is named `Type::function`. A gate decision on a Workspace path never runs them.
 const ALLOWED: &[(&str, &str, &str)] = &[
     (
         "permissions/paths.rs",
         "host_canonical",
-        "the Runtime host source of path facts (PathFacts::host); see the callers below",
+        "the Runtime host source of path facts (PathFacts::runtime_host), used only by the functions below",
     ),
     (
         "permissions/paths.rs",
         "host_read_link",
-        "the Runtime host source of path facts (PathFacts::host)",
+        "the Runtime host source of path facts (PathFacts::runtime_host)",
     ),
     (
         "permissions/paths.rs",
         "host_lstat",
-        "the Runtime host source of path facts (PathFacts::host)",
+        "the Runtime host source of path facts (PathFacts::runtime_host)",
     ),
     (
         "permissions/paths.rs",
-        "host",
-        "GatePaths::host: the host env for a gate no Session bound to a Workspace env \
-         (tests, hosts that only gate agents); still read through the env",
+        "GatePaths::host",
+        "the host env for a gate that no Session bound to a Workspace env (tests, hosts that only gate agents); still read through the env",
     ),
     (
         "permissions/paths.rs",
-        "sync_facts",
-        "the sync search filter cannot wait for the env (SearchFilter is sync, in \
-         tools/search.rs): host facts only for a host-namespace env, none for a guest one",
+        "HostLookup::canonical",
+        "PathFacts::runtime_host: the Runtime host facts",
+    ),
+    (
+        "permissions/paths.rs",
+        "HostLookup::read_link",
+        "PathFacts::runtime_host: the Runtime host facts",
+    ),
+    (
+        "permissions/paths.rs",
+        "HostLookup::lstat",
+        "PathFacts::runtime_host: the Runtime host facts",
+    ),
+    (
+        "permissions/paths.rs",
+        "SearchMemo::canonical",
+        "the sync search filter's memo for one search: host facts only for a host-namespace env (GatePaths::sync_facts); SearchFilter is sync (tools/search.rs) and cannot wait for the env",
+    ),
+    (
+        "permissions/paths.rs",
+        "SearchMemo::read_link",
+        "the sync search filter's memo for one search: host facts only for a host-namespace env (GatePaths::sync_facts); SearchFilter is sync (tools/search.rs) and cannot wait for the env",
+    ),
+    (
+        "permissions/paths.rs",
+        "SearchMemo::lstat",
+        "the sync search filter's memo for one search: host facts only for a host-namespace env (GatePaths::sync_facts); SearchFilter is sync (tools/search.rs) and cannot wait for the env",
     ),
     (
         "permissions/policy.rs",
-        "resolve_in",
-        "Call::resolve_in: the sync API (tests, the E3 probe), on the Runtime host",
+        "Call::new",
+        "the sync API (tests, the E3 probe, external agents in agent_gate.rs): Runtime host facts; banned in tool_gate.rs and tool_approval.rs",
+    ),
+    (
+        "permissions/policy.rs",
+        "Call::resolve_in",
+        "the sync API (tests, the E3 probe), on the Runtime host",
+    ),
+    (
+        "permissions/policy.rs",
+        "Call::resolve_with",
+        "reads the HOME variable (not the disk), and only when the facts know the home (host namespace)",
     ),
     (
         "permissions/policy.rs",
@@ -115,8 +156,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     (
         "permissions/policy.rs",
         "workspace_root",
-        "the Runtime's own name for a Session folder (loop-runtime sessions.rs) and bare \
-         gates; a Session's gate uses GatePaths::workspace_root",
+        "the Runtime's own name for a Session folder (loop-runtime sessions.rs) and bare gates; a Session's gate uses GatePaths::workspace_root",
     ),
     (
         "permissions/rules.rs",
@@ -125,23 +165,27 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "permissions/tool_lock.rs",
-        "new",
-        "RuntimeToolLock::new and Confinement::new: the tool lock's root is admitted on the \
-         Runtime host at Runtime start and Session open; the lock needs a host-namespace driver",
+        "RuntimeToolLock::new",
+        "the tool lock's root is admitted on the Runtime host at Runtime start",
     ),
     (
         "permissions/tool_lock.rs",
-        "admit",
+        "RuntimeToolLock::admit",
         "the tool lock admits a Session folder under its host root at Session open",
     ),
     (
         "permissions/tool_lock.rs",
-        "moved",
+        "Confinement::new",
+        "the folder and root resolve on the Runtime host at Session open; the lock needs a host-namespace driver",
+    ),
+    (
+        "permissions/tool_lock.rs",
+        "Confinement::moved",
         "the sync API on the Runtime host; the gate uses moved_in with env facts",
     ),
     (
         "permissions/tool_lock.rs",
-        "allows",
+        "Confinement::allows",
         "the sync API on the Runtime host; the gate uses allows_in with env facts",
     ),
     (
@@ -152,8 +196,12 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     (
         "permissions/tool_lock.rs",
         "skill_runs_code",
-        "skill folders are checked at Session open under the tool lock, which needs a \
-         host-namespace driver; global skills are Runtime files",
+        "skill folders are checked at Session open under the tool lock, which needs a host-namespace driver; global skills are Runtime files",
+    ),
+    (
+        "permissions/decision.rs",
+        "local_user",
+        "the OS user of the Runtime process, for decision records",
     ),
     (
         "permissions/decision.rs",
@@ -177,24 +225,38 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "tool_gate.rs",
-        "new_for_workspace",
-        "a gate without a Session env (tests, hosts that only gate agents): its folder is a \
-         Runtime host folder",
+        "ToolGate::new_for_workspace",
+        "a gate without a Session env (tests, hosts that only gate agents): its folder is a Runtime host folder",
     ),
     (
         "tool_gate.rs",
-        "install",
+        "ToolGate::install",
         "fallback git root for a gate without a Session env (host folder of the harness)",
     ),
     (
         "tool_gate.rs",
-        "workspace",
+        "ToolGate::available",
+        "no path argument (Null args): no path fact is read",
+    ),
+    (
+        "tool_gate.rs",
+        "ToolGate::record",
+        "no path argument (Null args): only the kind and the Capability of the call",
+    ),
+    (
+        "tool_gate.rs",
+        "ToolGate::workspace",
         "fallback to the process cwd for a gate without a folder (not a file-system read)",
     ),
     (
         "tool_gate.rs",
-        "agent_call_denied_by",
+        "ToolGate::agent_call_denied_by",
         "external agents run on the Runtime host, in their own host folder",
+    ),
+    (
+        "tool_gate.rs",
+        "ToolGate::search_filter",
+        "reads the HOME variable (not the disk); a guest Session's filter has no facts, so `~` rules fail closed there",
     ),
     (
         "tool_approval.rs",
@@ -230,6 +292,8 @@ fn gate_files() -> (PathBuf, Vec<PathBuf>) {
     sources(&src.join("permissions"), &mut files);
     files.push(src.join("tool_gate.rs"));
     files.push(src.join("tool_approval.rs"));
+    // External agents' calls pass the same gate.
+    files.push(src.join("agent_gate.rs"));
     (src, files)
 }
 
@@ -243,6 +307,13 @@ fn violations(code: &str, gate_file: bool) -> Vec<(usize, String)> {
             if line.contains(needle) {
                 found.push((n + 1, (*needle).to_string()));
             }
+        }
+        // The `nix` crate (not `unix::`).
+        if line
+            .match_indices("nix::")
+            .any(|(at, _)| !line[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_'))
+        {
+            found.push((n + 1, "nix::".into()));
         }
         let trimmed = line.trim_start();
         if (trimmed.starts_with("use std::") || trimmed.starts_with("use tokio::"))
@@ -336,8 +407,12 @@ fn the_guard_catches_a_host_call_in_a_gate_function() {
         ["decide"]
     );
     assert_eq!(
-        found("impl X {\n    fn a(&self) {}\n    fn b(&self) { let _ = PathFacts::host(); }\n}\n"),
-        ["b"]
+        found("impl X {\n    fn a(&self) {}\n    fn b(&self) { let _ = PathFacts::runtime_host(); }\n}\n"),
+        ["X::b"]
+    );
+    assert_eq!(
+        found("impl<T: Send> Tr for a::Y<T> where T: Sync {\n    fn c() { let _ = dirs::home_dir(); }\n}\n"),
+        ["Y::c"]
     );
     assert_eq!(
         found("fn f() {\n    let c = Call::resolve_in(t, k, a, w, c);\n}\n"),

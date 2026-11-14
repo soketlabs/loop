@@ -126,9 +126,10 @@ pub fn parse_local_sandbox_flags(args: &[&str]) -> Result<LocalSandboxFlags, Str
 }
 
 /// Which path policy the Session uses. Path rules check paths through the
-/// Session's Workspace env (task C2b), so a guest-namespace driver can
-/// serve them. The tool lock cannot: its root is a Runtime host folder,
-/// admitted on the host, and its second layer confines host reads.
+/// Session's Workspace env (task C2b), but some of their checks still use
+/// host forms, so a guest-namespace driver is refused with them for now.
+/// The tool lock cannot work with one at all: its root is a Runtime host
+/// folder, admitted on the host, and its second layer confines host reads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PathPolicyUse {
     /// Not stated: treated as the tool lock.
@@ -136,7 +137,8 @@ pub enum PathPolicyUse {
     Unknown,
     /// No path rules and no tool lock.
     None,
-    /// Path rules (or none), and no tool lock.
+    /// Path rules, and no tool lock. Refused with a guest driver until the
+    /// guest leftovers of task C2b are done.
     Rules,
     /// The tool lock applies.
     ToolLock,
@@ -417,8 +419,9 @@ impl std::error::Error for SandboxBuildError {}
 ///
 /// - A driver whose paths are guest paths is refused with the tool lock (or
 ///   when the caller does not say): the lock's root and its confined reads
-///   are Runtime host paths. Path rules are fine: the gate checks them
-///   through the Workspace env (task C2b).
+///   are Runtime host paths. It is also refused with path rules until the
+///   guest leftovers of task C2b are done (`~`, subagent rule bases, the
+///   search filter).
 /// - For kinds other than `local` (hosted and remote use), every
 ///   restriction the user set must be enforced. `local` keeps today's
 ///   behaviour (for example Linux does not enforce `sandbox.network` yet).
@@ -443,6 +446,16 @@ fn check_driver(
         return Err(unmet(
             "the tool lock",
             "its root and its confined reads are Runtime host paths, and this driver's paths are not host paths",
+        ));
+    }
+    // The gate checks path rules through the env (C2b), but `~` rules,
+    // subagent rule bases and the search filter still use host forms
+    // (docs/design/workspace-driver.md section 6). Refused until those are
+    // done.
+    if caps.path_namespace == PathNamespace::Guest && request.path_policy == PathPolicyUse::Rules {
+        return Err(unmet(
+            "path permission rules",
+            "some of their checks still use Runtime host paths, and this driver's paths are not host paths",
         ));
     }
     if kind == LOCAL_SANDBOX_KIND {
@@ -722,16 +735,29 @@ mod tests {
                 "{policy:?}"
             );
         }
-        // Path rules go through the env (C2b): a guest driver serves them.
-        for policy in [PathPolicyUse::None, PathPolicyUse::Rules] {
-            let request = SandboxRequest {
-                path_policy: policy,
+        // Path rules: refused until the guest leftovers are done (section 6).
+        let err = start(
+            caps_builder("local", guest_caps()),
+            SandboxRequest {
+                path_policy: PathPolicyUse::Rules,
                 ..Default::default()
-            };
-            start(caps_builder("local", guest_caps()), request)
-                .await
-                .unwrap();
-        }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the `fake` workspace driver does not meet path permission rules: some of their \
+             checks still use Runtime host paths, and this driver's paths are not host paths"
+        );
+        // No path policy at all: a guest driver is fine.
+        let request = SandboxRequest {
+            path_policy: PathPolicyUse::None,
+            ..Default::default()
+        };
+        start(caps_builder("local", guest_caps()), request)
+            .await
+            .unwrap();
         let no_policy = SandboxRequest {
             path_policy: PathPolicyUse::None,
             ..Default::default()
