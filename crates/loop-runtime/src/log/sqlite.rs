@@ -827,22 +827,21 @@ const INSERT_TURN_SQL: &str = "INSERT OR IGNORE INTO tenant_session_turns \
 /// add, and the first parent and the first owner stay. In `DO UPDATE`,
 /// a bare column is the row's value before the update.
 const UPSERT_SUMMARY_SQL: &str = "INSERT INTO tenant_session_summary \
-    (tenant,session_key,last_seq,last_revision,last_activity_ms,prompts_sent,turn_count,parent,\
-    owner_seq,owner_kind,owner_issuer,owner_id,owner_via,owner_actor) \
-    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?10,?11,?12,?13,?14,?15) \
+    (tenant,session_key,last_seq,last_revision,last_activity_ms,prompts_sent,turn_count,parent) \
+    VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
     ON CONFLICT(tenant,session_key) DO UPDATE SET \
     last_seq=MAX(last_seq,excluded.last_seq), \
     last_revision=CASE WHEN ?9 THEN excluded.last_revision ELSE last_revision END, \
     last_activity_ms=MAX(last_activity_ms,excluded.last_activity_ms), \
     prompts_sent=prompts_sent+excluded.prompts_sent, \
     turn_count=turn_count+excluded.turn_count, \
-    parent=COALESCE(parent,excluded.parent), \
-    owner_kind=CASE WHEN owner_seq IS NULL THEN excluded.owner_kind ELSE owner_kind END, \
-    owner_issuer=CASE WHEN owner_seq IS NULL THEN excluded.owner_issuer ELSE owner_issuer END, \
-    owner_id=CASE WHEN owner_seq IS NULL THEN excluded.owner_id ELSE owner_id END, \
-    owner_via=CASE WHEN owner_seq IS NULL THEN excluded.owner_via ELSE owner_via END, \
-    owner_actor=CASE WHEN owner_seq IS NULL THEN excluded.owner_actor ELSE owner_actor END, \
-    owner_seq=COALESCE(owner_seq,excluded.owner_seq)";
+    parent=COALESCE(parent,excluded.parent)";
+/// Set the owner of record once: only a group with a creating
+/// `session_opened` runs it, after the upsert, so the common commit keeps
+/// the upsert of step B2.
+const SET_OWNER_SQL: &str = "UPDATE tenant_session_summary SET owner_seq=?3, owner_kind=?4, \
+    owner_issuer=?5, owner_id=?6, owner_via=?7, owner_actor=?8 \
+    WHERE tenant=?1 AND session_key=?2 AND owner_seq IS NULL";
 
 /// What the projection needs of stored rows, read from the columns and three
 /// JSON paths; the payload is never decoded. The text test `instr` keeps
@@ -1171,7 +1170,6 @@ fn apply<'a>(conn: &Connection, rows: impl Iterator<Item = &'a ProjectionRow>) -
             ])? as u64;
         }
         let summary = group.summary;
-        let owner = summary.owner.as_ref();
         upsert.execute(params![
             tenant.as_str(),
             session.as_str(),
@@ -1182,13 +1180,19 @@ fn apply<'a>(conn: &Connection, rows: impl Iterator<Item = &'a ProjectionRow>) -
             sql_seq(new_turns)?,
             summary.parent.as_ref().map(SessionKey::as_str),
             group.revised,
-            group.owner_seq.map(sql_seq).transpose()?,
-            owner.map(|o| o.principal.kind().as_str().to_owned()),
-            owner.map(|o| o.principal.issuer().to_owned()),
-            owner.map(|o| o.principal.id().to_owned()),
-            owner.and_then(|o| o.via.as_ref().map(|v| v.as_str().to_owned())),
-            owner.and_then(|o| o.actor.clone()),
         ])?;
+        if let (Some(owner_seq), Some(owner)) = (group.owner_seq, summary.owner.as_ref()) {
+            conn.prepare_cached(SET_OWNER_SQL)?.execute(params![
+                tenant.as_str(),
+                session.as_str(),
+                sql_seq(owner_seq)?,
+                owner.principal.kind().as_str(),
+                owner.principal.issuer(),
+                owner.principal.id(),
+                owner.via.as_ref().map(Via::as_str),
+                owner.actor.as_deref(),
+            ])?;
+        }
     }
     Ok(())
 }
