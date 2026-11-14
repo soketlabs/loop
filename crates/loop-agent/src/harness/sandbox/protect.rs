@@ -649,15 +649,49 @@ mod locks {
     impl ProjectLocks {
         /// Take the plan lock and a shared run lock. Alone, first remove the
         /// unchanged placeholders that an earlier sandbox left (a crash).
-        pub(super) fn acquire(project: &Path, agent: Option<&Path>) -> Result<Self, SandboxError> {
+        /// The base path of `project`'s lock files.
+        fn base(project: &Path, agent: Option<&Path>) -> Result<PathBuf, SandboxError> {
             use std::os::unix::ffi::OsStrExt;
             // FNV-1a: stable across builds.
             let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
             for byte in project.as_os_str().as_bytes() {
                 hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
             }
-            let dir = lock_dir(agent)?;
-            let base = dir.join(format!("{hash:016x}"));
+            Ok(lock_dir(agent)?.join(format!("{hash:016x}")))
+        }
+
+        /// Wait until no sandbox holds `project`'s run lock (at most
+        /// `limit`). A closed descriptor releases its lock only when no
+        /// process holds a copy: a process that this test process starts at
+        /// the same moment holds one until its exec. A real crash is a dead
+        /// process and holds nothing.
+        #[cfg(test)]
+        pub(super) fn wait_until_free(
+            project: &Path,
+            agent: Option<&Path>,
+            limit: std::time::Duration,
+        ) -> bool {
+            let Ok(run_path) = Self::base(project, agent).map(|b| b.with_extension("run")) else {
+                return false;
+            };
+            let Ok(run) = open(&run_path) else {
+                return false;
+            };
+            let deadline = std::time::Instant::now() + limit;
+            loop {
+                if flock(&run, FlockOperation::NonBlockingLockExclusive).is_ok() {
+                    let _ = flock(&run, FlockOperation::Unlock);
+                    return true;
+                }
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        pub(super) fn acquire(project: &Path, agent: Option<&Path>) -> Result<Self, SandboxError> {
+            let base = Self::base(project, agent)?;
             let plan_path = base.with_extension("plan");
             let run_path = base.with_extension("run");
             let plan = open(&plan_path)?;
@@ -955,6 +989,13 @@ mod tests {
         let crashed = plan(&project, None).unwrap();
         drop(crashed);
         assert!(project.join(".git").is_dir());
+        // The crashed holder is gone once no process holds a copy of its
+        // descriptor (another test may start a process right now).
+        assert!(locks::ProjectLocks::wait_until_free(
+            &project,
+            None,
+            std::time::Duration::from_secs(10)
+        ));
         let next = plan(&project, None).unwrap();
         assert!(
             !next.stub_paths().is_empty(),
