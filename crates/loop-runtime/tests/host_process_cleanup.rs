@@ -1,6 +1,7 @@
 //! A Runtime ends the processes of its host workspaces: at shutdown, when
-//! the last Session of a folder closes or is unloaded, and when
-//! `workspace/reload` replaces the workspace.
+//! the last Session of a folder is closed, and when `workspace/reload`
+//! replaces the workspace. Unloading a Session to make room never does: the
+//! last Session of a folder with a running process is not unloaded.
 //!
 //! This test binary starts real processes, so it has its own binary. Every
 //! test holds `PROCESSES`: the shutdown of a Runtime kills the host
@@ -18,7 +19,7 @@ use loop_agent::harness::sandbox::{
     WorkspaceSpec,
 };
 use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
-use loop_protocol::{admin::ReloadParams, AgentBackend, SessionRef, SessionSpec};
+use loop_protocol::{admin::ReloadParams, AgentBackend, BackendError, SessionRef, SessionSpec};
 use loop_runtime::{log::MemoryEventLog, Runtime, RuntimeLimits};
 use loop_wire::RuntimeAdmin;
 
@@ -246,10 +247,11 @@ async fn shutdown_if_empty_kills_what_a_closed_workspace_left() {
     assert_eq!(workspace.status(), SandboxStatus::Stopped);
 }
 
-/// The final net: a host process of a Workspace the Runtime does not know
-/// (and that nobody drops or destroys) is killed at shutdown too.
+/// A Runtime's shutdown ends the processes of its own workspaces only: the
+/// host process of a Workspace that another owner made is left alone (the
+/// process-wide kill is for the exit of the daemon process).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_kills_processes_of_workspaces_it_never_loaded() {
+async fn shutdown_leaves_processes_of_workspaces_it_did_not_make() {
     let _only = PROCESSES.lock().await;
     let env = Env::new();
     let rt = env.runtime(RuntimeLimits::default()).await;
@@ -262,10 +264,16 @@ async fn shutdown_kills_processes_of_workspaces_it_never_loaded() {
         .await
         .unwrap();
     stray.start().await.unwrap();
-    let process = start(&stray, &env.out, "stray").await;
+    let process = start_for(&stray, &env.out, "stray", LIFE * 4).await;
     rt.shutdown().await;
-    process.assert_killed("final net").await;
-    // Kept alive to here: the net killed it, not a drop.
+    process.assert_running("shutdown of another owner's Runtime");
+    // The daemon's exit path: the process-wide kill ends it.
+    tokio::task::spawn_blocking(|| {
+        loop_agent::harness::sandbox::kill_all_host_processes(Duration::from_secs(3))
+    })
+    .await
+    .unwrap();
+    process.assert_killed("process-wide kill").await;
     drop(stray);
 }
 
@@ -298,23 +306,86 @@ async fn closing_the_last_session_kills_its_processes_and_the_folder_restarts() 
     again.assert_killed("shutdown").await;
 }
 
-/// A Session unloaded to make room is the last of its folder: its
-/// processes end.
+/// Wait until no process of `workspace` runs (the leader is reaped).
+async fn wait_idle(workspace: &Arc<dyn Workspace>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while workspace
+        .list_processes()
+        .await
+        .unwrap()
+        .iter()
+        .any(|p| p.exit.is_none())
+    {
+        assert!(Instant::now() < deadline, "the process did not end");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Unload is a memory decision: the last Session of a folder with a running
+/// process is not unloaded. Another idle Session goes instead; with none to
+/// unload the open gets `Busy`; once the process has ended the Session can
+/// be unloaded again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unloading_the_last_session_kills_its_processes() {
+async fn unloading_never_kills_a_process_and_pins_its_session() {
     let _only = PROCESSES.lock().await;
     let env = Env::new();
+
+    // Room for two: the Session with the process stays, the idle one goes.
+    let rt = env
+        .runtime(RuntimeLimits {
+            max_sessions: 2,
+            max_active_turns: 2,
+        })
+        .await;
+    let pinned = open(&rt, &env.ws1).await;
+    let idle = open(&rt, &env.ws2).await;
+    let process = start_for(&host(&rt, &env.ws1), &env.out, "pinned", LIFE * 4).await;
+    let third = open(&rt, &env.ws2).await;
+    assert!(
+        matches!(
+            rt.close(&idle.key, false).await,
+            Err(BackendError::SessionNotFound(_))
+        ),
+        "the idle Session was unloaded"
+    );
+    process.assert_running("another Session unloaded");
+    assert_eq!(host(&rt, &env.ws1).status(), SandboxStatus::Ready);
+    rt.close(&third.key, false).await.unwrap();
+    // An explicit close of the last Session of the folder does stop it.
+    rt.close(&pinned.key, false).await.unwrap();
+    process.assert_killed("explicit close").await;
+    rt.shutdown().await;
+
+    // Room for one: nothing can be unloaded, so the open is refused.
     let rt = env
         .runtime(RuntimeLimits {
             max_sessions: 1,
             max_active_turns: 1,
         })
         .await;
-    open(&rt, &env.ws1).await;
-    let process = start(&host(&rt, &env.ws1), &env.out, "unloaded").await;
-    // The limit is one: the second Session unloads the first.
+    let pinned = open(&rt, &env.ws1).await;
+    let workspace = host(&rt, &env.ws1);
+    let process = start(&workspace, &env.out, "full").await;
+    let refused = rt
+        .new_session(SessionSpec {
+            cwd: Some(env.ws2.clone()),
+            ..Default::default()
+        })
+        .await;
+    assert!(matches!(refused, Err(BackendError::Busy)), "{refused:?}");
+    process.assert_running("the open was refused");
+
+    // The process ended on its own: the Session is unloadable again.
+    wait_idle(&workspace).await;
+    assert!(process.marker.exists(), "the process ran to its end");
     open(&rt, &env.ws2).await;
-    process.assert_killed("unloaded").await;
+    assert!(
+        matches!(
+            rt.close(&pinned.key, false).await,
+            Err(BackendError::SessionNotFound(_))
+        ),
+        "the Session was unloaded once nothing ran"
+    );
     rt.shutdown().await;
 }
 
