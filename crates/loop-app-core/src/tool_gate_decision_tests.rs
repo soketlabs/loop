@@ -892,7 +892,7 @@ mod unreadable_for_local_users {
                 "env FOO=1 cargo test",
                 "remove `env` and run the inner command directly",
             ),
-            ("FOO=1 cargo test", "set the variable in its own part first"),
+            ("FOO=1 cargo test", "leave the assignment out"),
             (
                 "sh -c 'cargo test'",
                 "remove `sh` and run the inner command directly",
@@ -909,7 +909,7 @@ mod unreadable_for_local_users {
         // The advice works: the plain forms run.
         for command in [
             "cargo test",
-            "export FOO=1; cargo test",
+            "export FOO=1",
             "cd src && ls",
             "cat a.txt b.txt",
         ] {
@@ -935,6 +935,8 @@ mod unreadable_for_local_users {
             "find . \\( -name a -o -name b \\)",
             "wc -l < file",
             "git diff HEAD~1 -- src",
+            "ls ~",
+            "cat ~/notes.txt",
             "echo \"${HOME}/x\"",
             "rg -n 'fn main' src",
             "find . -name '*.rs'",
@@ -954,9 +956,9 @@ mod unreadable_for_local_users {
             "echo $'a\\tb'",
             "tree -ao out.txt",
             "git diff --ext-diff",
-            "ls ~",
-            "cat ~/notes.txt",
             "ls # list",
+            "ls ~user",
+            "find ~ -name x",
             "ls &",
             "echo $1",
             "echo \"$@\"",
@@ -976,5 +978,99 @@ mod unreadable_for_local_users {
         ] {
             assert!(!read_only_command(command), "{command:?}");
         }
+    }
+}
+
+/// Programs started through an option or an exported variable: with a bash
+/// deny pattern they are refused with advice; with none, nothing changes.
+mod programs_through_options {
+    use super::*;
+
+    const PROVED: &[(&str, &str)] = &[
+        (
+            "export GIT_EXTERNAL_DIFF=touch; git diff",
+            "run the export and the command as two separate commands",
+        ),
+        ("find . -exec touch P \\;", "remove the option `-exec`"),
+        ("git -c alias.x='!touch P' x", "remove the option `-c`"),
+        (
+            "export 'BASH_FUNC_ls%%=() { touch P; }'",
+            "run the commands without `export`",
+        ),
+    ];
+
+    #[tokio::test]
+    async fn they_are_refused_under_a_deny_pattern() {
+        let (g, c) = gate(FullAccess, &[("bash(touch*)", "deny")], vec![]);
+        for (command, advice) in PROVED {
+            let refused = g.check_user_command(command, None, None).await.unwrap_err();
+            assert!(refused.0.contains(advice), "{command:?}: {refused}");
+            assert_eq!(c.take()[0].by, DecidedBy::Unreadable, "{command:?}");
+        }
+        for command in [
+            "rg --pre=touch x",
+            "sort --compress-program=touch a",
+            "tar -I touch -cf a.tar b",
+            "ssh -o ProxyCommand=touch host",
+            "man -P touch ls",
+            "find . $X",
+            "git $SUB",
+            "rg x *.rs",
+        ] {
+            assert!(
+                g.check_user_command(command, None, None).await.is_err(),
+                "{command}"
+            );
+        }
+        // These stay readable.
+        for command in [
+            "git log -c",
+            "git diff",
+            "find . -name '*.rs'",
+            "export FOO=1",
+        ] {
+            assert!(
+                g.check_user_command(command, None, None).await.is_ok(),
+                "{command}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn with_no_deny_pattern_nothing_changes() {
+        for (command, _) in PROVED {
+            assert!(!crate::permissions::read_only_command(command), "{command}");
+            let (g, _c) = gate(FullAccess, &[], vec![]);
+            assert_eq!(
+                g.decide("bash", &json!({ "command": command })).await,
+                Decision::Allow
+            );
+            let (g, _c) = gate(Ask, &[], vec![]);
+            assert_eq!(
+                g.decide("bash", &json!({ "command": command })).await,
+                Decision::Ask
+            );
+        }
+    }
+
+    /// A pattern with `~` matches the text as written, as before; the
+    /// shell fills the home directory in later.
+    #[tokio::test]
+    async fn a_tilde_pattern_matches_the_text_as_written() {
+        let (g, _c) = gate(FullAccess, &[("bash(cat ~/.ssh/*)", "deny")], vec![]);
+        assert!(g
+            .check_user_command("cat ~/.ssh/id_rsa", None, None)
+            .await
+            .is_err());
+        assert!(g
+            .check_user_command("cat ~/notes.txt", None, None)
+            .await
+            .is_ok());
+        let (g, _c) = gate(ReadOnly, &[], vec![]);
+        assert!(g.check_user_command("ls ~", None, None).await.is_ok());
+        assert!(g
+            .check_user_command("cat ~/notes.txt", None, None)
+            .await
+            .is_ok());
     }
 }

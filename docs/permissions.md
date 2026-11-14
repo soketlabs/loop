@@ -141,10 +141,12 @@ Loop reads a `bash` command with a small grammar that it models exactly. A comma
 A readable command is one or more simple commands separated by `|`, `||`, `&&`, `;` or newlines. A simple command is:
 
 - a **program** in plain text: letters, digits and `_ . / + -` only (no quotes, no `$`, no globs);
-- **arguments** made of: plain text from letters, digits and `_ . / + - = : , @ %`; the glob characters `* ? [ ]`; `~` inside a word (`HEAD~1`); a backslash before one printable character; `'single quotes'` and `"double quotes"` on one line (in double quotes no backtick or `!`); and `$NAME` or `${NAME}`;
+- **arguments** made of: plain text from letters, digits and `_ . / + - = : , @ %`; the glob characters `* ? [ ]`; `~` or `~/…` at the start of an argument (the home directory) and `~` inside a word (`HEAD~1`); a backslash before one printable character; `'single quotes'` and `"double quotes"` on one line (in double quotes no backtick or `!`); and `$NAME` or `${NAME}`;
 - **redirects**: `<`, `>`, `>>`, `>|`, `&>`, `&>>` with a file name, and `2>&1`, `>&2`, `>&-`.
 
-Anything else is unreadable, for example: a comment (`#`), `(`, `)`, `{`, `}`, backticks, `$(…)`, `$[…]`, `${x:…}` and every other `$` form, `~` at the start of a word, `!`, a lone `&`, here-documents, a quoted newline, unbalanced quotes, control characters, non-ASCII text outside quotes; shell keywords (`if`, `for`, `while`, …); an assignment before the program (`X=1 cmd`); programs that run another program (`env`, `command`, `exec`, `eval`, `source`, `.`, `time`, `nohup`, `nice`, `timeout`, `xargs`, `sudo`, shells such as `sh` and `bash`, …); built-ins that change how later commands run (`alias`, `hash`, `trap`, `set`, `read`, `export PATH=…`, `printf -v`, …); and `python* -c`, `node -e`, `perl -e`, `ruby -e`.
+Anything else is unreadable, for example: a comment (`#`), `(`, `)`, `{`, `}`, backticks, `$(…)`, `$[…]`, `${x:…}` and every other `$` form, `~user`, `~+`, `~-` and a `~` after `=` or `:`, `!`, a lone `&`, here-documents, a quoted newline, unbalanced quotes, control characters, non-ASCII text outside quotes; shell keywords (`if`, `for`, `while`, …); an assignment before the program (`X=1 cmd`); programs that run another program (`env`, `command`, `exec`, `eval`, `source`, `.`, `time`, `nohup`, `nice`, `timeout`, `xargs`, `sudo`, shells such as `sh` and `bash`, …); built-ins that change how later commands run (`alias`, `hash`, `trap`, `set`, `read`, `printf -v`, …); an `export`, `declare`, `typeset`, `readonly` or `local` followed by another command (an exported variable such as `GIT_EXTERNAL_DIFF` or `BASH_FUNC_…` can change what the later command runs), or of a name that is not `[A-Za-z_][A-Za-z0-9_]*`, of `PATH`, `IFS`, `BASH_ENV` and similar, or with an option; `python* -c`, `node -e`, `perl -e`, `ruby -e`, and `awk`, `sed`, `less` and `more`, which run code or commands from their text; options that make a program run another program (`find -exec`/`-execdir`/`-ok`/`-okdir`, `git -c`/`-C`/`--config-env`/`--exec-path` before the subcommand and `--upload-pack`/`--receive-pack`/`--ext-diff`, `rg --pre`/`--pre-glob`/`--hostname-bin`, `sort --compress-program`, `tar -I`/`-F`/`--to-command`/`--use-compress-program`/`--checkpoint-action`/`--info-script`/`--new-volume-script`, `ssh`/`scp`/`sftp -o`/`-F`, `man -P`/`--pager`/`-H`); and a variable or glob passed to one of these programs (`find . $X`, `rg x *.rs`), because it could become such an option.
+
+Each tool call and each typed command starts a new shell, so an `export` alone changes nothing that runs after it. It stays readable, and it is never read-only.
 
 For an unreadable command:
 
@@ -155,9 +157,11 @@ For an unreadable command:
 
 Deny and ask patterns match each simple command as written, with quotes and escapes removed, and with the program reduced to its last path part and lower-cased (`/usr/bin/touch` and `TOUCH` match `bash(touch*)`).
 
-A read-only command must also be readable. An argument the shell can change (a variable or an unquoted glob) makes `find`, `sort`, `file`, `rg`, `tree`, `uniq` and `git` not read-only, because it could become an option that writes or runs a program.
+A read-only command must also be readable. An argument the shell can change (a variable, an unquoted glob or a leading `~`) makes `find`, `sort`, `file`, `rg`, `tree`, `uniq` and `git` not read-only, because it could become an option that writes or runs a program.
 
-A test runs a seeded corpus of command strings under `sh`, `bash` and `dash`: no command that Loop calls read-only writes a file, and a readable command starts only the programs Loop reports (`crates/loop-app-core/tests/shell_differential.rs`).
+A pattern with `~` matches the text as written: `bash(cat ~/.ssh/*)` refuses `cat ~/.ssh/id_rsa`. The shell fills in the home directory after Loop checks the command, so `cat $HOME/.ssh/id_rsa` does not match that pattern; command patterns stay advisory.
+
+A test runs a seeded corpus of command strings under `sh`, `bash` and `dash`: no command that Loop calls read-only changes a file, and every readable command starts only the programs Loop reports. The corpus includes exports followed by a use, option injection through variables and globs, and the wrapper and option forms above; a self-check proves the test fails when a wrapper is missing from Loop's list (`crates/loop-app-core/tests/shell_differential.rs`).
 
 The `bash` block list reads a readable command the same way. It cuts an unreadable command at every separator and bracket and checks each piece, so `rm -rf /` after a comment or a `$'…'` is still refused.
 

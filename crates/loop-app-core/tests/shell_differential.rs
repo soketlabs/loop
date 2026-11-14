@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use loop_agent::harness::tools::shell::parse;
+use loop_agent::harness::tools::shell::{parse, parse_with, Simple, Unreadable, WRAPPERS};
 use loop_app_core::permissions::read_only_command;
 
 /// Programs Loop may call read-only; each runs for real through a logging
@@ -66,6 +66,18 @@ const ARGS: &[&str] = &[
     "\"a\\.b\"",
     "x\\ y",
     "-name '*.rs'",
+    "~",
+    "~/x",
+    // Option injection: `$X` holds `-exec touch M ;`, `$Y` holds `-o`, and
+    // `*` matches the files `-o` and `zz` in the working folder.
+    "$X",
+    "$Y",
+    "*",
+    // Options that run a program.
+    "-exec touch M \\;",
+    "--pre=touch",
+    "--compress-program=touch",
+    "-c alias.x='!touch M'",
 ];
 
 /// Fragments the reader must not be fooled by.
@@ -101,6 +113,23 @@ const HOSTILE: &[&str] = &[
 ];
 
 const SEPARATORS: &[&str] = &[" | ", " && ", " || ", "; ", "\n"];
+
+/// Whole commands: an export then a use, and wrapper forms.
+const WHOLE: &[&str] = &[
+    "export GIT_EXTERNAL_DIFF=touch; git diff",
+    "export FOO=1; ls",
+    "export FOO=1",
+    "export 'BASH_FUNC_ls%%=() { touch M; }'; ls",
+    "find . -exec touch M \\;",
+    "git -c alias.x='!touch M' x",
+    "rg --pre=touch x a.txt",
+    "env touch M",
+    "env FOO=1 touch M",
+    "xargs touch M",
+    "nohup touch M",
+    "find . $X",
+    "sort *",
+];
 
 /// The bypass strings of review rounds 1 and 2.
 const FIXED: &[&str] = &[
@@ -139,7 +168,15 @@ impl Rng {
 fn corpus(seed: u64, count: usize) -> Vec<String> {
     let mut rng = Rng(seed);
     let mut out: Vec<String> = FIXED.iter().map(|s| s.to_string()).collect();
+    out.extend(WHOLE.iter().map(|s| s.to_string()));
     while out.len() < count {
+        if rng.below(20) == 0 {
+            let mut text = rng.pick(WHOLE).to_owned();
+            text.push_str(rng.pick(SEPARATORS));
+            text.push_str(rng.pick(READERS));
+            out.push(text);
+            continue;
+        }
         let mut text = String::new();
         for i in 0..1 + rng.below(3) {
             if i > 0 {
@@ -200,12 +237,20 @@ fn stand_ins(dir: &Path) -> Vec<String> {
         }
     }
     for program in WRITERS {
-        write(
-            program,
-            format!(
+        let body = match *program {
+            // Wrappers run what they are given, as the real ones do, so a
+            // program they start shows in the log.
+            "env" => format!(
+                "#!/bin/sh\necho env >> \"$LOOP_DIFF_LOG\"\nwhile case \"$1\" in *=*) true;; *) false;; esac; do shift; done\n[ $# -gt 0 ] && exec \"$@\"\n"
+            ),
+            "xargs" | "nohup" => format!(
+                "#!/bin/sh\necho {program} >> \"$LOOP_DIFF_LOG\"\n[ $# -gt 0 ] && exec \"$@\"\n"
+            ),
+            _ => format!(
                 "#!/bin/sh\necho {program} >> \"$LOOP_DIFF_LOG\"\n: > \"$LOOP_DIFF_MARK/{program}\"\n"
             ),
-        );
+        };
+        write(program, body);
     }
     readers
 }
@@ -223,7 +268,19 @@ fn shells() -> Vec<&'static str> {
 struct Ran {
     started: Vec<String>,
     markers: Vec<String>,
-    files: Vec<String>,
+    /// The working folder changed (a file added, removed or rewritten).
+    changed: bool,
+}
+
+/// The working folder's files and their contents.
+fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    names(dir)
+        .into_iter()
+        .map(|name| {
+            let content = std::fs::read(dir.join(&name)).unwrap_or_default();
+            (name, content)
+        })
+        .collect()
 }
 
 fn names(dir: &Path) -> Vec<String> {
@@ -247,6 +304,10 @@ fn run(shell: &str, command: &str, bin: &Path) -> Ran {
     }
     let log = root.path().join("log");
     std::fs::write(&log, "").unwrap();
+    // Files a glob can turn into options.
+    std::fs::write(work.join("-o"), "").unwrap();
+    std::fs::write(work.join("zz"), "z\n").unwrap();
+    let before = snapshot(&work);
     let mut child = Command::new(shell)
         .arg("-c")
         .arg(command)
@@ -256,6 +317,8 @@ fn run(shell: &str, command: &str, bin: &Path) -> Ran {
         .env("HOME", &home)
         .env("LOOP_DIFF_LOG", &log)
         .env("LOOP_DIFF_MARK", &marks)
+        .env("X", "-exec touch M ;")
+        .env("Y", "-o")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -278,7 +341,7 @@ fn run(shell: &str, command: &str, bin: &Path) -> Ran {
     Ran {
         started,
         markers: names(&marks),
-        files: names(&work),
+        changed: snapshot(&work) != before,
     }
 }
 
@@ -291,17 +354,23 @@ fn counts(names: impl IntoIterator<Item = String>) -> BTreeMap<String, usize> {
     out
 }
 
-fn differential(count: usize) {
+/// Run `corpus` with `classify` as the reader; every disagreement with a
+/// real shell, as text. Returns the failures and the counts of readable
+/// and read-only strings.
+fn check(
+    corpus: &[String],
+    classify: &dyn Fn(&str) -> Result<Vec<Simple>, Unreadable>,
+) -> (Vec<String>, usize, usize) {
     let bin = tempfile::tempdir().unwrap();
     let readers = stand_ins(bin.path());
     let stubbed = |name: &str| readers.iter().any(|r| r == name) || WRITERS.contains(&name);
     let shells = shells();
-    let (mut read_only, mut readable) = (0, 0);
-    for command in corpus(20261113, count) {
-        let parsed = parse(&command);
-        let is_read_only = read_only_command(&command);
-        if is_read_only {
-            assert!(parsed.is_ok(), "read-only but unreadable: {command:?}");
+    let (mut failures, mut read_only, mut readable) = (Vec::new(), 0, 0);
+    for command in corpus {
+        let parsed = classify(command);
+        let is_read_only = read_only_command(command);
+        if is_read_only && parsed.is_err() {
+            failures.push(format!("read-only but unreadable: {command:?}"));
         }
         let Ok(commands) = parsed else {
             continue;
@@ -318,36 +387,67 @@ fn differential(count: usize) {
         let exact = !command.contains("&&")
             && !command.contains("||")
             && commands.iter().all(|c| c.redirects.is_empty());
+        // Every readable string, read-only or not.
         for shell in &shells {
-            let ran = run(shell, &command, bin.path());
-            if is_read_only {
-                assert!(
-                    ran.markers.is_empty() && ran.files.is_empty(),
-                    "{shell}: read-only {command:?} wrote: markers {:?}, files {:?}",
-                    ran.markers,
-                    ran.files
-                );
+            let ran = run(shell, command, bin.path());
+            if is_read_only && (!ran.markers.is_empty() || ran.changed) {
+                failures.push(format!(
+                    "{shell}: read-only {command:?} wrote: markers {:?}, folder changed {}",
+                    ran.markers, ran.changed
+                ));
             }
             let started = counts(ran.started.clone());
             let expected = counts(reported.clone());
             for (program, n) in &started {
-                assert!(
-                    expected.get(program).is_some_and(|m| n <= m),
-                    "{shell}: {command:?} started {program}, reported {reported:?}"
-                );
+                if !expected.get(program).is_some_and(|m| n <= m) {
+                    failures.push(format!(
+                        "{shell}: {command:?} started {program}, reported {reported:?}"
+                    ));
+                }
             }
-            if exact {
-                assert_eq!(started, expected, "{shell}: {command:?}");
+            if exact && started != expected {
+                failures.push(format!(
+                    "{shell}: {command:?} started {started:?}, reported {expected:?}"
+                ));
             }
         }
     }
+    (failures, readable, read_only)
+}
+
+fn differential(count: usize) {
+    let corpus = corpus(20261113, count);
+    let (failures, readable, read_only) = check(&corpus, &parse);
+    assert!(failures.is_empty(), "{failures:#?}");
     assert!(
         read_only >= count / 10 && readable >= count / 5,
         "too few cases: {read_only} read-only, {readable} readable of {count}"
     );
     eprintln!(
-        "shell differential: {count} strings, {readable} readable, {read_only} read-only, shells {shells:?}"
+        "shell differential: {count} strings, {readable} readable, {read_only} read-only, shells {:?}",
+        shells()
     );
+}
+
+/// The checker catches a weaker reader: with one wrapper left off the
+/// list, the programs it starts are not reported, and the check fails.
+#[test]
+fn the_check_fails_when_a_wrapper_is_missing() {
+    let corpus: Vec<String> = ["env touch M", "xargs touch M", "nohup touch M"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let (failures, _, _) = check(&corpus, &parse);
+    assert!(failures.is_empty(), "{failures:#?}");
+    for missing in ["env", "xargs", "nohup"] {
+        let fewer: Vec<&str> = WRAPPERS.iter().copied().filter(|w| *w != missing).collect();
+        let weak = move |command: &str| parse_with(command, &fewer);
+        let (failures, _, _) = check(&corpus, &weak);
+        assert!(
+            failures.iter().any(|f| f.contains(missing)),
+            "without `{missing}` the check passed: {failures:#?}"
+        );
+    }
 }
 
 #[test]

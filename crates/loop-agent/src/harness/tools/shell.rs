@@ -19,8 +19,9 @@
 //! - anything else is unreadable: comments, `(`, `)`, `{`, `}`, backticks,
 //!   any other `$` form, `!`, `&` alone, here-documents, control
 //!   characters, non-ASCII text outside quotes, a newline inside quotes,
-//!   a `~` at the start of a word or after `=` or `:` (elsewhere it is
-//!   text, as in `HEAD~1`),
+//!   `~user`, `~+`, `~-` and a `~` after `=` or `:` (`~` and `~/…` at the
+//!   start of an argument are the home directory; inside a word, as in
+//!   `HEAD~1`, it is text),
 //!   unbalanced quotes, keywords (`if`, `for`, …), programs that run
 //!   another program or change how later programs are found (`env`, `sh`,
 //!   `eval`, `xargs`, `trap`, `hash`, `read`, …), an assignment before the
@@ -83,11 +84,20 @@ impl Unreadable {
     }
 }
 
-/// Programs that run the program named in their arguments.
-const WRAPPERS: &[&str] = &[
+/// Programs that run the program named in their arguments, or run code
+/// or shell escapes from their arguments or their input.
+pub const WRAPPERS: &[&str] = &[
     "env", "command", "builtin", "exec", "eval", "source", ".", "time", "nohup", "nice", "timeout",
     "stdbuf", "xargs", "sudo", "su", "doas", "sh", "bash", "zsh", "dash", "ksh", "fish", "csh",
-    "tcsh", "busybox", "parallel", "watch", "script",
+    "tcsh", "busybox", "parallel", "watch", "script", "awk", "gawk", "mawk", "nawk", "sed", "less",
+    "more",
+];
+
+/// Programs whose options can make them run another program. An argument
+/// the shell can change (a variable or a glob) could become such an
+/// option, so with one their command is unreadable.
+const RUNS_THROUGH_OPTIONS: &[&str] = &[
+    "find", "git", "rg", "sort", "tar", "ssh", "scp", "sftp", "man",
 ];
 
 /// Shell keywords: they change how the following words are read.
@@ -140,11 +150,38 @@ const RISKY_VARIABLES: &[&str] = &[
 /// Read `command` under the grammar of this module: its simple commands,
 /// or why it is unreadable.
 pub fn parse(command: &str) -> Result<Vec<Simple>, Unreadable> {
+    parse_with(command, WRAPPERS)
+}
+
+/// [`parse`] with another list of wrapper programs; for tests that check
+/// the checks.
+pub fn parse_with(command: &str, wrappers: &[&str]) -> Result<Vec<Simple>, Unreadable> {
     let commands = Lexer::new(command).commands()?;
     for simple in &commands {
-        check_program(simple)?;
+        check_program(simple, wrappers)?;
+    }
+    // An exported variable can change what a later command runs
+    // (`GIT_EXTERNAL_DIFF`, `BASH_FUNC_*`, …). Each tool call starts a new
+    // shell, so an export on its own changes nothing after it.
+    let last = commands.len().saturating_sub(1);
+    for simple in &commands[..last] {
+        if ASSIGNERS.contains(&base_name(simple.program()).as_str()) {
+            return Err(Unreadable {
+                reason: REASON_EXPORT,
+                program: Some(simple.program().to_owned()),
+            });
+        }
     }
     Ok(commands)
+}
+
+/// A program's last path part, lower-cased.
+fn base_name(program: &str) -> String {
+    program
+        .rsplit('/')
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase()
 }
 
 /// Why `command` is unreadable, or `None` when [`parse`] reads it.
@@ -236,19 +273,22 @@ pub fn unreadable_advice(command: &str) -> Option<String> {
         REASON_HEREDOC => "put the text in a file and pass the file".into(),
         REASON_QUOTES => "close every quote, and keep each quoted text on one line".into(),
         REASON_COMMENT => "remove the comment".into(),
-        REASON_TILDE => "write the home directory out in full, or use `$HOME`".into(),
+        REASON_TILDE => "use `~/…` at the start of a word, or write the path out".into(),
         REASON_CHARACTER => "put the text in single quotes".into(),
         REASON_SEPARATOR => "use `;`, `&&`, `||` or `|` between whole commands".into(),
         REASON_REDIRECT => "use `<`, `>`, `>>` or `2>&1` with a plain file name".into(),
-        REASON_ASSIGNMENT => {
-            "set the variable in its own part first (`export NAME=value; …`), or leave it out"
-                .into()
-        }
+        REASON_ASSIGNMENT => "leave the assignment out".into(),
         REASON_PROGRAM_TEXT => "write the program name out in plain text".into(),
         REASON_INTERPRETER => {
             "put the code in a script file and run the file, or run the command directly".into()
         }
         REASON_KEYWORD => "run each command on its own, without the shell keyword".into(),
+        REASON_EXPORT => "run the export and the command as two separate commands".into(),
+        REASON_OPTION => match &why.program {
+            Some(option) => format!("remove the option `{option}`, which runs another program"),
+            None => "remove the option that runs another program".into(),
+        },
+        REASON_DYNAMIC => "write the arguments out in full, without variables or globs".into(),
         REASON_STATE => match &why.program {
             Some(program) => format!("run the commands without `{program}`"),
             None => "run the commands without it".into(),
@@ -281,9 +321,13 @@ const REASON_INTERPRETER: &str = "an interpreter with inline code";
 const REASON_KEYWORD: &str = "a shell keyword";
 const REASON_WRAPPER: &str = "a program that runs another program";
 const REASON_STATE: &str = "a built-in that changes how later commands run";
+const REASON_EXPORT: &str = "a variable export before another command";
+const REASON_OPTION: &str = "an option that makes the program run another program";
+const REASON_DYNAMIC: &str =
+    "a variable or glob passed to a program whose options can run another program";
 
 /// The checks on a simple command's program.
-fn check_program(simple: &Simple) -> Result<(), Unreadable> {
+fn check_program(simple: &Simple, wrappers: &[&str]) -> Result<(), Unreadable> {
     let program = simple.program();
     let named = |reason| Unreadable {
         reason,
@@ -305,15 +349,11 @@ fn check_program(simple: &Simple) -> Result<(), Unreadable> {
             REASON_PROGRAM_TEXT
         }));
     }
-    let base = program
-        .rsplit('/')
-        .next()
-        .unwrap_or(program)
-        .to_ascii_lowercase();
+    let base = base_name(program);
     if KEYWORDS.contains(&base.as_str()) {
         return Err(named(REASON_KEYWORD));
     }
-    if WRAPPERS.contains(&base.as_str()) {
+    if wrappers.contains(&base.as_str()) {
         return Err(named(REASON_WRAPPER));
     }
     if SHELL_STATE.contains(&base.as_str()) {
@@ -321,9 +361,16 @@ fn check_program(simple: &Simple) -> Result<(), Unreadable> {
     }
     let args = &simple.words[1..];
     if ASSIGNERS.contains(&base.as_str()) {
+        let identifier = |name: &str| {
+            name.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
         let risky = args.iter().any(|a| {
             let name = a.split('=').next().unwrap_or(a);
             a.starts_with('-')
+                || !identifier(name)
                 || RISKY_VARIABLES.contains(&name)
                 || name.starts_with("LD_")
                 || name.starts_with("DYLD_")
@@ -342,7 +389,63 @@ fn check_program(simple: &Simple) -> Result<(), Unreadable> {
     if interpreter {
         return Err(named(REASON_INTERPRETER));
     }
+    if let Some(option) = runs_through_option(&base, args) {
+        return Err(Unreadable {
+            reason: REASON_OPTION,
+            program: Some(option.to_owned()),
+        });
+    }
+    if RUNS_THROUGH_OPTIONS.contains(&base.as_str()) && simple.dynamic.iter().skip(1).any(|&d| d) {
+        return Err(named(REASON_DYNAMIC));
+    }
     Ok(())
+}
+
+/// The option of `args` that makes `program` run another program, if any.
+fn runs_through_option<'a>(program: &str, args: &'a [String]) -> Option<&'a str> {
+    let starts = |a: &str, options: &[&str]| {
+        options
+            .iter()
+            .any(|o| a == *o || (o.starts_with("--") && a.starts_with(&format!("{o}="))))
+    };
+    let found = |options: &[&str]| args.iter().find(|a| starts(a, options)).map(String::as_str);
+    match program {
+        "find" => found(&["-exec", "-execdir", "-ok", "-okdir"]),
+        "git" => {
+            // Options before the subcommand; `git log -c` is a log option.
+            let global = args.iter().take_while(|a| a.starts_with('-'));
+            global
+                .clone()
+                .find(|a| {
+                    starts(a, &["-c", "-C", "--config-env", "--exec-path"]) || a.starts_with("-c")
+                })
+                .or_else(|| {
+                    args.iter()
+                        .find(|a| starts(a, &["--upload-pack", "--receive-pack", "--ext-diff"]))
+                })
+                .map(String::as_str)
+        }
+        "rg" => found(&["--pre", "--pre-glob", "--hostname-bin"]),
+        "sort" => found(&["--compress-program"]),
+        "tar" => found(&[
+            "--to-command",
+            "--use-compress-program",
+            "-I",
+            "--checkpoint-action",
+            "--info-script",
+            "--new-volume-script",
+            "-F",
+        ]),
+        "ssh" | "scp" | "sftp" => args
+            .iter()
+            .find(|a| a.starts_with("-o") || a.starts_with("-F"))
+            .map(String::as_str),
+        "man" => args
+            .iter()
+            .find(|a| starts(a, &["-P", "--pager", "-H", "--html"]) || a.starts_with("-P"))
+            .map(String::as_str),
+        _ => None,
+    }
 }
 
 /// Unquoted characters an argument word may hold.
@@ -594,8 +697,19 @@ impl<'a> Lexer<'a> {
                 // `:`; elsewhere (`HEAD~1`) it is text.
                 '~' => {
                     let previous = (self.at > start).then(|| self.chars[self.at - 1].1);
-                    if matches!(previous, None | Some('=' | ':')) {
-                        return Err(Unreadable::new(REASON_TILDE));
+                    match previous {
+                        // `~` or `~/…` at the start of a word: the home
+                        // directory, which the shell fills in.
+                        None if matches!(
+                            self.peek_at(1),
+                            None | Some('/' | ' ' | '\t' | '\n' | ';' | '|' | '&' | '<' | '>')
+                        ) =>
+                        {
+                            changes = true;
+                        }
+                        // `~user`, `~+`, `~-`, and after `=` or `:`.
+                        None | Some('=' | ':') => return Err(Unreadable::new(REASON_TILDE)),
+                        Some(_) => {}
                     }
                     text.push('~');
                 }
@@ -735,7 +849,10 @@ mod tests {
             "ls | ",
             "(ls)",
             "{ ls; }",
-            "ls ~",
+            "ls ~user",
+            "ls ~+",
+            "cp a x=~/b",
+            "~/bin/tool",
             "echo a\r",
             "cat <<EOF",
             "cat <> f",
@@ -757,6 +874,12 @@ mod tests {
         ] {
             assert!(parse(command).is_err(), "readable: {command:?}");
         }
-        assert!(parse("export FOO=1; cargo test").is_ok());
+        // An export before another command: unreadable; alone: readable.
+        assert!(parse("export FOO=1; cargo test").is_err());
+        assert!(parse("export FOO=1").is_ok());
+        assert!(parse("export 'BASH_FUNC_ls%%=() { touch P; }'").is_err());
+        let home = &parse("cat ~/notes.txt ~").unwrap()[0];
+        assert_eq!(home.words, ["cat", "~/notes.txt", "~"]);
+        assert_eq!(home.dynamic, [false, true, true]);
     }
 }
