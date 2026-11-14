@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use loop_protocol::admin;
+use loop_protocol::session_workspace as sw;
 use loop_protocol::rpc::{RuntimeStatus, SessionInfo};
 use loop_protocol::{BackendError, BackendResult, ErrorCategory, SessionRef, UpdateEnvelope};
 
@@ -178,6 +179,118 @@ pub trait RuntimeControl: Send + Sync {
     fn admin(&self) -> Option<&dyn RuntimeAdmin> {
         None
     }
+    /// The files and terminals of Sessions (`session/workspace`,
+    /// `session/files/*`, `session/terminal/*`), when this Runtime serves
+    /// them.
+    fn session_workspace(&self) -> Option<&dyn SessionWorkspace> {
+        None
+    }
+}
+
+/// One event of a terminal, for one connection's stream
+/// (`session/terminal/output`). Live only: never in the Event Log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalEvent {
+    /// Output bytes.
+    Output {
+        /// The event's sequence number.
+        seq: u64,
+        /// The bytes.
+        data: Vec<u8>,
+    },
+    /// This reader lost `bytes` of output; `seq` is the last lost event.
+    Dropped {
+        /// The last lost event.
+        seq: u64,
+        /// Bytes lost.
+        bytes: u64,
+    },
+    /// The process ended. No event follows.
+    Exited {
+        /// The event's sequence number.
+        seq: u64,
+        /// How it ended.
+        exit: loop_protocol::session_workspace::TerminalEnd,
+    },
+}
+
+/// A terminal's events for one connection, from an attach. Dropping it
+/// ends this connection's stream; the terminal runs on.
+#[async_trait]
+pub trait TerminalFeed: Send + Sync {
+    /// The next event, waiting for one; `None` after `Exited`, or when the
+    /// terminal is gone.
+    async fn next(&self) -> Option<TerminalEvent>;
+}
+
+/// The files and terminals of a Session's workspace. Each call checks the
+/// caller's access to the Session first, then the tool lock, the sandbox
+/// and the permission gate. See `docs/design/files-and-terminal-protocol.md`.
+#[async_trait]
+pub trait SessionWorkspace: Send + Sync {
+    /// `session/workspace`.
+    async fn info(
+        &self,
+        params: loop_protocol::rpc::SessionParams,
+    ) -> BackendResult<sw::SessionWorkspaceInfo>;
+    /// `session/files/list`.
+    async fn list(&self, params: sw::FilesListParams) -> BackendResult<sw::FilesListResult>;
+    /// `session/files/stat`.
+    async fn stat(&self, params: sw::FilePathParams) -> BackendResult<sw::FileEntry>;
+    /// `session/files/read`.
+    async fn read(&self, params: sw::FilesReadParams) -> BackendResult<sw::FilesReadResult>;
+    /// `session/files/upload_begin`.
+    async fn upload_begin(
+        &self,
+        params: sw::UploadBeginParams,
+    ) -> BackendResult<sw::UploadBeginResult>;
+    /// `session/files/upload_write`.
+    async fn upload_write(&self, params: sw::UploadWriteParams)
+        -> BackendResult<sw::UploadProgress>;
+    /// `session/files/upload_status`.
+    async fn upload_status(&self, params: sw::UploadParams) -> BackendResult<sw::UploadProgress>;
+    /// `session/files/upload_commit`.
+    async fn upload_commit(
+        &self,
+        params: sw::UploadParams,
+    ) -> BackendResult<sw::UploadCommitResult>;
+    /// `session/files/upload_abort`.
+    async fn upload_abort(&self, params: sw::UploadParams) -> BackendResult<()>;
+    /// `session/files/delete`.
+    async fn delete(&self, params: sw::FilesDeleteParams) -> BackendResult<()>;
+    /// `session/files/rename`.
+    async fn rename(&self, params: sw::FilesRenameParams) -> BackendResult<()>;
+    /// `session/files/mkdir`.
+    async fn mkdir(&self, params: sw::FilePathParams) -> BackendResult<()>;
+    /// `session/terminal/open`.
+    async fn terminal_open(
+        &self,
+        params: sw::TerminalOpenParams,
+    ) -> BackendResult<sw::TerminalOpenResult>;
+    /// `session/terminal/attach`: the events after `after_seq`, for this
+    /// connection.
+    async fn terminal_attach(
+        &self,
+        params: sw::TerminalAttachParams,
+    ) -> BackendResult<(sw::TerminalAttachResult, Box<dyn TerminalFeed>)>;
+    /// `session/terminal/detach`: checks the caller may use the terminal.
+    async fn terminal_detach(&self, params: sw::TerminalParams) -> BackendResult<()>;
+    /// `session/terminal/input`.
+    async fn terminal_input(&self, params: sw::TerminalInputParams) -> BackendResult<()>;
+    /// `session/terminal/resize`.
+    async fn terminal_resize(&self, params: sw::TerminalResizeParams) -> BackendResult<()>;
+    /// `session/terminal/signal`.
+    async fn terminal_signal(&self, params: sw::TerminalSignalParams) -> BackendResult<()>;
+    /// `session/terminal/close`.
+    async fn terminal_close(
+        &self,
+        params: sw::TerminalParams,
+    ) -> BackendResult<sw::TerminalCloseResult>;
+    /// `session/terminal/list`.
+    async fn terminal_list(
+        &self,
+        params: loop_protocol::rpc::SessionParams,
+    ) -> BackendResult<sw::TerminalListResult>;
 }
 
 /// Workspace admin, Session sandbox and permission mode, and host-only

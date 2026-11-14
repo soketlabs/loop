@@ -38,6 +38,9 @@ use crate::connection::{codes, Connection, Incoming, PeerRequestId, RpcError};
 use crate::control::{Attachment, RuntimeControl};
 use crate::transport::Transport;
 
+#[path = "server_workspace.rs"]
+mod workspace;
+
 /// How long a prompt's response waits for its `turn_ended` after the
 /// backend resolved the turn. A backend that rejected the prompt before the
 /// turn started may never send one.
@@ -142,7 +145,9 @@ fn outside_user_refusal(
             "an Edge Gateway user is served only by a Runtime with a tool lock",
         ));
     }
-    if method == methods::SESSION_SHELL {
+    if method == methods::SESSION_SHELL
+        || (method.starts_with("session/terminal/") && method != methods::SESSION_TERMINAL_OUTPUT)
+    {
         return Some(forbidden(
             "an Edge Gateway user cannot run shell commands on the Runtime host",
         ));
@@ -228,6 +233,7 @@ fn start(
         branch_reset: AtomicBool::new(false),
         id: NEXT_TICKET.fetch_add(1, Ordering::Relaxed),
         caller,
+        streams: workspace::Streams::default(),
     });
     let served = run(
         backend,
@@ -311,6 +317,19 @@ async fn run(
         runtime.clone(),
         host.clone(),
     ));
+    // Terminal input, resize and signal of this connection run in the order
+    // they arrive, one at a time.
+    let (ordered, mut ordered_rx) =
+        mpsc::channel::<(PeerRequestId, String, Value)>(workspace::ORDERED_QUEUE);
+    let ordered_worker = {
+        let runtime = runtime.clone();
+        let host = host.clone();
+        tokio::spawn(in_scope(host.caller.clone(), async move {
+            while let Some((id, method, params)) = ordered_rx.recv().await {
+                workspace::handle(runtime.as_deref(), &host, id, &method, params).await;
+            }
+        }))
+    };
     let mut initialized = false;
     while let Some(message) = incoming.recv().await {
         match message {
@@ -378,6 +397,19 @@ async fn run(
                                 capabilities.host_usage = false;
                                 capabilities.host_defaults = false;
                             }
+                            // Files and terminals: what this connection
+                            // can be served. A Session can still refuse
+                            // (`session/workspace` says why).
+                            let files = runtime
+                                .as_deref()
+                                .and_then(|runtime| runtime.session_workspace())
+                                .is_some();
+                            capabilities.session_files = files;
+                            capabilities.session_files_write =
+                                files && capabilities.tool_lock.is_none();
+                            capabilities.session_terminal = files
+                                && capabilities.tool_lock.is_none()
+                                && caller.as_ref().is_none_or(Caller::is_host_user);
                             let caller = caller.as_ref();
                             let result = InitializeResult {
                                 protocol_version: negotiate(params.protocol_version),
@@ -440,6 +472,22 @@ async fn run(
                     conn.close();
                     break;
                 }
+                if workspace::serves(&method) {
+                    if workspace::ordered(&method) {
+                        if let Err(error) = ordered.try_send((id, method, params)) {
+                            let (id, _, _) = error.into_inner();
+                            workspace::busy(&conn, id);
+                        }
+                    } else {
+                        let runtime = runtime.clone();
+                        let host = host.clone();
+                        tokio::spawn(in_scope(host.caller.clone(), async move {
+                            workspace::handle(runtime.as_deref(), &host, id, &method, params)
+                                .await;
+                        }));
+                    }
+                    continue;
+                }
                 let backend = Arc::clone(&backend);
                 let runtime = runtime.clone();
                 let control = control.clone();
@@ -465,6 +513,9 @@ async fn run(
     }
     forwarder.abort();
     let _ = forwarder.await;
+    drop(ordered);
+    ordered_worker.abort();
+    host.streams.stop_all();
     if let Some(runtime) = &runtime {
         runtime.disconnected(host.id).await;
     }
@@ -1493,6 +1544,8 @@ struct ClientHost {
     branch_reset: AtomicBool,
     /// Who this connection acts for. Fixed when the connection was accepted.
     caller: Option<Caller>,
+    /// This connection's terminal streams (`session/terminal/attach`).
+    streams: workspace::Streams,
 }
 
 /// Register this connection as a watcher (and Escalation recipient) of

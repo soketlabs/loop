@@ -28,6 +28,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::connection::{codes, Connection, Incoming, RpcError};
+use loop_protocol::session_workspace::{self as sw, TerminalOutputParams};
 use crate::transport::Transport;
 
 /// Updates a client keeps for a slow subscriber before it lags.
@@ -58,6 +59,8 @@ pub struct RemoteBackend {
     /// Sessions with a prompt this client sent still unanswered. Unlike
     /// `busy`, observation (detach) never clears these.
     local: Arc<Mutex<HashSet<SessionKey>>>,
+    /// `session/terminal/output` of the terminals this client attached.
+    terminal_output: broadcast::Sender<TerminalOutputParams>,
 }
 
 impl RemoteBackend {
@@ -144,11 +147,15 @@ impl RemoteBackend {
         let (conn, incoming) = Connection::new(transport);
         let mut initializing = Initializing(Some(conn.clone()));
         let (updates, _) = broadcast::channel(UPDATE_BUFFER);
+        let (terminal_output, _) = broadcast::channel(UPDATE_BUFFER);
         let busy: Arc<Mutex<HashSet<SessionKey>>> = Arc::default();
         tokio::spawn(read(
             Arc::clone(&conn),
             incoming,
-            updates.clone(),
+            Feeds {
+                updates: updates.clone(),
+                terminal_output: terminal_output.clone(),
+            },
             Arc::clone(&busy),
             host,
         ));
@@ -179,6 +186,7 @@ impl RemoteBackend {
             updates,
             busy,
             local: Arc::default(),
+            terminal_output,
         }))
     }
 
@@ -679,14 +687,24 @@ async fn call<T: DeserializeOwned>(
     }
 }
 
+/// Where [`read`] sends what the server streams.
+struct Feeds {
+    updates: broadcast::Sender<UpdateEnvelope>,
+    terminal_output: broadcast::Sender<TerminalOutputParams>,
+}
+
 /// Handle everything the server sends, in order.
 async fn read(
     conn: Arc<Connection>,
     mut incoming: tokio::sync::mpsc::Receiver<Incoming>,
-    updates: broadcast::Sender<UpdateEnvelope>,
+    feeds: Feeds,
     busy: Arc<Mutex<HashSet<SessionKey>>>,
     host: Arc<dyn HostServices>,
 ) {
+    let Feeds {
+        updates,
+        terminal_output,
+    } = feeds;
     while let Some(message) = incoming.recv().await {
         match message {
             Incoming::Response { id, result } => conn.resolve(id, result).await,
@@ -729,6 +747,17 @@ async fn read(
                     ));
                 }
             }
+            Incoming::Notification { method, params }
+                if method == methods::SESSION_TERMINAL_OUTPUT =>
+            {
+                match serde_json::from_value::<TerminalOutputParams>(params) {
+                    Ok(output) => {
+                        let _ = terminal_output.send(output);
+                    }
+                    Err(error) => tracing::debug!(%error, "skipping unreadable terminal output"),
+                }
+            }
+            // Notifications this client does not know are ignored.
             Incoming::Notification { .. } => {}
             Incoming::Request { id, method, params } if method == methods::HOST_INTERACT => {
                 let conn = Arc::clone(&conn);
@@ -877,5 +906,198 @@ impl RemoteBackend {
             return Err(BackendError::Unsupported(method.into()));
         }
         call(&self.conn, method, params).await
+    }
+}
+
+/// A terminal's `session/terminal/output` for this client, after an attach.
+struct RemoteFeed {
+    session: SessionKey,
+    terminal: String,
+    output: tokio::sync::Mutex<broadcast::Receiver<TerminalOutputParams>>,
+}
+
+#[async_trait]
+impl crate::control::TerminalFeed for RemoteFeed {
+    async fn next(&self) -> Option<crate::control::TerminalEvent> {
+        use crate::control::TerminalEvent;
+        let mut output = self.output.lock().await;
+        loop {
+            let event = match output.recv().await {
+                Ok(event) => event,
+                // This client fell behind its own buffer: the feed ends; attach
+                // again with the last `seq`.
+                Err(_) => return None,
+            };
+            if event.session != self.session || event.terminal != self.terminal {
+                continue;
+            }
+            return Some(match (event.exit, event.dropped, event.data) {
+                (Some(exit), _, _) => TerminalEvent::Exited {
+                    seq: event.seq,
+                    exit,
+                },
+                (None, Some(bytes), _) => TerminalEvent::Dropped {
+                    seq: event.seq,
+                    bytes,
+                },
+                (None, None, data) => TerminalEvent::Output {
+                    seq: event.seq,
+                    data: data
+                        .and_then(|data| sw::base64::decode(&data).ok())
+                        .unwrap_or_default(),
+                },
+            });
+        }
+    }
+}
+
+impl RemoteBackend {
+    async fn workspace_call<T: DeserializeOwned>(
+        &self,
+        flag: fn(&Capabilities) -> bool,
+        method: &str,
+        params: &impl serde::Serialize,
+    ) -> BackendResult<T> {
+        if !flag(&self.capabilities) {
+            return Err(BackendError::Unsupported(method.into()));
+        }
+        call(&self.conn, method, params).await
+    }
+
+    async fn workspace_unit(
+        &self,
+        flag: fn(&Capabilities) -> bool,
+        method: &str,
+        params: &impl serde::Serialize,
+    ) -> BackendResult<()> {
+        self.workspace_call::<Value>(flag, method, params)
+            .await
+            .map(|_| ())
+    }
+}
+
+fn files(c: &Capabilities) -> bool {
+    c.session_files
+}
+fn files_write(c: &Capabilities) -> bool {
+    c.session_files_write
+}
+fn terminal(c: &Capabilities) -> bool {
+    c.session_terminal
+}
+
+/// A Session's files and terminals over the wire. A method the server did
+/// not advertise answers Unsupported without a round trip.
+#[async_trait]
+impl crate::control::SessionWorkspace for RemoteBackend {
+    async fn info(&self, params: SessionParams) -> BackendResult<sw::SessionWorkspaceInfo> {
+        self.workspace_call(files, methods::SESSION_WORKSPACE, &params)
+            .await
+    }
+    async fn list(&self, params: sw::FilesListParams) -> BackendResult<sw::FilesListResult> {
+        self.workspace_call(files, methods::SESSION_FILES_LIST, &params)
+            .await
+    }
+    async fn stat(&self, params: sw::FilePathParams) -> BackendResult<sw::FileEntry> {
+        self.workspace_call(files, methods::SESSION_FILES_STAT, &params)
+            .await
+    }
+    async fn read(&self, params: sw::FilesReadParams) -> BackendResult<sw::FilesReadResult> {
+        self.workspace_call(files, methods::SESSION_FILES_READ, &params)
+            .await
+    }
+    async fn upload_begin(
+        &self,
+        params: sw::UploadBeginParams,
+    ) -> BackendResult<sw::UploadBeginResult> {
+        self.workspace_call(files_write, methods::SESSION_FILES_UPLOAD_BEGIN, &params)
+            .await
+    }
+    async fn upload_write(
+        &self,
+        params: sw::UploadWriteParams,
+    ) -> BackendResult<sw::UploadProgress> {
+        self.workspace_call(files_write, methods::SESSION_FILES_UPLOAD_WRITE, &params)
+            .await
+    }
+    async fn upload_status(&self, params: sw::UploadParams) -> BackendResult<sw::UploadProgress> {
+        self.workspace_call(files_write, methods::SESSION_FILES_UPLOAD_STATUS, &params)
+            .await
+    }
+    async fn upload_commit(
+        &self,
+        params: sw::UploadParams,
+    ) -> BackendResult<sw::UploadCommitResult> {
+        self.workspace_call(files_write, methods::SESSION_FILES_UPLOAD_COMMIT, &params)
+            .await
+    }
+    async fn upload_abort(&self, params: sw::UploadParams) -> BackendResult<()> {
+        self.workspace_unit(files_write, methods::SESSION_FILES_UPLOAD_ABORT, &params)
+            .await
+    }
+    async fn delete(&self, params: sw::FilesDeleteParams) -> BackendResult<()> {
+        self.workspace_unit(files_write, methods::SESSION_FILES_DELETE, &params)
+            .await
+    }
+    async fn rename(&self, params: sw::FilesRenameParams) -> BackendResult<()> {
+        self.workspace_unit(files_write, methods::SESSION_FILES_RENAME, &params)
+            .await
+    }
+    async fn mkdir(&self, params: sw::FilePathParams) -> BackendResult<()> {
+        self.workspace_unit(files_write, methods::SESSION_FILES_MKDIR, &params)
+            .await
+    }
+    async fn terminal_open(
+        &self,
+        params: sw::TerminalOpenParams,
+    ) -> BackendResult<sw::TerminalOpenResult> {
+        self.workspace_call(terminal, methods::SESSION_TERMINAL_OPEN, &params)
+            .await
+    }
+    async fn terminal_attach(
+        &self,
+        params: sw::TerminalAttachParams,
+    ) -> BackendResult<(
+        sw::TerminalAttachResult,
+        Box<dyn crate::control::TerminalFeed>,
+    )> {
+        // Subscribed first: output may follow the answer at once.
+        let output = self.terminal_output.subscribe();
+        let feed = RemoteFeed {
+            session: params.session.key.clone(),
+            terminal: params.terminal.clone(),
+            output: tokio::sync::Mutex::new(output),
+        };
+        let attached = self
+            .workspace_call(terminal, methods::SESSION_TERMINAL_ATTACH, &params)
+            .await?;
+        Ok((attached, Box::new(feed)))
+    }
+    async fn terminal_detach(&self, params: sw::TerminalParams) -> BackendResult<()> {
+        self.workspace_unit(terminal, methods::SESSION_TERMINAL_DETACH, &params)
+            .await
+    }
+    async fn terminal_input(&self, params: sw::TerminalInputParams) -> BackendResult<()> {
+        self.workspace_unit(terminal, methods::SESSION_TERMINAL_INPUT, &params)
+            .await
+    }
+    async fn terminal_resize(&self, params: sw::TerminalResizeParams) -> BackendResult<()> {
+        self.workspace_unit(terminal, methods::SESSION_TERMINAL_RESIZE, &params)
+            .await
+    }
+    async fn terminal_signal(&self, params: sw::TerminalSignalParams) -> BackendResult<()> {
+        self.workspace_unit(terminal, methods::SESSION_TERMINAL_SIGNAL, &params)
+            .await
+    }
+    async fn terminal_close(
+        &self,
+        params: sw::TerminalParams,
+    ) -> BackendResult<sw::TerminalCloseResult> {
+        self.workspace_call(terminal, methods::SESSION_TERMINAL_CLOSE, &params)
+            .await
+    }
+    async fn terminal_list(&self, params: SessionParams) -> BackendResult<sw::TerminalListResult> {
+        self.workspace_call(terminal, methods::SESSION_TERMINAL_LIST, &params)
+            .await
     }
 }

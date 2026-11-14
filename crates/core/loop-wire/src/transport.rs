@@ -5,6 +5,7 @@
 //! Unix sockets (one message per line), [`memory`] for two peers in one
 //! process. Dropping the outgoing side closes the underlying stream's output.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
@@ -31,6 +32,49 @@ impl std::fmt::Debug for QueuedMessage {
     }
 }
 
+/// Messages queued in a transport and not yet written (or, in memory, not
+/// yet received).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Backlog {
+    /// Messages.
+    pub messages: usize,
+    /// Bytes of text.
+    pub bytes: usize,
+}
+
+/// Counts what an unbounded transport holds: the sender adds, the writer
+/// (or the receiver) takes away.
+#[derive(Debug, Default)]
+struct Counter {
+    messages: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+impl Counter {
+    fn add(&self, bytes: usize) {
+        self.messages.fetch_add(1, Ordering::AcqRel);
+        self.bytes.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    fn take(&self, bytes: usize) {
+        let _ = self
+            .messages
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1)));
+        let _ = self
+            .bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_sub(bytes))
+            });
+    }
+
+    fn backlog(&self) -> Backlog {
+        Backlog {
+            messages: self.messages.load(Ordering::Acquire),
+            bytes: self.bytes.load(Ordering::Acquire),
+        }
+    }
+}
+
 /// Nonblocking message sender. Bounded sockets disconnect on overflow so a
 /// slow Surface can reconnect and replay instead of exhausting the host.
 #[derive(Debug, Clone)]
@@ -38,7 +82,8 @@ pub struct MessageSender(SenderKind);
 
 #[derive(Debug, Clone)]
 enum SenderKind {
-    Unbounded(mpsc::UnboundedSender<String>),
+    /// With a counter when this module made the channel.
+    Unbounded(mpsc::UnboundedSender<String>, Option<Arc<Counter>>),
     Bounded(
         mpsc::Sender<QueuedMessage>,
         Arc<Semaphore>,
@@ -48,15 +93,73 @@ enum SenderKind {
 
 impl From<mpsc::UnboundedSender<String>> for MessageSender {
     fn from(sender: mpsc::UnboundedSender<String>) -> Self {
-        Self(SenderKind::Unbounded(sender))
+        Self(SenderKind::Unbounded(sender, None))
+    }
+}
+
+/// An unbounded channel whose two ends count what it holds.
+fn counted() -> (MessageSender, MessageReceiver) {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let counter = Arc::new(Counter::default());
+    (
+        MessageSender(SenderKind::Unbounded(sender, Some(counter.clone()))),
+        MessageReceiver(ReceiverKind::Unbounded(receiver, Some(counter))),
+    )
+}
+
+/// Reads a transport's backlog without keeping its output open (a held
+/// [`MessageSender`] would).
+#[derive(Debug, Clone)]
+pub struct BacklogProbe(ProbeKind);
+
+#[derive(Debug, Clone)]
+enum ProbeKind {
+    Unknown,
+    Counter(Arc<Counter>),
+    Bounded(mpsc::WeakSender<QueuedMessage>, Arc<Semaphore>),
+}
+
+impl BacklogProbe {
+    /// What the transport holds and has not written yet; `None` when it
+    /// cannot tell (a channel made outside this module) or it closed.
+    pub fn backlog(&self) -> Option<Backlog> {
+        match &self.0 {
+            ProbeKind::Unknown => None,
+            ProbeKind::Counter(counter) => Some(counter.backlog()),
+            ProbeKind::Bounded(sender, budget) => {
+                let sender = sender.upgrade()?;
+                Some(Backlog {
+                    messages: SOCKET_QUEUE_MESSAGES.saturating_sub(sender.capacity()),
+                    bytes: MAX_MESSAGE_BYTES.saturating_sub(budget.available_permits()),
+                })
+            }
+        }
     }
 }
 
 impl MessageSender {
+    /// A probe of this transport's backlog.
+    pub fn probe(&self) -> BacklogProbe {
+        BacklogProbe(match &self.0 {
+            SenderKind::Unbounded(_, None) => ProbeKind::Unknown,
+            SenderKind::Unbounded(_, Some(counter)) => ProbeKind::Counter(counter.clone()),
+            SenderKind::Bounded(sender, budget, _) => {
+                ProbeKind::Bounded(sender.downgrade(), budget.clone())
+            }
+        })
+    }
+
     /// Queue a message, or close an overloaded socket and return the unsent text.
     pub fn send(&self, text: String) -> Result<(), mpsc::error::SendError<String>> {
         let (sender, budget, closed) = match &self.0 {
-            SenderKind::Unbounded(sender) => return sender.send(text),
+            SenderKind::Unbounded(sender, counter) => {
+                let bytes = text.len();
+                sender.send(text)?;
+                if let Some(counter) = counter {
+                    counter.add(bytes);
+                }
+                return Ok(());
+            }
             SenderKind::Bounded(sender, budget, closed) => (sender, budget, closed),
         };
         if closed.is_cancelled() {
@@ -94,13 +197,13 @@ pub struct MessageReceiver(ReceiverKind);
 
 #[derive(Debug)]
 enum ReceiverKind {
-    Unbounded(mpsc::UnboundedReceiver<String>),
+    Unbounded(mpsc::UnboundedReceiver<String>, Option<Arc<Counter>>),
     Bounded(mpsc::Receiver<QueuedMessage>),
 }
 
 impl From<mpsc::UnboundedReceiver<String>> for MessageReceiver {
     fn from(receiver: mpsc::UnboundedReceiver<String>) -> Self {
-        Self(ReceiverKind::Unbounded(receiver))
+        Self(ReceiverKind::Unbounded(receiver, None))
     }
 }
 
@@ -108,7 +211,13 @@ impl MessageReceiver {
     /// Receive an already queued message without waiting.
     pub fn try_recv(&mut self) -> Result<String, mpsc::error::TryRecvError> {
         match &mut self.0 {
-            ReceiverKind::Unbounded(receiver) => receiver.try_recv(),
+            ReceiverKind::Unbounded(receiver, counter) => {
+                let text = receiver.try_recv()?;
+                if let Some(counter) = counter {
+                    counter.take(text.len());
+                }
+                Ok(text)
+            }
             ReceiverKind::Bounded(receiver) => receiver.try_recv().map(|message| message.text),
         }
     }
@@ -116,7 +225,13 @@ impl MessageReceiver {
     /// Receive the next message in order, or `None` after the peer closes.
     pub async fn recv(&mut self) -> Option<String> {
         match &mut self.0 {
-            ReceiverKind::Unbounded(receiver) => receiver.recv().await,
+            ReceiverKind::Unbounded(receiver, counter) => {
+                let text = receiver.recv().await?;
+                if let Some(counter) = counter {
+                    counter.take(text.len());
+                }
+                Some(text)
+            }
             ReceiverKind::Bounded(receiver) => receiver.recv().await.map(|message| message.text),
         }
     }
@@ -148,17 +263,17 @@ pub struct Transport {
 
 /// Two connected ends in one process.
 pub fn memory() -> (Transport, Transport) {
-    let (a_tx, a_rx) = mpsc::unbounded_channel();
-    let (b_tx, b_rx) = mpsc::unbounded_channel();
+    let (a_tx, a_rx) = counted();
+    let (b_tx, b_rx) = counted();
     (
         Transport {
-            incoming: b_rx.into(),
-            outgoing: a_tx.into(),
+            incoming: b_rx,
+            outgoing: a_tx,
             is_websocket: false,
         },
         Transport {
-            incoming: a_rx.into(),
-            outgoing: b_tx.into(),
+            incoming: a_rx,
+            outgoing: b_tx,
             is_websocket: false,
         },
     )
@@ -172,13 +287,21 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (incoming_tx, incoming) = mpsc::unbounded_channel();
-    let (outgoing, mut to_write) = mpsc::unbounded_channel::<String>();
+    let (outgoing, to_write) = mpsc::unbounded_channel::<String>();
+    // Counted when written, not when taken from the channel: the backlog is
+    // what the peer has not got yet.
+    let counter = Arc::new(Counter::default());
+    let outgoing = MessageSender(SenderKind::Unbounded(outgoing, Some(counter.clone())));
     tokio::spawn(async move {
         let mut writer = writer;
+        let mut to_write = to_write;
         while let Some(mut message) = to_write.recv().await {
+            let bytes = message.len();
             message.push('\n');
-            if writer.write_all(message.as_bytes()).await.is_err() || writer.flush().await.is_err()
-            {
+            let failed = writer.write_all(message.as_bytes()).await.is_err()
+                || writer.flush().await.is_err();
+            counter.take(bytes);
+            if failed {
                 break;
             }
         }
@@ -207,7 +330,7 @@ where
     });
     Transport {
         incoming: incoming.into(),
-        outgoing: outgoing.into(),
+        outgoing,
         is_websocket: false,
     }
 }

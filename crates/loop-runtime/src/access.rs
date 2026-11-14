@@ -235,6 +235,30 @@ pub const METHODS: &[(&str, Rule)] = &[
     (methods::RUNTIME_PROVIDERS, Rule::HostOnly),
     (methods::RUNTIME_MCP_AUTH, Rule::HostOnly),
     (methods::RUNTIME_TRACING, Rule::HostOnly),
+    // A Session's files: reading is `Read`, changing is `Write`.
+    (methods::SESSION_WORKSPACE, Rule::Session(Need::Read)),
+    (methods::SESSION_FILES_LIST, Rule::Session(Need::Read)),
+    (methods::SESSION_FILES_STAT, Rule::Session(Need::Read)),
+    (methods::SESSION_FILES_READ, Rule::Session(Need::Read)),
+    (methods::SESSION_FILES_UPLOAD_BEGIN, Rule::Session(Need::Write)),
+    (methods::SESSION_FILES_UPLOAD_WRITE, Rule::Session(Need::Write)),
+    (methods::SESSION_FILES_UPLOAD_STATUS, Rule::Session(Need::Write)),
+    (methods::SESSION_FILES_UPLOAD_COMMIT, Rule::Session(Need::Write)),
+    (methods::SESSION_FILES_UPLOAD_ABORT, Rule::Session(Need::Write)),
+    (methods::SESSION_FILES_DELETE, Rule::Session(Need::Write)),
+    (methods::SESSION_FILES_RENAME, Rule::Session(Need::Write)),
+    (methods::SESSION_FILES_MKDIR, Rule::Session(Need::Write)),
+    // A terminal is a shell: every call is `Write`, also the list and the
+    // attach (its output can hold secrets). Never for an outside user.
+    (methods::SESSION_TERMINAL_OPEN, Rule::Session(Need::Write)),
+    (methods::SESSION_TERMINAL_ATTACH, Rule::Session(Need::Write)),
+    (methods::SESSION_TERMINAL_DETACH, Rule::Session(Need::Write)),
+    (methods::SESSION_TERMINAL_INPUT, Rule::Session(Need::Write)),
+    (methods::SESSION_TERMINAL_RESIZE, Rule::Session(Need::Write)),
+    (methods::SESSION_TERMINAL_SIGNAL, Rule::Session(Need::Write)),
+    (methods::SESSION_TERMINAL_CLOSE, Rule::Session(Need::Write)),
+    (methods::SESSION_TERMINAL_LIST, Rule::Session(Need::Write)),
+    (methods::SESSION_TERMINAL_OUTPUT, Rule::ToClient(Need::Write)),
 ];
 
 /// The [`Rule`] of `method`, if the table has it.

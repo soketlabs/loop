@@ -96,10 +96,20 @@ type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, RpcError>>>>
 
 const QUEUE_MESSAGES: usize = 4096;
 
+/// Free places the connection queue keeps for everything but bulk
+/// notifications ([`Connection::bulk_room`]).
+const BULK_RESERVE_MESSAGES: usize = 1024;
+/// Most text a transport may hold unsent before bulk notifications wait.
+const BULK_BACKLOG_BYTES: usize = 1024 * 1024;
+/// Most messages a transport may hold unsent before bulk notifications wait.
+const BULK_BACKLOG_MESSAGES: usize = 32;
+
 /// One JSON-RPC connection.
 pub struct Connection {
     next_id: AtomicI64,
     outgoing: mpsc::Sender<Value>,
+    /// The transport's backlog.
+    peer: crate::transport::BacklogProbe,
     pending: Pending,
     closed: CancellationToken,
 }
@@ -113,6 +123,7 @@ impl Connection {
             outgoing: to_peer,
             ..
         } = transport;
+        let peer = to_peer.probe();
         let (outgoing, mut to_write) = mpsc::channel::<Value>(QUEUE_MESSAGES);
         let (incoming_tx, incoming) = mpsc::channel(QUEUE_MESSAGES);
         let pending: Pending = Arc::default();
@@ -166,6 +177,7 @@ impl Connection {
             Arc::new(Self {
                 next_id: AtomicI64::new(1),
                 outgoing,
+                peer,
                 pending,
                 closed,
             }),
@@ -180,6 +192,34 @@ impl Connection {
             return Err(RpcError::Closed);
         }
         Ok(())
+    }
+
+    /// Whether a bulk notification (terminal output) may be queued now
+    /// without crowding out the rest: the connection queue keeps
+    /// [`BULK_RESERVE_MESSAGES`] places free, and the transport holds at
+    /// most 1 MiB and 32 messages unsent. A transport that cannot tell its
+    /// backlog is judged by the connection queue only.
+    pub fn bulk_room(&self) -> bool {
+        self.outgoing.capacity() >= BULK_RESERVE_MESSAGES
+            && self.peer.backlog().is_none_or(|backlog| {
+                backlog.bytes <= BULK_BACKLOG_BYTES && backlog.messages <= BULK_BACKLOG_MESSAGES
+            })
+    }
+
+    /// Wait until [`Self::bulk_room`]. `false` when the connection closed.
+    pub async fn wait_bulk_room(&self) -> bool {
+        loop {
+            if self.closed.is_cancelled() {
+                return false;
+            }
+            if self.bulk_room() {
+                return true;
+            }
+            tokio::select! {
+                _ = self.closed.cancelled() => return false,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            }
+        }
     }
 
     /// Send a request and wait for its result.

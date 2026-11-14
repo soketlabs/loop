@@ -23,7 +23,9 @@ pub mod transport;
 
 pub use client::RemoteBackend;
 pub use connection::{codes, Connection, Incoming, PeerRequestId, RpcError};
-pub use control::{Attachment, RuntimeAdmin, RuntimeControl};
+pub use control::{
+    Attachment, RuntimeAdmin, RuntimeControl, SessionWorkspace, TerminalEvent, TerminalFeed,
+};
 pub use server::{
     local_principal, serve, serve_with_caller, serve_with_control, Authority, Served,
 };

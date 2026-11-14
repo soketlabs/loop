@@ -79,6 +79,7 @@ mod sessions;
 mod shell;
 mod tree;
 mod turns;
+mod workspace_io;
 
 /// The host's opaque, stable id for the workspace at canonical `cwd`.
 pub fn workspace_id(cwd: &std::path::Path) -> String {
@@ -151,6 +152,9 @@ pub struct Runtime {
     reload_gate: tokio::sync::RwLock<()>,
     /// Counts saved changes to new-Session defaults (`runtime/defaults`).
     defaults_revision: std::sync::atomic::AtomicU64,
+    /// Open uploads and terminals of Sessions (`session/files/*`,
+    /// `session/terminal/*`).
+    workspace_io: workspace_io::WorkspaceIo,
 }
 /// Newest event timestamp per Session, kept in memory so listing never scans the log.
 type Activity = Arc<Mutex<HashMap<SessionKey, i64>>>;
@@ -645,6 +649,7 @@ impl Runtime {
             admin: AsyncMutex::new(()),
             reload_gate: tokio::sync::RwLock::new(()),
             defaults_revision: std::sync::atomic::AtomicU64::new(0),
+            workspace_io: Default::default(),
         })
     }
     /// Share the Runtime. Only a shared Runtime offers its Sessions the
@@ -1220,6 +1225,8 @@ impl Runtime {
     }
 
     async fn finish_shutdown(&self) {
+        // Terminals and uploads end first, each terminal with a record.
+        self.close_workspace_io("the Runtime stopped").await;
         self.turns.close();
         let keys: Vec<_> = self.sessions.lock().unwrap().keys().cloned().collect();
         futures::future::join_all(keys.iter().map(|key| async move {
@@ -1414,6 +1421,9 @@ impl loop_wire::RuntimeControl for Runtime {
         Runtime::list(self).await
     }
     fn admin(&self) -> Option<&dyn loop_wire::RuntimeAdmin> {
+        Some(self)
+    }
+    fn session_workspace(&self) -> Option<&dyn loop_wire::SessionWorkspace> {
         Some(self)
     }
     async fn status(&self) -> BackendResult<loop_protocol::rpc::RuntimeStatus> {
