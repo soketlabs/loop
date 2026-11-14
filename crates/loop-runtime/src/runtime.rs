@@ -7,7 +7,6 @@ use loop_agent::{
         create_session_repository,
         session::{LeaseIdentity, RuntimeSessionStore, SessionStore},
         types::SessionError,
-        Sandbox,
     },
     native_backend::NATIVE_INSTANCE,
 };
@@ -71,6 +70,7 @@ mod attach;
 mod decisions;
 #[cfg(test)]
 mod gate_tests;
+mod host_cleanup;
 mod leases;
 mod pause;
 mod publish;
@@ -94,6 +94,12 @@ pub struct Runtime {
     workspaces: Mutex<HashMap<PathBuf, WorkspaceState>>,
     recipients: AsyncMutex<HashMap<SessionKey, Recipients>>,
     admission: AsyncMutex<()>,
+    /// Per folder: "a Session is published, so its host Workspace runs" is
+    /// ordered with "the last Session closed, so the host Workspace stops".
+    host_gates: host_cleanup::HostGates,
+    /// Tests: how long the stop of a folder's host Workspace takes.
+    #[cfg(test)]
+    host_stop_delay: Mutex<HashMap<PathBuf, Duration>>,
     stopped: AtomicBool,
     idle_epoch: std::sync::atomic::AtomicU64,
     /// In-memory only: caller environments must never enter persistent logs or settings.
@@ -249,7 +255,7 @@ fn session_index(
 const CLOSE_GRACE: Duration = Duration::from_secs(10);
 struct WorkspaceState {
     resources: Arc<WorkspaceResources>,
-    sandbox: Option<Arc<dyn Sandbox>>,
+    sandbox: Option<Arc<dyn loop_agent::harness::sandbox::Workspace>>,
     /// The current generation, held while it is current.
     generation: Arc<admin::Generation>,
     /// Counts committed admin changes and reloads of this workspace.
@@ -614,6 +620,9 @@ impl Runtime {
             workspaces: Mutex::new(HashMap::new()),
             recipients: AsyncMutex::new(HashMap::new()),
             admission: AsyncMutex::new(()),
+            host_gates: Default::default(),
+            #[cfg(test)]
+            host_stop_delay: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
             idle_epoch: std::sync::atomic::AtomicU64::new(0),
             launch_specs: Mutex::new(HashMap::new()),
@@ -1235,6 +1244,10 @@ impl Runtime {
             .drain()
             .map(|(_, value)| value)
             .collect();
+        // Host processes end before anything else of a workspace does: every
+        // host Workspace this Runtime made, and no one else's. The
+        // process-wide kill is left to the exit of the daemon process.
+        self.end_all_host_processes().await;
         for workspace in workspaces {
             workspace.resources.mcp_client.disconnect_all().await;
             if let Some(sandbox) = workspace.sandbox {

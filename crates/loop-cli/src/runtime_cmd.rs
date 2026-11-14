@@ -596,6 +596,12 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     drop(websocket);
     drop(edge);
     runtime.shutdown().await;
+    // This process is exiting: whatever host process is left anywhere in it
+    // ends now (the Runtime's shutdown ended its own).
+    let _ = tokio::task::spawn_blocking(|| {
+        loop_agent::harness::sandbox::kill_all_host_processes(Duration::from_secs(3));
+    })
+    .await;
     connections.abort_all();
     // The Lock is still held, so the socket is ours to remove.
     if let Err(e) = std::fs::remove_file(&socket) {
