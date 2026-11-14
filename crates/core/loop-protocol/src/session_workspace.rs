@@ -128,6 +128,10 @@ pub struct SessionWorkspaceLimits {
     pub upload_bytes: u64,
     /// Open uploads per caller.
     pub uploads_per_caller: u32,
+    /// Most bytes of the open uploads of one Session (their declared
+    /// sizes).
+    #[serde(default = "default_session_upload_bytes")]
+    pub upload_bytes_per_session: u64,
     /// Terminals per Session.
     pub terminals_per_session: u32,
     /// Terminals per caller, for the whole Runtime.
@@ -142,6 +146,10 @@ pub struct SessionWorkspaceLimits {
     pub terminal_buffer_bytes: u64,
 }
 
+fn default_session_upload_bytes() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+
 fn default_detached() -> u32 {
     2
 }
@@ -152,6 +160,7 @@ impl Default for SessionWorkspaceLimits {
             chunk_bytes: CHUNK_BYTES_MAX,
             upload_bytes: 4 * 1024 * 1024 * 1024,
             uploads_per_caller: 8,
+            upload_bytes_per_session: default_session_upload_bytes(),
             terminals_per_session: 4,
             terminals_per_caller: 8,
             detached_terminal_secs: 600,

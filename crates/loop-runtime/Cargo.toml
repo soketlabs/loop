@@ -32,3 +32,6 @@ loop-store-testkit = { path = "../core/loop-store-testkit", default-features = f
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 tokio-util.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }

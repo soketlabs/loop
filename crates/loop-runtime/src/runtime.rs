@@ -79,6 +79,7 @@ mod sessions;
 mod shell;
 mod tree;
 mod turns;
+mod workspace_fs;
 mod workspace_io;
 
 /// The host's opaque, stable id for the workspace at canonical `cwd`.

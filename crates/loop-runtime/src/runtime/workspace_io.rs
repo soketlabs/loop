@@ -25,11 +25,10 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use loop_agent::harness::sandbox::{
-    ExitState, FileTag, PathNamespace, ProcessEventKind, ProcessId, ProcessSignal, PtySize,
-    SpawnRequest, UploadId, UploadRequest, Workspace, WorkspaceError, WorkspacePath,
-    WorkspaceProcess,
+    ExitState, FileTag, ProcessEventKind, ProcessId, ProcessSignal, PtySize, SpawnRequest,
+    UploadId, UploadRequest, Workspace, WorkspaceError, WorkspacePath, WorkspaceProcess,
 };
-use loop_agent::harness::types::{FileErrorCode, PathKind};
+use loop_agent::harness::types::FileErrorCode;
 use loop_app_core::tool_gate::{ToolGate, UserFileAction, TERMINAL_COMMAND};
 use loop_protocol::rpc::SessionParams;
 use loop_protocol::session_workspace::{
@@ -44,6 +43,7 @@ use loop_protocol::session_workspace::{
 use loop_protocol::{BackendError, BackendResult, Caller, SessionKey, SessionRef};
 use loop_wire::{TerminalEvent, TerminalFeed};
 
+use super::workspace_fs::{self, FsError, Root};
 use super::{LiveSession, Runtime};
 use crate::access::{Actor, Need};
 
@@ -69,6 +69,8 @@ pub(super) struct WorkspaceIo {
     /// calls at the same time cannot pass a count limit together.
     opening: Mutex<HashMap<u64, Reserved>>,
     next_slot: std::sync::atomic::AtomicU64,
+    /// Session folders whose stale upload files were removed.
+    swept: Mutex<std::collections::HashSet<PathBuf>>,
 }
 
 /// What a running open or upload begin holds a slot for.
@@ -76,7 +78,14 @@ pub(super) struct WorkspaceIo {
 struct Reserved {
     session: SessionKey,
     owner: Option<Caller>,
-    terminal: bool,
+    kind: Kind,
+}
+
+/// A terminal, or an upload of this many bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Terminal,
+    Upload(u64),
 }
 
 /// A slot of [`WorkspaceIo::opening`]; dropping it frees the slot.
@@ -92,35 +101,56 @@ impl Drop for Slot<'_> {
 }
 
 impl WorkspaceIo {
-    /// Count the open terminals (or uploads) of `session` and of `owner`,
-    /// with the slots of calls still running, and take a slot when both
-    /// are below the limits. One lock: two calls never both pass.
+    /// Count the open terminals (or uploads and their bytes) of `session`
+    /// and of `owner`, with the slots of calls still running, and take a
+    /// slot when all are below `limits`. One lock: two calls never both
+    /// pass.
     fn reserve(
         &self,
-        terminal: bool,
+        kind: Kind,
         session: &SessionKey,
         owner: &Option<Caller>,
-        per_session: usize,
-        per_owner: usize,
+        limits: &SessionWorkspaceLimits,
     ) -> Option<Slot<'_>> {
         let mut opening = lock(&self.opening);
-        let (mut here, mut mine) = (0, 0);
-        if terminal {
-            for t in lock(&self.terminals).values() {
-                here += usize::from(&t.session == session);
-                mine += usize::from(same_owner(&t.owner, owner));
+        let (mut here, mut mine, mut bytes) = (0usize, 0usize, 0u64);
+        let mut count = |s: &SessionKey, o: &Option<Caller>, size: u64| {
+            here += usize::from(s == session);
+            mine += usize::from(same_owner(o, owner));
+            if s == session {
+                bytes = bytes.saturating_add(size);
             }
-        } else {
-            for u in lock(&self.uploads).values() {
-                here += usize::from(&u.session == session);
-                mine += usize::from(same_owner(&u.owner, owner));
+        };
+        match kind {
+            Kind::Terminal => {
+                for t in lock(&self.terminals).values() {
+                    count(&t.session, &t.owner, 0);
+                }
+            }
+            Kind::Upload(_) => {
+                for u in lock(&self.uploads).values() {
+                    count(&u.session, &u.owner, u.size);
+                }
             }
         }
-        for r in opening.values().filter(|r| r.terminal == terminal) {
-            here += usize::from(&r.session == session);
-            mine += usize::from(same_owner(&r.owner, owner));
+        for r in opening.values() {
+            match (r.kind, kind) {
+                (Kind::Terminal, Kind::Terminal) => count(&r.session, &r.owner, 0),
+                (Kind::Upload(size), Kind::Upload(_)) => count(&r.session, &r.owner, size),
+                _ => {}
+            }
         }
-        if here >= per_session || mine >= per_owner {
+        let refused = match kind {
+            Kind::Terminal => {
+                here >= limits.terminals_per_session as usize
+                    || mine >= limits.terminals_per_caller as usize
+            }
+            Kind::Upload(size) => {
+                mine >= limits.uploads_per_caller as usize
+                    || bytes.saturating_add(size) > limits.upload_bytes_per_session
+            }
+        };
+        if refused {
             return None;
         }
         let id = self.next_slot.fetch_add(1, Ordering::AcqRel);
@@ -129,7 +159,7 @@ impl WorkspaceIo {
             Reserved {
                 session: session.clone(),
                 owner: owner.clone(),
-                terminal,
+                kind,
             },
         );
         Some(Slot { io: self, id })
@@ -145,6 +175,9 @@ struct Upload {
     driver: UploadId,
     path: WorkspacePath,
     size: u64,
+    /// Neither `if_match` nor `overwrite`: the commit must not replace a
+    /// file that appeared meanwhile.
+    no_replace: bool,
     touched: Mutex<Instant>,
 }
 
@@ -221,9 +254,10 @@ impl TerminalFeed for Feed {
 struct Target {
     live: Arc<LiveSession>,
     workspace: Arc<dyn Workspace>,
-    env: Arc<dyn loop_agent::harness::ExecutionEnv>,
     root: PathBuf,
     caller: Option<Caller>,
+    /// The Runtime has a tool lock: refusals all look the same.
+    locked: bool,
 }
 
 impl Target {
@@ -260,7 +294,11 @@ impl Target {
             .check_user_file_action(action, native, self.record_session(), self.caller.clone())
             .await
             .map_err(|refused| {
-                BackendError::workspace(Code::Refused, scrub(&refused.0, &self.root))
+                if self.locked {
+                    refused_path()
+                } else {
+                    BackendError::workspace(Code::Refused, scrub(&refused.0, &self.root))
+                }
             })
     }
 
@@ -269,92 +307,86 @@ impl Target {
         workspace_error(error, &self.root)
     }
 
-    /// Refuse a path whose folder (and, with `follow`, the path itself)
-    /// leads out of the root through a link. Checked through the env, by
-    /// path: a folder swapped for a link during the call is a race (see the
-    /// design note). The root is checked as it resolves now.
-    async fn contained(&self, native: &Path, follow: bool) -> BackendResult<()> {
-        let env = &self.env;
-        let root = env
-            .canonical_path(&self.root)
+    /// Run a descriptor-based file operation on the Session's folder, on
+    /// the blocking pool. `raw` names the path in errors.
+    async fn fs<T: Send + 'static>(
+        &self,
+        raw: &str,
+        op: impl FnOnce(&Root) -> Result<T, FsError> + Send + 'static,
+    ) -> BackendResult<T> {
+        let root = self.root.clone();
+        let done = tokio::task::spawn_blocking(move || Root::open(&root).and_then(|r| op(&r)))
             .await
-            .map_err(|e| self.error(e.into()))?;
-        let outside = || {
-            BackendError::workspace(
-                Code::InvalidPath,
-                "the path leads out of the Session's folder",
-            )
-        };
-        if native == self.root {
-            return Ok(());
-        }
-        if let Some(parent) = native.parent() {
-            let parent = env
-                .canonical_path(parent)
-                .await
-                .map_err(|e| self.error(e.into()))?;
-            if !parent.starts_with(&root) {
-                return Err(outside());
-            }
-        }
-        if follow {
-            match env.canonical_path(native).await {
-                Ok(real) if !real.starts_with(&root) => return Err(outside()),
-                Ok(_) => {}
-                Err(error) => return Err(self.error(error.into())),
-            }
-        }
-        Ok(())
+            .map_err(|e| {
+                BackendError::failed(loop_protocol::ErrorCategory::Internal, e.to_string())
+            })?;
+        done.map_err(|e| self.fs_error(e, raw))
     }
 
-    /// Refuse a folder change that would take with it an entry the gate
-    /// would not let the user change itself (a deny rule, `.git`, `.loop`).
-    /// Walks the folder without following links, at most
-    /// [`SUBTREE_MAX`] entries.
-    async fn subtree_allowed(&self, folder: &Path, raw: &str) -> BackendResult<()> {
-        let mut todo = vec![folder.to_path_buf()];
-        let mut seen = 0usize;
-        while let Some(dir) = todo.pop() {
-            let entries = self
-                .env
-                .list_dir(&dir)
-                .await
-                .map_err(|e| self.error(e.into()))?;
-            for entry in entries {
-                seen += 1;
-                if seen > SUBTREE_MAX {
-                    return Err(BackendError::workspace(
-                        Code::Refused,
-                        format!(
-                            "`{raw}` holds more than {SUBTREE_MAX} entries; Loop does not \
-                             check that many, so use a terminal"
-                        ),
-                    ));
-                }
-                if let Err(reason) = self.gate().user_file_write_allowed(&entry.path).await {
-                    let inner = WorkspacePath::from_native(&self.root, &entry.path)
-                        .map(|p| p.as_str().to_owned())
-                        .unwrap_or_default();
-                    return Err(BackendError::workspace(
-                        Code::Refused,
-                        scrub(
-                            &format!("`{raw}` holds `{inner}`, which cannot be changed: {reason}"),
-                            &self.root,
-                        ),
-                    ));
-                }
-                let kind = self
-                    .env
-                    .symlink_metadata(&entry.path)
+    /// A file-operation error as the client sees it. Under the tool lock a
+    /// path through a link is the one refusal ([`refused_path`]), so a
+    /// refused path and a missing one look the same.
+    fn fs_error(&self, error: FsError, raw: &str) -> BackendError {
+        match error {
+            FsError::Link if self.locked => refused_path(),
+            FsError::Link => BackendError::workspace(
+                Code::InvalidPath,
+                format!("`{raw}` passes through a link; the file panel does not follow links"),
+            ),
+            FsError::NotFound => not_found(raw),
+            FsError::Exists => BackendError::workspace(Code::Exists, format!("`{raw}` exists")),
+            FsError::NotEmpty => BackendError::workspace(
+                Code::NotEmpty,
+                format!("`{raw}` is not empty; pass recursive"),
+            ),
+            e @ (FsError::Changed(_) | FsError::Protected(_) | FsError::TooMany(_)) => {
+                BackendError::workspace(Code::Refused, format!("`{raw}`: {e}"))
+            }
+            FsError::Unsupported(what) => BackendError::Unsupported(what.to_owned()),
+            FsError::Io(text) => BackendError::workspace(Code::Io, scrub(&text, &self.root)),
+        }
+    }
+
+    /// Check every entry inside the folder `path` as a write of its own
+    /// (deny rules, `.git`, `.loop`), without records: a recursive delete
+    /// or a folder rename takes them with it. Walks by descriptor, links
+    /// not entered, at most [`SUBTREE_MAX`] entries. The result is what the
+    /// delete may remove.
+    async fn subtree_allowed(
+        &self,
+        path: &WorkspacePath,
+        raw: &str,
+    ) -> BackendResult<HashMap<String, FileKind>> {
+        let walked = {
+            let path = path.clone();
+            self.fs(raw, move |root| root.walk(&path, SUBTREE_MAX))
+                .await?
+        };
+        for (inner, _) in &walked {
+            let refused = workspace_fs::protected_name(inner.rsplit('/').next().unwrap_or(""))
+                .then(|| "it is `.git` or `.loop`".to_owned());
+            let refused = match refused {
+                Some(reason) => Some(reason),
+                None => self
+                    .gate()
+                    .user_file_write_allowed(&self.root.join(inner))
                     .await
-                    .map(|m| m.kind)
-                    .map_err(|e| self.error(e.into()))?;
-                if kind == PathKind::Dir {
-                    todo.push(entry.path);
+                    .err(),
+            };
+            if let Some(reason) = refused {
+                if self.locked {
+                    return Err(refused_path());
                 }
+                return Err(BackendError::workspace(
+                    Code::Refused,
+                    scrub(
+                        &format!("`{raw}` holds `{inner}`, which cannot be changed: {reason}"),
+                        &self.root,
+                    ),
+                ));
             }
         }
-        Ok(())
+        Ok(walked)
     }
 
     /// Whether the gate's search filter shows `native` (deny rules for
@@ -463,6 +495,16 @@ fn workspace_error(error: WorkspaceError, root: &Path) -> BackendError {
     BackendError::workspace(code, scrub(&error.to_string(), root))
 }
 
+/// The one refusal under the tool lock for a path that a rule refuses,
+/// that leads out of the Session's folder, or that cannot be resolved:
+/// the same code and text whether or not something is there.
+fn refused_path() -> BackendError {
+    BackendError::workspace(
+        Code::Refused,
+        "the path is refused: a rule denies it, or it leads out of the Session's folder",
+    )
+}
+
 fn not_found(raw: &str) -> BackendError {
     BackendError::workspace(Code::NotFound, format!("`{raw}` does not exist"))
 }
@@ -478,22 +520,6 @@ fn unknown_terminal() -> BackendError {
 fn decode(data: &str) -> BackendResult<Vec<u8>> {
     base64::decode(data)
         .map_err(|e| BackendError::failed(loop_protocol::ErrorCategory::Protocol, e.to_string()))
-}
-
-/// The last change of `native` (without following a final link), when the
-/// env can tell.
-async fn mtime_ms(env: &dyn loop_agent::harness::ExecutionEnv, native: &Path) -> Option<u64> {
-    let identity = env.file_identity(native).await.ok()??;
-    u64::try_from(identity.mtime_ns? / 1_000_000).ok()
-}
-
-fn kind_of(kind: PathKind) -> FileKind {
-    match kind {
-        PathKind::File => FileKind::File,
-        PathKind::Dir => FileKind::Dir,
-        PathKind::Symlink => FileKind::Symlink,
-        PathKind::Other => FileKind::Other,
-    }
 }
 
 /// Why `live` cannot serve files or terminals now: its sandbox is on (or
@@ -534,14 +560,13 @@ impl Runtime {
             return Err(BackendError::Unsupported(reason.to_owned()));
         }
         let workspace = Arc::clone(&live.opened.workspace.host_workspace);
-        let env = workspace.env();
         let root = workspace.root();
         Ok(Target {
             live,
             workspace,
-            env,
             root,
             caller,
+            locked: self.factory.globals.tool_lock().is_some(),
         })
     }
 
@@ -605,65 +630,43 @@ impl Runtime {
         })
     }
 
-    /// `session/files/list`.
+    /// `session/files/list`. The gate first; then the folder is read by
+    /// descriptor, and only the entries of this page are looked at.
     pub(super) async fn files_list(
         &self,
         params: FilesListParams,
     ) -> BackendResult<FilesListResult> {
         let target = self.target(&params.session, Need::Read).await?;
         let (path, native) = target.path(&params.path)?;
-        target.contained(&native, true).await?;
         target.allow(UserFileAction::List, &native).await?;
-        let listed = target
-            .env
-            .list_dir(&native)
-            .await
-            .map_err(|e| target.error(e.into()))?;
-        let natives: Vec<PathBuf> = listed.iter().map(|info| info.path.clone()).collect();
-        let shown = target.shown(natives).await?;
-        let mut hidden = 0u64;
-        let mut entries = Vec::new();
-        for (info, shown) in listed.into_iter().zip(shown) {
-            if !shown {
-                hidden += 1;
-                continue;
-            }
-            let Some(name) = info
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-            else {
-                continue;
-            };
-            let entry_path = WorkspacePath::from_native(&target.root, &info.path)
-                .map(|p| p.as_str().to_owned())
-                .unwrap_or_else(|_| join(path.as_str(), &name));
-            let (kind, size) = match target.env.symlink_metadata(&info.path).await {
-                Ok(meta) => (kind_of(meta.kind), meta.size),
-                Err(_) if info.is_dir => (FileKind::Dir, 0),
-                Err(_) if info.is_file => (FileKind::File, info.size),
-                Err(_) => (FileKind::Other, info.size),
-            };
-            let mtime_ms = mtime_ms(&*target.env, &info.path).await;
-            entries.push(FileEntry {
-                name,
-                path: entry_path,
-                kind,
-                size: if kind == FileKind::Dir { 0 } else { size },
-                mtime_ms,
-                tag: None,
-            });
-        }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        if let Some(cursor) = &params.cursor {
-            entries.retain(|entry| entry.name.as_str() > cursor.as_str());
-        }
+        self.sweep_temps_once(&target).await;
         let limit = params
             .limit
             .unwrap_or(LIST_PAGE_DEFAULT)
             .clamp(1, LIST_PAGE_MAX) as usize;
-        let next_cursor = (entries.len() > limit).then(|| entries[limit - 1].name.clone());
-        entries.truncate(limit);
+        let filter = target.gate().search_filter();
+        let root = target.root.clone();
+        let (page, next_cursor, hidden) = {
+            let path = path.clone();
+            let cursor = params.cursor.clone();
+            target
+                .fs(&params.path, move |fs| {
+                    let shown = |rel: &str| filter("ls", &root.join(rel));
+                    fs.list(&path, cursor.as_deref(), limit, &shown)
+                })
+                .await?
+        };
+        let entries = page
+            .into_iter()
+            .map(|(name, meta)| FileEntry {
+                path: join(path.as_str(), &name),
+                name,
+                kind: meta.kind,
+                size: meta.size,
+                mtime_ms: meta.mtime_ms,
+                tag: None,
+            })
+            .collect();
         Ok(FilesListResult {
             path: path.as_str().to_owned(),
             entries,
@@ -676,19 +679,20 @@ impl Runtime {
     pub(super) async fn files_stat(&self, params: FilePathParams) -> BackendResult<FileEntry> {
         let target = self.target(&params.session, Need::Read).await?;
         let (path, native) = target.path(&params.path)?;
-        target.contained(&native, false).await?;
         target.allow(UserFileAction::Read, &native).await?;
         // A hidden entry is not there, for stat as for a listing.
         if native != target.root && !target.shown(vec![native.clone()]).await?[0] {
-            return Err(not_found(&params.path));
+            return Err(if target.locked {
+                refused_path()
+            } else {
+                not_found(&params.path)
+            });
         }
-        let meta = target
-            .env
-            .symlink_metadata(&native)
-            .await
-            .map_err(|e| target.error(e.into()))?;
-        let kind = kind_of(meta.kind);
-        let tag = if kind == FileKind::File {
+        let meta = {
+            let path = path.clone();
+            target.fs(&params.path, move |fs| fs.stat(&path)).await?
+        };
+        let tag = if meta.kind == FileKind::File {
             target
                 .workspace
                 .read_chunk(&path, 0, 0, None)
@@ -702,9 +706,9 @@ impl Runtime {
         Ok(FileEntry {
             name,
             path: path.as_str().to_owned(),
-            kind,
-            size: if kind == FileKind::Dir { 0 } else { meta.size },
-            mtime_ms: mtime_ms(&*target.env, &native).await,
+            kind: meta.kind,
+            size: meta.size,
+            mtime_ms: meta.mtime_ms,
             tag,
         })
     }
@@ -755,45 +759,12 @@ impl Runtime {
                 ),
             ));
         }
-        let Some(_slot) = self.workspace_io.reserve(
-            false,
-            &params.session.key,
-            &caller,
-            usize::MAX,
-            limits.uploads_per_caller as usize,
-        ) else {
-            return Err(BackendError::workspace(
-                Code::Limit,
-                format!(
-                    "{} uploads are open; finish or abort one first",
-                    limits.uploads_per_caller
-                ),
-            ));
-        };
-        // Containment (the driver checks the folders by descriptor at the
-        // begin), then the gate, and only then whether the file exists.
+        // The gate first; only then is anything about the file told.
         target.allow(UserFileAction::Write, &native).await?;
-        let driver = target
-            .workspace
-            .begin_upload(UploadRequest {
-                path: path.clone(),
-                size: params.size,
-                sha256: params.sha256,
-                if_match: params.if_match.clone().map(FileTag),
-                // 0644: an upload never gets an execute bit.
-                mode: None,
-            })
-            .await
-            .map_err(|e| target.error(e))?;
-        if params.if_match.is_none() && !params.overwrite {
-            let exists = match target.env.symlink_metadata(&native).await {
-                Ok(_) => Ok(true),
-                Err(error) if error.code == FileErrorCode::NotFound => Ok(false),
-                Err(error) => Err(target.error(error.into())),
-            };
-            if !matches!(exists, Ok(false)) {
-                let _ = target.workspace.upload_abort(&driver).await;
-                exists?;
+        let no_replace = params.if_match.is_none() && !params.overwrite;
+        if no_replace {
+            let probe = path.clone();
+            if target.fs(&params.path, move |fs| fs.exists(&probe)).await? {
                 return Err(BackendError::workspace(
                     Code::Exists,
                     format!(
@@ -803,6 +774,34 @@ impl Runtime {
                 ));
             }
         }
+        let Some(_slot) = self.workspace_io.reserve(
+            Kind::Upload(params.size),
+            &params.session.key,
+            &caller,
+            &limits,
+        ) else {
+            return Err(BackendError::workspace(
+                Code::Limit,
+                format!(
+                    "too many uploads: at most {} open per user and {} bytes open per Session",
+                    limits.uploads_per_caller, limits.upload_bytes_per_session
+                ),
+            ));
+        };
+        self.sweep_temps_once(&target).await;
+        let driver = target
+            .workspace
+            .begin_upload(UploadRequest {
+                path: path.clone(),
+                size: params.size,
+                sha256: params.sha256,
+                if_match: params.if_match.clone().map(FileTag),
+                // 0644 for a new file; an existing one loses its execute
+                // bits at the commit.
+                mode: Some(0o644),
+            })
+            .await
+            .map_err(|e| target.error(e))?;
         let id = new_id("up");
         lock(&self.workspace_io.uploads).insert(
             id.clone(),
@@ -814,6 +813,7 @@ impl Runtime {
                 driver,
                 path,
                 size: params.size,
+                no_replace,
                 touched: Mutex::new(Instant::now()),
             }),
         );
@@ -923,9 +923,32 @@ impl Runtime {
             return Err(error);
         }
         let root = upload.workspace.root();
+        let raw = upload.path.as_str().to_owned();
+        if upload.no_replace {
+            // A file that appeared since the begin is not replaced. (The
+            // driver has no "must not exist" commit; a file made between
+            // this check and the rename is the remaining race.)
+            let probe = upload.path.clone();
+            if target.fs(&raw, move |fs| fs.exists(&probe)).await? {
+                let _ = upload.workspace.upload_abort(&upload.driver).await;
+                self.forget_upload(&params.upload);
+                return Err(BackendError::workspace(
+                    Code::Exists,
+                    format!("`{raw}` appeared after the upload began; it was not replaced"),
+                ));
+            }
+        }
         match upload.workspace.upload_commit(&upload.driver).await {
             Ok(tag) => {
                 self.forget_upload(&params.upload);
+                // An upload never leaves an execute bit, also over a file
+                // that had one (the driver keeps an existing file's mode).
+                let path = upload.path.clone();
+                target.fs(&raw, move |fs| fs.clear_execute(&path)).await?;
+                let tag = match upload.workspace.read_chunk(&upload.path, 0, 0, None).await {
+                    Ok(chunk) => chunk.tag,
+                    Err(_) => tag,
+                };
                 Ok(UploadCommitResult {
                     path: upload.path.as_str().to_owned(),
                     size: upload.size,
@@ -959,126 +982,71 @@ impl Runtime {
             .map_err(|e| workspace_error(e, &root))
     }
 
-    /// `session/files/delete`.
+    /// `session/files/delete`. The gate first; then by descriptor: a link
+    /// is unlinked, never followed. A folder with entries needs
+    /// `recursive`; its entries are checked first (a check pass), then
+    /// deleted by descriptor; an entry that appeared or changed between
+    /// the passes stops the delete (what was deleted stays deleted).
     pub(super) async fn files_delete(&self, params: FilesDeleteParams) -> BackendResult<()> {
         self.check(&params.session, Need::Write).await?;
         self.refuse_if_locked("session/files/delete")?;
         let target = self.target(&params.session, Need::Write).await?;
-        let (_, native) = target.below_root(&params.path, "delete")?;
-        target.contained(&native, false).await?;
+        let (path, native) = target.below_root(&params.path, "delete")?;
         target.allow(UserFileAction::Delete, &native).await?;
-        let meta = target
-            .env
-            .symlink_metadata(&native)
-            .await
-            .map_err(|e| target.error(e.into()))?;
-        if meta.kind == PathKind::Dir && params.recursive {
-            target.subtree_allowed(&native, &params.path).await?;
-        }
-        if meta.kind == PathKind::Dir && !params.recursive {
-            let entries = target
-                .env
-                .list_dir(&native)
-                .await
-                .map_err(|e| target.error(e.into()))?;
-            if !entries.is_empty() {
-                return Err(BackendError::workspace(
-                    Code::NotEmpty,
-                    format!("`{}` is not empty; pass recursive", params.path),
-                ));
-            }
-        }
-        // A link goes, never its target. `remove` follows a final link to
-        // learn the kind, so a host link (also a dangling one) is removed
-        // directly.
-        if meta.kind == PathKind::Symlink && target.env.path_namespace() == PathNamespace::Host {
-            return tokio::fs::remove_file(&native).await.map_err(|e| {
-                BackendError::workspace(Code::Io, scrub(&e.to_string(), &target.root))
-            });
-        }
+        let meta = {
+            let path = path.clone();
+            target.fs(&params.path, move |fs| fs.stat(&path)).await?
+        };
+        let checked = if meta.kind == FileKind::Dir && params.recursive {
+            Some(target.subtree_allowed(&path, &params.path).await?)
+        } else {
+            None
+        };
         target
-            .env
-            .remove(&native)
+            .fs(&params.path, move |fs| fs.delete(&path, checked.as_ref()))
             .await
-            .map_err(|e| target.error(e.into()))
     }
 
-    /// `session/files/rename`. The Workspace contract has no rename yet, so
-    /// only a Workspace whose paths are host paths can do it.
+    /// `session/files/rename`: by descriptor, never replacing `to`
+    /// (`RENAME_NOREPLACE` on Linux, `RENAME_EXCL` on macOS), never
+    /// following a link on the way. A folder's entries are checked as
+    /// writes first.
     pub(super) async fn files_rename(&self, params: FilesRenameParams) -> BackendResult<()> {
         self.check(&params.session, Need::Write).await?;
         self.refuse_if_locked("session/files/rename")?;
         let target = self.target(&params.session, Need::Write).await?;
-        if target.env.path_namespace() != PathNamespace::Host {
-            return Err(BackendError::Unsupported(
-                "renaming in a workspace whose paths are not host paths".into(),
-            ));
-        }
-        let (_, from) = target.below_root(&params.from, "rename")?;
-        let (_, to) = target.below_root(&params.to, "rename to")?;
-        target.contained(&from, false).await?;
-        target.contained(&to, false).await?;
-        target.allow(UserFileAction::Write, &from).await?;
-        target.allow(UserFileAction::Write, &to).await?;
-        let meta = target
-            .env
-            .symlink_metadata(&from)
-            .await
-            .map_err(|e| target.error(e.into()))?;
-        if meta.kind == PathKind::Dir {
+        let (from, from_native) = target.below_root(&params.from, "rename")?;
+        let (to, to_native) = target.below_root(&params.to, "rename to")?;
+        target.allow(UserFileAction::Write, &from_native).await?;
+        target.allow(UserFileAction::Write, &to_native).await?;
+        let meta = {
+            let from = from.clone();
+            target.fs(&params.from, move |fs| fs.stat(&from)).await?
+        };
+        if meta.kind == FileKind::Dir {
             target.subtree_allowed(&from, &params.from).await?;
         }
-        match target.env.symlink_metadata(&to).await {
-            Ok(_) => {
-                return Err(BackendError::workspace(
-                    Code::Exists,
-                    format!("`{}` exists", params.to),
-                ))
-            }
-            Err(error) if error.code == FileErrorCode::NotFound => {}
-            Err(error) => return Err(target.error(error.into())),
-        }
-        // Host namespace: the env's paths are host paths.
-        tokio::fs::rename(&from, &to)
+        let raw = format!("{} -> {}", params.from, params.to);
+        target
+            .fs(&raw, move |fs| fs.rename(&from, &to))
             .await
-            .map_err(|e| BackendError::workspace(Code::Io, scrub(&e.to_string(), &target.root)))
+            .map_err(|error| match error {
+                BackendError::Workspace {
+                    code: Code::Exists, ..
+                } => BackendError::workspace(Code::Exists, format!("`{}` exists", params.to)),
+                other => other,
+            })
     }
 
-    /// `session/files/mkdir`: one new folder in a folder that exists.
+    /// `session/files/mkdir`: one new folder (0755) in a folder that
+    /// exists, by descriptor.
     pub(super) async fn files_mkdir(&self, params: FilePathParams) -> BackendResult<()> {
         self.check(&params.session, Need::Write).await?;
         self.refuse_if_locked("session/files/mkdir")?;
         let target = self.target(&params.session, Need::Write).await?;
-        let (_, native) = target.below_root(&params.path, "make")?;
-        target.contained(&native, false).await?;
+        let (path, native) = target.below_root(&params.path, "make")?;
         target.allow(UserFileAction::Write, &native).await?;
-        let parent = native.parent().unwrap_or(&target.root);
-        let parent_meta = target
-            .env
-            .file_info(parent)
-            .await
-            .map_err(|e| target.error(e.into()))?;
-        if !parent_meta.is_dir {
-            return Err(BackendError::workspace(
-                Code::NotAFolder,
-                "the parent is not a folder",
-            ));
-        }
-        match target.env.symlink_metadata(&native).await {
-            Ok(_) => {
-                return Err(BackendError::workspace(
-                    Code::Exists,
-                    format!("`{}` exists", params.path),
-                ))
-            }
-            Err(error) if error.code == FileErrorCode::NotFound => {}
-            Err(error) => return Err(target.error(error.into())),
-        }
-        target
-            .env
-            .create_dir(&native)
-            .await
-            .map_err(|e| target.error(e.into()))
+        target.fs(&params.path, move |fs| fs.mkdir(&path)).await
     }
 
     /// `session/terminal/open`.
@@ -1103,13 +1071,10 @@ impl Runtime {
         }
         self.need_sweep()?;
         let limits = self.workspace_limits();
-        let Some(_slot) = self.workspace_io.reserve(
-            true,
-            &params.session.key,
-            &caller,
-            limits.terminals_per_session as usize,
-            limits.terminals_per_caller as usize,
-        ) else {
+        let Some(_slot) =
+            self.workspace_io
+                .reserve(Kind::Terminal, &params.session.key, &caller, &limits)
+        else {
             return Err(BackendError::workspace(
                 Code::Limit,
                 format!(
@@ -1446,6 +1411,17 @@ impl Runtime {
         for upload in uploads {
             let _ = upload.workspace.upload_abort(&upload.driver).await;
         }
+    }
+
+    /// Remove the upload temporary files that a killed Runtime left in the
+    /// Session's folder (older than the idle expiry), once per folder.
+    async fn sweep_temps_once(&self, target: &Target) {
+        if !lock(&self.workspace_io.swept).insert(target.root.clone()) {
+            return;
+        }
+        let _ = target
+            .fs("", |fs| Ok(fs.sweep_upload_temps(UPLOAD_IDLE, SUBTREE_MAX)))
+            .await;
     }
 
     /// Start the sweep task once. Only a shared Runtime can run it; without
