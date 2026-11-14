@@ -33,6 +33,9 @@ use loop_wire::{Authority, Connection, Incoming, RpcError, RuntimeControl};
 use serde_json::{json, Value};
 
 const SECRET: &str = "alice-secret-7f3a";
+/// Ids Bob guesses for her uploads and terminals.
+const GUESSED_UPLOAD: &str = "up-00000000000000000000000000000000";
+const GUESSED_TERMINAL: &str = "term-00000000000000000000000000000000";
 
 fn say(line: String) {
     println!("E10|{line}");
@@ -216,6 +219,41 @@ fn params(method: &str, session: &Value, workspace: &str, request_id: &str) -> V
             json!({"workspace_id": workspace, "jsonl": "", "request_id": request_id})
         }
         m if m.starts_with("workspace/") => json!({"workspace_id": workspace, "action": "list"}),
+        // Her file, her upload and terminal ids as Bob would guess them.
+        methods::SESSION_FILES_STAT
+        | methods::SESSION_FILES_READ
+        | methods::SESSION_FILES_DELETE
+        | methods::SESSION_FILES_MKDIR => json!({"session": session, "path": "secret.txt"}),
+        methods::SESSION_FILES_LIST => json!({"session": session, "path": ""}),
+        methods::SESSION_FILES_RENAME => {
+            json!({"session": session, "from": "secret.txt", "to": "mine.txt"})
+        }
+        methods::SESSION_FILES_UPLOAD_BEGIN => {
+            json!({"session": session, "path": "planted.txt", "size": 1})
+        }
+        methods::SESSION_FILES_UPLOAD_WRITE => json!({"session": session,
+            "upload": GUESSED_UPLOAD, "offset": 0, "data": "eA=="}),
+        methods::SESSION_FILES_UPLOAD_STATUS
+        | methods::SESSION_FILES_UPLOAD_COMMIT
+        | methods::SESSION_FILES_UPLOAD_ABORT => {
+            json!({"session": session, "upload": GUESSED_UPLOAD})
+        }
+        methods::SESSION_TERMINAL_OPEN => json!({"session": session, "cols": 80, "rows": 24}),
+        methods::SESSION_TERMINAL_ATTACH => {
+            json!({"session": session, "terminal": GUESSED_TERMINAL, "after_seq": 0})
+        }
+        methods::SESSION_TERMINAL_INPUT => {
+            json!({"session": session, "terminal": GUESSED_TERMINAL, "data": "aWQK"})
+        }
+        methods::SESSION_TERMINAL_RESIZE => {
+            json!({"session": session, "terminal": GUESSED_TERMINAL, "cols": 1, "rows": 1})
+        }
+        methods::SESSION_TERMINAL_SIGNAL => {
+            json!({"session": session, "terminal": GUESSED_TERMINAL, "signal": "kill"})
+        }
+        methods::SESSION_TERMINAL_DETACH | methods::SESSION_TERMINAL_CLOSE => {
+            json!({"session": session, "terminal": GUESSED_TERMINAL})
+        }
         _ => json!({"session": session}),
     }
 }
@@ -278,6 +316,8 @@ async fn probe(attacker: &str) -> Found {
     let bob = connect(&rt, edge(attacker)).await;
     let alice_folder = folder(dir.path(), "alice");
     let bob_folder = folder(dir.path(), "bob");
+    // A file of hers, for the file methods.
+    std::fs::write(alice_folder.join("secret.txt"), SECRET).unwrap();
 
     // Alice works.
     let hers = alice
@@ -600,10 +640,73 @@ async fn probe(attacker: &str) -> Found {
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     let replayed = back.seen.lock().unwrap().join("\n");
+    let back_seen = &back.seen;
     for needle in [key.as_str(), SECRET] {
         if replayed.contains(needle) {
             leaks.push(format!("the refill replayed {needle:?}"));
         }
+    }
+
+    // 10. Her files from his own Session: a path out, a link he finds in
+    //     his folder (planted by someone else), and guessed upload and
+    //     terminal ids on his own Session. All refused, nothing of hers
+    //     read, nothing planted.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&alice_folder, bob_folder.join("to-alice")).unwrap();
+    for (method, params) in [
+        (
+            methods::SESSION_FILES_READ,
+            json!({"session": his, "path": "../alice/secret.txt"}),
+        ),
+        (
+            methods::SESSION_FILES_READ,
+            json!({"session": his, "path": "to-alice/secret.txt"}),
+        ),
+        (
+            methods::SESSION_FILES_LIST,
+            json!({"session": his, "path": "to-alice"}),
+        ),
+        (
+            methods::SESSION_FILES_STAT,
+            json!({"session": his, "path": "to-alice/secret.txt"}),
+        ),
+        (
+            methods::SESSION_FILES_READ,
+            json!({"session": his, "path": alice_folder.join("secret.txt")}),
+        ),
+        (
+            methods::SESSION_FILES_UPLOAD_BEGIN,
+            json!({"session": his, "path": "to-alice/planted.txt", "size": 1}),
+        ),
+        (
+            methods::SESSION_FILES_UPLOAD_STATUS,
+            json!({"session": his, "upload": GUESSED_UPLOAD}),
+        ),
+        (
+            methods::SESSION_TERMINAL_ATTACH,
+            json!({"session": his, "terminal": GUESSED_TERMINAL, "after_seq": 0}),
+        ),
+    ] {
+        attempts += 1;
+        // His Session was closed in section 6: load it again first.
+        let _ = back
+            .conn
+            .request(methods::SESSION_LOAD, json!({"session": his, "spec": {}}))
+            .await;
+        match back.conn.request(method, params.clone()).await {
+            // The refusal must come from the path, id or lock rules on his
+            // own Session, not from a Session the probe could not reach.
+            Err(RpcError::Remote { code, message, .. })
+                if code == loop_protocol::rpc::error_codes::SESSION_NOT_FOUND =>
+            {
+                leaks.push(format!("{method}: the probe missed his Session: {message}"))
+            }
+            Err(_) => refused += 1,
+            Ok(v) => leaks.push(format!("{method} {params} answered: {v}")),
+        }
+    }
+    if alice_folder.join("planted.txt").exists() {
+        leaks.push("Bob planted a file in her folder".into());
     }
 
     // 9. What Bob can see: lists, counts, everything he received.
@@ -634,7 +737,11 @@ async fn probe(attacker: &str) -> Found {
     {
         leaks.push(format!("counts: {rows} {status}"));
     }
-    let seen = bob.seen.lock().unwrap().join("\n");
+    let seen = format!(
+        "{}\n{}",
+        bob.seen.lock().unwrap().join("\n"),
+        back_seen.lock().unwrap().join("\n")
+    );
     for needle in [key.as_str(), SECRET, &alice_folder.display().to_string()] {
         if seen.contains(needle) {
             leaks.push(format!("Bob received {needle:?}"));

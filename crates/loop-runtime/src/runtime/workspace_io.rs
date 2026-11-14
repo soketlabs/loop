@@ -1460,6 +1460,115 @@ impl loop_wire::SessionWorkspace for Runtime {
 mod tests {
     use super::*;
 
+    async fn runtime(dir: &Path) -> Arc<Runtime> {
+        use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
+        let models = Arc::new(loop_ai::Models::create(Default::default()));
+        models.set_provider(loop_ai::providers::faux_provider_fn(Arc::new(|_| {
+            Box::pin(std::future::ready(
+                loop_ai::providers::faux::FauxResponse::Text("ok".into()),
+            ))
+        })));
+        let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let opts = BootstrapOpts {
+            cwd: ws.canonicalize().unwrap(),
+            provider: Some("faux".into()),
+            model: Some("faux-model".into()),
+            theme: None,
+            system_prompt: None,
+            append_system_prompt: None,
+            no_context_files: true,
+            interactive: false,
+            session_id: None,
+            no_web: true,
+            permission_mode: Some("full-access".into()),
+            agent: None,
+        };
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(
+            globals,
+            opts,
+            Arc::new(crate::log::MemoryEventLog::new()),
+            store,
+            super::super::RuntimeLimits::default(),
+        )
+        .await
+        .unwrap()
+        .into_shared()
+    }
+
+    fn turn_sandbox_on(rt: &Runtime, session: &SessionRef) {
+        let live = rt.route(session).unwrap();
+        *lock(&live.sandbox_choice) = loop_protocol::admin::SandboxChoice {
+            mode: "local".into(),
+            isolation: None,
+            runtime: None,
+        };
+    }
+
+    /// With the Session's sandbox on, no file call and no terminal is
+    /// served: the sandbox drivers do neither yet, and the host would
+    /// escape the sandbox. An open host terminal closes, with a record.
+    #[tokio::test]
+    async fn a_sandboxed_session_serves_no_files_and_no_terminal() {
+        use loop_protocol::AgentBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).await;
+        let session = rt.new_session(Default::default()).await.unwrap();
+        let open = || TerminalOpenParams {
+            session: session.clone(),
+            cols: 80,
+            rows: 24,
+            command: Some("sleep 300".into()),
+        };
+        // Off: a terminal opens.
+        let terminal = rt.term_open(open()).await.unwrap().terminal;
+        turn_sandbox_on(&rt, &session);
+        let info = rt
+            .workspace_info(SessionParams {
+                session: session.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(info.sandboxed);
+        assert!(!info.files.available && !info.files_write.available && !info.terminal.available);
+        let list = rt
+            .files_list(FilesListParams {
+                session: session.clone(),
+                path: String::new(),
+                cursor: None,
+                limit: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(list, BackendError::Unsupported(_)), "{list:?}");
+        let read = rt
+            .files_read(FilesReadParams {
+                session: session.clone(),
+                path: "x".into(),
+                offset: 0,
+                length: None,
+                if_match: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(read, BackendError::Unsupported(_)), "{read:?}");
+        let again = rt.term_open(open()).await.unwrap_err();
+        assert!(matches!(again, BackendError::Unsupported(_)), "{again:?}");
+        // The open one closes within a sweep or two.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while lock(&rt.workspace_io.terminals).contains_key(&terminal) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        rt.shutdown().await;
+        let left = loop_agent::harness::sandbox::leaked_host_processes();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
     #[test]
     fn ids_are_random_and_prefixed() {
         let a = new_id("term");
