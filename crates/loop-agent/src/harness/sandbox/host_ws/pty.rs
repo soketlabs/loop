@@ -81,6 +81,51 @@ pub(crate) fn resize(fd: &impl AsRawFd, size: PtySize) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Wait until `file` has data to read, at most `limit`. `select`, because
+/// `poll` does not report devices on macOS. A descriptor at or above
+/// `FD_SETSIZE` cannot be waited for: it reports ready at once (the read
+/// then blocks as before).
+pub(crate) fn wait_readable(file: &File, limit: std::time::Duration) -> std::io::Result<bool> {
+    let fd = file.as_raw_fd();
+    // FD_SETSIZE is `usize` on Linux and `c_int` on macOS.
+    #[allow(clippy::unnecessary_cast)]
+    let limit_fd = libc::FD_SETSIZE as usize;
+    if fd < 0 || fd as usize >= limit_fd {
+        return Ok(true);
+    }
+    let mut timeout = libc::timeval {
+        tv_sec: limit.as_secs() as _,
+        tv_usec: limit.subsec_micros() as _,
+    };
+    // SAFETY: `set` is a zeroed fd_set; FD_ZERO and FD_SET write only into
+    // it, `fd` is below FD_SETSIZE, and select reads the pointers for the
+    // call only.
+    let rc = unsafe {
+        let mut set: libc::fd_set = std::mem::zeroed();
+        libc::FD_ZERO(&mut set);
+        libc::FD_SET(fd, &mut set);
+        libc::select(
+            fd + 1,
+            &mut set,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut timeout,
+        )
+    };
+    match rc {
+        -1 => {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
+        0 => Ok(false),
+        _ => Ok(true),
+    }
+}
+
 /// Make `fd` (the terminal on stdin in the child) the controlling terminal
 /// of the calling process, which must lead a new session. For `pre_exec`:
 /// async-signal-safe.

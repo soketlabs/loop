@@ -564,6 +564,14 @@ where
         .expect("listed after the end");
     assert_eq!(info.exit, Some(ExitState::Exited { code: 0 }), "`{id}`");
 
+    let ahead = ws
+        .attach_process(&pid, info.last_seq + 100)
+        .await
+        .map(|_| ());
+    assert!(
+        matches!(ahead, Err(WorkspaceError::SeqAhead { .. })),
+        "`{id}`: after_seq past the last event: {ahead:?}"
+    );
     let unknown = ws
         .attach_process(&loop_workspace::ProcessId("no-such".into()), 0)
         .await

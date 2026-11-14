@@ -224,7 +224,10 @@ pub fn builtin_workspace_drivers() -> Vec<Arc<dyn WorkspaceDriver>> {
 /// project folder, as the tool lock does
 /// ([`HostExecutionEnv::confine_reads`]), and turns off processes and
 /// uploads. `uploadIdleMs` (number) sets the idle time after which an
-/// upload expires (default 10 minutes).
+/// upload expires (default 10 minutes). `pauseUnwatchedOutput` (bool,
+/// default true): a detached process with no handle stops being read when
+/// its buffer is full, so it waits on its output instead of running on
+/// unread; a handle that attaches resumes it.
 pub struct HostWorkspaceDriver;
 
 #[async_trait]
@@ -275,7 +278,12 @@ impl WorkspaceDriver for HostWorkspaceDriver {
             status: Mutex::new(SandboxStatus::Created),
             destroyed: AtomicBool::new(false),
             #[cfg(unix)]
-            processes: super::host_ws::ProcessTable::new(),
+            processes: super::host_ws::ProcessTable::new(
+                spec.options
+                    .get("pauseUnwatchedOutput")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+            ),
             #[cfg(unix)]
             transfers: Arc::new(transfers),
         }))
@@ -334,6 +342,8 @@ impl Sandbox for HostWorkspace {
             return Err(SandboxError::NotReady("workspace was destroyed".into()));
         }
         *self.status.lock() = SandboxStatus::Ready;
+        #[cfg(unix)]
+        self.processes.open();
         Ok(())
     }
     async fn stop(&self) -> Result<(), SandboxError> {

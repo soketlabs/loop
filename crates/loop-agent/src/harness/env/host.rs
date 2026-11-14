@@ -97,6 +97,10 @@ pub(crate) fn open_confined(
             ),
         )
     };
+    // Check before the open: a device or a FIFO is not opened at all.
+    if std::fs::metadata(path).is_ok_and(|m| !m.is_file()) {
+        return Err(outside());
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

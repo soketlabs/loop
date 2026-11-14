@@ -130,6 +130,17 @@ pub enum WorkspaceError {
     /// The uploaded bytes do not match the declared SHA-256.
     #[error("upload {0}: checksum mismatch")]
     ChecksumMismatch(String),
+    /// `attach_process` asked for events after a `seq` the process has
+    /// not reached. Nothing was attached.
+    #[error("process {process}: after_seq {after_seq} is past its last event {last_seq}")]
+    SeqAhead {
+        /// Process id.
+        process: String,
+        /// The `after_seq` asked for.
+        after_seq: u64,
+        /// The `seq` of its newest event.
+        last_seq: u64,
+    },
     /// No such process.
     #[error("unknown process {0}")]
     UnknownProcess(String),

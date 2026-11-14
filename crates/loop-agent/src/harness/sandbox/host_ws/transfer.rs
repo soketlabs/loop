@@ -205,6 +205,9 @@ struct Upload {
     mode: Option<u32>,
     committed: u64,
     touched: Instant,
+    /// Committed or aborted: no more writes (a writer that got the upload
+    /// before it left the map must not write into the placed file).
+    done: bool,
 }
 
 impl Upload {
@@ -213,7 +216,16 @@ impl Upload {
     }
 }
 
+/// Waits a little in tests, to widen race windows; nothing otherwise.
+fn widen() {
+    #[cfg(test)]
+    std::thread::sleep(Duration::from_micros(200));
+}
+
 /// The transfer state of one Workspace.
+///
+/// Lock order: the map (`uploads`) before an upload, never the reverse.
+/// Code that holds an upload releases it before it takes the map.
 pub(crate) struct Transfers {
     root: PathBuf,
     confined: bool,
@@ -237,11 +249,12 @@ impl Transfers {
         let mut uploads = self.uploads.lock();
         uploads.retain(|_, upload| {
             // An upload in use (locked) is not idle.
-            let Some(u) = upload.try_lock() else {
+            let Some(mut u) = upload.try_lock() else {
                 return true;
             };
             let keep = now.duration_since(u.touched) < self.idle;
             if !keep {
+                u.done = true;
                 u.remove_temp();
             }
             keep
@@ -252,7 +265,9 @@ impl Transfers {
     pub(crate) fn clear(&self) {
         let all: Vec<_> = self.uploads.lock().drain().map(|(_, u)| u).collect();
         for upload in all {
-            upload.lock().remove_temp();
+            let mut u = upload.lock();
+            u.done = true;
+            u.remove_temp();
         }
     }
 
@@ -331,6 +346,7 @@ impl Transfers {
             mode: request.mode,
             committed: 0,
             touched: Instant::now(),
+            done: false,
         };
         self.uploads
             .lock()
@@ -346,6 +362,9 @@ impl Transfers {
     ) -> Result<u64, WorkspaceError> {
         let upload = self.get(id)?;
         let mut u = upload.lock();
+        if u.done {
+            return Err(WorkspaceError::UnknownUpload(id.0.clone()));
+        }
         u.touched = Instant::now();
         if offset > u.committed {
             return Err(WorkspaceError::UploadOffset {
@@ -377,26 +396,52 @@ impl Transfers {
     }
 
     pub(crate) fn abort(&self, id: &UploadId) {
-        if let Some(upload) = self.uploads.lock().remove(&id.0) {
-            upload.lock().remove_temp();
+        // The map guard ends with this statement (lock order).
+        let removed = self.uploads.lock().remove(&id.0);
+        if let Some(upload) = removed {
+            widen();
+            let mut u = upload.lock();
+            u.done = true;
+            u.remove_temp();
         }
         self.expire();
     }
 
     pub(crate) fn commit(&self, id: &UploadId) -> Result<FileTag, WorkspaceError> {
         let upload = self.get(id)?;
-        let mut u = upload.lock();
-        u.touched = Instant::now();
-        if u.committed != u.size {
-            return Err(WorkspaceError::UploadOffset {
-                upload: id.0.clone(),
-                offset: u.size,
-                committed: u.committed,
-            });
+        let incomplete = |u: &Upload| WorkspaceError::UploadOffset {
+            upload: id.0.clone(),
+            offset: u.size,
+            committed: u.committed,
+        };
+        {
+            let mut u = upload.lock();
+            u.touched = Instant::now();
+            if u.committed != u.size {
+                return Err(incomplete(&u));
+            }
         }
+        widen();
+        // Take it out of the map (only this upload: an abort may have
+        // taken it already). The map guard ends with this statement.
+        let taken = {
+            let mut map = self.uploads.lock();
+            match map.get(&id.0) {
+                Some(found) if Arc::ptr_eq(found, &upload) => map.remove(&id.0),
+                _ => None,
+            }
+        };
+        if taken.is_none() {
+            return Err(WorkspaceError::UnknownUpload(id.0.clone()));
+        }
+        let mut u = upload.lock();
+        u.done = true;
         // From here on the upload ends, whatever the result.
-        self.uploads.lock().remove(&id.0);
-        let result = self.finish(&u, id);
+        let result = if u.committed != u.size {
+            Err(incomplete(&u))
+        } else {
+            self.finish(&u, id)
+        };
         if result.is_err() {
             u.remove_temp();
         }
@@ -432,16 +477,39 @@ impl Transfers {
         u.file.sync_all().map_err(|e| io(path, e))?;
         let current = target(&u.dir, &u.name, &u.path)?;
         check_if_match(&u.path, &current, u.if_match.as_ref())?;
+        // Only the permission bits: no setuid, setgid or sticky bit, from
+        // the request or from the file it replaces.
         let mode = match current {
             Target::File(_, mode) => mode,
             Target::Missing => u.mode.unwrap_or(DEFAULT_MODE),
-        };
+        } & 0o777;
         rustix::fs::fchmod(u.file.as_fd(), Mode::from_raw_mode(mode as _))
             .map_err(|e| errno(path, e))?;
+        let ours = u.file.metadata().map_err(|e| io(path, e))?;
+        let is_ours = |name: &OsString| {
+            rustix::fs::statat(&u.dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW)
+                .ok()
+                .is_some_and(|st| {
+                    #[allow(clippy::unnecessary_cast)]
+                    let same = st.st_dev as u64 == ours.dev() && st.st_ino as u64 == ours.ino();
+                    same
+                })
+        };
+        let changed = || WorkspaceError::Changed {
+            path: u.path.as_str().to_owned(),
+        };
+        // The temporary name must still be our file (not a link or a file
+        // that something put in its place).
+        if !is_ours(&u.temp) {
+            return Err(changed());
+        }
         rustix::fs::renameat(&u.dir, u.temp.as_os_str(), &u.dir, u.name.as_os_str())
             .map_err(|e| errno(path, e))?;
         // The rename is durable once the folder is synced.
         rustix::fs::fsync(&u.dir).map_err(|e| errno(path, e))?;
+        if !is_ours(&u.name) {
+            return Err(changed());
+        }
         let meta = u.file.metadata().map_err(|e| io(path, e))?;
         Ok(tag_of_metadata(&meta))
     }
@@ -461,6 +529,14 @@ impl Transfers {
                 return Err(invalid(path, "names the workspace root"));
             };
             let dir = open_dir(&self.root, &parent, false)?;
+            // Check before the open: a device or a FIFO is never opened.
+            match rustix::fs::statat(&dir, name, AtFlags::empty()) {
+                Ok(st)
+                    if rustix::fs::FileType::from_raw_mode(st.st_mode)
+                        == rustix::fs::FileType::RegularFile => {}
+                Ok(_) => return Err(invalid(path, "is not a regular file")),
+                Err(e) => return Err(errno(path.as_str(), e)),
+            }
             let fd = rustix::fs::openat(
                 &dir,
                 name,
@@ -521,5 +597,138 @@ impl Transfers {
 impl Drop for Transfers {
     fn drop(&mut self) {
         self.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn setup() -> (tempfile::TempDir, PathBuf, Arc<Transfers>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let t = Arc::new(Transfers::new(root.clone(), false, UPLOAD_IDLE));
+        (dir, root, t)
+    }
+
+    fn request(path: &str, size: u64) -> UploadRequest {
+        UploadRequest {
+            path: WorkspacePath::parse(path).unwrap(),
+            size,
+            sha256: None,
+            if_match: None,
+            mode: None,
+        }
+    }
+
+    /// Commit and abort of one upload at the same time never deadlock;
+    /// one of them wins and no temporary file stays.
+    #[test]
+    fn commit_and_abort_race_without_deadlock() {
+        let (_dir, root, t) = setup();
+        for round in 0..200 {
+            let id = t.begin("ws", request("race.bin", 4)).unwrap();
+            t.write(&id, 0, b"abcd").unwrap();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            for commit in [true, false] {
+                let t = Arc::clone(&t);
+                let id = id.clone();
+                let done = done_tx.clone();
+                std::thread::spawn(move || {
+                    if commit {
+                        let _ = t.commit(&id);
+                    } else {
+                        t.abort(&id);
+                    }
+                    let _ = done.send(());
+                });
+            }
+            for _ in 0..2 {
+                done_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap_or_else(|_| panic!("deadlock in round {round}"));
+            }
+            assert!(t.committed(&id).is_err(), "round {round}");
+            let temps: Vec<_> = std::fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains(".loop-upload-"))
+                .collect();
+            assert!(temps.is_empty(), "round {round}: {temps:?}");
+        }
+    }
+
+    /// A temporary file replaced by a link before the commit: the commit
+    /// fails with `Changed` and the destination is not that link.
+    #[test]
+    fn a_swapped_temporary_file_is_refused() {
+        let (dir, root, t) = setup();
+        let outside = dir
+            .path()
+            .join("..")
+            .join(format!("outside-{}", loop_ai::new_id()));
+        std::fs::write(&outside, "outside").unwrap();
+        let id = t.begin("ws", request("dest.txt", 3)).unwrap();
+        t.write(&id, 0, b"new").unwrap();
+        let temp = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().contains(".loop-upload-"))
+            .unwrap()
+            .path();
+        std::fs::remove_file(&temp).unwrap();
+        std::os::unix::fs::symlink(&outside, &temp).unwrap();
+        let result = t.commit(&id);
+        assert!(
+            matches!(result, Err(WorkspaceError::Changed { .. })),
+            "{result:?}"
+        );
+        assert!(!root
+            .join("dest.txt")
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink()));
+        std::fs::remove_file(&outside).unwrap();
+    }
+
+    #[test]
+    fn limits_give_busy_and_too_large() {
+        let (_dir, _root, t) = setup();
+        let big = t.begin("ws", request("big.bin", MAX_UPLOAD_BYTES + 1));
+        assert!(
+            matches!(big, Err(WorkspaceError::TooLarge { .. })),
+            "{big:?}"
+        );
+        let ids: Vec<_> = (0..MAX_UPLOADS)
+            .map(|i| t.begin("ws", request(&format!("u{i}.bin"), 1)).unwrap())
+            .collect();
+        let over = t.begin("ws", request("over.bin", 1));
+        assert!(
+            matches!(over, Err(WorkspaceError::Busy { .. })),
+            "the 17th upload: {over:?}"
+        );
+        t.abort(&ids[0]);
+        assert!(t.begin("ws", request("again.bin", 1)).is_ok());
+    }
+
+    #[test]
+    fn special_mode_bits_are_dropped() {
+        let (_dir, root, t) = setup();
+        let id = t
+            .begin(
+                "ws",
+                UploadRequest {
+                    mode: Some(0o4755),
+                    ..request("setuid.sh", 1)
+                },
+            )
+            .unwrap();
+        t.write(&id, 0, b"x").unwrap();
+        t.commit(&id).unwrap();
+        let mode = std::fs::metadata(root.join("setuid.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o755);
     }
 }

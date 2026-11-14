@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use loop_agent::harness::sandbox::{HostWorkspaceDriver, WorkspaceSource, WorkspaceSpec};
+use loop_agent::harness::sandbox::{
+    HostWorkspaceDriver, WorkspaceDriver, WorkspaceSource, WorkspaceSpec,
+};
 use loop_agent::harness::types::ShellExecOptions;
 use loop_agent::harness::{SessionExecutionEnv, ToolEnvPolicy};
 use loop_workspace_testkit::{
@@ -188,4 +190,165 @@ async fn dropping_the_workspace_kills_its_processes() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(!marker.exists(), "a process outlived its workspace");
     assert_no_leaked_processes().await;
+}
+
+/// Parallel starts never pass the limit: of 200, exactly 64 run, the rest
+/// are `Busy`; `destroy` then leaves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn parallel_spawns_stop_at_the_limit() {
+    use loop_agent::harness::sandbox::{SpawnRequest, WorkspaceError};
+    let f = fixture(false);
+    let ws = f.start().await;
+    let tasks: Vec<_> = (0..200)
+        .map(|_| {
+            let ws = Arc::clone(&ws);
+            tokio::spawn(async move {
+                ws.spawn(SpawnRequest {
+                    command: "sleep 30".into(),
+                    detach: true,
+                    ..Default::default()
+                })
+                .await
+            })
+        })
+        .collect();
+    let mut ok = 0;
+    let mut busy = 0;
+    let mut handles = Vec::new();
+    for task in tasks {
+        match task.await.expect("task") {
+            Ok(p) => {
+                ok += 1;
+                handles.push(p);
+            }
+            Err(WorkspaceError::Busy { .. }) => busy += 1,
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+    assert_eq!((ok, busy), (64, 136));
+    ws.destroy().await.expect("destroy");
+    drop(handles);
+    assert_no_leaked_processes().await;
+}
+
+/// A start that races `destroy` either fails or is killed: no process
+/// runs after `destroy` returned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_spawn_racing_destroy_leaves_nothing() {
+    use loop_agent::harness::sandbox::{ExitState, SpawnRequest};
+    for _ in 0..20 {
+        let f = fixture(false);
+        let ws = f.start().await;
+        let marker = ws.root().join("raced");
+        let spawns: Vec<_> = (0..8)
+            .map(|_| {
+                let ws = Arc::clone(&ws);
+                let marker = marker.clone();
+                tokio::spawn(async move {
+                    ws.spawn(SpawnRequest {
+                        command: format!("sleep 1; touch '{}'", marker.display()),
+                        detach: true,
+                        ..Default::default()
+                    })
+                    .await
+                })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        ws.destroy().await.expect("destroy");
+        for s in spawns {
+            if let Ok(p) = s.await.expect("task") {
+                let mut exit = None;
+                while let Some(e) = tokio::time::timeout(Duration::from_secs(10), p.next_event())
+                    .await
+                    .expect("ends after destroy")
+                {
+                    if let loop_agent::harness::sandbox::ProcessEventKind::Exited(x) = e.kind {
+                        exit = Some(x);
+                    }
+                }
+                assert_eq!(exit, Some(ExitState::Cancelled));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!marker.exists(), "a process ran after destroy");
+    }
+    assert_no_leaked_processes().await;
+}
+
+/// A `spawn` call dropped at any point leaves no command running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_spawn_call_leaves_no_command() {
+    use loop_agent::harness::sandbox::SpawnRequest;
+    let f = fixture(false);
+    let ws = f.start().await;
+    for i in 0..40 {
+        let marker = ws.root().join(format!("dropped-{i}"));
+        let call = ws.spawn(SpawnRequest {
+            command: format!("sleep 1; touch '{}'", marker.display()),
+            ..Default::default()
+        });
+        // Drop the call after a few microseconds to a few milliseconds.
+        let _ = tokio::time::timeout(Duration::from_micros(50 * i), call).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for i in 0..40 {
+        assert!(
+            !ws.root().join(format!("dropped-{i}")).exists(),
+            "the command of dropped call {i} ran on"
+        );
+    }
+    ws.destroy().await.expect("destroy");
+    assert_no_leaked_processes().await;
+}
+
+/// A detached process that nobody watches stops being read when its
+/// buffer is full: it waits on its output and does not finish. Attaching
+/// resumes it. With `pauseUnwatchedOutput: false` it runs to the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unwatched_detached_output_pauses_when_the_buffer_is_full() {
+    use loop_agent::harness::sandbox::{ExitState, ProcessEventKind, SpawnRequest, WorkspaceSpec};
+    for pause in [true, false] {
+        let layout = common::layout();
+        let ws = HostWorkspaceDriver
+            .create(WorkspaceSpec {
+                source: WorkspaceSource::HostFolder(layout.project.clone()),
+                options: json!({ "pauseUnwatchedOutput": pause }),
+                ..Default::default()
+            })
+            .await
+            .expect("create");
+        ws.start().await.expect("start");
+        let done = ws.root().join("done");
+        let p = ws
+            .spawn(SpawnRequest {
+                command: format!(
+                    "head -c 8000000 /dev/zero | tr '\\000' a; touch '{}'",
+                    done.display()
+                ),
+                detach: true,
+                output_buffer_bytes: Some(64 * 1024),
+                ..Default::default()
+            })
+            .await
+            .expect("spawn");
+        let id = p.id().clone();
+        drop(p);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(done.exists(), !pause, "pause={pause}");
+        let again = ws.attach_process(&id, 0).await.expect("attach");
+        let mut exit = None;
+        while let Some(e) = tokio::time::timeout(Duration::from_secs(20), again.next_event())
+            .await
+            .expect("resumes")
+        {
+            if let ProcessEventKind::Exited(x) = e.kind {
+                exit = Some(x);
+            }
+        }
+        assert_eq!(exit, Some(ExitState::Exited { code: 0 }));
+        assert!(done.exists());
+        ws.destroy().await.expect("destroy");
+        drop(layout);
+    }
 }

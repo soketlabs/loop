@@ -36,6 +36,7 @@ use std::io::{Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -69,6 +70,39 @@ fn exec_error(code: ExecutionErrorCode, message: impl Into<String>) -> Workspace
 /// Every pid that leads a session this driver started, for the leak
 /// check of the tests.
 static STARTED: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// Every process of every host Workspace in this Runtime process.
+static LIVE: Mutex<Vec<Weak<HostProcess>>> = Mutex::new(Vec::new());
+
+/// Kill every process that any host Workspace of this Runtime started
+/// (with its tree) and wait until each is reaped, at most `limit`. For the
+/// Runtime's shutdown: a Workspace that is never dropped or destroyed
+/// still leaves no process behind. Blocking; call it from a blocking
+/// context.
+pub fn kill_all_host_processes(limit: Duration) {
+    let live: Vec<Arc<HostProcess>> = {
+        let mut all = LIVE.lock();
+        all.retain(|p| p.strong_count() > 0);
+        all.iter().filter_map(Weak::upgrade).collect()
+    };
+    for p in &live {
+        if p.ring.exit().is_none() {
+            p.stop_reason(ExitState::Cancelled);
+            p.signal_now(libc::SIGKILL);
+        }
+    }
+    let deadline = std::time::Instant::now() + limit;
+    while live.iter().any(|p| !*p.reaped.lock()) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Kill the tree of `sid` with the process-group signal only, as when the
+/// process listing finds nothing (no `/proc`). For tests.
+#[doc(hidden)]
+pub fn kill_tree_without_listing(sid: i32) -> Vec<i32> {
+    tree::kill_session_with(sid, |_| Vec::new())
+}
 
 /// Live processes in a session that a host Workspace started and whose
 /// leader already ended. Tests call this to prove that nothing is left
@@ -115,6 +149,13 @@ pub(crate) struct HostProcess {
     /// The guard that kills a process that is not detached when the last
     /// handle goes.
     owner: Mutex<Weak<OwnerGuard>>,
+    /// Handles open now.
+    handles: AtomicUsize,
+    /// Readers stop reading while this process is detached, has no handle
+    /// and its buffer is full (the child then waits on its pipe or PTY).
+    pause_unwatched: bool,
+    /// Readers end now (a short time after the exit).
+    readers_stop: Arc<AtomicBool>,
 }
 
 impl HostProcess {
@@ -127,6 +168,15 @@ impl HostProcess {
             exit: self.ring.exit(),
             last_seq: self.ring.last_seq(),
         }
+    }
+
+    /// Whether readers wait: detached, no handle, full buffer.
+    fn paused(&self) -> bool {
+        self.pause_unwatched
+            && self.detached
+            && self.handles.load(Ordering::Acquire) == 0
+            && self.ring.full(READ_CHUNK)
+            && self.ring.exit().is_none()
     }
 
     /// Set the stop reason unless one is set.
@@ -199,16 +249,51 @@ impl Drop for OwnerGuard {
 /// The processes of one Workspace.
 pub(crate) struct ProcessTable {
     inner: Arc<TableInner>,
+    pause_unwatched: bool,
 }
 
+/// Lock order: `slots` before `processes` before `ended`.
 #[derive(Default)]
 struct TableInner {
+    slots: Mutex<Slots>,
     processes: Mutex<HashMap<String, Arc<HostProcess>>>,
     ended: Mutex<VecDeque<String>>,
 }
 
+#[derive(Default)]
+struct Slots {
+    /// Processes running or being started.
+    running: usize,
+    /// `stop` or `destroy` runs or ran: no process starts.
+    closing: bool,
+}
+
+/// A place for one process, taken before the start; given back on drop
+/// unless the process started (then its end gives it back).
+struct Slot(Option<Arc<TableInner>>);
+
+impl Slot {
+    fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Some(table) = self.0.take() {
+            table.free_slot();
+        }
+    }
+}
+
 impl TableInner {
+    fn free_slot(&self) {
+        let mut slots = self.slots.lock();
+        slots.running = slots.running.saturating_sub(1);
+    }
+
     fn ended(&self, id: &str) {
+        self.free_slot();
         let mut ended = self.ended.lock();
         ended.push_back(id.to_owned());
         while ended.len() > MAX_ENDED {
@@ -227,10 +312,17 @@ pub(crate) struct Launch {
 }
 
 impl ProcessTable {
-    pub(crate) fn new() -> Self {
+    /// A table; `pause_unwatched` is the spec option `pauseUnwatchedOutput`.
+    pub(crate) fn new(pause_unwatched: bool) -> Self {
         Self {
             inner: Arc::new(TableInner::default()),
+            pause_unwatched,
         }
+    }
+
+    /// Allow starts again (after `stop`, at `start`).
+    pub(crate) fn open(&self) {
+        self.inner.slots.lock().closing = false;
     }
 
     fn get(&self, id: &ProcessId) -> Result<Arc<HostProcess>, WorkspaceError> {
@@ -260,6 +352,14 @@ impl ProcessTable {
         after_seq: u64,
     ) -> Result<Box<dyn WorkspaceProcess>, WorkspaceError> {
         let process = self.get(id)?;
+        let last = process.ring.last_seq();
+        if after_seq > last {
+            return Err(WorkspaceError::SeqAhead {
+                process: id.0.clone(),
+                after_seq,
+                last_seq: last,
+            });
+        }
         let owner = process.owner.lock().upgrade();
         if !process.detached && owner.is_none() && process.ring.exit().is_none() {
             // Its last handle went and the kill is under way.
@@ -270,6 +370,9 @@ impl ProcessTable {
 
     /// Kill every process and wait for each to be reaped (bounded).
     pub(crate) async fn kill_all(&self, clear: bool) {
+        // No start after this point: a start that took its slot before
+        // sees `closing` when it registers and kills its own process.
+        self.inner.slots.lock().closing = true;
         let all: Vec<Arc<HostProcess>> = self.inner.processes.lock().values().cloned().collect();
         let waits = all
             .iter()
@@ -284,6 +387,7 @@ impl ProcessTable {
 
     /// Kill every process without waiting (for `Drop`).
     pub(crate) fn kill_all_now(&self) {
+        self.inner.slots.lock().closing = true;
         for p in self.inner.processes.lock().values() {
             if p.ring.exit().is_none() {
                 p.kill_detached(ExitState::Cancelled);
@@ -300,19 +404,24 @@ impl ProcessTable {
             cwd,
             workspace_id,
         } = launch;
-        let running = self
-            .inner
-            .processes
-            .lock()
-            .values()
-            .filter(|p| p.ring.exit().is_none())
-            .count();
-        if running >= MAX_RUNNING {
-            return Err(WorkspaceError::Busy {
-                id: workspace_id,
-                operation: "spawn",
-            });
-        }
+        // Take a slot before any wait, so parallel starts never pass the
+        // limit and a start after `stop` or `destroy` is refused.
+        let slot = {
+            let mut slots = self.inner.slots.lock();
+            if slots.closing {
+                return Err(WorkspaceError::Sandbox(
+                    loop_workspace::SandboxError::NotReady("workspace is stopping".into()),
+                ));
+            }
+            if slots.running >= MAX_RUNNING {
+                return Err(WorkspaceError::Busy {
+                    id: workspace_id,
+                    operation: "spawn",
+                });
+            }
+            slots.running += 1;
+            Slot(Some(Arc::clone(&self.inner)))
+        };
         if request.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
             return Err(exec_error(ExecutionErrorCode::Aborted, "operation aborted"));
         }
@@ -351,8 +460,11 @@ impl ProcessTable {
             }
         };
         let with_pty = pty.is_some();
-        // SAFETY: only async-signal-safe calls (setsid, ioctl) run between
-        // fork and exec; no allocation and no lock.
+        // SAFETY: getpid has no arguments.
+        let runtime_pid = unsafe { libc::getpid() };
+        // SAFETY: only async-signal-safe calls (setsid, ioctl, prctl,
+        // getppid, close_range, fcntl) run between fork and exec; no
+        // allocation and no lock.
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() == -1 {
@@ -361,6 +473,19 @@ impl ProcessTable {
                 if with_pty {
                     pty::take_controlling_terminal()?;
                 }
+                #[cfg(target_os = "linux")]
+                {
+                    // Die with the waiter thread (it lives as long as this
+                    // child), so a Runtime that dies leaves no leader.
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() != runtime_pid {
+                        return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                    }
+                }
+                let _ = runtime_pid;
+                close_inherited_fds();
                 Ok(())
             });
         }
@@ -381,10 +506,14 @@ impl ProcessTable {
                     )
                 })?;
         }
-        let (leader, stdio) = match ready_rx.await {
-            Ok(Ok(started)) => started,
-            Ok(Err(e)) => return Err(exec_error(ExecutionErrorCode::SpawnFailed, e.to_string())),
-            Err(_) => {
+        let mut ready_rx = ReadyGuard {
+            rx: Some(ready_rx),
+            reaped: Arc::clone(&reaped),
+        };
+        let (leader, stdio) = match ready_rx.wait().await {
+            Some(Ok(started)) => started,
+            Some(Err(e)) => return Err(exec_error(ExecutionErrorCode::SpawnFailed, e.to_string())),
+            None => {
                 return Err(exec_error(
                     ExecutionErrorCode::SpawnFailed,
                     "the waiter thread ended",
@@ -399,8 +528,12 @@ impl ProcessTable {
             started.push(leader);
         }
 
-        let mut readers: Vec<oneshot::Receiver<()>> = Vec::new();
+        let mut readers: Vec<Reader> = Vec::new();
         let mut keep_slave = None;
+        let readers_stop = Arc::new(AtomicBool::new(false));
+        // Filled once the process exists; readers ask it whether to pause.
+        let gate: Arc<std::sync::OnceLock<Weak<HostProcess>>> =
+            Arc::new(std::sync::OnceLock::new());
         let (stdin, master) = match pty {
             Some(pair) => {
                 let reader = pair.master.try_clone();
@@ -412,7 +545,12 @@ impl ProcessTable {
                         return Err(exec_error(ExecutionErrorCode::SpawnFailed, e.to_string()));
                     }
                 };
-                readers.push(start_pty_reader(reader, Arc::clone(&ring)));
+                readers.push(start_pty_reader(
+                    reader,
+                    Arc::clone(&ring),
+                    Arc::clone(&readers_stop),
+                    Arc::clone(&gate),
+                ));
                 let queue = start_pty_writer(writer);
                 // Keep the slave open until the exit, so the master never
                 // sees a hang-up before the child's output is read.
@@ -446,10 +584,20 @@ impl ProcessTable {
                     }
                 };
                 if let Some(out) = child_out {
-                    readers.push(start_pipe_reader(out, StreamId::Stdout, Arc::clone(&ring)));
+                    readers.push(start_pipe_reader(
+                        out,
+                        StreamId::Stdout,
+                        Arc::clone(&ring),
+                        Arc::clone(&gate),
+                    ));
                 }
                 if let Some(err) = child_err {
-                    readers.push(start_pipe_reader(err, StreamId::Stderr, Arc::clone(&ring)));
+                    readers.push(start_pipe_reader(
+                        err,
+                        StreamId::Stderr,
+                        Arc::clone(&ring),
+                        Arc::clone(&gate),
+                    ));
                 }
                 (Stdin::Pipe(tokio::sync::Mutex::new(child_in)), None)
             }
@@ -467,16 +615,36 @@ impl ProcessTable {
             stdin,
             master,
             owner: Mutex::new(Weak::new()),
+            handles: AtomicUsize::new(0),
+            pause_unwatched: self.pause_unwatched,
+            readers_stop,
         });
+        let _ = gate.set(Arc::downgrade(&process));
         let owner = (!request.detach).then(|| {
             let guard = Arc::new(OwnerGuard(Arc::clone(&process)));
             *process.owner.lock() = Arc::downgrade(&guard);
             guard
         });
-        self.inner
-            .processes
-            .lock()
-            .insert(id.0.clone(), Arc::clone(&process));
+        {
+            let slots = self.inner.slots.lock();
+            if slots.closing {
+                // `stop` or `destroy` ran while this one started.
+                drop(slots);
+                process.stop_reason(ExitState::Cancelled);
+                kill_unwatched(leader, &process.reaped);
+            }
+            self.inner
+                .processes
+                .lock()
+                .insert(id.0.clone(), Arc::clone(&process));
+        }
+        // The process's end gives the slot back.
+        slot.keep();
+        {
+            let mut live = LIVE.lock();
+            live.retain(|p| p.strong_count() > 0);
+            live.push(Arc::downgrade(&process));
+        }
 
         tokio::spawn(supervise(
             Arc::clone(&process),
@@ -532,12 +700,19 @@ fn waiter(
         // The spawn call went away: nobody owns this process.
         tree::kill_session(leader);
     }
-    if let Err(error) = wait_without_reaping(leader) {
-        tracing::warn!(%error, "workspace process: waitid failed; reaping directly");
-    }
+    let waited = wait_without_reaping(leader);
     let status = {
         let mut reaped = reaped.lock();
-        tree::kill_session(leader);
+        match waited {
+            // A zombie, not reaped: its ids are still ours.
+            Ok(()) => {
+                tree::kill_session(leader);
+            }
+            // The leader may already be reaped (ECHILD): signal nothing.
+            Err(error) => {
+                tracing::warn!(%error, "workspace process: waitid failed; not signalling");
+            }
+        }
         let status = child.wait();
         *reaped = true;
         status
@@ -569,14 +744,39 @@ fn wait_without_reaping(pid: i32) -> std::io::Result<()> {
     }
 }
 
-fn start_pipe_reader<R>(mut pipe: R, stream: StreamId, ring: Arc<Ring>) -> oneshot::Receiver<()>
+/// A reader of a pipe or the PTY: done when it reached the end; `abort`
+/// ends a pipe reader task (the PTY reader thread sees `readers_stop`).
+struct Reader {
+    done: oneshot::Receiver<()>,
+    task: Option<tokio::task::AbortHandle>,
+}
+
+/// Whether a reader of `gate`'s process must wait now.
+fn paused(gate: &std::sync::OnceLock<Weak<HostProcess>>) -> bool {
+    gate.get()
+        .and_then(Weak::upgrade)
+        .is_some_and(|p| p.paused())
+}
+
+/// How long a paused reader waits before it looks again.
+const PAUSE_POLL: Duration = Duration::from_millis(50);
+
+fn start_pipe_reader<R>(
+    mut pipe: R,
+    stream: StreamId,
+    ring: Arc<Ring>,
+    gate: Arc<std::sync::OnceLock<Weak<HostProcess>>>,
+) -> Reader
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     let (done, rx) = oneshot::channel();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut buf = vec![0u8; READ_CHUNK];
         loop {
+            while paused(&gate) {
+                tokio::time::sleep(PAUSE_POLL).await;
+            }
             match pipe.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => ring.push_output(stream, buf[..n].to_vec()),
@@ -584,21 +784,44 @@ where
         }
         let _ = done.send(());
     });
-    rx
+    Reader {
+        done: rx,
+        task: Some(task.abort_handle()),
+    }
 }
 
-fn start_pty_reader(mut master: File, ring: Arc<Ring>) -> oneshot::Receiver<()> {
+fn start_pty_reader(
+    master: File,
+    ring: Arc<Ring>,
+    stop: Arc<AtomicBool>,
+    gate: Arc<std::sync::OnceLock<Weak<HostProcess>>>,
+) -> Reader {
     let (done, rx) = oneshot::channel();
     let spawned = std::thread::Builder::new()
         .name("loop-pty-read".into())
         .spawn(move || {
             let mut buf = vec![0u8; READ_CHUNK];
             loop {
-                match master.read(&mut buf) {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                if paused(&gate) {
+                    std::thread::sleep(PAUSE_POLL);
+                    continue;
+                }
+                // Wait at most 200 ms for data, so `stop` is seen even when
+                // a process that left the session still holds the slave.
+                match pty::wait_readable(&master, Duration::from_millis(200)) {
+                    Ok(false) => continue,
+                    Ok(true) => {}
+                    Err(_) => break,
+                }
+                match (&master).read(&mut buf) {
                     // macOS ends with 0, Linux with EIO after the hang-up.
                     Ok(0) => break,
                     Ok(n) => ring.push_output(StreamId::Pty, buf[..n].to_vec()),
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(_) => break,
                 }
             }
@@ -607,7 +830,71 @@ fn start_pty_reader(mut master: File, ring: Arc<Ring>) -> oneshot::Receiver<()> 
     if let Err(error) = spawned {
         tracing::error!(%error, "workspace process: could not start the PTY reader");
     }
-    rx
+    Reader {
+        done: rx,
+        task: None,
+    }
+}
+
+/// Mark every descriptor from 3 up close-on-exec, in the child between
+/// fork and exec (async-signal-safe calls only). Descriptors that another
+/// thread of the Runtime opened without `O_CLOEXEC`, or before it set the
+/// flag, do not reach the command. Stdio (0, 1, 2) stays; the error pipe
+/// of `std::process` is already close-on-exec, so it keeps working.
+fn close_inherited_fds() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: close_range takes integers; CLOSE_RANGE_CLOEXEC closes
+        // nothing now.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3u32,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if rc == 0 {
+            return;
+        }
+    }
+    // SAFETY: getdtablesize has no arguments.
+    let max = unsafe { libc::getdtablesize() }.clamp(3, 1 << 20);
+    for fd in 3..max {
+        // SAFETY: fcntl on any number is safe; a closed one fails with EBADF.
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
+}
+
+/// The receiver of the waiter's "started" message. When the spawn call is
+/// dropped before it reads the message, the drop kills the child, so no
+/// child runs without a supervisor.
+struct ReadyGuard {
+    rx: Option<oneshot::Receiver<std::io::Result<Started>>>,
+    reaped: Arc<Mutex<bool>>,
+}
+
+impl ReadyGuard {
+    /// The waiter's message; `None` when the waiter ended without one.
+    async fn wait(&mut self) -> Option<std::io::Result<Started>> {
+        let got = self.rx.as_mut()?.await.ok();
+        self.rx = None;
+        got
+    }
+}
+
+impl Drop for ReadyGuard {
+    fn drop(&mut self) {
+        let Some(mut rx) = self.rx.take() else {
+            return;
+        };
+        rx.close();
+        if let Ok(Ok((leader, _))) = rx.try_recv() {
+            kill_unwatched(leader, &self.reaped);
+        }
+    }
 }
 
 fn start_pty_writer(mut master: File) -> Option<mpsc::Sender<PtyWrite>> {
@@ -637,7 +924,7 @@ async fn supervise(
     timeout_ms: Option<u64>,
     cancel: Option<tokio_util::sync::CancellationToken>,
     mut exit: oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
-    readers: Vec<oneshot::Receiver<()>>,
+    readers: Vec<Reader>,
     keep_slave: Option<File>,
 ) {
     let timeout = async {
@@ -674,7 +961,14 @@ async fn supervise(
     // The leader is reaped and its session killed: close the parent's
     // slave so the PTY reader reaches the end, and let readers drain.
     drop(keep_slave);
-    let _ = tokio::time::timeout(DRAIN, futures::future::join_all(readers)).await;
+    let (done, tasks): (Vec<_>, Vec<_>) = readers.into_iter().map(|r| (r.done, r.task)).unzip();
+    let _ = tokio::time::timeout(DRAIN, futures::future::join_all(done)).await;
+    // Readers still blocked (a process outside the session holds the pipe
+    // or the slave) end now: their threads and descriptors are released.
+    process.readers_stop.store(true, Ordering::Release);
+    for task in tasks.into_iter().flatten() {
+        task.abort();
+    }
     let state = match *process.reason.lock() {
         Some(reason) => reason,
         None => match status {
@@ -707,11 +1001,18 @@ impl Handle {
     fn new(process: Arc<HostProcess>, after_seq: u64, owner: Option<Arc<OwnerGuard>>) -> Self {
         let cursor = process.ring.cursor_after(after_seq);
         let changes = process.ring.subscribe();
+        process.handles.fetch_add(1, Ordering::AcqRel);
         Self {
             process,
             reader: tokio::sync::Mutex::new((cursor, changes)),
             _owner: owner,
         }
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.process.handles.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

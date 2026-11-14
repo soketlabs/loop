@@ -140,6 +140,12 @@ impl Ring {
         self.notify();
     }
 
+    /// Whether `more` bytes of output would evict an event now.
+    pub(crate) fn full(&self, more: usize) -> bool {
+        let s = self.state.lock();
+        s.cost + more + EVENT_OVERHEAD > s.limit
+    }
+
     /// The exit, once it happened.
     pub(crate) fn exit(&self) -> Option<ExitState> {
         self.state.lock().exit.map(|(_, e)| e)

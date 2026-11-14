@@ -18,7 +18,7 @@ pub use drivers::{
     PODMAN_DRIVER_ID, SEATBELT_DRIVER_ID,
 };
 #[cfg(unix)]
-pub use host_ws::leaked_host_processes;
+pub use host_ws::{kill_all_host_processes, kill_tree_without_listing, leaked_host_processes};
 pub use krun::{
     KrunExecutionEnv, KrunIsolation, KrunSandbox, KrunSandboxFactory, LocalSandboxRuntime,
     KRUN_DEFAULT_IMAGE, KRUN_DEFAULT_RUNTIME, LOCAL_DEFAULT_RUNTIME,
