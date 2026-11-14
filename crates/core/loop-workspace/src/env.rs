@@ -185,6 +185,10 @@ pub struct PathMetadata {
     pub uid: Option<u32>,
     /// Number of hard links, when the environment has it.
     pub nlink: Option<u64>,
+    /// Permission bits (`0o7777` part of the mode), when the environment
+    /// has them. The permission gate follows a link in an allow rule's
+    /// prefix only inside a folder that root owns and only root may write.
+    pub mode: Option<u32>,
 }
 
 /// What the permission gate needs to decide on a path, in one call.
