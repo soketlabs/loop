@@ -58,6 +58,20 @@ const FORBIDDEN: &[&str] = &[
     "HostExecutionEnv",
 ];
 
+/// The gate's sync wrappers that take host facts by default. Banned in
+/// `tool_gate.rs` and `tool_approval.rs`: a gate decision uses the
+/// `_with` / `_in` forms with facts from `GatePaths`.
+const HOST_WRAPPERS: &[&str] = &[
+    "Call::resolve(",
+    "Call::resolve_in(",
+    "search_may_show(",
+    "search_may_show_in(",
+    ".allows(",
+    ".moved()",
+    "inside_workspace(",
+    "inside_folder(",
+];
+
 /// Runtime-side functions that may use host calls: `(file, function,
 /// reason)`. A gate decision on a Workspace path never runs them.
 const ALLOWED: &[(&str, &str, &str)] = &[
@@ -221,10 +235,11 @@ fn gate_files() -> (PathBuf, Vec<PathBuf>) {
 
 /// Every forbidden name in `code`, as `(line, name)`; imports of `fs` or
 /// `process` from `std` or `tokio` count.
-fn violations(code: &str) -> Vec<(usize, String)> {
+fn violations(code: &str, gate_file: bool) -> Vec<(usize, String)> {
     let mut found = Vec::new();
+    let wrappers: &[&str] = if gate_file { HOST_WRAPPERS } else { &[] };
     for (n, line) in code.lines().enumerate() {
-        for needle in FORBIDDEN {
+        for needle in FORBIDDEN.iter().chain(wrappers) {
             if line.contains(needle) {
                 found.push((n + 1, (*needle).to_string()));
             }
@@ -255,7 +270,8 @@ fn the_gate_uses_no_host_file_calls() {
             .replace('\\', "/");
         let code = production_code(&std::fs::read_to_string(file).unwrap());
         let fns = functions(&code);
-        for (line, needle) in violations(&code) {
+        let gate_file = rel == "tool_gate.rs" || rel == "tool_approval.rs";
+        for (line, needle) in violations(&code, gate_file) {
             let function = function_at(&fns, line).unwrap_or("<outside a function>");
             if let Some(at) = ALLOWED
                 .iter()
@@ -310,7 +326,7 @@ fn the_guard_catches_a_host_call_in_a_gate_function() {
     let found = |src: &str| -> Vec<String> {
         let code = production_code(src);
         let fns = functions(&code);
-        violations(&code)
+        violations(&code, true)
             .into_iter()
             .map(|(line, _)| function_at(&fns, line).unwrap_or("").to_owned())
             .collect()
@@ -322,6 +338,10 @@ fn the_guard_catches_a_host_call_in_a_gate_function() {
     assert_eq!(
         found("impl X {\n    fn a(&self) {}\n    fn b(&self) { let _ = PathFacts::host(); }\n}\n"),
         ["b"]
+    );
+    assert_eq!(
+        found("fn f() {\n    let c = Call::resolve_in(t, k, a, w, c);\n}\n"),
+        ["f"]
     );
     assert!(
         found("#[cfg(all(test, unix))]\nmod t { fn g() { std::fs::read(\"x\"); } }\n").is_empty()
