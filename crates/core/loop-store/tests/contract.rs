@@ -4,7 +4,7 @@ use loop_protocol::{SessionUpdate, ToolCallStatus, ToolCallUpdate, UpdateEnvelop
 use loop_store::class::{classify_update, Durability, UpdateCase, RECORD_CLASSES, UPDATE_CLASSES};
 use loop_store::{
     DecidedBy, DecisionAnswer, DecisionOutcome, DecisionSource, DecisionSubject, Event, EventKind,
-    PolicyDecisionRecord, Principal, PrincipalKind, StoreError, Tenant,
+    Identity, PolicyDecisionRecord, Principal, PrincipalKind, StoreError, Tenant, Via,
 };
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -291,12 +291,20 @@ fn a_policy_decision_row_stays_readable_by_old_and_new_readers() {
         decision()
     );
     assert_eq!(serde_json::to_value(&kind).unwrap(), raw);
+    // The record's own identity fields are the event's: one representation.
+    let record = decision();
     let event = Event {
         generation: 1,
         session_key: Some("s1".into()),
         turn: None,
         ts_ms: 1,
         kind,
+        identity: Identity {
+            tenant: record.tenant.clone(),
+            principal: record.principal.clone(),
+            via: record.via.clone(),
+            actor: None,
+        },
     };
     loop_store::validate_batch(&[event]).unwrap();
     assert!(!loop_store::is_recovery_record(&EventKind::PolicyDecision(
@@ -316,4 +324,82 @@ fn a_policy_decision_row_stays_readable_by_old_and_new_readers() {
     let later = json!({"kind": "later_kind", "payload": {"x": 1}});
     let kind: EventKind = serde_json::from_value(later.clone()).unwrap();
     assert_eq!(kind, EventKind::Unknown(later));
+}
+
+/// An Event's identity is flat in its JSON form (ADR-0007 §7.1), and a form
+/// written before step B3 (no identity) reads as `Identity::unrecorded`.
+#[test]
+fn event_identity_serde_is_flat_and_old_forms_read_as_unrecorded() {
+    let identity = Identity {
+        tenant: Tenant::new("acme").unwrap(),
+        principal: Principal::new(PrincipalKind::Person, "https://idp.example", "u1").unwrap(),
+        via: Some(Via::edge()),
+        actor: Some("parent-1".into()),
+    };
+    let event = Event::new(
+        3,
+        Some("s1".into()),
+        None,
+        7,
+        EventKind::Cancelled(json!({})),
+        identity.clone(),
+    );
+    let value = serde_json::to_value(&event).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "generation": 3, "session_key": "s1", "turn": null, "ts_ms": 7,
+            "kind": {"kind": "cancelled", "payload": {}},
+            "tenant": "acme",
+            "principal": {"kind": "person", "issuer": "https://idp.example", "id": "u1"},
+            "via": "edge", "actor": "parent-1",
+        })
+    );
+    assert_eq!(serde_json::from_value::<Event>(value).unwrap(), event);
+    let old = json!({
+        "generation": 3, "session_key": "s1", "turn": null, "ts_ms": 7,
+        "kind": {"kind": "cancelled", "payload": {}},
+    });
+    let read: Event = serde_json::from_value(old).unwrap();
+    assert_eq!(read.identity, Identity::unrecorded());
+    // An unknown principal kind from a newer writer still reads.
+    let newer = json!({
+        "generation": 3, "session_key": "s1", "turn": null, "ts_ms": 7,
+        "kind": {"kind": "later_kind", "payload": {}},
+        "tenant": "local",
+        "principal": {"kind": "robot", "issuer": "local", "id": "r1"},
+    });
+    let read: Event = serde_json::from_value(newer).unwrap();
+    assert_eq!(
+        read.identity.principal.kind(),
+        &PrincipalKind::Unknown("robot".into())
+    );
+}
+
+/// The append rules check the identity: a Runtime record is in a reserved
+/// tenant, and an actor is bounded.
+#[test]
+fn validate_batch_checks_identity() {
+    let runtime = |tenant: Tenant| {
+        Event::new(
+            1,
+            None,
+            None,
+            1,
+            EventKind::RuntimeStarted(json!({})),
+            Identity::runtime_in(tenant),
+        )
+    };
+    loop_store::validate_batch(&[runtime(Tenant::local())]).unwrap();
+    loop_store::validate_batch(&[runtime(Tenant::system())]).unwrap();
+    assert!(matches!(
+        loop_store::validate_batch(&[runtime(Tenant::new("acme").unwrap())]),
+        Err(StoreError::Invalid(_))
+    ));
+    let mut bad = runtime(Tenant::local());
+    bad.identity.actor = Some(String::new());
+    assert!(matches!(
+        loop_store::validate_batch(&[bad]),
+        Err(StoreError::Invalid(_))
+    ));
 }

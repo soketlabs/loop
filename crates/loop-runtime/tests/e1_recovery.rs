@@ -292,22 +292,25 @@ impl EventLog for FaultyLog {
     }
     async fn read_after(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
         after_seq: u64,
     ) -> loop_runtime::log::Result<Vec<LoggedEvent>> {
-        self.inner.read_after(session, after_seq).await
+        self.inner.read_after(tenant, session, after_seq).await
     }
     async fn read_runtime_after(
         &self,
+        scope: loop_store::Scope<'_>,
         global_seq: u64,
     ) -> loop_runtime::log::Result<Vec<LoggedEvent>> {
-        self.inner.read_runtime_after(global_seq).await
+        self.inner.read_runtime_after(scope, global_seq).await
     }
     async fn latest_seq(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
     ) -> loop_runtime::log::Result<u64> {
-        self.inner.latest_seq(session).await
+        self.inner.latest_seq(tenant, session).await
     }
     async fn allocate_generation(
         &self,
@@ -324,11 +327,18 @@ impl EventLog for FaultyLog {
     ) -> loop_runtime::log::Result<()> {
         self.inner.finish_generation(generation, stopped_ms).await
     }
-    async fn recovery_records(&self, from: u64) -> loop_runtime::log::Result<Vec<LoggedEvent>> {
-        self.inner.recovery_records(from).await
+    async fn recovery_records(
+        &self,
+        scope: loop_store::Scope<'_>,
+        from: u64,
+    ) -> loop_runtime::log::Result<Vec<LoggedEvent>> {
+        self.inner.recovery_records(scope, from).await
     }
-    async fn last_recovered_generation(&self) -> loop_runtime::log::Result<u64> {
-        self.inner.last_recovered_generation().await
+    async fn last_recovered_generation(
+        &self,
+        scope: &loop_store::SystemScope,
+    ) -> loop_runtime::log::Result<u64> {
+        self.inner.last_recovered_generation(scope).await
     }
     async fn mark_recovered(&self, generation: u64, at: i64) -> loop_runtime::log::Result<()> {
         self.faults.hit(true, &["mark_recovered"]);
@@ -338,25 +348,29 @@ impl EventLog for FaultyLog {
     }
     async fn subagent_sessions(
         &self,
-    ) -> loop_runtime::log::Result<HashSet<loop_protocol::SessionKey>> {
-        self.inner.subagent_sessions().await
+        scope: loop_store::Scope<'_>,
+    ) -> loop_runtime::log::Result<HashSet<loop_store::TenantSession>> {
+        self.inner.subagent_sessions(scope).await
     }
     async fn prompts_sent(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
     ) -> loop_runtime::log::Result<u64> {
-        self.inner.prompts_sent(session).await
+        self.inner.prompts_sent(tenant, session).await
     }
     async fn turn_ids(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
     ) -> loop_runtime::log::Result<Vec<TurnId>> {
-        self.inner.turn_ids(session).await
+        self.inner.turn_ids(tenant, session).await
     }
     async fn last_activity_ms(
         &self,
-    ) -> loop_runtime::log::Result<HashMap<loop_protocol::SessionKey, i64>> {
-        self.inner.last_activity_ms().await
+        scope: loop_store::Scope<'_>,
+    ) -> loop_runtime::log::Result<HashMap<loop_store::TenantSession, i64>> {
+        self.inner.last_activity_ms(scope).await
     }
     fn capabilities(&self) -> loop_store::StoreCapabilities {
         self.inner.capabilities()
@@ -366,29 +380,32 @@ impl EventLog for FaultyLog {
     }
     async fn read_session_page(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
         after_seq: u64,
         through_seq: Option<u64>,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<LoggedEvent>> {
         self.inner
-            .read_session_page(session, after_seq, through_seq, limit)
+            .read_session_page(tenant, session, after_seq, through_seq, limit)
             .await
     }
     async fn session_summary(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
     ) -> loop_runtime::log::Result<Option<loop_runtime::log::SessionSummary>> {
-        self.inner.session_summary(session).await
+        self.inner.session_summary(tenant, session).await
     }
     async fn recovery_page(
         &self,
+        scope: loop_store::Scope<'_>,
         from_generation: u64,
         after_global: u64,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<LoggedEvent>> {
         self.inner
-            .recovery_page(from_generation, after_global, limit)
+            .recovery_page(scope, from_generation, after_global, limit)
             .await
     }
 }

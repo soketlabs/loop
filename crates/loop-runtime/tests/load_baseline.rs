@@ -218,16 +218,25 @@ impl EventLog for CountingLog {
     }
     async fn read_after(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
         after_seq: u64,
     ) -> LogResult<Vec<LoggedEvent>> {
-        self.inner.read_after(session, after_seq).await
+        self.inner.read_after(tenant, session, after_seq).await
     }
-    async fn read_runtime_after(&self, global_seq: u64) -> LogResult<Vec<LoggedEvent>> {
-        self.inner.read_runtime_after(global_seq).await
+    async fn read_runtime_after(
+        &self,
+        scope: loop_store::Scope<'_>,
+        global_seq: u64,
+    ) -> LogResult<Vec<LoggedEvent>> {
+        self.inner.read_runtime_after(scope, global_seq).await
     }
-    async fn latest_seq(&self, session: &loop_protocol::SessionKey) -> LogResult<u64> {
-        self.inner.latest_seq(session).await
+    async fn latest_seq(
+        &self,
+        tenant: &loop_store::Tenant,
+        session: &loop_protocol::SessionKey,
+    ) -> LogResult<u64> {
+        self.inner.latest_seq(tenant, session).await
     }
     async fn allocate_generation(&self, owner: &str, pid: u32, started_ms: i64) -> LogResult<u64> {
         self.inner.allocate_generation(owner, pid, started_ms).await
@@ -235,29 +244,44 @@ impl EventLog for CountingLog {
     async fn finish_generation(&self, generation: u64, stopped_ms: i64) -> LogResult<()> {
         self.inner.finish_generation(generation, stopped_ms).await
     }
-    async fn recovery_records(&self, from_generation: u64) -> LogResult<Vec<LoggedEvent>> {
-        self.inner.recovery_records(from_generation).await
+    async fn recovery_records(
+        &self,
+        scope: loop_store::Scope<'_>,
+        from_generation: u64,
+    ) -> LogResult<Vec<LoggedEvent>> {
+        self.inner.recovery_records(scope, from_generation).await
     }
-    async fn last_recovered_generation(&self) -> LogResult<u64> {
-        self.inner.last_recovered_generation().await
+    async fn last_recovered_generation(&self, scope: &loop_store::SystemScope) -> LogResult<u64> {
+        self.inner.last_recovered_generation(scope).await
     }
     async fn mark_recovered(&self, generation: u64, recovered_ms: i64) -> LogResult<()> {
         self.inner.mark_recovered(generation, recovered_ms).await
     }
-    async fn subagent_sessions(&self) -> LogResult<HashSet<loop_protocol::SessionKey>> {
-        self.inner.subagent_sessions().await
+    async fn subagent_sessions(
+        &self,
+        scope: loop_store::Scope<'_>,
+    ) -> LogResult<HashSet<loop_store::TenantSession>> {
+        self.inner.subagent_sessions(scope).await
     }
-    async fn prompts_sent(&self, session: &loop_protocol::SessionKey) -> LogResult<u64> {
-        self.inner.prompts_sent(session).await
+    async fn prompts_sent(
+        &self,
+        tenant: &loop_store::Tenant,
+        session: &loop_protocol::SessionKey,
+    ) -> LogResult<u64> {
+        self.inner.prompts_sent(tenant, session).await
     }
     async fn turn_ids(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
     ) -> LogResult<Vec<loop_protocol::TurnId>> {
-        self.inner.turn_ids(session).await
+        self.inner.turn_ids(tenant, session).await
     }
-    async fn last_activity_ms(&self) -> LogResult<HashMap<loop_protocol::SessionKey, i64>> {
-        self.inner.last_activity_ms().await
+    async fn last_activity_ms(
+        &self,
+        scope: loop_store::Scope<'_>,
+    ) -> LogResult<HashMap<loop_store::TenantSession, i64>> {
+        self.inner.last_activity_ms(scope).await
     }
     fn capabilities(&self) -> loop_store::StoreCapabilities {
         self.inner.capabilities()
@@ -267,29 +291,32 @@ impl EventLog for CountingLog {
     }
     async fn read_session_page(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
         after_seq: u64,
         through_seq: Option<u64>,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<LoggedEvent>> {
         self.inner
-            .read_session_page(session, after_seq, through_seq, limit)
+            .read_session_page(tenant, session, after_seq, through_seq, limit)
             .await
     }
     async fn session_summary(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
     ) -> loop_runtime::log::Result<Option<loop_runtime::log::SessionSummary>> {
-        self.inner.session_summary(session).await
+        self.inner.session_summary(tenant, session).await
     }
     async fn recovery_page(
         &self,
+        scope: loop_store::Scope<'_>,
         from_generation: u64,
         after_global: u64,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<LoggedEvent>> {
         self.inner
-            .recovery_page(from_generation, after_global, limit)
+            .recovery_page(scope, from_generation, after_global, limit)
             .await
     }
 }
@@ -709,4 +736,18 @@ async fn load_baseline() {
     );
 
     rt.shutdown().await;
+    drop(rt);
+    drop(log);
+    // LOAD_KEEP_DB=<dir>: copy the Event Log files there, to measure their size.
+    if let Ok(keep) = std::env::var("LOAD_KEEP_DB") {
+        // The writer thread closes its connection after the last handle goes.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        std::fs::create_dir_all(&keep).unwrap();
+        for name in ["events.db", "events.db-wal", "events.db-shm"] {
+            let from = dir.path().join("agent").join(name);
+            if from.exists() {
+                std::fs::copy(&from, Path::new(&keep).join(name)).unwrap();
+            }
+        }
+    }
 }

@@ -187,10 +187,13 @@ impl Runtime {
     ) -> BackendResult<loop_wire::Attachment> {
         let mut replay = Vec::new();
         let mut after = after_seq;
+        // Read in the Session's tenant, whoever attaches (access is task I3).
+        let tenant = self.session_tenant(&session.key);
         while after < snapshot.at_seq {
             let page = self
                 .log
                 .read_session_page(
+                    &tenant,
                     &session.key,
                     after,
                     Some(snapshot.at_seq),

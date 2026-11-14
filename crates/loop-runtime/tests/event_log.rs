@@ -85,6 +85,21 @@ shared_suite!(
     summary_matches_fold
 );
 shared_suite!(memory_recovery_pages, sqlite_recovery_pages, recovery_pages);
+shared_suite!(
+    memory_identity_round_trip,
+    sqlite_identity_round_trip,
+    identity_round_trip
+);
+shared_suite!(
+    memory_tenant_isolation,
+    sqlite_tenant_isolation,
+    tenant_isolation
+);
+shared_suite!(
+    memory_owner_of_record,
+    sqlite_owner_of_record,
+    owner_of_record
+);
 
 #[tokio::test]
 async fn sqlite_reopen_keeps_cursors_generations_and_unknown() {
@@ -97,10 +112,24 @@ async fn sqlite_reopen_keeps_cursors_generations_and_unknown() {
             1
         );
         kit::round_trip_on(&log).await;
-        original = log.read_runtime_after(0).await.unwrap();
+        original = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
     }
     let log = SqliteEventLog::open(dir.path()).await.unwrap();
-    assert_eq!(log.read_runtime_after(0).await.unwrap(), original);
+    assert_eq!(
+        log.read_runtime_after(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            0
+        )
+        .await
+        .unwrap(),
+        original
+    );
     assert_eq!(
         log.allocate_generation("runtime", 43, 200).await.unwrap(),
         2
@@ -144,8 +173,20 @@ async fn sqlite_transaction_failure_does_not_consume_cursors() {
         .append_batch(vec![update("s1"), update("s1")])
         .await
         .is_err());
-    assert!(log.read_runtime_after(0).await.unwrap().is_empty());
-    assert_eq!(log.latest_seq(&"s1".into()).await.unwrap(), 0);
+    assert!(log
+        .read_runtime_after(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            0
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        log.latest_seq(&loop_store::Tenant::local(), &"s1".into())
+            .await
+            .unwrap(),
+        0
+    );
     conn.execute_batch("DROP TRIGGER fail_second").unwrap();
     let records = log.append_batch(vec![update("s1")]).await.unwrap();
     assert_eq!(
@@ -168,6 +209,7 @@ async fn sqlite_recovery_does_not_load_prompt_content() {
         turn: None,
         ts_ms: 1,
         kind,
+        identity: loop_store::Identity::unrecorded(),
     };
     log.append_batch(vec![
         prompt(EventKind::PromptSent(
@@ -178,7 +220,10 @@ async fn sqlite_recovery_does_not_load_prompt_content() {
     .await
     .unwrap();
     let kinds: Vec<_> = log
-        .recovery_records(1)
+        .recovery_records(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            1,
+        )
         .await
         .unwrap()
         .into_iter()
@@ -219,16 +264,26 @@ async fn a_policy_decision_row_is_log_only_and_survives_a_reopen() {
             turn: None,
             ts_ms: 1,
             kind: EventKind::PolicyDecision(decision.clone()),
+            identity: loop_store::Identity::unrecorded(),
         }])
         .await
         .unwrap();
         log.append_batch(vec![update("s")]).await.unwrap();
     }
     let log = SqliteEventLog::open(dir.path()).await.unwrap();
-    let session = log.read_after(&SessionKey::from("s"), 0).await.unwrap();
+    let session = log
+        .read_after(&loop_store::Tenant::local(), &SessionKey::from("s"), 0)
+        .await
+        .unwrap();
     let seqs: Vec<_> = session.iter().map(|r| r.session_seq).collect();
     assert_eq!(seqs, [Some(1), Some(2)]);
-    let all = log.read_runtime_after(0).await.unwrap();
+    let all = log
+        .read_runtime_after(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            0,
+        )
+        .await
+        .unwrap();
     let stored = all
         .iter()
         .find(|r| matches!(r.event.kind, EventKind::PolicyDecision(_)))
@@ -236,7 +291,10 @@ async fn a_policy_decision_row_is_log_only_and_survives_a_reopen() {
     assert_eq!(stored.event.kind, EventKind::PolicyDecision(decision));
     assert_eq!(stored.session_seq, None);
     assert!(log
-        .recovery_records(0)
+        .recovery_records(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            0
+        )
         .await
         .unwrap()
         .iter()
@@ -252,19 +310,28 @@ async fn policy_decision_rows_add_no_phantom_turns_to_the_projection() {
     async fn check(log: &dyn EventLog) {
         let s = SessionKey::from("s");
         log.append_batch(vec![update("s")]).await.unwrap();
-        let before = log.session_summary(&s).await.unwrap().unwrap();
+        let before = log
+            .session_summary(&loop_store::Tenant::local(), &s)
+            .await
+            .unwrap()
+            .unwrap();
         let decision = |turn: Option<&str>, ts_ms| Event {
             generation: 1,
             session_key: Some(s.clone()),
             turn: turn.map(Into::into),
             ts_ms,
             kind: EventKind::PolicyDecision(json!({"id": "pd", "outcome": "allow"})),
+            identity: loop_store::Identity::unrecorded(),
         };
         log.append_batch(vec![decision(Some("turn-1"), 5_000)])
             .await
             .unwrap();
         log.append_batch(vec![decision(None, 6_000)]).await.unwrap();
-        let after = log.session_summary(&s).await.unwrap().unwrap();
+        let after = log
+            .session_summary(&loop_store::Tenant::local(), &s)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(after.last_seq, before.last_seq);
         assert_eq!(after.last_revision, before.last_revision);
         assert_eq!(after.prompts_sent, before.prompts_sent);
@@ -272,7 +339,7 @@ async fn policy_decision_rows_add_no_phantom_turns_to_the_projection() {
         assert_eq!(after.parent, before.parent);
         assert_eq!(after.last_activity_ms, 6_000);
         let turns: Vec<String> = log
-            .turn_ids(&s)
+            .turn_ids(&loop_store::Tenant::local(), &s)
             .await
             .unwrap()
             .into_iter()
@@ -286,7 +353,7 @@ async fn policy_decision_rows_add_no_phantom_turns_to_the_projection() {
     // The same after a reopen, from the stored projection.
     let log = SqliteEventLog::open(dir.path()).await.unwrap();
     let summary = log
-        .session_summary(&SessionKey::from("s"))
+        .session_summary(&loop_store::Tenant::local(), &SessionKey::from("s"))
         .await
         .unwrap()
         .unwrap();

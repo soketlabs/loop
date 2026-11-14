@@ -376,6 +376,53 @@ A principal id comes from an outside identity provider. Text such as
 `../x` or `a,b` is a valid id. Code must never use an id as a file or folder
 name; use a hash of it. A tenant is safe as a file or folder name.
 
+**Who acted, in the Event Log.** Every row of `events.db` names who caused
+it, in the columns `tenant`, `principal_kind`, `principal_issuer`,
+`principal_id`, `via` and `actor`:
+
+- A Session's tenant is the tenant of the caller that created it. It does
+  not change. Every row of the Session is in that tenant, also when a caller
+  of another tenant uses the Session.
+- The principal and `via` are of the caller that caused the row: the caller
+  that sent the prompt (for the whole turn), the config change, the command,
+  the close, or the Escalation answer. A Subagent acts for the caller of its
+  parent's turn, and its rows have `actor` set to the parent Session's key.
+- Rows the Runtime makes on its own (start and stop, recovery after a crash,
+  a lost lease, an unload) have the Runtime's own principal
+  `{service, local, runtime}`. On one host their tenant is `local`.
+- The row of the opening that created a Session (`session_opened` with
+  `created: true`) names its **owner of record**. Nothing checks the owner
+  yet.
+- Rows written by a Loop version before this change read as tenant `local`
+  and the Runtime's principal. Their Sessions have no owner of record.
+- Each read of the Event Log names a tenant. The same Session key in two
+  tenants is two Sessions.
+- **No downgrade once a non-local row exists.** A Loop from before this
+  change writes every row as tenant `local`, also a row of a Session of
+  another tenant. Such a Session then has rows in two tenants. The Runtime
+  reports it at start, reads it in the tenant of its creating row, and
+  refuses to load it.
+- Storage note: the identity is stored in columns on each row (about 44
+  bytes more per row). A lookup table with a small id per row is to be
+  evaluated in step B4, if B4 rewrites rows.
+
+**Rules for the access checks (next step, I3; not in force yet).**
+
+- A Session whose owner of record is `None` (created before this change,
+  or outside the Runtime) is host-only: only the host's own user may use
+  it.
+- A Subagent takes its **parent's** access. Its own owner row (the
+  parent's caller) does not grant access of its own.
+- A copy (fork, clone or import) belongs to the caller that made it.
+  Before a fork or clone, check that the caller may read the **source**
+  Session.
+
+```sh
+sqlite3 ~/.loop/agent/events.db \
+  "SELECT global_seq, kind, tenant, principal_issuer, principal_id, via, actor
+   FROM events ORDER BY global_seq DESC LIMIT 20"
+```
+
 **Edge Gateway connections (unstable).** This option is not for real users
 yet. It is for a gateway that signs users in (for example with OIDC) and then
 connects to the Runtime for each user. It is off by default. To turn it on,
@@ -435,7 +482,8 @@ loop runtime start --tool-lock chat --tool-lock-root /srv/loop-users \
 - list, create, load, attach to, prompt, cancel, fork, clone, export, import,
   rename and close **every** Session of this Runtime. This includes the
   Sessions of the local user and of other tenants. **There is no tenant
-  isolation and no Session owner yet.**
+  isolation yet.** The Event Log records each Session's tenant and its owner
+  of record (see above), but the Runtime does not check them.
 - through the agent of a Session: read the files in that Session's folder
   (any folder in the tool-lock root) and use the web tools. The tool lock
   turns off the shell, file changes, Subagents, workflows, MCP servers and

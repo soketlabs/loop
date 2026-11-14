@@ -23,8 +23,9 @@ use loop_protocol::{
     UpdateEnvelope,
 };
 use loop_store::{
-    summarize, Cursor, Event, EventKind, EventLog, LoggedEvent, Page, PageLimit, MAX_BATCH_EVENTS,
-    WRITER_QUEUE_CAPACITY,
+    summarize, Caller, Cursor, Event, EventKind, EventLog, Identity, LoggedEvent, Page, PageLimit,
+    Principal, PrincipalKind, Scope, SystemScope, Tenant, Via, MAX_BATCH_EVENTS,
+    SESSION_CREATED_KEY, WRITER_QUEUE_CAPACITY,
 };
 use serde_json::json;
 
@@ -34,6 +35,44 @@ use crate::Fixture;
 pub fn fixture(log: impl EventLog + 'static) -> Fixture<dyn EventLog> {
     let log: Arc<dyn EventLog> = Arc::new(log);
     Fixture::new(log)
+}
+
+/// The `local` tenant.
+pub fn local() -> Tenant {
+    Tenant::local()
+}
+
+/// A tenant from outside the host.
+pub fn acme() -> Tenant {
+    Tenant::new("acme").expect("valid tenant")
+}
+
+/// A system scope for the checks. Only tests and the Runtime's startup
+/// code make one.
+pub fn system() -> &'static SystemScope {
+    static SCOPE: std::sync::OnceLock<SystemScope> = std::sync::OnceLock::new();
+    SCOPE.get_or_init(SystemScope::for_runtime_startup)
+}
+
+/// Every tenant's rows.
+pub fn all() -> Scope<'static> {
+    Scope::System(system())
+}
+
+/// The host's user (`uid:501`) acting in the `local` tenant, the identity
+/// of most records of the checks.
+pub fn host() -> Identity {
+    Identity::acting(&Caller::host(Principal::local_uid(501)), local())
+}
+
+/// An Edge Gateway user of tenant `acme`, acting in `tenant`.
+pub fn edge_user(tenant: Tenant) -> Identity {
+    let caller = Caller::asserted(
+        Principal::new(PrincipalKind::Person, "https://idp.example", "u-7").expect("principal"),
+        acme(),
+    )
+    .expect("caller");
+    Identity::acting(&caller, tenant)
 }
 
 /// A `TurnStarted` Update for `session`, generation 1, turn `turn-1`.
@@ -51,6 +90,7 @@ pub fn update(session: &str) -> Event {
                 turn_id: "turn-1".into(),
             },
         ),
+        host(),
     )
 }
 
@@ -75,6 +115,44 @@ where
     long_read_does_not_delay_appends(&factory).await;
     summary_matches_fold(&factory).await;
     recovery_pages(&factory).await;
+    identity_round_trip(&factory).await;
+    tenant_isolation(&factory).await;
+    owner_of_record(&factory).await;
+}
+
+/// Every kind, Unknown kinds included, keeps the identity it was appended
+/// with: tenant, principal (also of an unknown kind), `via` and `actor`
+/// (step B3).
+pub async fn identity_round_trip<F, Fut>(factory: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Fixture<dyn EventLog>>,
+{
+    let fixture = factory().await;
+    identity_round_trip_on(fixture.store.as_ref()).await;
+}
+
+/// A tenant's reads never return another tenant's rows, on every read
+/// method; the same Session key in two tenants is two Sessions with their
+/// own `session_seq`; a system scope reads all tenants (step B3).
+pub async fn tenant_isolation<F, Fut>(factory: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Fixture<dyn EventLog>>,
+{
+    let fixture = factory().await;
+    tenant_isolation_on(fixture.store.as_ref()).await;
+}
+
+/// The owner of record is the identity of the creating `session_opened`,
+/// set once (step B3).
+pub async fn owner_of_record<F, Fut>(factory: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Fixture<dyn EventLog>>,
+{
+    let fixture = factory().await;
+    owner_of_record_on(fixture.store.as_ref()).await;
 }
 
 /// Every event kind survives a batch with cursors assigned in order.
@@ -257,11 +335,12 @@ pub async fn round_trip_on(log: &dyn EventLog) {
             turn: None,
             ts_ms: 101,
             kind,
+            identity: host(),
         });
     }
     let committed = log.append_batch(events.clone()).await.unwrap();
     assert_eq!(committed.len(), 11);
-    assert_eq!(log.read_runtime_after(0).await.unwrap(), committed);
+    assert_eq!(log.read_runtime_after(all(), 0).await.unwrap(), committed);
     for (index, (record, input)) in committed.iter().zip(events).enumerate() {
         assert_eq!(record.global_seq, index as u64 + 1);
         assert_eq!(record.session_seq, if index == 0 { Some(1) } else { None });
@@ -299,9 +378,9 @@ pub async fn concurrent_producers_on(log: Arc<dyn EventLog>) {
     for task in tasks {
         task.await.unwrap();
     }
-    assert_eq!(log.latest_seq(&"s1".into()).await.unwrap(), 256);
-    assert_eq!(log.latest_seq(&"s2".into()).await.unwrap(), 128);
-    let all = log.read_runtime_after(0).await.unwrap();
+    assert_eq!(log.latest_seq(&local(), &"s1".into()).await.unwrap(), 256);
+    assert_eq!(log.latest_seq(&local(), &"s2".into()).await.unwrap(), 128);
+    let all = log.read_runtime_after(all(), 0).await.unwrap();
     assert_eq!(all.len(), 384);
     for (i, record) in all.iter().enumerate() {
         assert_eq!(record.global_seq, i as u64 + 1);
@@ -309,9 +388,12 @@ pub async fn concurrent_producers_on(log: Arc<dyn EventLog>) {
 }
 
 pub async fn cursors_on(log: &dyn EventLog) {
-    assert_eq!(log.latest_seq(&"missing".into()).await.unwrap(), 0);
+    assert_eq!(
+        log.latest_seq(&local(), &"missing".into()).await.unwrap(),
+        0
+    );
     assert!(log
-        .read_after(&"missing".into(), 0)
+        .read_after(&local(), &"missing".into(), 0)
         .await
         .unwrap()
         .is_empty());
@@ -330,16 +412,16 @@ pub async fn cursors_on(log: &dyn EventLog) {
     ])
     .await
     .unwrap();
-    let session = log.read_after(&"s1".into(), 1).await.unwrap();
+    let session = log.read_after(&local(), &"s1".into(), 1).await.unwrap();
     assert_eq!(session.len(), 1);
     assert_eq!(
         (session[0].global_seq, session[0].session_seq),
         (5, Some(2))
     );
-    assert_eq!(log.latest_seq(&"s1".into()).await.unwrap(), 2);
-    assert_eq!(log.latest_seq(&"s2".into()).await.unwrap(), 1);
+    assert_eq!(log.latest_seq(&local(), &"s1".into()).await.unwrap(), 2);
+    assert_eq!(log.latest_seq(&local(), &"s2".into()).await.unwrap(), 1);
     assert_eq!(
-        log.read_runtime_after(3)
+        log.read_runtime_after(all(), 3)
             .await
             .unwrap()
             .iter()
@@ -347,15 +429,23 @@ pub async fn cursors_on(log: &dyn EventLog) {
             .collect::<Vec<_>>(),
         vec![4, 5]
     );
-    assert!(log.read_after(&"s1".into(), 2).await.unwrap().is_empty());
     assert!(log
-        .read_after(&"s1".into(), u64::MAX)
+        .read_after(&local(), &"s1".into(), 2)
         .await
         .unwrap()
         .is_empty());
-    assert!(log.read_runtime_after(u64::MAX).await.unwrap().is_empty());
+    assert!(log
+        .read_after(&local(), &"s1".into(), u64::MAX)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(log
+        .read_runtime_after(all(), u64::MAX)
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(
-        log.read_runtime_after(0).await.unwrap()[0]
+        log.read_runtime_after(all(), 0).await.unwrap()[0]
             .event
             .session_key,
         None
@@ -402,7 +492,7 @@ pub async fn atomic_validation_on(log: &dyn EventLog) {
         .append_batch(vec![update("s1"); MAX_BATCH_EVENTS + 1])
         .await
         .is_err());
-    assert!(log.read_runtime_after(0).await.unwrap().is_empty());
+    assert!(log.read_runtime_after(all(), 0).await.unwrap().is_empty());
     assert_eq!(
         log.append_batch(vec![update("s1"); MAX_BATCH_EVENTS])
             .await
@@ -410,14 +500,14 @@ pub async fn atomic_validation_on(log: &dyn EventLog) {
             .len(),
         256
     );
-    assert_eq!(log.latest_seq(&"s1".into()).await.unwrap(), 256);
+    assert_eq!(log.latest_seq(&local(), &"s1".into()).await.unwrap(), 256);
 }
 
 pub async fn invalid_unknown_is_atomic_on(log: &dyn EventLog) {
     let mut bad = update("s1");
     bad.kind = EventKind::Unknown(json!({"payload":7}));
     assert!(log.append_batch(vec![update("s1"), bad]).await.is_err());
-    assert!(log.read_runtime_after(0).await.unwrap().is_empty());
+    assert!(log.read_runtime_after(all(), 0).await.unwrap().is_empty());
 }
 
 pub async fn runtime_records_have_no_session_cursor_on(log: &dyn EventLog) {
@@ -442,6 +532,7 @@ pub async fn subagent_sessions_on(log: &dyn EventLog) {
             turn: None,
             ts_ms: 1,
             kind: EventKind::SessionOpened(json!({"cwd": "/w", "parent": parent, "depth": 1})),
+            identity: host(),
         };
         log.append_batch(vec![
             opened("root", json!(null)),
@@ -452,8 +543,8 @@ pub async fn subagent_sessions_on(log: &dyn EventLog) {
         ])
         .await
         .unwrap();
-        let keys = log.subagent_sessions().await.unwrap();
-        assert_eq!(keys, HashSet::from([SessionKey::from("kid")]));
+        let keys = log.subagent_sessions(all()).await.unwrap();
+        assert_eq!(keys, HashSet::from([(local(), SessionKey::from("kid"))]));
     })
     .await
     .unwrap();
@@ -467,13 +558,14 @@ pub async fn prompts_sent_on(log: &dyn EventLog) {
             turn: None,
             ts_ms: 1,
             kind: EventKind::PromptSent(json!({"content": []})),
+            identity: host(),
         };
         log.append_batch(vec![prompt("a"), update("a"), prompt("a"), prompt("b")])
             .await
             .unwrap();
-        assert_eq!(log.prompts_sent(&"a".into()).await.unwrap(), 2);
-        assert_eq!(log.prompts_sent(&"b".into()).await.unwrap(), 1);
-        assert_eq!(log.prompts_sent(&"c".into()).await.unwrap(), 0);
+        assert_eq!(log.prompts_sent(&local(), &"a".into()).await.unwrap(), 2);
+        assert_eq!(log.prompts_sent(&local(), &"b".into()).await.unwrap(), 1);
+        assert_eq!(log.prompts_sent(&local(), &"c".into()).await.unwrap(), 0);
     })
     .await
     .unwrap();
@@ -494,6 +586,7 @@ pub fn update_with(session: &str, turn: &str, ts_ms: i64, update: SessionUpdate)
             0,
             update,
         ),
+        host(),
     )
 }
 
@@ -520,6 +613,7 @@ fn record(session: Option<&str>, turn: Option<&str>, ts_ms: i64, kind: EventKind
         turn: turn.map(TurnId::from),
         ts_ms,
         kind,
+        identity: host(),
     }
 }
 
@@ -541,6 +635,16 @@ pub fn workload() -> Vec<Vec<Event>> {
             None,
             ts,
             EventKind::SessionOpened(json!({"cwd": "/w", "parent": parent, "depth": 1})),
+        )
+    };
+    let created = |session: &str, ts| {
+        record(
+            Some(session),
+            None,
+            ts,
+            EventKind::SessionOpened(
+                json!({"cwd": "/w", "parent": null, "depth": 0, SESSION_CREATED_KEY: true}),
+            ),
         )
     };
     let prompt = |session: &str, turn: Option<&str>, ts| {
@@ -576,7 +680,7 @@ pub fn workload() -> Vec<Vec<Event>> {
     vec![
         vec![
             record(None, None, 10, EventKind::RuntimeStarted(json!({"pid": 1}))),
-            opened("a", json!(null), 10),
+            created("a", 10),
             opened("kid", json!("a"), 11),
             prompt("a", None, 12),
             started("a", "turn-1", 13),
@@ -640,7 +744,7 @@ pub async fn all_pages(
     let mut after = after;
     loop {
         let page = log
-            .read_session_page(session, after, through, limit)
+            .read_session_page(&local(), session, after, through, limit)
             .await
             .unwrap();
         let next = page.next;
@@ -679,7 +783,7 @@ pub async fn paged_reads_on(log: &dyn EventLog) {
         .await
         .unwrap();
     }
-    let all = log.read_after(&session, 0).await.unwrap();
+    let all = log.read_after(&local(), &session, 0).await.unwrap();
     assert_eq!(seqs(&all), (1..=10).collect::<Vec<_>>());
 
     // Event limit: 3 + 3 + 3 + 1. `next` is the last seq of a full page.
@@ -700,13 +804,13 @@ pub async fn paged_reads_on(log: &dyn EventLog) {
 
     // `through_seq` bounds the read.
     let page = log
-        .read_session_page(&session, 2, Some(5), PageLimit::events(10))
+        .read_session_page(&local(), &session, 2, Some(5), PageLimit::events(10))
         .await
         .unwrap();
     assert_eq!(seqs(&page.items), vec![3, 4, 5]);
     assert_eq!(page.next, None);
     let page = log
-        .read_session_page(&session, 2, Some(5), PageLimit::events(2))
+        .read_session_page(&local(), &session, 2, Some(5), PageLimit::events(2))
         .await
         .unwrap();
     assert_eq!(seqs(&page.items), vec![3, 4]);
@@ -739,7 +843,7 @@ pub async fn paged_reads_on(log: &dyn EventLog) {
         (0, Some(0)),
     ] {
         let page = log
-            .read_session_page(&session, after, through, PageLimit::events(4))
+            .read_session_page(&local(), &session, after, through, PageLimit::events(4))
             .await
             .unwrap();
         assert_eq!(
@@ -749,13 +853,13 @@ pub async fn paged_reads_on(log: &dyn EventLog) {
         );
     }
     let missing = log
-        .read_session_page(&"missing".into(), 0, None, PageLimit::DEFAULT)
+        .read_session_page(&local(), &"missing".into(), 0, None, PageLimit::DEFAULT)
         .await
         .unwrap();
     assert_eq!(missing, Page::last(Vec::new()));
     // A limit of 0 records is read as 1.
     let page = log
-        .read_session_page(&session, 0, None, PageLimit::events(0))
+        .read_session_page(&local(), &session, 0, None, PageLimit::events(0))
         .await
         .unwrap();
     assert_eq!(page.items.len(), 1);
@@ -767,9 +871,9 @@ pub async fn paged_read_under_appends_on(log: Arc<dyn EventLog>) {
         for _ in 0..5 {
             log.append_batch(vec![update("s"); 10]).await.unwrap();
         }
-        let pinned = log.latest_seq(&session).await.unwrap();
+        let pinned = log.latest_seq(&local(), &session).await.unwrap();
         assert_eq!(pinned, 50);
-        let before = log.read_after(&session, 0).await.unwrap();
+        let before = log.read_after(&local(), &session, 0).await.unwrap();
         let writer = {
             let log = Arc::clone(&log);
             tokio::spawn(async move {
@@ -803,7 +907,7 @@ pub async fn paged_read_under_appends_on(log: Arc<dyn EventLog>) {
         assert_eq!(pinned_read, before);
         // Without one, the pages are a contiguous prefix of the final log.
         let open_read: Vec<_> = open_pages.into_iter().flat_map(|p| p.items).collect();
-        let final_read = log.read_after(&session, 0).await.unwrap();
+        let final_read = log.read_after(&local(), &session, 0).await.unwrap();
         assert!(open_read.len() >= 50);
         assert_eq!(
             seqs(&open_read),
@@ -837,19 +941,19 @@ pub async fn read_your_writes_on(log: Arc<dyn EventLog>) {
                         .unwrap();
                     let seq = records[1].session_seq.unwrap();
                     assert_eq!(seq, i);
-                    assert_eq!(log.latest_seq(&key).await.unwrap(), seq);
+                    assert_eq!(log.latest_seq(&local(), &key).await.unwrap(), seq);
                     let page = log
-                        .read_session_page(&key, seq - 1, None, PageLimit::DEFAULT)
+                        .read_session_page(&local(), &key, seq - 1, None, PageLimit::DEFAULT)
                         .await
                         .unwrap();
                     assert_eq!(page.items, records[1..].to_vec());
-                    let tail = log.read_after(&key, seq - 1).await.unwrap();
+                    let tail = log.read_after(&local(), &key, seq - 1).await.unwrap();
                     assert_eq!(tail, records[1..].to_vec());
-                    let summary = log.session_summary(&key).await.unwrap().unwrap();
+                    let summary = log.session_summary(&local(), &key).await.unwrap().unwrap();
                     assert_eq!((summary.last_seq, summary.prompts_sent), (seq, i));
-                    assert_eq!(log.prompts_sent(&key).await.unwrap(), i);
+                    assert_eq!(log.prompts_sent(&local(), &key).await.unwrap(), i);
                     let global = log
-                        .read_runtime_after(records[0].global_seq - 1)
+                        .read_runtime_after(all(), records[0].global_seq - 1)
                         .await
                         .unwrap();
                     assert!(global.starts_with(&records));
@@ -911,7 +1015,7 @@ pub async fn long_read_does_not_delay_appends_on(log: Arc<dyn EventLog>) {
                 .unwrap();
         }
         let start = Instant::now();
-        assert_eq!(log.read_after(&big, 0).await.unwrap().len(), events);
+        assert_eq!(log.read_after(&local(), &big, 0).await.unwrap().len(), events);
         let replay = start.elapsed();
         let idle = append_latencies(log.as_ref()).await;
         let stop = Arc::new(AtomicBool::new(false));
@@ -923,7 +1027,7 @@ pub async fn long_read_does_not_delay_appends_on(log: Arc<dyn EventLog>) {
             readers.push(tokio::spawn(async move {
                 let mut replays = 0u32;
                 while !stop.load(Ordering::Acquire) {
-                    assert!(log.read_after(&big, 0).await.unwrap().len() >= events);
+                    assert!(log.read_after(&local(), &big, 0).await.unwrap().len() >= events);
                     replays += 1;
                 }
                 replays
@@ -962,24 +1066,32 @@ pub async fn summary_matches_fold_on(log: &dyn EventLog) {
     for batch in workload() {
         log.append_batch(batch).await.unwrap();
     }
-    let records = log.read_runtime_after(0).await.unwrap();
+    let records = log.read_runtime_after(all(), 0).await.unwrap();
     let expected = summarize(&records);
     assert!(expected.len() >= 4);
-    for (session, (summary, turns)) in &expected {
+    for ((tenant, session), (summary, turns)) in &expected {
         assert_eq!(
-            log.session_summary(session).await.unwrap().as_ref(),
+            log.session_summary(tenant, session).await.unwrap().as_ref(),
             Some(summary),
             "summary of {session:?}"
         );
-        assert_eq!(&log.turn_ids(session).await.unwrap(), turns);
+        assert_eq!(&log.turn_ids(tenant, session).await.unwrap(), turns);
         assert_eq!(
-            log.prompts_sent(session).await.unwrap(),
+            log.prompts_sent(tenant, session).await.unwrap(),
             summary.prompts_sent
         );
-        assert_eq!(log.latest_seq(session).await.unwrap(), summary.last_seq);
+        assert_eq!(
+            log.latest_seq(tenant, session).await.unwrap(),
+            summary.last_seq
+        );
+        assert_eq!(
+            log.session_owner(tenant, session).await.unwrap(),
+            summary.owner
+        );
     }
+    let key = |session: &str| (local(), SessionKey::from(session));
     // The workload's rules, spelled out.
-    let a = &expected[&SessionKey::from("a")].0;
+    let a = &expected[&key("a")].0;
     assert_eq!(
         a.last_revision, 4,
         "the last revision wins, not the largest"
@@ -988,28 +1100,39 @@ pub async fn summary_matches_fold_on(log: &dyn EventLog) {
     assert_eq!(a.prompts_sent, 2);
     assert_eq!(a.turn_count, 2);
     assert_eq!(a.parent, None);
+    assert_eq!(a.owner, Some(host()), "the creating opening is the owner");
     assert_eq!(
-        expected[&SessionKey::from("kid")].0.parent,
+        expected[&key("kid")].0.parent,
         Some(SessionKey::from("a")),
         "a later opening without a parent does not clear it"
     );
     assert_eq!(
-        expected[&SessionKey::from("b")].1,
+        expected[&key("kid")].0.owner,
+        None,
+        "an opening that does not create sets no owner"
+    );
+    assert_eq!(
+        expected[&key("b")].1,
         vec![TurnId::from("turn-7"), TurnId::from("turn-2")],
         "a prompt's turn counts"
     );
-    assert_eq!(log.session_summary(&"missing".into()).await.unwrap(), None);
+    assert_eq!(
+        log.session_summary(&local(), &"missing".into())
+            .await
+            .unwrap(),
+        None
+    );
     let subagents: HashSet<_> = expected
         .iter()
         .filter(|(_, (summary, _))| summary.parent.is_some())
         .map(|(key, _)| key.clone())
         .collect();
-    assert_eq!(log.subagent_sessions().await.unwrap(), subagents);
+    assert_eq!(log.subagent_sessions(all()).await.unwrap(), subagents);
     let activity: HashMap<_, _> = expected
         .iter()
         .map(|(key, (summary, _))| (key.clone(), summary.last_activity_ms))
         .collect();
-    assert_eq!(log.last_activity_ms().await.unwrap(), activity);
+    assert_eq!(log.last_activity_ms(all()).await.unwrap(), activity);
 }
 
 pub async fn recovery_pages_on(log: &dyn EventLog) {
@@ -1032,12 +1155,12 @@ pub async fn recovery_pages_on(log: &dyn EventLog) {
         }
     }
     for from in [0, 1, 2, 3] {
-        let whole = log.recovery_records(from).await.unwrap();
+        let whole = log.recovery_records(all(), from).await.unwrap();
         let mut paged = Vec::new();
         let mut after = 0;
         loop {
             let page = log
-                .recovery_page(from, after, PageLimit::events(4))
+                .recovery_page(all(), from, after, PageLimit::events(4))
                 .await
                 .unwrap();
             assert!(page.items.len() <= 4);
@@ -1054,4 +1177,371 @@ pub async fn recovery_pages_on(log: &dyn EventLog) {
             assert!(whole.is_empty());
         }
     }
+}
+
+// ------------------------------------------------------------------ step B3
+
+/// One record of each kind (an Update first), all of `session`.
+fn every_kind(session: &str, identity: &Identity) -> Vec<Event> {
+    let kinds = vec![
+        EventKind::PromptSent(json!({"prompt":"hello"})),
+        EventKind::PromptSettled(json!({})),
+        EventKind::Cancelled(json!({"reason":"user"})),
+        EventKind::EscalationRaised(json!({"id":"e1"})),
+        EventKind::EscalationAnswered(json!({"id":"e1","answer":"allow"})),
+        EventKind::EscalationWithdrawn(json!({"id":"e1","reason":"cancelled"})),
+        EventKind::SessionOpened(json!({"cwd":"/work","parent":null, SESSION_CREATED_KEY: true})),
+        EventKind::SessionClosed(json!({"reason":"done"})),
+        EventKind::SubagentStarted(json!({"child":"k"})),
+        EventKind::SubagentEnded(json!({"child":"k"})),
+        EventKind::PolicyDecision(json!({"id":"pd-1"})),
+        EventKind::Unknown(json!({"kind":"future_kind","payload":{"x":7}})),
+    ];
+    let mut first = update(session);
+    first.identity = identity.clone();
+    let mut events = vec![first];
+    for kind in kinds {
+        events.push(Event::new(
+            1,
+            Some(session.into()),
+            Some("turn-1".into()),
+            101,
+            kind,
+            identity.clone(),
+        ));
+    }
+    events
+}
+
+pub async fn identity_round_trip_on(log: &dyn EventLog) {
+    let robot = Principal::new(
+        PrincipalKind::Unknown("robot".into()),
+        "https://idp.example",
+        "r-1",
+    )
+    .expect("principal");
+    let identities = [
+        host(),
+        Identity::acting(&Caller::local_token(Principal::local_uid(501)), local()),
+        edge_user(acme()),
+        edge_user(local()).with_actor(Some("parent-session".into())),
+        Identity {
+            tenant: acme(),
+            principal: robot,
+            via: Some(Via::edge()),
+            actor: Some("agent:x".into()),
+        },
+    ];
+    let mut appended = Vec::new();
+    for (i, identity) in identities.iter().enumerate() {
+        let session = format!("id-{i}");
+        let records = log
+            .append_batch(every_kind(&session, identity))
+            .await
+            .unwrap();
+        for record in &records {
+            assert_eq!(&record.event.identity, identity, "{:?}", record.event.kind);
+        }
+        appended.extend(records);
+    }
+    // Runtime records of both deployments.
+    for identity in [
+        loop_store::Deployment::SingleNode.runtime_identity(),
+        loop_store::Deployment::SharedCell.runtime_identity(),
+    ] {
+        appended.extend(
+            log.append_batch(vec![
+                Event::new(
+                    1,
+                    None,
+                    None,
+                    1,
+                    EventKind::RuntimeStarted(json!({"pid": 1})),
+                    identity.clone(),
+                ),
+                Event::new(
+                    1,
+                    None,
+                    None,
+                    2,
+                    EventKind::RuntimeStopped(json!({})),
+                    identity,
+                ),
+            ])
+            .await
+            .unwrap(),
+        );
+    }
+    // Read back by every path that returns records.
+    assert_eq!(log.read_runtime_after(all(), 0).await.unwrap(), appended);
+    for (i, identity) in identities.iter().enumerate() {
+        let session = SessionKey::from(format!("id-{i}"));
+        let updates = log.read_after(&identity.tenant, &session, 0).await.unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(&updates[0].event.identity, identity);
+        let page = log
+            .read_session_page(&identity.tenant, &session, 0, None, PageLimit::DEFAULT)
+            .await
+            .unwrap();
+        assert_eq!(page.items, updates);
+    }
+    let recovery = log.recovery_records(all(), 0).await.unwrap();
+    assert!(!recovery.is_empty());
+    for record in &recovery {
+        let original = appended
+            .iter()
+            .find(|r| r.global_seq == record.global_seq)
+            .expect("recovery record was appended");
+        assert_eq!(record.event.identity, original.event.identity);
+    }
+}
+
+pub async fn tenant_isolation_on(log: &dyn EventLog) {
+    let (l, a) = (local(), acme());
+    let in_tenant = |tenant: &Tenant, mut event: Event| {
+        event.identity.tenant = tenant.clone();
+        event
+    };
+    let opened = |tenant: &Tenant, key: &str, parent: serde_json::Value| {
+        in_tenant(
+            tenant,
+            record(
+                Some(key),
+                None,
+                5,
+                EventKind::SessionOpened(
+                    json!({"cwd": "/w", "parent": parent, SESSION_CREATED_KEY: true}),
+                ),
+            ),
+        )
+    };
+    let prompt = |tenant: &Tenant, key: &str, turn: &str, ts: i64| {
+        in_tenant(
+            tenant,
+            record(Some(key), Some(turn), ts, EventKind::PromptSent(json!({}))),
+        )
+    };
+    let started = |tenant: &Tenant, key: &str, turn: &str, ts: i64| {
+        in_tenant(
+            tenant,
+            update_with(
+                key,
+                turn,
+                ts,
+                SessionUpdate::TurnStarted {
+                    turn_id: turn.into(),
+                },
+            ),
+        )
+    };
+    // The same key "s" in both tenants, interleaved, plus a key and a
+    // Subagent that exist in one tenant only.
+    log.append_batch(vec![
+        opened(&l, "s", json!(null)),
+        opened(&a, "s", json!(null)),
+        prompt(&l, "s", "turn-1", 10),
+        started(&l, "s", "turn-1", 11),
+        prompt(&a, "s", "turn-9", 50),
+        started(&a, "s", "turn-9", 51),
+        started(&a, "s", "turn-9", 52),
+        opened(&a, "only-acme", json!(null)),
+        opened(&a, "kid", json!("s")),
+        started(&a, "only-acme", "turn-1", 60),
+        in_tenant(
+            &a,
+            record(
+                Some("s"),
+                None,
+                53,
+                EventKind::EscalationRaised(json!({"id":"e1"})),
+            ),
+        ),
+    ])
+    .await
+    .unwrap();
+    log.append_batch(vec![started(&l, "s", "turn-1", 12)])
+        .await
+        .unwrap();
+    let s = SessionKey::from("s");
+    let only = SessionKey::from("only-acme");
+    // Own `session_seq` space per tenant.
+    assert_eq!(log.latest_seq(&l, &s).await.unwrap(), 2);
+    assert_eq!(log.latest_seq(&a, &s).await.unwrap(), 2);
+    assert_eq!(log.latest_seq(&l, &only).await.unwrap(), 0);
+    assert_eq!(log.latest_seq(&a, &only).await.unwrap(), 1);
+    let check_tenant = |records: &[LoggedEvent], tenant: &Tenant| {
+        assert!(!records.is_empty());
+        for record in records {
+            assert_eq!(record.event.tenant(), tenant, "{record:?}");
+        }
+    };
+    for tenant in [&l, &a] {
+        let read = log.read_after(tenant, &s, 0).await.unwrap();
+        check_tenant(&read, tenant);
+        assert_eq!(seqs(&read), vec![1, 2]);
+        let page = log
+            .read_session_page(tenant, &s, 0, None, PageLimit::events(1))
+            .await
+            .unwrap();
+        check_tenant(&page.items, tenant);
+        assert_eq!(page.next, Some(Cursor(1)));
+        let pages = all_pages_in(log, tenant, &s, 0, None, PageLimit::events(1)).await;
+        let joined: Vec<_> = pages.into_iter().flat_map(|p| p.items).collect();
+        assert_eq!(joined, read);
+        let runtime = log
+            .read_runtime_after(Scope::Tenant(tenant), 0)
+            .await
+            .unwrap();
+        check_tenant(&runtime, tenant);
+        let recovery = log
+            .recovery_records(Scope::Tenant(tenant), 0)
+            .await
+            .unwrap();
+        check_tenant(&recovery, tenant);
+        let mut paged = Vec::new();
+        let mut after = 0;
+        loop {
+            let page = log
+                .recovery_page(Scope::Tenant(tenant), 0, after, PageLimit::events(1))
+                .await
+                .unwrap();
+            paged.extend(page.items);
+            match page.next {
+                Some(Cursor(next)) => after = next,
+                None => break,
+            }
+        }
+        assert_eq!(paged, recovery);
+        let summary = log.session_summary(tenant, &s).await.unwrap().unwrap();
+        assert_eq!(&summary.tenant, tenant);
+        assert_eq!(summary.last_seq, 2);
+        assert_eq!(summary.prompts_sent, 1);
+        assert_eq!(summary.turn_count, 1);
+        assert_eq!(
+            summary.owner.as_ref().map(|o| &o.tenant),
+            Some(tenant),
+            "each tenant's Session has its own owner"
+        );
+        for (key, _) in log.last_activity_ms(Scope::Tenant(tenant)).await.unwrap() {
+            assert_eq!(&key.0, tenant, "activity of {key:?}");
+        }
+        for (key_tenant, _) in log.subagent_sessions(Scope::Tenant(tenant)).await.unwrap() {
+            assert_eq!(&key_tenant, tenant);
+        }
+    }
+    assert_eq!(
+        log.turn_ids(&l, &s).await.unwrap(),
+        vec![TurnId::from("turn-1")]
+    );
+    assert_eq!(
+        log.turn_ids(&a, &s).await.unwrap(),
+        vec![TurnId::from("turn-9")]
+    );
+    assert_eq!(log.prompts_sent(&l, &only).await.unwrap(), 0);
+    assert!(log.read_after(&l, &only, 0).await.unwrap().is_empty());
+    assert_eq!(
+        log.read_session_page(&l, &only, 0, None, PageLimit::DEFAULT)
+            .await
+            .unwrap(),
+        Page::last(Vec::new())
+    );
+    assert_eq!(log.session_summary(&l, &only).await.unwrap(), None);
+    assert_eq!(log.session_owner(&l, &only).await.unwrap(), None);
+    assert!(log.turn_ids(&l, &only).await.unwrap().is_empty());
+    assert_eq!(
+        log.subagent_sessions(Scope::Tenant(&l)).await.unwrap(),
+        HashSet::new()
+    );
+    assert_eq!(
+        log.subagent_sessions(Scope::Tenant(&a)).await.unwrap(),
+        HashSet::from([(a.clone(), SessionKey::from("kid"))])
+    );
+    let local_activity = log.last_activity_ms(Scope::Tenant(&l)).await.unwrap();
+    assert_eq!(
+        local_activity,
+        HashMap::from([((l.clone(), s.clone()), 12)])
+    );
+    // The system scope sees both tenants' Sessions apart.
+    let activity = log.last_activity_ms(all()).await.unwrap();
+    assert_eq!(activity[&(l.clone(), s.clone())], 12);
+    assert_eq!(activity[&(a.clone(), s.clone())], 53);
+    assert_eq!(activity[&(a.clone(), only.clone())], 60);
+    let everything = log.read_runtime_after(all(), 0).await.unwrap();
+    assert_eq!(everything.len(), 12);
+    let recovery = log.recovery_records(all(), 0).await.unwrap();
+    assert!(recovery.iter().any(|r| r.event.tenant() == &l));
+    assert!(recovery.iter().any(|r| r.event.tenant() == &a));
+}
+
+/// All pages of `tenant`'s Session's read.
+pub async fn all_pages_in(
+    log: &dyn EventLog,
+    tenant: &Tenant,
+    session: &SessionKey,
+    after: u64,
+    through: Option<u64>,
+    limit: PageLimit,
+) -> Vec<Page<LoggedEvent>> {
+    let mut pages = Vec::new();
+    let mut after = after;
+    loop {
+        let page = log
+            .read_session_page(tenant, session, after, through, limit)
+            .await
+            .unwrap();
+        let next = page.next;
+        pages.push(page);
+        match next {
+            Some(Cursor(seq)) => after = seq,
+            None => return pages,
+        }
+    }
+}
+
+pub async fn owner_of_record_on(log: &dyn EventLog) {
+    let opened = |identity: Identity, created: bool| {
+        let mut payload = json!({"cwd": "/w", "parent": null});
+        if created {
+            payload[SESSION_CREATED_KEY] = json!(true);
+        }
+        Event::new(
+            1,
+            Some("o".into()),
+            None,
+            1,
+            EventKind::SessionOpened(payload),
+            identity,
+        )
+    };
+    let o = SessionKey::from("o");
+    // A load before any creating record sets no owner.
+    log.append_batch(vec![opened(edge_user(local()), false)])
+        .await
+        .unwrap();
+    assert_eq!(log.session_owner(&local(), &o).await.unwrap(), None);
+    // The creating opening sets it; later loads by others do not change it.
+    log.append_batch(vec![opened(host(), true)]).await.unwrap();
+    log.append_batch(vec![
+        opened(edge_user(local()), false),
+        opened(edge_user(local()), true),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(log.session_owner(&local(), &o).await.unwrap(), Some(host()));
+    // The same key in another tenant has its own owner.
+    log.append_batch(vec![opened(edge_user(acme()), true)])
+        .await
+        .unwrap();
+    assert_eq!(
+        log.session_owner(&acme(), &o).await.unwrap(),
+        Some(edge_user(acme()))
+    );
+    assert_eq!(log.session_owner(&local(), &o).await.unwrap(), Some(host()));
+    assert_eq!(
+        log.session_summary(&local(), &o)
+            .await
+            .unwrap()
+            .and_then(|s| s.owner),
+        Some(host())
+    );
 }

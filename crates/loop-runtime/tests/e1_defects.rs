@@ -107,14 +107,23 @@ impl EventLog for AtTurnEnd {
         }
         result
     }
-    async fn read_after(&self, s: &SessionKey, after: u64) -> LogResult<Vec<LoggedEvent>> {
-        self.inner.read_after(s, after).await
+    async fn read_after(
+        &self,
+        tenant: &loop_store::Tenant,
+        s: &SessionKey,
+        after: u64,
+    ) -> LogResult<Vec<LoggedEvent>> {
+        self.inner.read_after(tenant, s, after).await
     }
-    async fn read_runtime_after(&self, g: u64) -> LogResult<Vec<LoggedEvent>> {
-        self.inner.read_runtime_after(g).await
+    async fn read_runtime_after(
+        &self,
+        scope: loop_store::Scope<'_>,
+        g: u64,
+    ) -> LogResult<Vec<LoggedEvent>> {
+        self.inner.read_runtime_after(scope, g).await
     }
-    async fn latest_seq(&self, s: &SessionKey) -> LogResult<u64> {
-        self.inner.latest_seq(s).await
+    async fn latest_seq(&self, tenant: &loop_store::Tenant, s: &SessionKey) -> LogResult<u64> {
+        self.inner.latest_seq(tenant, s).await
     }
     async fn allocate_generation(&self, o: &str, p: u32, t: i64) -> LogResult<u64> {
         self.inner.allocate_generation(o, p, t).await
@@ -122,55 +131,72 @@ impl EventLog for AtTurnEnd {
     async fn finish_generation(&self, g: u64, t: i64) -> LogResult<()> {
         self.inner.finish_generation(g, t).await
     }
-    async fn recovery_records(&self, g: u64) -> LogResult<Vec<LoggedEvent>> {
-        self.inner.recovery_records(g).await
+    async fn recovery_records(
+        &self,
+        scope: loop_store::Scope<'_>,
+        g: u64,
+    ) -> LogResult<Vec<LoggedEvent>> {
+        self.inner.recovery_records(scope, g).await
     }
-    async fn last_recovered_generation(&self) -> LogResult<u64> {
-        self.inner.last_recovered_generation().await
+    async fn last_recovered_generation(&self, scope: &loop_store::SystemScope) -> LogResult<u64> {
+        self.inner.last_recovered_generation(scope).await
     }
     async fn mark_recovered(&self, g: u64, t: i64) -> LogResult<()> {
         self.inner.mark_recovered(g, t).await
     }
-    async fn subagent_sessions(&self) -> LogResult<HashSet<SessionKey>> {
-        self.inner.subagent_sessions().await
+    async fn subagent_sessions(
+        &self,
+        scope: loop_store::Scope<'_>,
+    ) -> LogResult<HashSet<loop_store::TenantSession>> {
+        self.inner.subagent_sessions(scope).await
     }
-    async fn prompts_sent(&self, s: &SessionKey) -> LogResult<u64> {
-        self.inner.prompts_sent(s).await
+    async fn prompts_sent(&self, tenant: &loop_store::Tenant, s: &SessionKey) -> LogResult<u64> {
+        self.inner.prompts_sent(tenant, s).await
     }
-    async fn turn_ids(&self, s: &SessionKey) -> LogResult<Vec<TurnId>> {
-        self.inner.turn_ids(s).await
+    async fn turn_ids(
+        &self,
+        tenant: &loop_store::Tenant,
+        s: &SessionKey,
+    ) -> LogResult<Vec<TurnId>> {
+        self.inner.turn_ids(tenant, s).await
     }
-    async fn last_activity_ms(&self) -> LogResult<HashMap<SessionKey, i64>> {
-        self.inner.last_activity_ms().await
+    async fn last_activity_ms(
+        &self,
+        scope: loop_store::Scope<'_>,
+    ) -> LogResult<HashMap<loop_store::TenantSession, i64>> {
+        self.inner.last_activity_ms(scope).await
     }
     async fn sync(&self) -> loop_runtime::log::Result<()> {
         self.inner.sync().await
     }
     async fn read_session_page(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
         after_seq: u64,
         through_seq: Option<u64>,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
         self.inner
-            .read_session_page(session, after_seq, through_seq, limit)
+            .read_session_page(tenant, session, after_seq, through_seq, limit)
             .await
     }
     async fn session_summary(
         &self,
+        tenant: &loop_store::Tenant,
         session: &loop_protocol::SessionKey,
     ) -> loop_runtime::log::Result<Option<loop_runtime::log::SessionSummary>> {
-        self.inner.session_summary(session).await
+        self.inner.session_summary(tenant, session).await
     }
     async fn recovery_page(
         &self,
+        scope: loop_store::Scope<'_>,
         from_generation: u64,
         after_global: u64,
         limit: loop_runtime::log::PageLimit,
     ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
         self.inner
-            .recovery_page(from_generation, after_global, limit)
+            .recovery_page(scope, from_generation, after_global, limit)
             .await
     }
 }
@@ -274,7 +300,7 @@ async fn d3_a_completed_turn_is_in_the_tree() {
         );
         // The turn's end reports the failed write; no separate error notice.
         let updates: Vec<_> = log
-            .read_after(&session.key, 0)
+            .read_after(&loop_store::Tenant::local(), &session.key, 0)
             .await
             .unwrap()
             .into_iter()
@@ -343,6 +369,7 @@ async fn d2_a_prompt_whose_turn_start_was_not_logged_is_recovered_as_uncertain()
                     0,
                     update,
                 ),
+                loop_store::Identity::unrecorded(),
             )
         };
         let prompt = Event {
@@ -351,6 +378,7 @@ async fn d2_a_prompt_whose_turn_start_was_not_logged_is_recovered_as_uncertain()
             turn: None,
             ts_ms: 1,
             kind: EventKind::PromptSent(json!({"content": [{"type": "text", "text": "x"}]})),
+            identity: loop_store::Identity::unrecorded(),
         };
         // One finished turn, then a prompt whose turn start never committed.
         log.append_batch(vec![
@@ -387,7 +415,7 @@ async fn d2_a_prompt_whose_turn_start_was_not_logged_is_recovered_as_uncertain()
         );
         // The recovered turn is named after the prompt's global sequence (4).
         let started: Vec<_> = log
-            .read_after(&a, 0)
+            .read_after(&loop_store::Tenant::local(), &a, 0)
             .await
             .unwrap()
             .into_iter()

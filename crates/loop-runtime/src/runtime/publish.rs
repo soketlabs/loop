@@ -27,9 +27,11 @@ pub(super) async fn barrier(live: &LiveSession) -> BackendResult<()> {
     }
     result
 }
+/// Commit one update of `live` as `identity` (who caused it), then publish it.
 pub(super) async fn publish(
     live: &LiveSession,
     envelope: UpdateEnvelope,
+    identity: Identity,
     log: &dyn EventLog,
     generation: u64,
     updates: &broadcast::Sender<UpdateEnvelope>,
@@ -39,7 +41,7 @@ pub(super) async fn publish(
     }
     let ts_ms = now();
     let committed = log
-        .append_batch(vec![Event::update(generation, ts_ms, envelope)])
+        .append_batch(vec![Event::update(generation, ts_ms, envelope, identity)])
         .await
         .map_err(failed)?;
     touch(&live.activity, &live.reference.key, ts_ms);
@@ -96,6 +98,8 @@ pub(super) async fn pump(
     let id = live.reference.native_id.clone();
     let key = live.reference.key.clone();
     let renew_log = Arc::clone(&log);
+    // A lost lease is the Runtime's own record.
+    let lost_identity = live.runtime_identity();
     renewals.spawn(async move {
         let end = renew_loop(
             || store.renew_lease(&id, &identity),
@@ -120,36 +124,43 @@ pub(super) async fn pump(
                 kind: EventKind::Cancelled(
                     json!({"reason": format!("lease {state}"), "detail": reason}),
                 ),
+                identity: lost_identity,
             }])
             .await;
     });
     loop {
         let result: BackendResult<()> = tokio::select! {
             envelope = receiver.recv() => match envelope {
-                Ok(envelope) => publish(&live, envelope, log.as_ref(), generation, &updates).await,
+                Ok(envelope) => {
+                    let identity = live.update_identity(&envelope);
+                    publish(&live, envelope, identity, log.as_ref(), generation, &updates).await
+                }
                 Err(error) => Err(failed(format!("Session update pump lost activity: {error}"))),
             },
             _ = renewals.join_next() => return,
             command = commands.recv() => {
                 let stop = matches!(&command, Some(Command::Stop(_)));
                 match command {
-                    Some(Command::Publish(update, tx)) => {
+                    Some(Command::Publish(update, identity, tx)) => {
                         let envelope = UpdateEnvelope::live(live.reference.instance.clone(), generation, live.reference.key.clone(), None, 0, *update);
-                        let result = publish(&live,envelope,log.as_ref(),generation,&updates).await;
+                        let result = publish(&live,envelope,identity,log.as_ref(),generation,&updates).await;
                         let _ = tx.send(result.clone());
                         result
                     }
-                    Some(Command::Cancel) => {
-                        let result = log.append_batch(vec![Event { generation, session_key: Some(live.reference.key.clone()), turn: None, ts_ms: now(), kind: EventKind::Cancelled(json!({})) }]).await.map_err(failed);
+                    Some(Command::Cancel(by)) => {
+                        let result = log.append_batch(vec![Event { generation, session_key: Some(live.reference.key.clone()), turn: None, ts_ms: now(), kind: EventKind::Cancelled(json!({})), identity: live.identity(&by) }]).await.map_err(failed);
                         live.cancel.send_modify(|n| *n += 1);
                         live.opened.native.cancel(&live.reference);
-                        let withdrawn = live.escalations.withdraw("turn cancelled", false).await.map_err(failed);
+                        let withdrawn = live.escalations.withdraw("turn cancelled", false, &by).await.map_err(failed);
                         result.map(|_| ()).and(withdrawn)
                     }
                     Some(Command::Barrier(tx) | Command::Stop(tx)) => {
                         let result = async {
                             loop { match receiver.try_recv() {
-                                Ok(e) => publish(&live, e, log.as_ref(), generation, &updates).await?,
+                                Ok(e) => {
+                                    let identity = live.update_identity(&e);
+                                    publish(&live, e, identity, log.as_ref(), generation, &updates).await?
+                                }
                                 Err(broadcast::error::TryRecvError::Empty) => break,
                                 Err(error) => return Err(failed(format!("Session update pump lost activity: {error}"))),
                             } }

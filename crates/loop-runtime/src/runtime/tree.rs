@@ -219,7 +219,7 @@ impl Runtime {
             let baseline = live.turn_start_seq.load(Ordering::Acquire);
             for record in self
                 .log
-                .read_after(&live.reference.key, baseline)
+                .read_after(&live.tenant, &live.reference.key, baseline)
                 .await
                 .map_err(failed)?
             {
@@ -242,9 +242,10 @@ impl Runtime {
         session: &SessionRef,
         after_seq: u64,
     ) -> BackendResult<bool> {
+        let tenant = self.session_tenant(&session.key);
         Ok(self
             .log
-            .read_after(&session.key, after_seq.saturating_sub(1))
+            .read_after(&tenant, &session.key, after_seq.saturating_sub(1))
             .await
             .map_err(failed)?
             .iter()
@@ -612,14 +613,14 @@ impl Runtime {
         let Some(marker) = state.pending else {
             return self
                 .log
-                .latest_seq(&live.reference.key)
+                .latest_seq(&live.tenant, &live.reference.key)
                 .await
                 .map_err(failed);
         };
         let marker_value: serde_json::Value = serde_json::from_str(&marker).map_err(failed)?;
         let at_seq = self
             .log
-            .latest_seq(&live.reference.key)
+            .latest_seq(&live.tenant, &live.reference.key)
             .await
             .map_err(failed)?;
         // The native backend counted the change, at commit or when the
@@ -644,9 +645,12 @@ impl Runtime {
                 reason: marker_value["kind"].as_str().unwrap_or("navigate").into(),
             }
         };
+        // The request that announces it: a rename, navigation or
+        // compaction, or the admission that finishes a lost announcement.
+        let identity = live.identity(&request_caller());
         let (tx, rx) = oneshot::channel();
         live.commands
-            .send(Command::Publish(Box::new(update), tx))
+            .send(Command::Publish(Box::new(update), identity, tx))
             .map_err(failed)?;
         let result = rx.await.map_err(failed)?;
         if let Err(error) = result {
@@ -660,7 +664,7 @@ impl Runtime {
             .await
             .map_err(failed)?;
         self.log
-            .latest_seq(&live.reference.key)
+            .latest_seq(&live.tenant, &live.reference.key)
             .await
             .map_err(failed)
     }
@@ -927,7 +931,8 @@ impl Runtime {
         let admitted = if injected {
             Err(failed("injected admission failure"))
         } else {
-            self.open(Some(&session), SessionSpec::default(), None)
+            // This request created the destination: it is the creator.
+            self.open_as(Some(&session), SessionSpec::default(), None, true)
                 .await
         };
         let mut created = unadmitted.created.take().unwrap();
