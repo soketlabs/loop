@@ -397,6 +397,25 @@ it, in the columns `tenant`, `principal_kind`, `principal_issuer`,
   and the Runtime's principal. Their Sessions have no owner of record.
 - Each read of the Event Log names a tenant. The same Session key in two
   tenants is two Sessions.
+- **No downgrade once a non-local row exists.** A Loop from before this
+  change writes every row as tenant `local`, also a row of a Session of
+  another tenant. Such a Session then has rows in two tenants. The Runtime
+  reports it at start, reads it in the tenant of its creating row, and
+  refuses to load it.
+- Storage note: the identity is stored in columns on each row (about 44
+  bytes more per row). A lookup table with a small id per row is to be
+  evaluated in step B4, if B4 rewrites rows.
+
+**Rules for the access checks (next step, I3; not in force yet).**
+
+- A Session whose owner of record is `None` (created before this change,
+  or outside the Runtime) is host-only: only the host's own user may use
+  it.
+- A Subagent takes its **parent's** access. Its own owner row (the
+  parent's caller) does not grant access of its own.
+- A copy (fork, clone or import) belongs to the caller that made it.
+  Before a fork or clone, check that the caller may read the **source**
+  Session.
 
 ```sh
 sqlite3 ~/.loop/agent/events.db \

@@ -7,7 +7,7 @@ use loop_store::{
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -1111,55 +1111,66 @@ fn catch_up(conn: &Connection, mut after: u64, through: u64) -> SqlResult<Malfor
 }
 
 /// One commit group's change to one Session.
-struct GroupFold {
+struct GroupFold<'a> {
     summary: SessionSummary,
     revised: bool,
-    turns: Vec<(TurnId, u64)>,
+    turns: Vec<(&'a TurnId, u64)>,
     /// The `global_seq` of the group's first creating `session_opened`.
     owner_seq: Option<u64>,
 }
 
 /// Fold the rows per `(tenant, Session)`, then write one upsert per Session.
 fn apply<'a>(conn: &Connection, rows: impl Iterator<Item = &'a ProjectionRow>) -> SqlResult<()> {
-    let mut groups: BTreeMap<TenantSession, GroupFold> = BTreeMap::new();
+    // A commit group holds few Sessions: a short list keyed by borrowed
+    // keys, so no key is copied per row.
+    let mut groups: Vec<(&'a Tenant, &'a SessionKey, GroupFold<'a>)> = Vec::new();
     for row in rows {
         let Some(session) = &row.session else {
             continue;
         };
-        let delta = SummaryDelta {
-            tenant: row.tenant.clone(),
-            session: session.clone(),
-            seq: row.seq,
-            ts_ms: row.ts_ms,
-            revision: row.revision,
-            prompt: row.kind == "prompt_sent",
-            turn: row.turn.clone(),
-            parent: row.parent.clone(),
-            owner: row.owner.clone(),
+        let at = match groups
+            .iter()
+            .position(|(t, k, _)| *k == session && *t == &row.tenant)
+        {
+            Some(at) => at,
+            None => {
+                groups.push((
+                    &row.tenant,
+                    session,
+                    GroupFold {
+                        summary: SessionSummary::empty(row.tenant.clone(), session.clone()),
+                        revised: false,
+                        turns: Vec::new(),
+                        owner_seq: None,
+                    },
+                ));
+                groups.len() - 1
+            }
         };
-        let group = groups
-            .entry((row.tenant.clone(), session.clone()))
-            .or_insert_with(|| GroupFold {
-                summary: SessionSummary::empty(row.tenant.clone(), session.clone()),
-                revised: false,
-                turns: Vec::new(),
-                owner_seq: None,
-            });
-        group.revised |= delta.revision.is_some();
-        if delta.owner.is_some() && group.owner_seq.is_none() {
+        let group = &mut groups[at].2;
+        group.revised |= row.revision.is_some();
+        if row.owner.is_some() && group.owner_seq.is_none() {
             group.owner_seq = Some(row.global_seq);
         }
-        if let Some(turn) = &delta.turn {
-            if !group.turns.iter().any(|(seen, _)| seen == turn) {
-                group.turns.push((turn.clone(), row.global_seq));
+        if let Some(turn) = &row.turn {
+            if !group.turns.iter().any(|(seen, _)| *seen == turn) {
+                group.turns.push((turn, row.global_seq));
             }
         }
         // Turns are counted against the table below, not in the group.
-        group.summary.apply(&delta, false);
+        group.summary.apply_parts(
+            row.seq,
+            row.ts_ms,
+            row.revision,
+            row.kind == "prompt_sent",
+            false,
+            row.parent.as_ref(),
+            row.owner.as_ref(),
+        );
     }
     let mut insert_turn = conn.prepare_cached(INSERT_TURN_SQL)?;
     let mut upsert = conn.prepare_cached(UPSERT_SUMMARY_SQL)?;
-    for ((tenant, session), group) in groups {
+    for (tenant, session, group) in groups {
         let mut new_turns: u64 = 0;
         for (turn, global) in &group.turns {
             new_turns += insert_turn.execute(params![
@@ -1660,7 +1671,7 @@ mod tests {
     use super::*;
     use loop_store::summarize;
     use loop_store_testkit::event_log as kit;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// Rows of `EXPLAIN QUERY PLAN`, with every parameter left NULL.
     fn plan(conn: &Connection, sql: &str) -> Vec<String> {

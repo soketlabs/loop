@@ -148,24 +148,49 @@ impl SessionSummary {
     /// delta's turn was not seen before in this Session; the caller keeps
     /// the set of turns.
     pub fn apply(&mut self, delta: &SummaryDelta, new_turn: bool) {
-        if let Some(seq) = delta.seq {
+        self.apply_parts(
+            delta.seq,
+            delta.ts_ms,
+            delta.revision,
+            delta.prompt,
+            new_turn && delta.turn.is_some(),
+            delta.parent.as_ref(),
+            delta.owner.as_ref(),
+        );
+    }
+
+    /// [`SessionSummary::apply`] from borrowed parts, for a store that folds
+    /// many rows and must not copy keys per row. `new_turn` is true when the
+    /// record has a turn not seen before in this Session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_parts(
+        &mut self,
+        seq: Option<u64>,
+        ts_ms: i64,
+        revision: Option<u64>,
+        prompt: bool,
+        new_turn: bool,
+        parent: Option<&SessionKey>,
+        owner: Option<&Identity>,
+    ) {
+        if let Some(seq) = seq {
             self.last_seq = self.last_seq.max(seq);
         }
-        self.last_activity_ms = self.last_activity_ms.max(delta.ts_ms);
-        if let Some(revision) = delta.revision {
+        self.last_activity_ms = self.last_activity_ms.max(ts_ms);
+        if let Some(revision) = revision {
             self.last_revision = revision;
         }
-        if delta.prompt {
+        if prompt {
             self.prompts_sent += 1;
         }
-        if new_turn && delta.turn.is_some() {
+        if new_turn {
             self.turn_count += 1;
         }
         if self.parent.is_none() {
-            self.parent.clone_from(&delta.parent);
+            self.parent = parent.cloned();
         }
         if self.owner.is_none() {
-            self.owner.clone_from(&delta.owner);
+            self.owner = owner.cloned();
         }
     }
 }
