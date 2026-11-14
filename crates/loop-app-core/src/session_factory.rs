@@ -346,7 +346,23 @@ impl WorkspaceResources {
                                 match crate::sandbox_builder::SandboxRequest::from_settings(
                                     &settings.sandbox,
                                 ) {
-                                    Ok(request) => builder.start(&self.cwd, &request).await,
+                                    Ok(mut request) => {
+                                        // A locked workspace never starts a
+                                        // sandbox (`lock_workspace` sets the
+                                        // mode off): path rules are the only
+                                        // path policy that can apply here.
+                                        use crate::sandbox_builder::PathPolicyUse;
+                                        let rules = crate::tool_approval::permissions_from_settings(
+                                            &settings.tool_permissions,
+                                        );
+                                        request.path_policy =
+                                            if crate::permissions::has_path_rules(&rules) {
+                                                PathPolicyUse::Rules
+                                            } else {
+                                                PathPolicyUse::None
+                                            };
+                                        builder.start(&self.cwd, &request).await
+                                    }
                                     Err(e) => Err(e),
                                 };
                             match started {
@@ -829,10 +845,27 @@ impl SessionFactory {
         }
 
         let bash_limits = settings.bash.unwrap_or_default().limits();
-        let tool_gate = crate::tool_gate::ToolGate::new_for_workspace(
+        // The gate checks Workspace paths through an env in the driver's
+        // namespace: the host env for host paths (a sandbox env confines
+        // its own reads and is not a resolver), the Session's env for guest
+        // paths.
+        use loop_agent::harness::sandbox::PathNamespace;
+        let guest = matches!(&sandbox, SandboxMode::Enabled { sandbox }
+            if sandbox.capabilities().path_namespace == PathNamespace::Guest);
+        let gate_paths = if guest {
+            if globals.tool_lock_config().is_some() {
+                bail!("the tool lock needs a workspace driver whose paths are Runtime host paths");
+            }
+            crate::permissions::GatePaths::new(tool_env.clone(), PathNamespace::Guest)
+        } else {
+            crate::permissions::GatePaths::new(workspace.host.clone(), PathNamespace::Host)
+        };
+        let tool_gate = crate::tool_gate::ToolGate::new_for_env(
             crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
             &workspace.cwd,
-        );
+            gate_paths,
+        )
+        .await;
         if let Some(lock) = globals.tool_lock_config() {
             tool_gate.lock_tools(lock.lock());
             // The folder and root as they resolve now: later checks compare

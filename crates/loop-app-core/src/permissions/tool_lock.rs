@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 
 use super::capability::{Capability, Scope, Setting, State};
 use super::layers::{Layer, LayerSource};
+use super::paths::{Got, PathFacts};
+use super::policy::resolve as resolve_path;
 
 /// The environment variable that sets the lock when the flag does not.
 pub const ENV: &str = "LOOP_TOOL_LOCK";
@@ -213,46 +215,73 @@ impl Confinement {
 
     /// Whether the folder or the root no longer resolves to itself: one of
     /// them, or a folder above, was replaced by a link. Every call of the
-    /// Session is then refused.
+    /// Session is then refused. Resolved on the Runtime host.
     pub fn moved(&self) -> bool {
-        super::policy::resolve(&self.folder).as_deref() != Some(self.folder.as_path())
-            || super::policy::resolve(&self.root).as_deref() != Some(self.root.as_path())
+        self.moved_in(&PathFacts::runtime_host())
+    }
+
+    /// [`Self::moved`] with facts from `paths`. A folder that cannot be
+    /// resolved counts as moved.
+    pub fn moved_in(&self, paths: &PathFacts) -> bool {
+        resolve_path(paths, &self.folder).path().as_deref() != Some(self.folder.as_path())
+            || resolve_path(paths, &self.root).path().as_deref() != Some(self.root.as_path())
     }
 
     /// Whether a locked read of `path` stays inside the folder: the folder
     /// has not moved, and `path` with symlinks and `..` resolved is inside
-    /// the stored folder and root and is not a hard-linked file.
+    /// the stored folder and root and is not a hard-linked file. Resolved
+    /// on the Runtime host.
     pub fn allows(&self, path: &Path) -> bool {
-        if self.moved() {
+        self.allows_in(&PathFacts::runtime_host(), path)
+    }
+
+    /// [`Self::allows`] with facts from `paths`.
+    pub fn allows_in(&self, paths: &PathFacts, path: &Path) -> bool {
+        if self.moved_in(paths) {
             return false;
         }
-        let Some(real) = super::policy::resolve(path) else {
+        let Some(real) = resolve_path(paths, path).path() else {
             return false;
         };
-        real.starts_with(&self.folder) && real.starts_with(&self.root) && !hard_linked(&real)
+        real.starts_with(&self.folder) && real.starts_with(&self.root) && !hard_linked(paths, &real)
     }
 }
 
 /// Whether a locked read of `path` stays inside `folder`: the path, with
 /// symlinks and `..` resolved, is in the folder, and it is not a file with
 /// more than one hard link (a hard link to a file outside the folder looks
-/// like a file inside it, so every hard-linked file is refused).
+/// like a file inside it, so every hard-linked file is refused). Resolved
+/// on the Runtime host.
 pub fn inside_folder(path: &Path, folder: &Path) -> bool {
-    let (Some(real), Some(root)) = (super::policy::resolve(path), super::policy::resolve(folder))
-    else {
-        return false;
-    };
-    real.starts_with(&root) && !hard_linked(&real)
+    inside_folder_in(&PathFacts::runtime_host(), path, folder)
 }
 
+/// [`inside_folder`] with facts from `paths`.
+pub(crate) fn inside_folder_in(paths: &PathFacts, path: &Path, folder: &Path) -> bool {
+    let (Some(real), Some(root)) = (
+        resolve_path(paths, path).path(),
+        resolve_path(paths, folder).path(),
+    ) else {
+        return false;
+    };
+    real.starts_with(&root) && !hard_linked(paths, &real)
+}
+
+/// Whether `real` (resolved, so `lstat` names the file itself) is a file
+/// with more than one hard link. A file whose link count is unknown, or a
+/// path the facts cannot describe, counts as hard-linked (fail closed).
 #[cfg(unix)]
-fn hard_linked(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.nlink() > 1)
+fn hard_linked(paths: &PathFacts, real: &Path) -> bool {
+    use loop_agent::harness::types::PathKind;
+    match paths.lookup().lstat(real) {
+        Got::Yes(meta) => meta.kind == PathKind::File && meta.nlink.is_none_or(|n| n > 1),
+        Got::No => false,
+        Got::Unknown => true,
+    }
 }
 
 #[cfg(not(unix))]
-fn hard_linked(_path: &Path) -> bool {
+fn hard_linked(_paths: &PathFacts, _real: &Path) -> bool {
     false
 }
 

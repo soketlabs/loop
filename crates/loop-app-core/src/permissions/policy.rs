@@ -1,7 +1,9 @@
 //! The decision for one call: a function of the mode, the rules and a
 //! [`Call`] the gate resolved first. Path patterns in the rules also look
-//! at the filesystem, to match the file a path names through symlinks
-//! ([`super::rules::rule_for`]).
+//! at the file system, to match the file a path names through symlinks
+//! ([`super::rules::rule_for`]). They look through the call's
+//! [`PathFacts`]: a Session's gate fills them from the Workspace env
+//! ([`super::paths::GatePaths`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,6 +14,7 @@ use serde_json::Value;
 
 use super::capability::{Capability, State};
 use super::layers::LayerSource;
+use super::paths::{Got, Lookup, PathFacts};
 use super::rules::{rule_and_key, ToolPermission};
 use super::PermissionMode;
 use loop_store::DecidedBy;
@@ -53,6 +56,10 @@ pub struct Call {
     /// Under a tool lock: the Session's folder and root as they resolved
     /// when it opened ([`super::tool_lock::Confinement`]).
     pub confinement: Option<std::sync::Arc<super::tool_lock::Confinement>>,
+    /// Where the path checks of this call get their facts: the Runtime
+    /// host for [`Call::new`] and [`Call::resolve`] (the sync API), the
+    /// Session's Workspace env in the gate ([`Call::resolve_with`]).
+    pub paths: PathFacts,
 }
 
 impl Call {
@@ -69,11 +76,12 @@ impl Call {
             home: None,
             inside_workspace: false,
             confinement: None,
+            paths: PathFacts::runtime_host(),
         }
     }
 
     /// A call of `kind`, with the home directory and the workspace check
-    /// read from the filesystem.
+    /// read from the Runtime host's file system.
     pub fn resolve(tool: &str, kind: ToolKind, args: &Value, workspace: &Path) -> Self {
         Self::resolve_in(tool, kind, args, workspace, workspace)
     }
@@ -87,16 +95,35 @@ impl Call {
         workspace: &Path,
         cwd: &Path,
     ) -> Self {
+        Self::resolve_with(&PathFacts::runtime_host(), tool, kind, args, workspace, cwd)
+    }
+
+    /// [`Call::resolve_in`] with path facts from `paths`; the call keeps
+    /// them for its other path checks.
+    pub fn resolve_with(
+        paths: &PathFacts,
+        tool: &str,
+        kind: ToolKind,
+        args: &Value,
+        workspace: &Path,
+        cwd: &Path,
+    ) -> Self {
         let inside_workspace = is_file_write(tool)
             && args
                 .get("path")
                 .and_then(Value::as_str)
-                .is_some_and(|path| inside_workspace(&cwd.join(path).to_string_lossy(), workspace));
+                .is_some_and(|path| {
+                    inside_workspace_in(paths, &cwd.join(path).to_string_lossy(), workspace)
+                });
+        // A guest env's home is not the Runtime's: `~` stays unexpanded and
+        // `~` rules fail closed (`Lookup::home_known`).
+        let home = paths.lookup().home_known().then(dirs::home_dir).flatten();
         Self {
             kind,
-            home: dirs::home_dir(),
+            home,
             inside_workspace,
             cwd: cwd.to_path_buf(),
+            paths: paths.clone(),
             ..Self::new(tool, args.clone(), workspace)
         }
     }
@@ -252,59 +279,113 @@ fn off_reason(mode: PermissionMode, capability: &Capability, tool: &str) -> Stri
 }
 
 /// Whether `path` (relative to `workspace` when not absolute) resolves inside
-/// `workspace`, following symlinks of the parts that exist.
+/// `workspace`, following symlinks of the parts that exist, on the Runtime
+/// host.
 pub fn inside_workspace(path: &str, workspace: &Path) -> bool {
+    inside_workspace_in(&PathFacts::runtime_host(), path, workspace)
+}
+
+/// [`inside_workspace`] with facts from `paths`.
+pub(crate) fn inside_workspace_in(paths: &PathFacts, path: &str, workspace: &Path) -> bool {
     let joined = workspace.join(path);
-    let (Some(target), Some(root)) = (resolve(&joined), resolve(workspace)) else {
+    let (Some(target), Some(root)) = (
+        resolve(paths, &joined).path(),
+        resolve(paths, workspace).path(),
+    ) else {
         return false;
     };
     target.starts_with(root)
 }
 
+/// A path as [`resolve`] found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Resolved {
+    /// Resolved: the longest existing ancestor canonical, the rest as
+    /// written.
+    Path(PathBuf),
+    /// Cannot be resolved, and the kernel could not open it either: a link
+    /// loop, or `..` below a missing part.
+    Gone,
+    /// A fact was unknown (an env error, or a limit). Fails closed: a deny
+    /// or ask rule that needed this form counts as matching.
+    Unknown,
+}
+
+impl Resolved {
+    /// The path, when it resolved.
+    pub(crate) fn path(self) -> Option<PathBuf> {
+        match self {
+            Self::Path(path) => Some(path),
+            _ => None,
+        }
+    }
+}
+
 /// Canonicalise the longest existing ancestor of `path` and append the
 /// rest, rejecting `..` in the part that does not exist yet. A dangling
 /// symlink is followed to its target, so a write through it lands where
-/// the result says.
-pub(crate) fn resolve(path: &Path) -> Option<PathBuf> {
-    resolve_at(path, 0)
+/// the result says. See [`Resolved`] for the other answers.
+pub(crate) fn resolve(paths: &PathFacts, path: &Path) -> Resolved {
+    resolve_at(paths.lookup(), path, 0)
 }
 
 /// Symlinks followed before giving up (the kernel's own limit is 40).
 const MAX_LINKS: usize = 40;
 
-fn resolve_at(path: &Path, links: usize) -> Option<PathBuf> {
+fn resolve_at(lookup: &dyn Lookup, path: &Path, links: usize) -> Resolved {
+    if path.components().count() > super::paths::MAX_COMPONENTS {
+        lookup.note_limit();
+        return Resolved::Unknown;
+    }
     let mut existing = path.to_path_buf();
     let mut rest = Vec::new();
     loop {
-        if let Ok(canonical) = existing.canonicalize() {
-            let mut out = canonical;
-            for part in rest.iter().rev() {
-                out.push(part);
+        match lookup.canonical(&existing) {
+            Got::Yes(canonical) => {
+                let mut out = canonical;
+                for part in rest.iter().rev() {
+                    out.push(part);
+                }
+                return Resolved::Path(out);
             }
-            return Some(out);
+            Got::Unknown => return Resolved::Unknown,
+            Got::No => {}
         }
         // A symlink whose target does not exist: resolve the target.
-        if let Ok(target) = std::fs::read_link(&existing) {
-            if links >= MAX_LINKS {
-                return None;
+        match lookup.read_link(&existing) {
+            Got::Yes(target) => {
+                if links >= MAX_LINKS {
+                    return Resolved::Gone;
+                }
+                let Some(parent) = existing.parent() else {
+                    return Resolved::Gone;
+                };
+                let mut next = parent.join(target);
+                for part in rest.iter().rev() {
+                    next.push(part);
+                }
+                return resolve_at(lookup, &next, links + 1);
             }
-            let mut next = existing.parent()?.join(target);
-            for part in rest.iter().rev() {
-                next.push(part);
-            }
-            return resolve_at(&next, links + 1);
+            Got::Unknown => return Resolved::Unknown,
+            Got::No => {}
         }
-        let name = existing.file_name()?.to_owned();
+        let Some(name) = existing.file_name().map(|n| n.to_owned()) else {
+            return Resolved::Gone;
+        };
         if name == ".." {
-            return None;
+            return Resolved::Gone;
         }
         rest.push(name);
-        existing = existing.parent()?.to_path_buf();
+        let Some(parent) = existing.parent() else {
+            return Resolved::Gone;
+        };
+        existing = parent.to_path_buf();
     }
 }
 
 /// The directory `accept-edits` lets Loop edit: the git root containing
-/// `cwd`, or `cwd` itself.
+/// `cwd`, or `cwd` itself, on the Runtime host. A Session's gate finds it
+/// through its Workspace env ([`super::paths::GatePaths::workspace_root`]).
 pub fn workspace_root(cwd: &Path) -> PathBuf {
     cwd.ancestors()
         .find(|dir| dir.join(".git").exists())
