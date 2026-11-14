@@ -186,6 +186,23 @@ impl Runtime {
         }
         result
     }
+    /// The in-progress snapshot of a loaded Session: the open turn,
+    /// messages and tool calls, with `H` (`through_seq`), read under the
+    /// lock that moves `H` (ADR-0007 §2.3). No client gets it yet: steps A1
+    /// (refill) and A4 (attach) send it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn in_progress(
+        &self,
+        session: &SessionRef,
+    ) -> BackendResult<crate::sequencer::Snapshot> {
+        Ok(self
+            .route(session)?
+            .announced
+            .lock()
+            .unwrap()
+            .seq
+            .snapshot())
+    }
     pub(super) async fn disconnect_recipients(&self, connection: u64) {
         let mut recipients = self.recipients.lock().await;
         recipients.retain(|_, attached| {

@@ -490,7 +490,9 @@ impl Runtime {
                 waiting: AsyncMutex::new(0),
                 turn_epoch: std::sync::atomic::AtomicU64::new(0),
                 announced: Mutex::new(Announced {
-                    published,
+                    // Until the first turn or command, the Session's
+                    // updates are the opener's.
+                    seq: Sequencer::new(published, opened_identity),
                     revision: initial_config.revision,
                     latest: initial_config.clone(),
                     receipts: HashMap::new(),
@@ -504,7 +506,7 @@ impl Runtime {
                 tenant,
                 access,
                 actor,
-                acting: Mutex::new(Acting::new(acting, opened_identity)),
+                turn_caller: Mutex::new(acting),
             });
             decisions.bind(&live);
             if unannounced {
@@ -520,7 +522,7 @@ impl Runtime {
                         0,
                         SessionUpdate::ConfigChanged(initial_config),
                     ),
-                    identity,
+                    Some(identity),
                     self.log.as_ref(),
                     self.generation,
                     &self.updates,

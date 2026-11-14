@@ -33,12 +33,16 @@ impl Runtime {
         let session = session.clone();
         let command = command.to_owned();
         let task = tokio::spawn(async move {
-            let result = tokio::select! {
-                result = live.opened.native.run_as(&session, &command, Some(timeout_ms), Some(caller)) => result,
-                _ = cancelled.changed() => Err(BackendError::failed(
-                    ErrorCategory::Cancelled,
-                    "the command was cancelled",
-                )),
+            // From here the backend's updates are the command's caller's.
+            let result = match act(&live, live.identity(&caller)).await {
+                Err(error) => Err(error),
+                Ok(()) => tokio::select! {
+                    result = live.opened.native.run_as(&session, &command, Some(timeout_ms), Some(caller)) => result,
+                    _ = cancelled.changed() => Err(BackendError::failed(
+                        ErrorCategory::Cancelled,
+                        "the command was cancelled",
+                    )),
+                },
             };
             let _lifecycle = live.lifecycle.lock().await;
             live.busy.store(false, Ordering::Release);

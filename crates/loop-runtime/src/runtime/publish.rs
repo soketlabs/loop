@@ -27,23 +27,45 @@ pub(super) async fn barrier(live: &LiveSession) -> BackendResult<()> {
     }
     result
 }
-/// Commit one update of `live` as `identity` (who caused it), then publish it.
+/// A turn or command of `identity` starts: the pump commits everything the
+/// backend sent before this point with its own caller, then stamps the
+/// updates that follow with `identity`. Returns after the switch.
+pub(super) async fn act(live: &LiveSession, identity: Identity) -> BackendResult<()> {
+    let (tx, rx) = oneshot::channel();
+    let result = match live.commands.send(Command::Act(identity, tx)) {
+        Ok(()) => rx.await.map_err(failed),
+        Err(error) => Err(failed(error)),
+    };
+    if let Some(error) = live.failure.lock().unwrap().clone() {
+        return Err(failed(error));
+    }
+    result
+}
+/// Commit one update of `live`, then publish it. `cause` is who caused it
+/// when the Runtime made it for a request; without one, the Session's
+/// sequencer names who caused it. The sequencer then moves its high-water
+/// mark and its in-progress snapshot, under the same lock, before the
+/// update is sent.
 pub(super) async fn publish(
     live: &LiveSession,
     envelope: UpdateEnvelope,
-    identity: Identity,
+    cause: Option<Identity>,
     log: &dyn EventLog,
     generation: u64,
     updates: &broadcast::Sender<UpdateEnvelope>,
 ) -> BackendResult<()> {
-    if envelope.origin == Origin::Replay {
-        return Ok(());
-    }
     let ts_ms = now();
-    let committed = log
-        .append_batch(vec![Event::update(generation, ts_ms, envelope, identity)])
-        .await
-        .map_err(failed)?;
+    let event = live
+        .announced
+        .lock()
+        .unwrap()
+        .seq
+        .record(envelope, cause, generation, ts_ms);
+    // Replayed history is never stored again, nor published.
+    let Some(event) = event else {
+        return Ok(());
+    };
+    let committed = log.append_batch(vec![event]).await.map_err(failed)?;
     touch(&live.activity, &live.reference.key, ts_ms);
     if let Some(error) = live.failure.lock().unwrap().clone() {
         return Err(failed(error));
@@ -52,7 +74,7 @@ pub(super) async fn publish(
         if let EventKind::Update(envelope) = record.event.kind {
             {
                 let mut announced = live.announced.lock().unwrap();
-                announced.published = envelope.seq;
+                announced.seq.committed(envelope.seq, &envelope.update);
                 match &envelope.update {
                     SessionUpdate::ConfigChanged(changed) => {
                         announced.commit(envelope.seq, changed)
@@ -75,8 +97,34 @@ pub(super) async fn publish(
     }
     Ok(())
 }
+/// Commit what the backend has sent so far (a barrier).
+async fn drain(
+    live: &LiveSession,
+    receiver: &mut broadcast::Receiver<UpdateEnvelope>,
+    log: &dyn EventLog,
+    generation: u64,
+    updates: &broadcast::Sender<UpdateEnvelope>,
+) -> BackendResult<()> {
+    loop {
+        match receiver.try_recv() {
+            Ok(envelope) => publish(live, envelope, None, log, generation, updates).await?,
+            Err(broadcast::error::TryRecvError::Empty) => return Ok(()),
+            Err(error) => {
+                return Err(failed(format!(
+                    "Session update pump lost activity: {error}"
+                )))
+            }
+        }
+    }
+}
 pub(super) fn fail(live: &LiveSession, error: impl std::fmt::Display) {
     *live.failure.lock().unwrap() = Some(error.to_string());
+    // Nothing is in progress any more.
+    live.announced
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .seq
+        .reset();
     live.cancel.send_modify(|n| *n += 1);
     live.opened.native.cancel(&live.reference);
 }
@@ -131,10 +179,7 @@ pub(super) async fn pump(
     loop {
         let result: BackendResult<()> = tokio::select! {
             envelope = receiver.recv() => match envelope {
-                Ok(envelope) => {
-                    let identity = live.update_identity(&envelope);
-                    publish(&live, envelope, identity, log.as_ref(), generation, &updates).await
-                }
+                Ok(envelope) => publish(&live, envelope, None, log.as_ref(), generation, &updates).await,
                 Err(error) => Err(failed(format!("Session update pump lost activity: {error}"))),
             },
             _ = renewals.join_next() => return,
@@ -143,7 +188,7 @@ pub(super) async fn pump(
                 match command {
                     Some(Command::Publish(update, identity, tx)) => {
                         let envelope = UpdateEnvelope::live(live.reference.instance.clone(), generation, live.reference.key.clone(), None, 0, *update);
-                        let result = publish(&live,envelope,identity,log.as_ref(),generation,&updates).await;
+                        let result = publish(&live, envelope, Some(identity), log.as_ref(), generation, &updates).await;
                         let _ = tx.send(result.clone());
                         result
                     }
@@ -155,20 +200,19 @@ pub(super) async fn pump(
                         result.map(|_| ()).and(withdrawn)
                     }
                     Some(Command::Barrier(tx) | Command::Stop(tx)) => {
-                        let result = async {
-                            loop { match receiver.try_recv() {
-                                Ok(e) => {
-                                    let identity = live.update_identity(&e);
-                                    publish(&live, e, identity, log.as_ref(), generation, &updates).await?
-                                }
-                                Err(broadcast::error::TryRecvError::Empty) => break,
-                                Err(error) => return Err(failed(format!("Session update pump lost activity: {error}"))),
-                            } }
-                            Ok(())
-                        }.await;
+                        let result = drain(&live, &mut receiver, log.as_ref(), generation, &updates).await;
                         if let Err(error) = &result { fail(&live, error); }
                         let _ = tx.send(());
                         if stop { return; }
+                        result
+                    }
+                    Some(Command::Act(identity, tx)) => {
+                        // Everything the backend sent before the switch keeps
+                        // the caller it was sent under.
+                        let result = drain(&live, &mut receiver, log.as_ref(), generation, &updates).await;
+                        live.announced.lock().unwrap().seq.act(identity);
+                        if let Err(error) = &result { fail(&live, error); }
+                        let _ = tx.send(());
                         result
                     }
                     None => return,

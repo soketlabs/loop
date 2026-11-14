@@ -3,6 +3,7 @@ pub mod access;
 pub mod log;
 mod recovery;
 mod runtime;
+pub mod sequencer;
 pub use recovery::Recovery;
 pub use runtime::{workspace_id, Runtime, RuntimeLimits, SplitSessionError};
 

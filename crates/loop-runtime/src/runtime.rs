@@ -1,6 +1,7 @@
 //! Session ownership, routing and committed update publication.
 use crate::access::{Actor, Need};
 use crate::log::{Event, EventKind, EventLog};
+use crate::sequencer::Sequencer;
 use async_trait::async_trait;
 use loop_agent::{
     harness::{
@@ -26,7 +27,7 @@ use loop_protocol::{
 use loop_protocol::{Caller, Principal};
 use loop_store::{Deployment, Identity, Scope, SystemScope, Tenant};
 use loop_wire::control::EscalationRecipient;
-use publish::{barrier, fail};
+use publish::{act, barrier, fail};
 use serde_json::json;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -74,6 +75,8 @@ mod gate_tests;
 mod leases;
 mod pause;
 mod publish;
+#[cfg(test)]
+mod pump_tests;
 mod reach;
 mod sessions;
 mod shell;
@@ -319,74 +322,25 @@ struct LiveSession {
     /// The `actor` of every record of this Session: a Subagent's parent
     /// Session key; `None` for a Session a Surface opened.
     actor: Option<String>,
-    /// Who the pump stamps on the updates it commits (step B3).
-    acting: Mutex<Acting>,
+    /// The caller of the current (or last) turn or command. Escalations,
+    /// Subagents and the decision sink read it. Who caused each committed
+    /// update is the sequencer's (`Announced::seq`), not this.
+    turn_caller: Mutex<Caller>,
 }
-/// Who caused the updates a Session's backend sends to its pump. The pump
-/// commits them without a request in scope, so the cause is recorded here
-/// first, and each identity is built once, not per update.
-///
-/// - An update with a turn id is the turn's caller's. A turn's caller cannot
-///   change while its updates are in flight: the next prompt is admitted
-///   only after the turn's barrier.
-/// - A `config_changed` is stamped by its revision: the caller that made the
-///   change, recorded under the lifecycle lock before the setter runs
-///   ([`LiveSession::claim_changes`]). So a change waiting in the pump's
-///   queue keeps its caller, also when another caller's prompt is admitted
-///   meanwhile, and a deferred change that takes effect at a turn's end
-///   (same revision) is still its setter's.
-/// - What remains: an update with no turn id that is not a `config_changed`
-///   (a notice, a command's output) is the caller of the last turn or
-///   command. If such an update still waits in the pump's queue when the
-///   next turn is admitted, it gets the next turn's caller. A
-///   `config_changed` whose revision no request claimed (the opening config,
-///   or more than [`CHANGES_KEPT`] changes ago) also falls back to that
-///   caller. The per-Session sequencer (A0) can carry the caller with every
-///   update.
-struct Acting {
-    turn_caller: Caller,
-    turn: Identity,
-    request: Identity,
-    /// Who made each Session revision, newest [`CHANGES_KEPT`].
-    changes: std::collections::BTreeMap<u64, Identity>,
-    /// A setter running now: revisions after the first value are the
-    /// second's, until the claim ends.
-    claim: Option<(u64, Identity)>,
-}
-/// How many revisions [`Acting::changes`] remembers.
-const CHANGES_KEPT: usize = 256;
-impl Acting {
-    fn new(caller: Caller, identity: Identity) -> Self {
-        Self {
-            turn_caller: caller,
-            turn: identity.clone(),
-            request: identity,
-            changes: std::collections::BTreeMap::new(),
-            claim: None,
-        }
-    }
-}
-/// The revisions a setter makes while this lives are its caller's. Ends
-/// (and records them) on drop.
+/// The revisions a setter makes while this lives are its caller's (see
+/// [`crate::sequencer`], "Who caused an update"). Ends the claim on drop.
 struct ChangeClaim<'a> {
     live: &'a LiveSession,
 }
 impl Drop for ChangeClaim<'_> {
     fn drop(&mut self) {
         let after = self.live.opened.native.config().revision;
-        let mut acting = self
-            .live
-            .acting
+        self.live
+            .announced
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((before, identity)) = acting.claim.take() {
-            for revision in before.saturating_add(1)..=after {
-                acting.changes.insert(revision, identity.clone());
-            }
-            while acting.changes.len() > CHANGES_KEPT {
-                acting.changes.pop_first();
-            }
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .seq
+            .end_claim(after);
     }
 }
 impl LiveSession {
@@ -398,37 +352,14 @@ impl LiveSession {
     fn runtime_identity(&self) -> Identity {
         Identity::runtime_in(self.tenant.clone()).with_actor(self.actor.clone())
     }
-    /// The identity of an update the pump commits (see [`Acting`]).
-    fn update_identity(&self, envelope: &UpdateEnvelope) -> Identity {
-        let acting = self
-            .acting
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if envelope.turn.is_some() {
-            return acting.turn.clone();
-        }
-        if let SessionUpdate::ConfigChanged(changed) = &envelope.update {
-            if let Some(identity) = acting.changes.get(&changed.revision) {
-                return identity.clone();
-            }
-            if let Some((before, identity)) = &acting.claim {
-                if changed.revision > *before {
-                    return identity.clone();
-                }
-            }
-        }
-        acting.request.clone()
-    }
-    /// A turn or command of `caller` starts: it causes the updates that follow.
+    /// A turn or command of `caller` is admitted. The updates it causes are
+    /// stamped with its identity only after [`publish::act`] in its task:
+    /// updates the backend sent before keep their own caller.
     fn set_turn_caller(&self, caller: Caller) {
-        let identity = self.identity(&caller);
-        let mut acting = self
-            .acting
+        *self
+            .turn_caller
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        acting.turn_caller = caller;
-        acting.turn = identity.clone();
-        acting.request = identity;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = caller;
     }
     /// Claim the revisions the next setter makes for `caller`. Call under
     /// the lifecycle lock, which serializes setters; keep the claim until
@@ -436,27 +367,30 @@ impl LiveSession {
     fn claim_changes(&self, caller: &Caller) -> ChangeClaim<'_> {
         let identity = self.identity(caller);
         let before = self.opened.native.config().revision;
-        self.acting
+        self.announced
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .claim = Some((before, identity));
+            .seq
+            .claim(before, identity);
         ChangeClaim { live: self }
     }
     /// The caller of the current (or last) turn.
     fn turn_caller(&self) -> Caller {
-        self.acting
+        self.turn_caller
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .turn_caller
             .clone()
     }
 }
 /// What the pump has committed and published of one Session. The pump is
-/// the only writer of a loaded Session's updates, so `published` and
-/// `latest`, read together, are a consistent point in its stream.
+/// the only writer of a loaded Session's updates, so `seq` (its high-water
+/// mark and in-progress snapshot) and `latest`, read together, are a
+/// consistent point in its stream.
 struct Announced {
-    /// The newest update sequence the pump committed and is publishing.
-    published: u64,
+    /// The Session's sequencer: the newest update sequence the pump
+    /// committed and is publishing (`H`), who causes the next updates, and
+    /// the open turn, messages and tool calls up to `H`.
+    seq: Sequencer,
     /// The newest committed config (or the config the Session opened with).
     latest: ConfigChanged,
     /// Receipts of committed changes whose setters have not read them yet:
@@ -468,6 +402,10 @@ struct Announced {
     revision: u64,
 }
 impl Announced {
+    /// The newest update sequence the pump committed and is publishing.
+    fn published(&self) -> u64 {
+        self.seq.through_seq()
+    }
     fn commit(&mut self, seq: u64, changed: &ConfigChanged) {
         if changed.revision > self.revision {
             self.revision = changed.revision;
@@ -508,6 +446,9 @@ enum Command {
         oneshot::Sender<BackendResult<()>>,
     ),
     Barrier(oneshot::Sender<()>),
+    /// Commit what the backend sent so far, then stamp the updates that
+    /// follow with this identity (a turn or command starts).
+    Act(Identity, oneshot::Sender<()>),
     Stop(oneshot::Sender<()>),
 }
 pub(crate) fn now() -> i64 {
@@ -1297,6 +1238,13 @@ impl loop_wire::RuntimeControl for Runtime {
             live.escalations
                 .set_turn_caller(loop_protocol::Caller::current());
             live.set_turn_caller(request_caller());
+            // Under the lifecycle lock: the Session is idle, so this waits
+            // only for updates still queued in the pump.
+            let acted = act(&live, live.identity(&request_caller())).await;
+            if let Err(error) = acted {
+                live.busy.store(false, Ordering::Release);
+                return Err(error);
+            }
             match live.opened.native.workflow(p).await {
                 Ok(result) => result,
                 Err(error) => {
@@ -1490,7 +1438,7 @@ impl Runtime {
     /// The newest published sequence and config. Caller holds the lifecycle lock.
     fn announced(live: &LiveSession) -> (u64, ConfigChanged) {
         let announced = live.announced.lock().unwrap();
-        (announced.published, announced.latest.clone())
+        (announced.published(), announced.latest.clone())
     }
     /// Public state at `at_seq`, without a transcript view.
     fn public_snapshot(
@@ -1972,6 +1920,9 @@ impl AgentBackend for Runtime {
                 if cancelled.has_changed().unwrap_or(true) || live.closing.load(Ordering::Acquire) {
                     return Ok(TurnOutcome::Cancelled);
                 }
+                // From here the backend's updates are this turn's caller's;
+                // what it sent before keeps its own caller.
+                act(&live, identity.clone()).await?;
                 let turn = live.opened.native.prompt(&live.reference, input).await?;
                 unsettled = false;
                 // A cancel that raced the turn's registration hit an idle backend.

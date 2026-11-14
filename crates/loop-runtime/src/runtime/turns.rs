@@ -41,7 +41,7 @@ impl Runtime {
             // The pump's committed point, without waiting on the Event
             // Log: anything still queued before this turn is a config
             // update, which transcript views leave out.
-            let published = live.announced.lock().unwrap().published;
+            let published = live.announced.lock().unwrap().published();
             live.turn_start_seq.store(published, Ordering::Release);
             *live.committed.lock().await =
                 Some(live.opened.harness.export_session().await.map_err(failed)?);
