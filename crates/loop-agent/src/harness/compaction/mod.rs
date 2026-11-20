@@ -10,6 +10,8 @@ use loop_ai::{estimate_context_tokens, estimate_message_tokens, Message};
 pub const DEFAULT_RESERVE_TOKENS: u64 = 16384;
 /// Keep recent tokens.
 pub const DEFAULT_KEEP_RECENT_TOKENS: u64 = 20000;
+/// Summarize once the context reaches this percentage of the model's context window.
+pub const DEFAULT_TRIGGER_PERCENT: u64 = 90;
 
 /// Compaction settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,14 +22,26 @@ pub struct CompactionSettings {
     pub reserve_tokens: u64,
     /// Keep recent tokens after cut.
     pub keep_recent_tokens: u64,
+    /// Compact once the context reaches this many tokens, but never later than
+    /// `trigger_percent` of the model's window (Codex's `auto_compact_token_limit` rule).
+    #[serde(default)]
+    pub trigger_tokens: Option<u64>,
+    /// Compact once the context reaches this percentage of the model's context window.
+    #[serde(default = "default_trigger_percent")]
+    pub trigger_percent: u64,
 }
 
+fn default_trigger_percent() -> u64 {
+    DEFAULT_TRIGGER_PERCENT
+}
 impl Default for CompactionSettings {
     fn default() -> Self {
         Self {
             enabled: true,
             reserve_tokens: DEFAULT_RESERVE_TOKENS,
             keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
+            trigger_tokens: None,
+            trigger_percent: DEFAULT_TRIGGER_PERCENT,
         }
     }
 }
@@ -47,17 +61,63 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
     estimate_context_tokens(&ctx)
 }
 
+/// Token count at which summarizing starts, Codex style: `trigger_percent` (90) of the model's
+/// context window, and a configured `trigger_tokens` can only lower that, never raise it.
+/// `None` when neither the window nor a configured trigger is known.
+pub fn compaction_limit(context_window: u64, settings: &CompactionSettings) -> Option<u64> {
+    let percent = settings.trigger_percent.min(100);
+    let from_window = (context_window > 0 && percent > 0)
+        .then(|| (u128::from(context_window) * u128::from(percent) / 100) as u64);
+    let configured = settings.trigger_tokens.filter(|t| *t > 0);
+    match (from_window, configured) {
+        (Some(w), Some(c)) => Some(w.min(c)),
+        (w, c) => w.or(c),
+    }
+}
+
+/// [`compaction_limit`] that also leaves room for the reply. A request reserves the model's
+/// maximum output on top of its input, so the limit is the lower of the configured one and
+/// the window minus `max_output_tokens`. A model whose maximum output is more than half its
+/// window still gets half the window to work in.
+pub fn compaction_limit_with_reply_room(
+    context_window: u64,
+    max_output_tokens: u64,
+    settings: &CompactionSettings,
+) -> Option<u64> {
+    let limit = compaction_limit(context_window, settings)?;
+    if context_window == 0 {
+        return Some(limit);
+    }
+    let room = context_window
+        .saturating_sub(max_output_tokens)
+        .max(context_window / 2);
+    Some(limit.min(room))
+}
+
+/// How many recent tokens a summary keeps verbatim: `keep_recent_tokens`, but at most a third of the
+/// trigger, so on small windows there is always an older part to summarize and the result lands
+/// well under the limit instead of re-triggering every turn.
+pub fn effective_keep_recent_tokens(limit: Option<u64>, keep_recent_tokens: u64) -> u64 {
+    limit.map_or(keep_recent_tokens, |l| {
+        keep_recent_tokens.min((l / 3).max(1))
+    })
+}
+
 /// Whether compaction should run.
 pub fn should_compact(
     total_tokens: u64,
     context_window: u64,
     settings: &CompactionSettings,
 ) -> bool {
-    if !settings.enabled || context_window == 0 {
-        return false;
-    }
-    total_tokens + settings.reserve_tokens >= context_window
+    settings.enabled
+        && compaction_limit(context_window, settings).is_some_and(|limit| total_tokens >= limit)
 }
+
+mod auto;
+pub use auto::{
+    auto_compact_context, force_compact_context, plan_in_loop_compaction, render_for_summary,
+    AutoCompaction, InLoopPlan,
+};
 
 /// Find a cut index that keeps roughly `keep_recent_tokens` at the end.
 pub fn find_cut_point(messages: &[Message], keep_recent_tokens: u64) -> usize {

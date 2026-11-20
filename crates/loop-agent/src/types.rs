@@ -177,6 +177,8 @@ pub struct AgentLoopTurnUpdate {
     pub model: Option<Model>,
     /// Thinking level for the next request.
     pub thinking_level: Option<AgentThinkingLevel>,
+    /// One-line status shown to the user (for example "context compacted").
+    pub notice: Option<String>,
 }
 
 /// Final or partial result produced by a tool.
@@ -457,6 +459,12 @@ pub enum AgentEvent {
         /// One-line human-readable step description.
         message: String,
     },
+    /// A message the user should see in the transcript (for example "context compacted"), as
+    /// opposed to `Progress`, which is only a transient status line.
+    Notice {
+        /// One-line human-readable message.
+        message: String,
+    },
     /// New turn begins.
     TurnStart,
     /// Turn completes.
@@ -523,6 +531,7 @@ impl AgentEvent {
             Self::AgentStart => "agent_start",
             Self::AgentEnd { .. } => "agent_end",
             Self::Progress { .. } => "progress",
+            Self::Notice { .. } => "notice",
             Self::TurnStart => "turn_start",
             Self::TurnEnd { .. } => "turn_end",
             Self::MessageStart { .. } => "message_start",
@@ -577,6 +586,14 @@ pub type PrepareNextTurnFn = Arc<
         + Sync,
 >;
 
+/// Called when the provider rejects a request as too long: returns a smaller context to retry
+/// with, plus a one-line notice, or `None` when it cannot shrink the context.
+pub type RecoverFromOverflowFn = Arc<
+    dyn Fn(AgentContext) -> Pin<Box<dyn Future<Output = Option<(AgentContext, String)>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Async getter for queued messages (steering, follow-up).
 pub type AgentMessagesFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>> + Send + Sync>;
@@ -616,6 +633,8 @@ pub struct AgentLoopConfig {
     pub should_stop_after_turn: Option<ShouldStopAfterTurnFn>,
     /// Prepare next turn snapshot.
     pub prepare_next_turn: Option<PrepareNextTurnFn>,
+    /// Shrink the context and retry once when the provider says the request is too long.
+    pub recover_from_overflow: Option<RecoverFromOverflowFn>,
     /// Steering message getter.
     pub get_steering_messages: Option<AgentMessagesFn>,
     /// Follow-up message getter.
@@ -666,6 +685,7 @@ impl AgentLoopConfig {
             get_api_key: None,
             should_stop_after_turn: None,
             prepare_next_turn: None,
+            recover_from_overflow: None,
             get_steering_messages: None,
             get_follow_up_messages: None,
             tool_execution: ToolExecutionMode::Parallel,

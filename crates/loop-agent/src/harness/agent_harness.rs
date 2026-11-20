@@ -29,8 +29,9 @@ use crate::messages::{convert_to_llm, user_message_with_images};
 use crate::stream_fn::{stream_fn_from_models, StreamFn};
 use crate::types::{
     AfterToolCallContext, AfterToolCallResult, AgentContext, AgentEvent, AgentEventSink,
-    AgentLoopConfig, AgentMessage, AgentThinkingLevel, AgentTool, BeforeToolCallContext,
-    BeforeToolCallResult, PromptInput, QueueMode, RunLabels, ToolExecutionMode,
+    AgentLoopConfig, AgentLoopTurnUpdate, AgentMessage, AgentThinkingLevel, AgentTool,
+    BeforeToolCallContext, BeforeToolCallResult, PromptInput, QueueMode, RunLabels,
+    ShouldStopAfterTurnContext, ToolExecutionMode,
 };
 
 type BeforeToolHook = Arc<
@@ -1419,6 +1420,33 @@ impl AgentHarness {
             let store = session.store();
             let sid = session.metadata().id.clone();
             for w in writes {
+                let w = match in_loop_compaction_tail(&w) {
+                    None => w,
+                    Some(tail_len) => {
+                        let PendingSessionWrite::Compaction { summary, .. } = w else {
+                            unreachable!("in_loop_compaction_tail matched a compaction write");
+                        };
+                        // Only now do the run's messages have entry ids: the first kept entry is
+                        // the one `tail_len` messages from the end of the branch. Without one,
+                        // skip the entry; a resume then replays the full history.
+                        let first_kept = match session.read_branch().await {
+                            Ok(branch) => first_kept_entry_id_for_tail(&branch, tail_len),
+                            Err(e) => {
+                                tracing::error!(session_id = %sid, "reading branch failed: {e}");
+                                None
+                            }
+                        };
+                        if first_kept.is_none() {
+                            tracing::warn!(session_id = %sid, "in-loop compaction not saved: first kept entry not found");
+                            continue;
+                        }
+                        PendingSessionWrite::Compaction {
+                            summary,
+                            first_kept_entry_id: first_kept,
+                            details: None,
+                        }
+                    }
+                };
                 if let Err(e) = store.append_entry(&sid, w).await {
                     tracing::error!(session_id = %sid, "session write failed: {e}");
                     // A turn the Session does not hold is not complete. Later
@@ -1529,6 +1557,110 @@ impl AgentHarness {
                 .map(|skill| (skill.path.clone(), skill.name.clone()))
                 .collect(),
         };
+
+        // Auto-compaction between turns: once the context reaches the configured
+        // threshold, older messages are replaced by a model-written summary.
+        let compaction = self.compaction_settings.read().await.clone();
+        if compaction.enabled {
+            let compaction_writes = Arc::clone(&self.pending_writes);
+            let stream_fn = Arc::clone(&self.stream_fn);
+            let model = snapshot.model.clone();
+            // Cancelling the run also cancels a summary request in flight.
+            let mut summary_options = snapshot.stream_options.clone();
+            summary_options.base.cancel = Some(token.clone());
+            let backoff = Arc::new(parking_lot::Mutex::new(SummaryBackoff::default()));
+            let cancel = token.clone();
+            config.prepare_next_turn = Some(Arc::new({
+                let stream_fn = Arc::clone(&stream_fn);
+                let model = model.clone();
+                let summary_options = summary_options.clone();
+                let compaction = compaction.clone();
+                let compaction_writes = Arc::clone(&compaction_writes);
+                move |turn: ShouldStopAfterTurnContext| {
+                    let backoff = Arc::clone(&backoff);
+                    let cancel = cancel.clone();
+                    let compaction_writes = Arc::clone(&compaction_writes);
+                    let stream_fn = Arc::clone(&stream_fn);
+                    let model = model.clone();
+                    let summary_options = summary_options.clone();
+                    let compaction = compaction.clone();
+                    Box::pin(async move {
+                        // Nothing follows a turn without tool calls, so don't spend a model
+                        // call compacting a context that is about to be discarded.
+                        if turn.tool_results.is_empty() || backoff.lock().skip_this_turn() {
+                            return None;
+                        }
+                        let done = match crate::harness::compaction::auto_compact_context(
+                            &turn.context,
+                            &model,
+                            &stream_fn,
+                            summary_options,
+                            &compaction,
+                        )
+                        .await
+                        {
+                            Ok(done) => {
+                                backoff.lock().succeeded();
+                                done?
+                            }
+                            // The user stopped the run: not a failed summary.
+                            Err(_) if cancel.is_cancelled() => return None,
+                            Err(error) => {
+                                tracing::warn!("auto-compaction failed: {error}");
+                                // Say so once; the retries that follow are quiet.
+                                let first = backoff.lock().failed();
+                                return first.then(|| AgentLoopTurnUpdate {
+                                    notice: Some(format!(
+                                        "Automatic context compaction failed ({error}). \
+                                         Continuing with the full context; it will be tried again."
+                                    )),
+                                    ..Default::default()
+                                });
+                            }
+                        };
+                        compaction_writes
+                            .lock()
+                            .push(in_loop_compaction_write(&done.summary, done.tail_len));
+                        Some(AgentLoopTurnUpdate {
+                            context: Some(done.context),
+                            notice: Some(done.notice),
+                            ..Default::default()
+                        })
+                    })
+                }
+            }));
+            // The provider can reject a request as too long before our trigger fires (its own
+            // size check may count more tokens than our estimate): compact and retry once.
+            config.recover_from_overflow = Some(Arc::new(move |context: AgentContext| {
+                let compaction_writes = Arc::clone(&compaction_writes);
+                let stream_fn = Arc::clone(&stream_fn);
+                let model = model.clone();
+                let summary_options = summary_options.clone();
+                let compaction = compaction.clone();
+                Box::pin(async move {
+                    let done = crate::harness::compaction::force_compact_context(
+                        &context,
+                        &model,
+                        &stream_fn,
+                        summary_options,
+                        &compaction,
+                    )
+                    .await
+                    .inspect_err(|error| tracing::warn!("overflow recovery failed: {error}"))
+                    .ok()??;
+                    compaction_writes
+                        .lock()
+                        .push(in_loop_compaction_write(&done.summary, done.tail_len));
+                    Some((
+                        done.context,
+                        format!(
+                            "Provider said the request was too long. {}; retrying",
+                            done.notice
+                        ),
+                    ))
+                })
+            }));
+        }
 
         let steer_q = Arc::clone(&self.steering);
         let follow_q = Arc::clone(&self.follow_up);
@@ -1895,7 +2027,82 @@ impl AgentHarness {
 /// Map a cut index in the built context messages back to the branch entry that
 /// produced that message. Mirrors the message-production order of
 /// `default_context_from_entries`.
+/// Spaces out automatic compaction after a failed summary, so a model that cannot produce one
+/// does not cost an extra request after every turn: 2 turns are skipped after the first failure
+/// in a row, then 4, then 8.
+#[derive(Default)]
+struct SummaryBackoff {
+    failures: u32,
+    skip_turns: u32,
+}
+
+impl SummaryBackoff {
+    /// Whether to leave compaction alone after this turn.
+    fn skip_this_turn(&mut self) -> bool {
+        let skip = self.skip_turns > 0;
+        self.skip_turns = self.skip_turns.saturating_sub(1);
+        skip
+    }
+
+    /// Record a failed summary. `true` for the first failure in a row.
+    fn failed(&mut self) -> bool {
+        self.failures += 1;
+        self.skip_turns = 1 << self.failures.min(3);
+        self.failures == 1
+    }
+
+    fn succeeded(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Key in a queued compaction's `details` that marks one made inside a run (see
+/// [`in_loop_compaction_write`]). It never reaches the session store.
+const IN_LOOP_TAIL_KEY: &str = "inLoopTail";
+
+/// A compaction made between turns of a run, queued after the messages it follows. Messages get
+/// their entry ids only when the run's writes are flushed, so the first kept entry is not known
+/// yet: the marker records how many of the newest messages stay, and the flush resolves it.
+fn in_loop_compaction_write(summary: &str, tail_len: usize) -> PendingSessionWrite {
+    let mut details = serde_json::Map::new();
+    details.insert(IN_LOOP_TAIL_KEY.to_string(), tail_len.into());
+    PendingSessionWrite::Compaction {
+        summary: summary.to_string(),
+        first_kept_entry_id: None,
+        details: Some(details.into()),
+    }
+}
+
+/// `Some(tail_len)` when `write` is a marker from [`in_loop_compaction_write`].
+fn in_loop_compaction_tail(write: &PendingSessionWrite) -> Option<usize> {
+    match write {
+        PendingSessionWrite::Compaction {
+            first_kept_entry_id: None,
+            details: Some(details),
+            ..
+        } => details
+            .get(IN_LOOP_TAIL_KEY)
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize),
+        _ => None,
+    }
+}
+
+/// Entry id of the message that is `tail_len` from the end of the branch's context, so that it
+/// and everything after it stay when a compaction is written now.
+fn first_kept_entry_id_for_tail(entries: &[SessionTreeEntry], tail_len: usize) -> Option<String> {
+    let count = context_producer_ids(entries).len();
+    first_kept_entry_id_for_cut(entries, count.checked_sub(tail_len)?)
+}
+
 fn first_kept_entry_id_for_cut(entries: &[SessionTreeEntry], cut_index: usize) -> Option<String> {
+    context_producer_ids(entries)
+        .get(cut_index)
+        .map(|s| s.to_string())
+}
+
+/// Ids of the entries that each yield one message of the context, in order.
+fn context_producer_ids(entries: &[SessionTreeEntry]) -> Vec<&str> {
     let mut producer_ids: Vec<&str> = Vec::new();
     for e in entries {
         match e {
@@ -1914,7 +2121,7 @@ fn first_kept_entry_id_for_cut(entries: &[SessionTreeEntry], cut_index: usize) -
             _ => {}
         }
     }
-    producer_ids.get(cut_index).map(|s| s.to_string())
+    producer_ids
 }
 
 /// Counts one turn in flight for [`AgentHarness::wait_for_settled`].

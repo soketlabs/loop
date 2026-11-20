@@ -430,3 +430,188 @@ async fn a_context_overflow_is_not_continued() {
         "{msgs:?}"
     );
 }
+
+// ---- overflow recovery and compaction notices ----
+
+const OVERFLOW: &str = "This model's maximum context length is 1000 tokens";
+
+fn user_context(text: &str) -> AgentContext {
+    AgentContext {
+        system_prompt: "sys".into(),
+        messages: vec![AgentMessage::user_text(text)],
+        tools: None,
+    }
+}
+
+fn assistant_errors(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| match e {
+            AgentEvent::MessageEnd { message } => {
+                message.role() == "assistant"
+                    && matches!(
+                        message.as_llm(),
+                        Some(loop_ai::Message::Assistant(a))
+                            if a.stop_reason == loop_ai::StopReason::Error
+                    )
+            }
+            _ => false,
+        })
+        .count()
+}
+
+fn progress(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Notice { message } => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn run_with(
+    script: FauxScript,
+    config_fn: impl FnOnce(&mut AgentLoopConfig),
+) -> Vec<AgentEvent> {
+    let (models, model) = setup_faux(script);
+    let stream_fn = stream_fn_from_models(Arc::new(models));
+    let mut config = AgentLoopConfig::new(model);
+    config_fn(&mut config);
+    collect_agent_events(agent_loop(
+        vec![AgentMessage::user_text("a very long conversation")],
+        user_context("earlier"),
+        config,
+        None,
+        Some(stream_fn),
+    ))
+    .await
+}
+
+#[tokio::test]
+async fn overflow_error_is_compacted_and_retried_once() {
+    let script = FauxScript::new();
+    script.push(FauxResponse::Error(OVERFLOW.into()));
+    script.push(FauxResponse::Text("recovered".into()));
+    let events = run_with(script, |config| {
+        config.recover_from_overflow = Some(Arc::new(|_ctx| {
+            Box::pin(async { Some((user_context("short"), "compacted it".to_string())) })
+        }));
+    })
+    .await;
+    assert_eq!(
+        assistant_errors(&events),
+        0,
+        "failed attempt must leave no trace"
+    );
+    assert_eq!(progress(&events), vec!["compacted it".to_string()]);
+    let last = events.last().unwrap();
+    let AgentEvent::AgentEnd { messages } = last else {
+        panic!("run did not end cleanly: {last:?}");
+    };
+    assert!(messages.iter().any(|m| matches!(
+        m.as_llm(),
+        Some(loop_ai::Message::Assistant(a)) if a.stop_reason != loop_ai::StopReason::Error
+    )));
+}
+
+#[tokio::test]
+async fn overflow_without_a_hook_still_fails_as_before() {
+    let script = FauxScript::new();
+    script.push(FauxResponse::Error(OVERFLOW.into()));
+    let events = run_with(script, |_| {}).await;
+    assert_eq!(assistant_errors(&events), 1);
+    assert!(progress(&events).is_empty());
+}
+
+#[tokio::test]
+async fn overflow_when_nothing_can_be_shrunk_surfaces_the_error() {
+    let script = FauxScript::new();
+    script.push(FauxResponse::Error(OVERFLOW.into()));
+    let events = run_with(script, |config| {
+        config.recover_from_overflow = Some(Arc::new(|_ctx| Box::pin(async { None })));
+    })
+    .await;
+    assert_eq!(assistant_errors(&events), 1);
+    assert!(matches!(events.last(), Some(AgentEvent::AgentEnd { .. })));
+}
+
+#[tokio::test]
+async fn overflow_recovery_is_attempted_only_once_per_turn() {
+    let script = FauxScript::new();
+    script.push(FauxResponse::Error(OVERFLOW.into()));
+    script.push(FauxResponse::Error(OVERFLOW.into()));
+    script.push(FauxResponse::Text("never reached".into()));
+    let events = run_with(script, |config| {
+        config.recover_from_overflow = Some(Arc::new(|_ctx| {
+            Box::pin(async { Some((user_context("short"), "compacted".to_string())) })
+        }));
+    })
+    .await;
+    assert_eq!(progress(&events).len(), 1);
+    assert_eq!(assistant_errors(&events), 1, "second failure is reported");
+}
+
+#[tokio::test]
+async fn other_errors_do_not_trigger_recovery() {
+    let script = FauxScript::new();
+    script.push(FauxResponse::Error("HTTP 500 upstream exploded".into()));
+    let events = run_with(script, |config| {
+        config.recover_from_overflow = Some(Arc::new(|_ctx| {
+            Box::pin(async { Some((user_context("short"), "compacted".to_string())) })
+        }));
+    })
+    .await;
+    assert!(progress(&events).is_empty());
+    assert_eq!(assistant_errors(&events), 1);
+}
+
+#[tokio::test]
+async fn turn_update_notice_is_shown_to_the_user() {
+    let script = FauxScript::new();
+    script.push(FauxResponse::ToolCalls(vec![ToolCall {
+        id: "c1".into(),
+        name: "ping".into(),
+        arguments: json!({}),
+        thought_signature: None,
+    }]));
+    let (models, model) = setup_faux(script);
+    let stream_fn = stream_fn_from_models(Arc::new(models));
+    let tool = AgentTool::simple(
+        "ping",
+        "Ping",
+        "ping",
+        json!({"type":"object","properties":{}}),
+        |_id, _args, _c, _u| async move {
+            let mut r = AgentToolResult::text("pong");
+            r.terminate = Some(true);
+            Ok(r)
+        },
+    );
+    let mut config = AgentLoopConfig::new(model);
+    config.prepare_next_turn = Some(Arc::new(|_turn| {
+        Box::pin(async {
+            Some(loop_agent::AgentLoopTurnUpdate {
+                notice: Some("Context compacted automatically: 118,092 → 22,990 tokens".into()),
+                ..Default::default()
+            })
+        })
+    }));
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: vec![],
+        tools: Some(vec![tool]),
+    };
+    let events = collect_agent_events(agent_loop(
+        vec![AgentMessage::user_text("go")],
+        context,
+        config,
+        None,
+        Some(stream_fn),
+    ))
+    .await;
+    assert_eq!(
+        progress(&events),
+        vec!["Context compacted automatically: 118,092 → 22,990 tokens".to_string()]
+    );
+}

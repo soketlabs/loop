@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use loop_ai::{
-    now_ms, validate_tool_arguments, AssistantContent, AssistantMessage, AssistantMessageEvent,
-    Context, Message, StopReason, TextContent, Tool, ToolCall, ToolResultContent,
-    ToolResultMessage,
+    is_context_overflow, now_ms, validate_tool_arguments, AssistantContent, AssistantMessage,
+    AssistantMessageEvent, Context, Message, StopReason, TextContent, Tool, ToolCall,
+    ToolResultContent, ToolResultMessage,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -341,10 +341,42 @@ async fn run_loop(
                 }
             }
 
-            let message =
-                stream_assistant_response(current_context, &config, cancel, emit, stream_fn)
+            let can_recover = config.recover_from_overflow.is_some();
+            let (mut message, mut deferred) = stream_assistant_response(
+                current_context,
+                &config,
+                cancel,
+                emit,
+                stream_fn,
+                can_recover,
+            )
+            .instrument(turn.clone())
+            .await;
+            if deferred {
+                // The provider rejected the request as too long. Compact and retry once; the
+                // failed attempt left no trace in the context or the event stream.
+                let recovered = match &config.recover_from_overflow {
+                    Some(recover) => recover(current_context.clone()).await,
+                    None => None,
+                };
+                if let Some((context, notice)) = recovered {
+                    *current_context = context;
+                    emit_ev(emit, AgentEvent::Notice { message: notice }).await;
+                    (message, deferred) = stream_assistant_response(
+                        current_context,
+                        &config,
+                        cancel,
+                        emit,
+                        stream_fn,
+                        false,
+                    )
                     .instrument(turn.clone())
                     .await;
+                }
+                if deferred {
+                    commit_assistant_message(current_context, emit, &message).await;
+                }
+            }
             new_messages.push(AgentMessage::assistant(message.clone()));
 
             if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
@@ -418,10 +450,14 @@ async fn run_loop(
                     context,
                     model,
                     thinking_level,
+                    notice,
                 }) = prepare(next_ctx.clone()).await
                 {
                     if let Some(ctx) = context {
                         *current_context = ctx;
+                    }
+                    if let Some(message) = notice {
+                        emit_ev(emit, AgentEvent::Notice { message }).await;
                     }
                     if let Some(model) = model {
                         config.model = model;
@@ -494,7 +530,8 @@ async fn stream_assistant_response(
     cancel: Option<&CancellationToken>,
     emit: &AgentEventSink,
     stream_fn: &StreamFn,
-) -> AssistantMessage {
+    defer_overflow: bool,
+) -> (AssistantMessage, bool) {
     let mut messages = context.messages.clone();
     if let Some(transform) = &config.transform_context {
         messages = transform(messages, cancel.cloned()).await;
@@ -590,6 +627,15 @@ async fn stream_assistant_response(
 
     let final_message = stream.result().await;
     generation.finish(&final_message);
+    if defer_overflow
+        && !added_partial
+        && final_message.stop_reason == StopReason::Error
+        && is_context_overflow(&config.model, &final_message)
+    {
+        // Leave the failed attempt out of the context and the event stream: the caller may
+        // shrink the context and retry, or commit it with `commit_assistant_message`.
+        return (final_message, true);
+    }
     if added_partial {
         if let Some(last) = context.messages.last_mut() {
             *last = AgentMessage::assistant(final_message.clone());
@@ -613,7 +659,33 @@ async fn stream_assistant_response(
         },
     )
     .await;
-    final_message
+    (final_message, false)
+}
+
+/// Add an assistant message that `stream_assistant_response` deferred to the context and the
+/// event stream, exactly as it would have done itself.
+async fn commit_assistant_message(
+    context: &mut AgentContext,
+    emit: &AgentEventSink,
+    message: &AssistantMessage,
+) {
+    context
+        .messages
+        .push(AgentMessage::assistant(message.clone()));
+    emit_ev(
+        emit,
+        AgentEvent::MessageStart {
+            message: AgentMessage::assistant(message.clone()),
+        },
+    )
+    .await;
+    emit_ev(
+        emit,
+        AgentEvent::MessageEnd {
+            message: AgentMessage::assistant(message.clone()),
+        },
+    )
+    .await;
 }
 
 struct ExecutedToolCallBatch {
