@@ -5,6 +5,7 @@ members = [
     "crates/loop-orchestration",
     "crates/loop-runtime",
     "crates/loop-mcp",
+    "crates/loop-defensive",
     "crates/loop-agent",
     "crates/loop-app-core",
     "crates/loop-telemetry",
@@ -23,6 +24,7 @@ default-members = [
     "crates/loop-orchestration",
     "crates/loop-runtime",
     "crates/loop-mcp",
+    "crates/loop-defensive",
     "crates/loop-agent",
     "crates/loop-app-core",
     "crates/loop-telemetry",
@@ -49,6 +51,7 @@ loop-app-core = { path = "crates/loop-app-core" }
 loop-orchestration = { path = "crates/loop-orchestration" }
 loop-runtime = { path = "crates/loop-runtime" }
 loop-mcp = { path = "crates/loop-mcp" }
+loop-defensive = { path = "crates/loop-defensive" }
 loop-telemetry = { path = "crates/loop-telemetry" }
 loop-test-support = { path = "crates/loop-test-support" }
 loop-update = { path = "crates/ops/loop-update" }

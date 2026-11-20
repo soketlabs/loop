@@ -1,0 +1,37 @@
+[package]
+name = "loop-defensive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Defensive workflows for Loop: `/patch` finds, reproduces and fixes a vulnerability in a podman sandbox and grades the fix; `/audit` reports findings"
+
+[[bin]]
+name = "loop-defensive"
+path = "src/main.rs"
+
+[dependencies]
+loop-agent = { workspace = true }
+async-trait = { workspace = true }
+loop-ai = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
+regex = { workspace = true }
+similar = { workspace = true }
+sha2 = { workspace = true }
+walkdir = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+tempfile = { workspace = true }
+tar = { workspace = true }
+dirs = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+tokio-util = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
