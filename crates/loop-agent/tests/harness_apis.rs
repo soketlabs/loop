@@ -398,3 +398,85 @@ async fn a_failed_in_loop_compaction_is_reported_once_and_backs_off() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Stopping a run while its summary is being made is not a failed summary: the user asked for
+/// the stop, so no "compaction failed" warning appears.
+#[tokio::test]
+async fn stopping_a_run_during_the_summary_is_not_reported_as_a_failed_compaction() {
+    use loop_ai::ToolCall;
+
+    let dir = std::env::temp_dir().join(format!("loop-inloop-stop-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("f.txt"), "z".repeat(4000)).unwrap();
+    let read = |i: usize| {
+        FauxResponse::ToolCalls(vec![ToolCall {
+            id: format!("call-{i}"),
+            name: "read".into(),
+            arguments: serde_json::json!({ "path": dir.join("f.txt") }),
+            thought_signature: None,
+        }])
+    };
+    let script = FauxScript::new();
+    for i in 1..=4 {
+        script.push(read(i));
+    }
+    // Over the trigger after the fourth read: the summary request fails, as a request that was
+    // cancelled in flight does.
+    script.push(FauxResponse::Error("request cancelled".into()));
+    script.push(FauxResponse::Text("all done".into()));
+
+    let models = Arc::new(Models::new());
+    models.set_provider(faux_provider(script));
+    let model = models.get_model("faux", "faux-model").unwrap();
+    let store = create_in_memory_session_store();
+    let repo = create_session_repository(store, None);
+    let session = repo.create(None, Some("inloop-stop".into())).await.unwrap();
+    let host: Arc<dyn loop_agent::harness::ExecutionEnv> =
+        Arc::new(HostExecutionEnv::new(dir.clone()));
+    let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
+        models,
+        model: Some(model),
+        session,
+        host_env: Arc::clone(&host),
+        tools: vec![loop_agent::harness::tools::create_read_tool(host)],
+        system_prompt: "sys".into(),
+        sandbox: SandboxMode::Disabled,
+        resources: Default::default(),
+    }));
+    harness
+        .set_compaction_settings(CompactionSettings {
+            enabled: true,
+            reserve_tokens: 0,
+            keep_recent_tokens: 800,
+            trigger_tokens: Some(3500),
+            ..Default::default()
+        })
+        .await;
+    let notices = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    harness.subscribe({
+        let notices = Arc::clone(&notices);
+        let stopper = Arc::clone(&harness);
+        move |event| {
+            match event {
+                loop_agent::AgentEvent::Notice { message } => notices.lock().push(message),
+                // The user stops the run as the fourth turn ends, just before its summary.
+                loop_agent::AgentEvent::TurnEnd { .. }
+                    if turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == 4 =>
+                {
+                    stopper.abort();
+                }
+                _ => {}
+            }
+            async {}
+        }
+    });
+
+    let _ = harness.prompt("read f.txt four times, then say done").await;
+    let notices = notices.lock().clone();
+    assert!(
+        notices.iter().all(|n| !n.contains("compaction failed")),
+        "a stop is not a failed compaction: {notices:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
