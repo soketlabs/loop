@@ -346,6 +346,12 @@ async fn run_loop(
                     .instrument(turn.clone())
                     .await;
             new_messages.push(AgentMessage::assistant(message.clone()));
+            if let Some(budget) = &config.cost_budget {
+                budget.charge_usd_force(
+                    message.usage.cost.total,
+                    llm_budget::ChargeContext::new().model(message.model.clone()),
+                );
+            }
 
             if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
                 emit_ev(
@@ -430,6 +436,21 @@ async fn run_loop(
                         config.stream_options.reasoning = level.to_reasoning();
                     }
                 }
+            }
+
+            let over_budget = config
+                .cost_budget
+                .as_ref()
+                .is_some_and(|budget| budget.is_exhausted());
+            if over_budget {
+                emit_ev(
+                    emit,
+                    AgentEvent::AgentEnd {
+                        messages: new_messages.clone(),
+                    },
+                )
+                .await;
+                return Ok(());
             }
 
             if let Some(should_stop) = &config.should_stop_after_turn {

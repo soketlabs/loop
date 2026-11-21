@@ -430,3 +430,72 @@ async fn a_context_overflow_is_not_continued() {
         "{msgs:?}"
     );
 }
+
+/// A tool-calling turn that cost `usd`.
+fn priced_tool_call(model: &loop_ai::Model, id: &str, usd: f64) -> FauxResponse {
+    use loop_ai::{AssistantContent, AssistantMessage, AssistantMessageEvent, StopReason};
+    let mut message = AssistantMessage::pending(model);
+    message.usage.cost.total = usd;
+    message.content.push(AssistantContent::ToolCall(ToolCall {
+        id: id.into(),
+        name: "ping".into(),
+        arguments: json!({}),
+        thought_signature: None,
+    }));
+    message.stop_reason = StopReason::ToolUse;
+    FauxResponse::Events(vec![
+        AssistantMessageEvent::Start {
+            partial: AssistantMessage::pending(model),
+        },
+        AssistantMessageEvent::Done {
+            reason: StopReason::ToolUse,
+            message,
+        },
+    ])
+}
+
+#[tokio::test]
+async fn cost_budget_ends_the_run_after_the_turn_that_exhausts_it() {
+    let script = FauxScript::new();
+    let (models, model) = setup_faux(script.clone());
+    script.extend((1..=5).map(|i| priced_tool_call(&model, &format!("c{i}"), 0.6)));
+    let stream_fn = stream_fn_from_models(Arc::new(models));
+    let tool = AgentTool::simple(
+        "ping",
+        "Ping",
+        "ping",
+        json!({"type":"object","properties":{}}),
+        |_id, _args, _c, _u| async move { Ok(AgentToolResult::text("pong")) },
+    );
+    let budget = Arc::new(
+        llm_budget::AgentBudget::builder("run", 1.0)
+            .build()
+            .unwrap(),
+    );
+    let mut config = AgentLoopConfig::new(model);
+    config.cost_budget = Some(Arc::clone(&budget));
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: vec![],
+        tools: Some(vec![tool]),
+    };
+    let emit = Arc::new(|_ev: AgentEvent| {
+        Box::pin(async {}) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    });
+
+    let msgs = run_agent_loop(
+        vec![AgentMessage::user_text("go")],
+        context,
+        config,
+        emit,
+        None,
+        Some(stream_fn),
+    )
+    .await
+    .unwrap();
+
+    let calls = msgs.iter().filter(|m| m.role() == "assistant").count();
+    assert_eq!(calls, 2, "a $1.00 cap stops after the second $0.60 call");
+    assert!((budget.spent_usd() - 1.2).abs() < 1e-9);
+    assert!(budget.is_exhausted());
+}

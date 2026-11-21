@@ -69,6 +69,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 thiserror = "2"
+llm-budget = { version = "0.10.0", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "signal", "net"] }
 tokio-util = { version = "0.7", default-features = true }
 futures = "0.3"

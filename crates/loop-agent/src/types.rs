@@ -632,6 +632,9 @@ pub struct AgentLoopConfig {
     pub thinking_budgets: Option<ThinkingBudgets>,
     /// Labels recorded on the run's trace.
     pub run_labels: RunLabels,
+    /// USD cap: each assistant message's `usage.cost.total` is booked here and the
+    /// run ends after the turn that exhausts it. Share one across runs for a session cap.
+    pub cost_budget: Option<Arc<llm_budget::AgentBudget>>,
 }
 
 /// Labels on a run's trace, for usage views. Names only, never user content, so they are
@@ -674,6 +677,7 @@ impl AgentLoopConfig {
             stream_options: SimpleStreamOptions::default(),
             thinking_budgets: None,
             run_labels: RunLabels::default(),
+            cost_budget: None,
         }
     }
 }
