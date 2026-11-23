@@ -41,15 +41,19 @@ async fn runtime(dir: &std::path::Path, log: Arc<dyn EventLog>) -> Arc<Runtime> 
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(loop_ai::providers::faux_provider(Default::default()));
     let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
-    Runtime::new(
-        globals,
-        opts(dir),
-        log,
-        RuntimeLimits {
-            max_sessions: 1,
-            max_active_turns: 1,
-        },
-    )
+    {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(
+            globals,
+            opts(dir),
+            log,
+            store,
+            RuntimeLimits {
+                max_sessions: 1,
+                max_active_turns: 1,
+            },
+        )
+    }
     .await
     .unwrap()
     .into_shared()
@@ -214,6 +218,7 @@ impl EventLog for GatedLog {
     }
     async fn read_after(
         &self,
+        tenant: &loop_store::Tenant,
         key: &SessionKey,
         seq: u64,
     ) -> loop_runtime::log::Result<Vec<LoggedEvent>> {
@@ -221,13 +226,21 @@ impl EventLog for GatedLog {
             self.reading.notify_one();
             self.release.notified().await;
         }
-        self.inner.read_after(key, seq).await
+        self.inner.read_after(tenant, key, seq).await
     }
-    async fn read_runtime_after(&self, seq: u64) -> loop_runtime::log::Result<Vec<LoggedEvent>> {
-        self.inner.read_runtime_after(seq).await
+    async fn read_runtime_after(
+        &self,
+        scope: loop_store::Scope<'_>,
+        seq: u64,
+    ) -> loop_runtime::log::Result<Vec<LoggedEvent>> {
+        self.inner.read_runtime_after(scope, seq).await
     }
-    async fn latest_seq(&self, key: &SessionKey) -> loop_runtime::log::Result<u64> {
-        self.inner.latest_seq(key).await
+    async fn latest_seq(
+        &self,
+        tenant: &loop_store::Tenant,
+        key: &SessionKey,
+    ) -> loop_runtime::log::Result<u64> {
+        self.inner.latest_seq(tenant, key).await
     }
     async fn allocate_generation(
         &self,

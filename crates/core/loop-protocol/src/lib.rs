@@ -13,6 +13,7 @@ mod capabilities;
 mod content;
 mod error;
 pub mod host;
+mod identity;
 mod ids;
 mod interaction;
 pub mod rpc;
@@ -27,9 +28,13 @@ pub use backend::{
     StatsSummary, TerminalExit, TerminalOutput, TerminalRequest, TurnHandle, TurnOutcome,
     SHELL_OUTPUT_LIMIT,
 };
-pub use capabilities::Capabilities;
+pub use capabilities::{Capabilities, ToolLock};
 pub use content::ContentBlock;
 pub use error::{ErrorCategory, ErrorInfo};
+pub use identity::{
+    Caller, IdentityError, Principal, PrincipalKind, Tenant, Via, LOCAL_ISSUER,
+    MAX_PRINCIPAL_PART_BYTES, MAX_TENANT_BYTES, MAX_VIA_BYTES,
+};
 pub use ids::{BackendInstanceId, InteractionId, MessageId, SessionKey, ToolCallId, TurnId};
 pub use interaction::{
     Choice, InteractionOutcome, InteractionRequest, PermissionKind, PermissionOption,

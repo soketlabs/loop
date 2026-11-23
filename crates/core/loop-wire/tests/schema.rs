@@ -413,3 +413,43 @@ fn admin_methods_are_in_the_schema_and_host_only_ones_are_marked() {
     }
     assert!(!validator("McpParams").is_valid(&json!({"workspace_id": "w", "action": "nuke"})));
 }
+
+#[test]
+fn identity_in_the_initialize_result_validates() {
+    use loop_protocol::{Caller, Principal, PrincipalKind, Tenant};
+    let edge = Caller::asserted(
+        Principal::new(PrincipalKind::Person, "https://accounts.google.com", "42").unwrap(),
+        Tenant::new("acme").unwrap(),
+    )
+    .unwrap();
+    let principal = validator("Principal");
+    let tenant = validator("Tenant");
+    let caller = validator("Caller");
+    for value in [
+        serde_json::to_value(Caller::host(Principal::local_uid(501))).unwrap(),
+        serde_json::to_value(Caller::local_token(Principal::local_uid(501))).unwrap(),
+        serde_json::to_value(&edge).unwrap(),
+    ] {
+        assert!(caller.is_valid(&value), "{value}");
+        assert!(principal.is_valid(&value["principal"]), "{value}");
+        assert!(tenant.is_valid(&value["tenant"]), "{value}");
+    }
+    let result = validator("InitializeResult");
+    let mut message = json!({
+        "protocol_version": 1, "server_info": {"name": "loop", "version": "1"},
+        "instance": "runtime", "capabilities": {},
+        "principal": {"kind": "person", "issuer": "local", "id": "uid:501"},
+        "tenant": "local"
+    });
+    let errors: Vec<String> = result
+        .iter_errors(&message)
+        .map(|e| e.to_string())
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    message["tenant"] = json!("A/B");
+    assert!(
+        !result.is_valid(&message),
+        "the schema rejects a bad tenant"
+    );
+    assert!(!principal.is_valid(&json!({"kind": "person", "issuer": "local", "id": "a b"})));
+}

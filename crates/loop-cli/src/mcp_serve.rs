@@ -92,10 +92,12 @@ pub async fn run_mcp_server(
             let mut tools = harness.tools_snapshot();
             tools.retain(|tool| gate.available(&tool.name));
             // Calls from MCP clients pass the same checks as the agent's.
-            let provider = Arc::new(
-                LoopToolProvider::new(tools)
-                    .with_tool_hooks(Some(gate.before_hook()), Some(gate.after_hook())),
-            );
+            let provider = Arc::new(LoopToolProvider::new(tools).with_tool_hooks(
+                Some(gate.before_hook_from(Some(
+                    loop_app_core::permissions::decision::DecisionSource::McpServe,
+                ))),
+                Some(gate.after_hook()),
+            ));
             Ok(McpServer::new(provider))
         },
         LocalSessionManager::default().into(),

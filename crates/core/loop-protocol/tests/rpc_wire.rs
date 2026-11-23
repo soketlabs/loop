@@ -61,6 +61,47 @@ fn initialize() {
     );
 }
 
+/// A client reads the identity of a newer server leniently: a value that
+/// today's rules refuse reads as absent, and `initialize` still succeeds.
+#[test]
+fn a_client_reads_a_newer_server_s_identity_leniently() {
+    let base = json!({
+        "protocol_version": 1,
+        "server_info": {"name": "loop", "version": "9.0.0"},
+        "instance": "native",
+        "capabilities": {}
+    });
+    let with = |fields: Value| {
+        let mut value = base.clone();
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        serde_json::from_value::<InitializeResult>(value).unwrap()
+    };
+    let good = with(json!({
+        "principal": {"kind": "person", "issuer": "https://idp", "id": "alice"},
+        "tenant": "acme",
+        "via": "edge"
+    }));
+    assert_eq!(good.principal.unwrap().id(), "alice");
+    assert_eq!(good.tenant.unwrap().as_str(), "acme");
+    assert_eq!(good.via.unwrap().as_str(), "edge");
+    let newer = with(json!({
+        "principal": {"kind": "person", "issuer": "https://idp", "id": "has space"},
+        "tenant": "Upper/Case",
+        "via": "a via with spaces"
+    }));
+    assert_eq!(
+        (newer.principal, newer.tenant, newer.via),
+        (None, None, None)
+    );
+    // A kind this client does not know is kept, not dropped.
+    let robot = with(json!({"principal": {"kind": "robot", "issuer": "https://idp", "id": "r"}}));
+    assert_eq!(robot.principal.unwrap().kind().as_str(), "robot");
+    assert!(with(json!({"principal": null})).principal.is_none());
+}
+
 #[test]
 fn sessions_and_prompts() {
     roundtrip(
@@ -254,6 +295,7 @@ fn runtime_status_wire() {
             max_active_turns: 8,
             max_sessions_from: None,
             max_active_turns_from: None,
+            tool_lock: None,
         },
         json!({"pid":42,"socket":"/a/run/runtime.sock","generation":3,"loaded":2,"busy":1,
             "max_sessions":16,"max_active_turns":8}),
@@ -271,6 +313,7 @@ fn runtime_status_wire() {
             max_active_turns: 8,
             max_sessions_from: Some("settings".into()),
             max_active_turns_from: Some("default".into()),
+            tool_lock: None,
         },
         json!({"auto_started":true,"pid":42,"socket":"/s","listen_url":"ws://127.0.0.1:1234/","generation":3,"loaded":0,"busy":0,
             "max_sessions":3,"max_active_turns":8,
@@ -933,6 +976,25 @@ fn forbidden_error_and_admin_capabilities_wire() {
     .unwrap();
     assert_eq!(some["workspace_reload"], json!(true));
     assert_eq!(some["host_usage"], json!(true));
+}
+
+#[test]
+fn tool_locked_error_wire() {
+    use loop_protocol::rpc::{error_codes, RpcErrorBody};
+    use loop_protocol::{BackendError, ToolLock};
+    let error = BackendError::ToolLocked {
+        what: "session/shell".into(),
+        lock: ToolLock::Chat,
+    };
+    let body = RpcErrorBody::from(&error);
+    assert_eq!(error_codes::TOOL_LOCKED, -32007);
+    assert_eq!(
+        serde_json::to_value(&body).unwrap(),
+        json!({"code":-32007,
+            "message":"session/shell is off: this Runtime runs with the `chat` tool lock",
+            "data":{"what":"session/shell","lock":"chat"}})
+    );
+    assert_eq!(body.into_backend_error(), error);
 }
 
 #[test]

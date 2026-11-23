@@ -297,9 +297,14 @@ impl Walk {
         filter: Option<SearchFilter>,
     ) -> Result<Self, String> {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let root = env
+        // Without `.` and doubled separators (`.` is the default path): the
+        // env may return the entries of a folder in that plain form, and
+        // the ignore rules, the filter and the display compare by prefix.
+        let root: PathBuf = env
             .absolute_path(Path::new(path))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .components()
+            .collect();
         if !env.exists(&root).await.map_err(|e| e.to_string())? {
             return Err(format!("no such file or directory: {path}"));
         }
@@ -345,7 +350,11 @@ impl Walk {
                 // Read ignore rules through the capability too: the host walker
                 // would otherwise read a symlinked .gitignore outside the jail.
                 for name in [".gitignore", ".ignore"] {
-                    if let Ok(text) = self.env.read_text_file(&path.join(name)).await {
+                    // An ignore file the filter hides is not read either: under a
+                    // tool lock it may link out of the folder.
+                    let ignore = path.join(name);
+                    if self.filter.as_ref().is_some_and(|f| !f(self.tool, &ignore)) { continue; }
+                    if let Ok(text) = self.env.read_text_file(&ignore).await {
                         let mut builder = GitignoreBuilder::new(&path);
                         for line in text.lines() { let _ = builder.add_line(None, line); }
                         if let Ok(rules) = builder.build() { ignores.push(Arc::new(rules)); }

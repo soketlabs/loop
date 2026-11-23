@@ -12,6 +12,6 @@ pub use cost::calculate_cost;
 pub use estimate::{calculate_context_tokens, estimate_context_tokens, estimate_message_tokens};
 pub use http_error::summarize_http_error;
 pub use id::{new_id, now_ms};
-pub use overflow::is_context_overflow;
+pub use overflow::{is_context_overflow, is_overflow_text};
 pub use partial_json::parse_streaming_json;
 pub use validate::{validate_tool_arguments, validate_tool_call, ToolValidationError};

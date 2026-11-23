@@ -1,9 +1,26 @@
 //! Session-scoped Escalation arbitration and durable decisions.
+//!
+//! Who may answer (task I3): a recipient whose caller may act in the Session
+//! ([`Need::Write`] under [`crate::access::decide`]) gets, and can answer,
+//! its Escalations; an in-process recipient always. So the host's user gets
+//! every Escalation of a `local` Session, as before; an outside user only
+//! those of its own Sessions; nobody those of a Session it may not act in.
+//! The Runtime gives the host the Session's [`Subject`]
+//! ([`EscalationHost::set_access`]); until then it is host-only. The
+//! `escalation_answered` record names the caller that answered.
+//!
+//! Who each record names (step B3): `escalation_raised` the caller that
+//! started the turn; `escalation_answered` the caller that answered;
+//! `escalation_withdrawn` the caller whose cancel or close withdrew it, or
+//! the Runtime when it withdraws on its own. Every record is in the
+//! Session's tenant.
+use crate::access::{decide, Actor, Need, Subject};
 use crate::log::{Event, EventKind, EventLog};
 use async_trait::async_trait;
 use loop_protocol::{
-    rpc::InteractParams, HostServices, InteractionOutcome, InteractionRequest, SessionRef,
+    rpc::InteractParams, Caller, HostServices, InteractionOutcome, InteractionRequest, SessionRef,
 };
+use loop_store::{Identity, Tenant};
 use loop_wire::control::EscalationRecipient;
 use serde_json::json;
 use std::{collections::HashMap, sync::Arc};
@@ -16,8 +33,30 @@ struct Inner {
     session: SessionRef,
     log: Arc<dyn EventLog>,
     generation: u64,
+    /// The Session's tenant, fixed when it was created.
+    tenant: Tenant,
+    /// The `actor` of every record of this Session (a Subagent's parent).
+    actor: Option<String>,
     state: Mutex<State>,
     interrupted: watch::Sender<bool>,
+    /// The caller that started the current turn (or command), carried
+    /// here from prompt admission: the task-local caller does not cross
+    /// the turn's spawned task. `None` for an in-process prompt.
+    turn_caller: std::sync::Mutex<Option<Caller>>,
+    /// Who may see and answer this Session's Escalations.
+    access: std::sync::Mutex<Subject>,
+    /// Who answered recent Escalations, by id, until the decision record
+    /// takes it. Holds at most [`ANSWERS_KEPT`].
+    answered: std::sync::Mutex<std::collections::VecDeque<(String, Option<Caller>)>>,
+}
+
+/// How many answers [`Inner::answered`] keeps for the decision records.
+const ANSWERS_KEPT: usize = 64;
+
+/// Whether `recipient` may see and answer an Escalation of the Session
+/// that `access` describes: the same rule as every other act in it.
+fn may_answer(recipient: &dyn EscalationRecipient, access: &Subject) -> bool {
+    decide(&Actor::of(recipient.caller()), access, Need::Write)
 }
 #[derive(Default)]
 struct State {
@@ -58,10 +97,15 @@ impl Drop for WaitingTool {
         tokio::spawn(async move {
             let mut state = host.0.state.lock().await;
             if let Some(pending) = state.pending.remove(&ticket) {
+                // The Runtime withdraws it on its own: the waiting tool went.
+                let by = crate::runtime::in_process_caller();
                 if let Err(error) = host
-                    .record(EventKind::EscalationWithdrawn(
-                        json!({"id": pending.request.id(), "reason":"waiting tool cancelled"}),
-                    ))
+                    .record(
+                        EventKind::EscalationWithdrawn(
+                            json!({"id": pending.request.id(), "reason":"waiting tool cancelled"}),
+                        ),
+                        &by,
+                    )
                     .await
                 {
                     eprintln!("Runtime: could not log Escalation withdrawal: {error}");
@@ -74,22 +118,94 @@ impl Drop for WaitingTool {
     }
 }
 impl EscalationHost {
-    /// Create the host before exposing the Session to prompts.
-    pub fn new(session: SessionRef, log: Arc<dyn EventLog>, generation: u64) -> Self {
+    /// Create the host before exposing the Session to prompts. `tenant` is
+    /// the Session's tenant and `actor` the `actor` of its records (a
+    /// Subagent's parent Session); every record the host writes has them.
+    pub fn new(
+        session: SessionRef,
+        log: Arc<dyn EventLog>,
+        generation: u64,
+        tenant: Tenant,
+        actor: Option<String>,
+    ) -> Self {
         Self(Arc::new(Inner {
+            access: std::sync::Mutex::new(Subject::unowned(tenant.clone())),
             session,
             log,
             generation,
+            tenant,
+            actor,
             state: Mutex::new(State::default()),
             interrupted: watch::channel(false).0,
+            turn_caller: std::sync::Mutex::new(None),
+            answered: std::sync::Mutex::new(Default::default()),
         }))
+    }
+    /// Set who may see and answer this Session's Escalations: the Session's
+    /// access subject (for a Subagent, its root's). Before this, only the
+    /// host's user and in-process recipients may.
+    pub fn set_access(&self, access: Subject) {
+        *self
+            .0
+            .access
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = access;
+    }
+    fn access(&self) -> Subject {
+        self.0
+            .access
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    /// Set the caller that started the turn about to run, at prompt
+    /// admission. Escalations raised from now on belong to its turn.
+    pub fn set_turn_caller(&self, caller: Option<Caller>) {
+        *self
+            .0
+            .turn_caller
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = caller;
+    }
+    /// The caller that started the current turn, if known.
+    pub fn turn_caller(&self) -> Option<Caller> {
+        self.0
+            .turn_caller
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    /// Who answered the Escalation `id`, once; `None` when it is not known.
+    pub fn take_answered_by(&self, id: &str) -> Option<Caller> {
+        let mut answered = self
+            .0
+            .answered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = answered.iter().position(|(answered, _)| answered == id)?;
+        answered.remove(at).and_then(|(_, caller)| caller)
+    }
+    fn remember_answer(&self, id: String, caller: Option<Caller>) {
+        let mut answered = self
+            .0
+            .answered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if answered.len() >= ANSWERS_KEPT {
+            answered.pop_front();
+        }
+        answered.push_back((id, caller));
     }
     /// Stop in-flight decision waits after close grace expires. The Event Log
     /// writer may already have committed; pending requests must still withdraw.
     pub(crate) fn interrupt_decisions(&self) {
         self.0.interrupted.send_replace(true);
     }
-    async fn record(&self, kind: EventKind) -> crate::log::Result<()> {
+    /// `by` acting on this Session, in the Session's tenant.
+    fn identity(&self, by: &Caller) -> Identity {
+        Identity::acting(by, self.0.tenant.clone()).with_actor(self.0.actor.clone())
+    }
+    async fn record(&self, kind: EventKind, by: &Caller) -> crate::log::Result<()> {
         let decision = matches!(
             kind,
             EventKind::EscalationRaised(_) | EventKind::EscalationAnswered(_)
@@ -100,6 +216,7 @@ impl EscalationHost {
             turn: None,
             ts_ms: crate::runtime::now(),
             kind,
+            identity: self.identity(by),
         }];
         let mut interrupted = self.0.interrupted.subscribe();
         tokio::select! {
@@ -117,9 +234,12 @@ impl EscalationHost {
             return;
         }
         state.recipients.insert(connection, recipient.clone());
+        let access = self.access();
         let mut next = state.delivery;
         for (&ticket, pending) in &mut state.pending {
-            if !pending.deliveries.contains_key(&connection) {
+            if !pending.deliveries.contains_key(&connection)
+                && may_answer(recipient.as_ref(), &access)
+            {
                 next += 1;
                 self.dispatch(ticket, pending, connection, next, recipient.clone());
             }
@@ -204,11 +324,16 @@ impl EscalationHost {
         let Some(pending) = state.pending.get(&ticket) else {
             return;
         };
-        if !pending
+        let Some(delivery) = pending
             .deliveries
             .get(&connection)
-            .is_some_and(|d| d.token == token)
-            || !valid(&pending.request, &answer)
+            .filter(|d| d.token == token)
+        else {
+            return;
+        };
+        let answered_by = delivery.recipient.caller();
+        if !valid(&pending.request, &answer)
+            || !may_answer(delivery.recipient.as_ref(), &self.access())
         {
             return;
         }
@@ -221,11 +346,22 @@ impl EscalationHost {
             ),
             _ => None,
         };
+        // An in-process recipient answers as the Runtime.
+        let by = answered_by
+            .clone()
+            .unwrap_or_else(crate::runtime::in_process_caller);
         let result = self
-            .record(EventKind::EscalationAnswered(json!({
-                "id": pending.request.id(), "answer": answer, "grant": grant,
-            })))
+            .record(
+                EventKind::EscalationAnswered(json!({
+                    "id": pending.request.id(), "answer": answer, "grant": grant,
+                    "answered_by": answered_by,
+                })),
+                &by,
+            )
             .await;
+        if result.is_ok() {
+            self.remember_answer(pending.request.id().to_string(), answered_by);
+        }
         if result.is_err() && *self.0.interrupted.borrow() {
             // Close owns the terminal withdrawal, even if this write committed
             // before its acknowledgement stalled. Never resume the gate here.
@@ -245,17 +381,27 @@ impl EscalationHost {
         }
         let _ = pending.answer.send(outcome);
     }
-    /// Withdraw on cancellation; closing also refuses future requests.
-    pub async fn withdraw(&self, reason: &str, closing: bool) -> crate::log::Result<()> {
+    /// Withdraw on cancellation; closing also refuses future requests. `by`
+    /// is the caller whose cancel or close withdraws them (the Runtime's own
+    /// caller when it acts on its own); the records name it.
+    pub async fn withdraw(
+        &self,
+        reason: &str,
+        closing: bool,
+        by: &Caller,
+    ) -> crate::log::Result<()> {
         let mut state = self.0.state.lock().await;
         state.closed |= closing;
         let pending = std::mem::take(&mut state.pending);
         let mut error = None;
         for (_, pending) in pending {
             if let Err(e) = self
-                .record(EventKind::EscalationWithdrawn(
-                    json!({"id": pending.request.id(), "reason": reason}),
-                ))
+                .record(
+                    EventKind::EscalationWithdrawn(
+                        json!({"id": pending.request.id(), "reason": reason}),
+                    ),
+                    by,
+                )
                 .await
             {
                 error = Some(e);
@@ -318,10 +464,16 @@ impl HostServices for EscalationHost {
                 host: self.clone(),
                 ticket,
             };
+            // Raised for the caller that started the turn; an in-process
+            // turn is the Runtime's.
+            let by = self
+                .turn_caller()
+                .unwrap_or_else(crate::runtime::in_process_caller);
             if let Err(e) = self
-                .record(EventKind::EscalationRaised(
-                    json!({"id": request.id(), "request": request}),
-                ))
+                .record(
+                    EventKind::EscalationRaised(json!({"id": request.id(), "request": request})),
+                    &by,
+                )
                 .await
             {
                 if !*self.0.interrupted.borrow() {
@@ -333,7 +485,11 @@ impl HostServices for EscalationHost {
             }
             let mut pending = state.pending.remove(&ticket).unwrap();
             let recipients = state.recipients.clone();
+            let access = self.access();
             for (connection, recipient) in recipients {
+                if !may_answer(recipient.as_ref(), &access) {
+                    continue;
+                }
                 state.delivery += 1;
                 self.dispatch(ticket, &mut pending, connection, state.delivery, recipient);
             }

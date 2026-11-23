@@ -32,6 +32,21 @@ pub enum Capability {
 }
 
 impl Capability {
+    /// The id in decision records and the S4 `policy` block: `read_files`,
+    /// `write_files`, `shell`, `web_fetch`, `web_search`, `mcp:<server>` or
+    /// `other`.
+    pub fn id(&self) -> String {
+        match self {
+            Self::ReadFiles => "read_files".into(),
+            Self::WriteFiles => "write_files".into(),
+            Self::Shell => "shell".into(),
+            Self::WebFetch => "web_fetch".into(),
+            Self::WebSearch => "web_search".into(),
+            Self::Mcp(server) => format!("mcp:{server}"),
+            Self::Other => "other".into(),
+        }
+    }
+
     /// The name in notices and refusals.
     pub fn label(&self) -> String {
         match self {
@@ -87,6 +102,11 @@ pub enum Scope {
     ReadOnlyCommands,
     /// MCP tools their server marks read-only (`readOnlyHint`).
     ReadOnlyHint,
+    /// Calls whose `path` resolves inside the Session's folder (its cwd,
+    /// not the git root above it), symlinks and `..` followed. A missing
+    /// `path` is the cwd for the search tools; `read` must name one. For
+    /// reads under a tool lock.
+    InsideCwd,
 }
 
 impl Scope {
@@ -96,7 +116,11 @@ impl Scope {
             Self::Workspace => {
                 call.inside_workspace
                     && call.path().is_some_and(|path| {
-                        !protected(&call.cwd.join(path).to_string_lossy(), &call.workspace)
+                        !protected(
+                            &call.paths,
+                            &call.cwd.join(path).to_string_lossy(),
+                            &call.workspace,
+                        )
                     })
             }
             Self::ReadOnlyCommands => {
@@ -108,6 +132,18 @@ impl Scope {
                         .is_some_and(read_only_command)
             }
             Self::ReadOnlyHint => call.kind == ToolKind::Read,
+            Self::InsideCwd => {
+                let path = match call.path() {
+                    Some(path) => path,
+                    None if call.tool == "read" => return false,
+                    None => ".",
+                };
+                let target = call.cwd.join(path);
+                match &call.confinement {
+                    Some(confined) => confined.allows_in(&call.paths, &target),
+                    None => super::tool_lock::inside_folder_in(&call.paths, &target, &call.cwd),
+                }
+            }
         }
     }
 }
@@ -120,6 +156,8 @@ impl Scope {
             Self::Workspace => matches!(call.tool.as_str(), "write" | "edit"),
             Self::ReadOnlyCommands => call.tool == "bash",
             Self::ReadOnlyHint => self.contains(call),
+            // The path is not known before the call.
+            Self::InsideCwd => true,
         }
     }
 }
@@ -128,7 +166,7 @@ impl Scope {
 /// settings and environment files. Both the path as written and the path
 /// it resolves to (symlinks followed) are checked, ignoring case, since
 /// macOS and Windows disks ignore case (`.GIT` is `.git`).
-fn protected(path: &str, workspace: &std::path::Path) -> bool {
+fn protected(paths: &super::paths::PathFacts, path: &str, workspace: &std::path::Path) -> bool {
     use std::path::{Component, Path};
     let check = |path: &Path| {
         path.components().any(|c| {
@@ -146,14 +184,19 @@ fn protected(path: &str, workspace: &std::path::Path) -> bool {
     if check(written.strip_prefix(workspace).unwrap_or(written)) {
         return true;
     }
-    match super::policy::resolve(&workspace.join(written)) {
+    use super::policy::Resolved;
+    match super::policy::resolve(paths, &workspace.join(written)) {
         // Only the part below the workspace counts: a workspace that
         // itself sits under a `.git` directory is not protected.
-        Some(real) => {
-            let root = super::policy::resolve(workspace).unwrap_or_default();
+        Resolved::Path(real) => {
+            let root = match super::policy::resolve(paths, workspace) {
+                Resolved::Path(root) => root,
+                Resolved::Gone => std::path::PathBuf::new(),
+                Resolved::Unknown => return true,
+            };
             check(real.strip_prefix(&root).unwrap_or(&real))
         }
-        None => true,
+        Resolved::Gone | Resolved::Unknown => true,
     }
 }
 
@@ -205,6 +248,7 @@ impl Setting {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::PathFacts;
     use serde_json::json;
 
     fn call(tool: &str) -> Call {
@@ -218,10 +262,20 @@ mod tests {
             let ws = base.path().join(dir);
             std::fs::create_dir_all(&ws).unwrap();
             let abs = ws.join("src/main.rs");
-            assert!(!protected(&abs.to_string_lossy(), &ws), "{dir}");
-            assert!(!protected("src/main.rs", &ws), "{dir}");
-            assert!(protected(&ws.join(".git/config").to_string_lossy(), &ws));
-            assert!(protected(".env", &ws));
+            assert!(
+                !protected(&PathFacts::runtime_host(), &abs.to_string_lossy(), &ws),
+                "{dir}"
+            );
+            assert!(
+                !protected(&PathFacts::runtime_host(), "src/main.rs", &ws),
+                "{dir}"
+            );
+            assert!(protected(
+                &PathFacts::runtime_host(),
+                &ws.join(".git/config").to_string_lossy(),
+                &ws
+            ));
+            assert!(protected(&PathFacts::runtime_host(), ".env", &ws));
         }
     }
 

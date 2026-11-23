@@ -1,254 +1,45 @@
-use loop_protocol::{SessionKey, SessionUpdate, UpdateEnvelope};
-use loop_runtime::log::{Event, EventKind, EventLog, MemoryEventLog};
+use loop_protocol::SessionKey;
+use loop_runtime::log::{Event, EventKind, EventLog, MemoryEventLog, SqliteEventLog};
+use loop_store_testkit::event_log as kit;
+use loop_store_testkit::Fixture;
 use serde_json::json;
 
+// The shared Event Log suite lives in `loop-store-testkit` so that stores
+// outside this repository can run the same checks. This file runs it on the
+// memory and SQLite logs and keeps the SQLite-only tests.
+
 fn update(session: &str) -> Event {
-    Event::update(
-        1,
-        100,
-        UpdateEnvelope::live(
-            "loop".into(),
-            0,
-            SessionKey::from(session),
-            Some("turn-1".into()),
-            900,
-            SessionUpdate::TurnStarted {
-                turn_id: "turn-1".into(),
-            },
-        ),
-    )
+    kit::update(session)
 }
 
-async fn round_trip(log: &dyn EventLog) {
-    let kinds = vec![
-        EventKind::PromptSent(json!({"prompt":"hello"})),
-        EventKind::Cancelled(json!({"reason":"user"})),
-        EventKind::EscalationRaised(json!({"id":"e1"})),
-        EventKind::EscalationAnswered(json!({"id":"e1","answer":"allow"})),
-        EventKind::EscalationWithdrawn(json!({"id":"e1","reason":"cancelled"})),
-        EventKind::SessionOpened(json!({"cwd":"/work","parent":null})),
-        EventKind::SessionClosed(json!({"reason":"done"})),
-        EventKind::RuntimeStarted(json!({"pid":42})),
-        EventKind::RuntimeStopped(json!({"reason":"shutdown"})),
-        EventKind::Unknown(json!({"kind":"future_kind","payload":{"x":7}})),
-    ];
-    let mut events = vec![update("s1")];
-    for kind in kinds {
-        events.push(Event {
-            generation: 1,
-            session_key: if matches!(
-                kind,
-                EventKind::RuntimeStarted(_) | EventKind::RuntimeStopped(_)
-            ) {
-                None
-            } else {
-                Some("s1".into())
-            },
-            turn: None,
-            ts_ms: 101,
-            kind,
-        });
-    }
-    let committed = log.append_batch(events.clone()).await.unwrap();
-    assert_eq!(committed.len(), 11);
-    assert_eq!(log.read_runtime_after(0).await.unwrap(), committed);
-    for (index, (record, input)) in committed.iter().zip(events).enumerate() {
-        assert_eq!(record.global_seq, index as u64 + 1);
-        assert_eq!(record.session_seq, if index == 0 { Some(1) } else { None });
-        if let EventKind::Update(envelope) = &record.event.kind {
-            assert_eq!(envelope.seq, 1);
-            assert_eq!(envelope.generation, 1);
-        } else {
-            assert_eq!(record.event, input);
-        }
-    }
+async fn memory_fixture() -> Fixture<dyn EventLog> {
+    kit::fixture(MemoryEventLog::new())
 }
 
-#[tokio::test]
-async fn memory_round_trip() {
-    round_trip(&MemoryEventLog::new()).await;
-}
-
-#[tokio::test]
-async fn sqlite_round_trip() {
+async fn sqlite_fixture() -> Fixture<dyn EventLog> {
     let dir = tempfile::tempdir().unwrap();
-    let log = loop_runtime::log::SqliteEventLog::open(dir.path())
-        .await
-        .unwrap();
-    round_trip(&log).await;
-}
-
-async fn concurrent_producers(log: std::sync::Arc<dyn EventLog>) {
-    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(129));
-    let mut tasks = Vec::new();
-    for _ in 0..128 {
-        let log = log.clone();
-        let barrier = barrier.clone();
-        tasks.push(tokio::spawn(async move {
-            barrier.wait().await;
-            let records = log
-                .append_batch(vec![update("s1"), update("s2"), update("s1")])
-                .await
-                .unwrap();
-            assert_eq!(records.len(), 3);
-            assert_eq!(records[1].global_seq, records[0].global_seq + 1);
-            assert_eq!(records[2].global_seq, records[0].global_seq + 2);
-            assert_eq!(
-                records[2].session_seq,
-                records[0].session_seq.map(|s| s + 1)
-            );
-        }));
-    }
-    barrier.wait().await;
-    for task in tasks {
-        task.await.unwrap();
-    }
-    assert_eq!(log.latest_seq(&"s1".into()).await.unwrap(), 256);
-    assert_eq!(log.latest_seq(&"s2".into()).await.unwrap(), 128);
-    let all = log.read_runtime_after(0).await.unwrap();
-    assert_eq!(all.len(), 384);
-    for (i, record) in all.iter().enumerate() {
-        assert_eq!(record.global_seq, i as u64 + 1);
-    }
-}
-
-#[tokio::test]
-async fn sqlite_concurrent_producers() {
-    let dir = tempfile::tempdir().unwrap();
-    concurrent_producers(std::sync::Arc::new(
-        loop_runtime::log::SqliteEventLog::open(dir.path())
-            .await
-            .unwrap(),
-    ))
-    .await;
-}
-#[tokio::test]
-async fn memory_concurrent_producers() {
-    concurrent_producers(std::sync::Arc::new(MemoryEventLog::new())).await;
-}
-
-async fn cursors(log: &dyn EventLog) {
-    assert_eq!(log.latest_seq(&"missing".into()).await.unwrap(), 0);
-    assert!(log
-        .read_after(&"missing".into(), 0)
-        .await
-        .unwrap()
-        .is_empty());
-    let mut audit = update("s1");
-    audit.kind = EventKind::PromptSent(json!({"prompt":"go"}));
-    let mut runtime = audit.clone();
-    runtime.session_key = None;
-    runtime.turn = None;
-    runtime.kind = EventKind::RuntimeStarted(json!({}));
-    log.append_batch(vec![
-        runtime,
-        update("s1"),
-        audit,
-        update("s2"),
-        update("s1"),
-    ])
-    .await
-    .unwrap();
-    let session = log.read_after(&"s1".into(), 1).await.unwrap();
-    assert_eq!(session.len(), 1);
-    assert_eq!(
-        (session[0].global_seq, session[0].session_seq),
-        (5, Some(2))
-    );
-    assert_eq!(log.latest_seq(&"s1".into()).await.unwrap(), 2);
-    assert_eq!(log.latest_seq(&"s2".into()).await.unwrap(), 1);
-    assert_eq!(
-        log.read_runtime_after(3)
-            .await
-            .unwrap()
-            .iter()
-            .map(|e| e.global_seq)
-            .collect::<Vec<_>>(),
-        vec![4, 5]
-    );
-    assert!(log.read_after(&"s1".into(), 2).await.unwrap().is_empty());
-    assert!(log
-        .read_after(&"s1".into(), u64::MAX)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(log.read_runtime_after(u64::MAX).await.unwrap().is_empty());
-    assert_eq!(
-        log.read_runtime_after(0).await.unwrap()[0]
-            .event
-            .session_key,
-        None
-    );
-}
-
-async fn generations(log: &dyn EventLog) {
-    assert!(log.finish_generation(0, 20).await.is_err());
-    assert_eq!(
-        log.allocate_generation("runtime", 42, 100).await.unwrap(),
-        1
-    );
-    log.append_batch(vec![update("s1")]).await.unwrap();
-    log.finish_generation(1, 110).await.unwrap();
-    assert_eq!(
-        log.allocate_generation("runtime", 43, 120).await.unwrap(),
-        2
-    );
-    let mut event = update("s1");
-    event.generation = 2;
-    let records = log.append_batch(vec![event]).await.unwrap();
-    assert_eq!(records[0].session_seq, Some(2));
-    if let EventKind::Update(envelope) = &records[0].event.kind {
-        assert_eq!(envelope.generation, 2);
-    } else {
-        panic!("expected Update");
-    }
-    assert!(log.finish_generation(9, 130).await.is_err());
-}
-
-async fn atomic_validation(log: &dyn EventLog) {
-    use loop_runtime::log::MAX_BATCH_EVENTS;
-    assert_eq!(MAX_BATCH_EVENTS, 256);
-    assert_eq!(loop_runtime::log::WRITER_QUEUE_CAPACITY, 64);
-    assert!(log.append_batch(Vec::new()).await.unwrap().is_empty());
-    let mut invalid = update("s1");
-    invalid.session_key = None;
-    assert!(log.append_batch(vec![update("s1"), invalid]).await.is_err());
-    let mut replay = update("s1");
-    if let EventKind::Update(envelope) = &mut replay.kind {
-        envelope.origin = loop_protocol::Origin::Replay;
-    }
-    assert!(log.append_batch(vec![replay]).await.is_err());
-    assert!(log
-        .append_batch(vec![update("s1"); MAX_BATCH_EVENTS + 1])
-        .await
-        .is_err());
-    assert!(log.read_runtime_after(0).await.unwrap().is_empty());
-    assert_eq!(
-        log.append_batch(vec![update("s1"); MAX_BATCH_EVENTS])
-            .await
-            .unwrap()
-            .len(),
-        256
-    );
-    assert_eq!(log.latest_seq(&"s1".into()).await.unwrap(), 256);
+    let log = SqliteEventLog::open(dir.path()).await.unwrap();
+    kit::fixture(log).with_guard(dir)
 }
 
 macro_rules! shared_suite {
     ($memory:ident, $sqlite:ident, $suite:ident) => {
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn $memory() {
-            $suite(&MemoryEventLog::new()).await;
+            kit::$suite(&memory_fixture).await;
         }
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn $sqlite() {
-            let dir = tempfile::tempdir().unwrap();
-            let log = loop_runtime::log::SqliteEventLog::open(dir.path())
-                .await
-                .unwrap();
-            $suite(&log).await;
+            kit::$suite(&sqlite_fixture).await;
         }
     };
 }
+shared_suite!(memory_round_trip, sqlite_round_trip, round_trip);
+shared_suite!(
+    memory_concurrent_producers,
+    sqlite_concurrent_producers,
+    concurrent_producers
+);
 shared_suite!(memory_cursors, sqlite_cursors, cursors);
 shared_suite!(memory_generations, sqlite_generations, generations);
 shared_suite!(
@@ -256,26 +47,89 @@ shared_suite!(
     sqlite_atomic_validation,
     atomic_validation
 );
+shared_suite!(
+    memory_invalid_unknown,
+    sqlite_invalid_unknown,
+    invalid_unknown_is_atomic
+);
+shared_suite!(
+    memory_runtime_records,
+    sqlite_runtime_records,
+    runtime_records_have_no_session_cursor
+);
+shared_suite!(
+    memory_subagent_sessions,
+    sqlite_subagent_sessions,
+    subagent_sessions
+);
+shared_suite!(memory_prompts_sent, sqlite_prompts_sent, prompts_sent);
+shared_suite!(memory_paged_reads, sqlite_paged_reads, paged_reads);
+shared_suite!(
+    memory_paged_read_under_appends,
+    sqlite_paged_read_under_appends,
+    paged_read_under_appends
+);
+shared_suite!(
+    memory_read_your_writes,
+    sqlite_read_your_writes,
+    read_your_writes
+);
+shared_suite!(
+    memory_long_read_does_not_delay_appends,
+    sqlite_long_read_does_not_delay_appends,
+    long_read_does_not_delay_appends
+);
+shared_suite!(
+    memory_summary_matches_fold,
+    sqlite_summary_matches_fold,
+    summary_matches_fold
+);
+shared_suite!(memory_recovery_pages, sqlite_recovery_pages, recovery_pages);
+shared_suite!(
+    memory_identity_round_trip,
+    sqlite_identity_round_trip,
+    identity_round_trip
+);
+shared_suite!(
+    memory_tenant_isolation,
+    sqlite_tenant_isolation,
+    tenant_isolation
+);
+shared_suite!(
+    memory_owner_of_record,
+    sqlite_owner_of_record,
+    owner_of_record
+);
 
 #[tokio::test]
 async fn sqlite_reopen_keeps_cursors_generations_and_unknown() {
     let dir = tempfile::tempdir().unwrap();
     let original;
     {
-        let log = loop_runtime::log::SqliteEventLog::open(dir.path())
-            .await
-            .unwrap();
+        let log = SqliteEventLog::open(dir.path()).await.unwrap();
         assert_eq!(
             log.allocate_generation("runtime", 42, 100).await.unwrap(),
             1
         );
-        round_trip(&log).await;
-        original = log.read_runtime_after(0).await.unwrap();
+        kit::round_trip_on(&log).await;
+        original = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
     }
-    let log = loop_runtime::log::SqliteEventLog::open(dir.path())
+    let log = SqliteEventLog::open(dir.path()).await.unwrap();
+    assert_eq!(
+        log.read_runtime_after(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            0
+        )
         .await
-        .unwrap();
-    assert_eq!(log.read_runtime_after(0).await.unwrap(), original);
+        .unwrap(),
+        original
+    );
     assert_eq!(
         log.allocate_generation("runtime", 43, 200).await.unwrap(),
         2
@@ -289,12 +143,8 @@ async fn sqlite_reopen_keeps_cursors_generations_and_unknown() {
 #[tokio::test]
 async fn sqlite_generation_allocation_is_transactional_across_connections() {
     let dir = tempfile::tempdir().unwrap();
-    let a = loop_runtime::log::SqliteEventLog::open(dir.path())
-        .await
-        .unwrap();
-    let b = loop_runtime::log::SqliteEventLog::open(dir.path())
-        .await
-        .unwrap();
+    let a = SqliteEventLog::open(dir.path()).await.unwrap();
+    let b = SqliteEventLog::open(dir.path()).await.unwrap();
     let (a, b) = tokio::join!(
         a.allocate_generation("runtime", 1, 10),
         b.allocate_generation("runtime", 2, 10)
@@ -312,24 +162,10 @@ fn unknown_kind_decode_preserves_future_payload() {
     assert_eq!(serde_json::to_value(kind).unwrap(), raw);
 }
 
-async fn invalid_unknown_is_atomic(log: &dyn EventLog) {
-    let mut bad = update("s1");
-    bad.kind = EventKind::Unknown(json!({"payload":7}));
-    assert!(log.append_batch(vec![update("s1"), bad]).await.is_err());
-    assert!(log.read_runtime_after(0).await.unwrap().is_empty());
-}
-shared_suite!(
-    memory_invalid_unknown,
-    sqlite_invalid_unknown,
-    invalid_unknown_is_atomic
-);
-
 #[tokio::test]
 async fn sqlite_transaction_failure_does_not_consume_cursors() {
     let dir = tempfile::tempdir().unwrap();
-    let log = loop_runtime::log::SqliteEventLog::open(dir.path())
-        .await
-        .unwrap();
+    let log = SqliteEventLog::open(dir.path()).await.unwrap();
     // Fault injection only: all behavior is observed through the public Event Log.
     let conn = rusqlite::Connection::open(dir.path().join("events.db")).unwrap();
     conn.execute_batch("CREATE TRIGGER fail_second BEFORE INSERT ON events WHEN NEW.global_seq=2 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
@@ -337,8 +173,20 @@ async fn sqlite_transaction_failure_does_not_consume_cursors() {
         .append_batch(vec![update("s1"), update("s1")])
         .await
         .is_err());
-    assert!(log.read_runtime_after(0).await.unwrap().is_empty());
-    assert_eq!(log.latest_seq(&"s1".into()).await.unwrap(), 0);
+    assert!(log
+        .read_runtime_after(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            0
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        log.latest_seq(&loop_store::Tenant::local(), &"s1".into())
+            .await
+            .unwrap(),
+        0
+    );
     conn.execute_batch("DROP TRIGGER fail_second").unwrap();
     let records = log.append_batch(vec![update("s1")]).await.unwrap();
     assert_eq!(
@@ -347,91 +195,13 @@ async fn sqlite_transaction_failure_does_not_consume_cursors() {
     );
 }
 
-async fn runtime_records_have_no_session_cursor(log: &dyn EventLog) {
-    let mut event = update("s1");
-    event.kind = EventKind::RuntimeStarted(json!({}));
-    assert!(log.append_batch(vec![event.clone()]).await.is_err());
-    event.session_key = None;
-    event.turn = None;
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        log.append_batch(vec![event]),
-    )
-    .await
-    .expect("a lone append must flush without waiting for another producer")
-    .unwrap();
-    assert_eq!(result[0].session_seq, None);
-    assert_eq!(result[0].event.session_key, None);
-}
-shared_suite!(
-    memory_runtime_records,
-    sqlite_runtime_records,
-    runtime_records_have_no_session_cursor
-);
-
-async fn subagent_sessions(log: &dyn EventLog) {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        let opened = |key: &str, parent: serde_json::Value| Event {
-            generation: 1,
-            session_key: Some(key.into()),
-            turn: None,
-            ts_ms: 1,
-            kind: EventKind::SessionOpened(json!({"cwd": "/w", "parent": parent, "depth": 1})),
-        };
-        log.append_batch(vec![
-            opened("root", json!(null)),
-            opened("kid", json!("root")),
-            update("kid"),
-            opened("kid", json!("root")),
-            opened("other", json!(null)),
-        ])
-        .await
-        .unwrap();
-        let keys = log.subagent_sessions().await.unwrap();
-        assert_eq!(
-            keys,
-            std::collections::HashSet::from([SessionKey::from("kid")])
-        );
-    })
-    .await
-    .unwrap();
-}
-shared_suite!(
-    memory_subagent_sessions,
-    sqlite_subagent_sessions,
-    subagent_sessions
-);
-
-async fn prompts_sent(log: &dyn EventLog) {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        let prompt = |key: &str| Event {
-            generation: 1,
-            session_key: Some(key.into()),
-            turn: None,
-            ts_ms: 1,
-            kind: EventKind::PromptSent(json!({"content": []})),
-        };
-        log.append_batch(vec![prompt("a"), update("a"), prompt("a"), prompt("b")])
-            .await
-            .unwrap();
-        assert_eq!(log.prompts_sent(&"a".into()).await.unwrap(), 2);
-        assert_eq!(log.prompts_sent(&"b".into()).await.unwrap(), 1);
-        assert_eq!(log.prompts_sent(&"c".into()).await.unwrap(), 0);
-    })
-    .await
-    .unwrap();
-}
-shared_suite!(memory_prompts_sent, sqlite_prompts_sent, prompts_sent);
-
 /// Recovery needs only that a prompt was sent, not its content: the SQLite
 /// log does not load `prompt_sent` payloads for it, and finds recovery
 /// records by an index on (generation, kind).
 #[tokio::test]
 async fn sqlite_recovery_does_not_load_prompt_content() {
     let dir = tempfile::tempdir().unwrap();
-    let log = loop_runtime::log::SqliteEventLog::open(dir.path())
-        .await
-        .unwrap();
+    let log = SqliteEventLog::open(dir.path()).await.unwrap();
     let g = log.allocate_generation("runtime", 1, 0).await.unwrap();
     let prompt = |kind: EventKind| Event {
         generation: g,
@@ -439,6 +209,7 @@ async fn sqlite_recovery_does_not_load_prompt_content() {
         turn: None,
         ts_ms: 1,
         kind,
+        identity: loop_store::Identity::unrecorded(),
     };
     log.append_batch(vec![
         prompt(EventKind::PromptSent(
@@ -449,7 +220,10 @@ async fn sqlite_recovery_does_not_load_prompt_content() {
     .await
     .unwrap();
     let kinds: Vec<_> = log
-        .recovery_records(1)
+        .recovery_records(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            1,
+        )
         .await
         .unwrap()
         .into_iter()
@@ -471,4 +245,118 @@ async fn sqlite_recovery_does_not_load_prompt_content() {
         .map(Result::unwrap)
         .collect();
     assert_eq!(columns, ["generation", "kind"]);
+}
+
+/// A `policy_decision` row in a SQLite Event Log: it takes no Session
+/// sequence, so a Session read (attach, replay) skips it and the Session's
+/// sequence stays contiguous; it reads back unchanged after a reopen; and
+/// recovery's reads leave it out.
+#[tokio::test]
+async fn a_policy_decision_row_is_log_only_and_survives_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let decision = json!({"id": "pd-1", "outcome": "deny", "by": "rule"});
+    {
+        let log = SqliteEventLog::open(dir.path()).await.unwrap();
+        log.append_batch(vec![update("s")]).await.unwrap();
+        log.append_batch(vec![Event {
+            generation: 1,
+            session_key: Some(SessionKey::from("s")),
+            turn: None,
+            ts_ms: 1,
+            kind: EventKind::PolicyDecision(decision.clone()),
+            identity: loop_store::Identity::unrecorded(),
+        }])
+        .await
+        .unwrap();
+        log.append_batch(vec![update("s")]).await.unwrap();
+    }
+    let log = SqliteEventLog::open(dir.path()).await.unwrap();
+    let session = log
+        .read_after(&loop_store::Tenant::local(), &SessionKey::from("s"), 0)
+        .await
+        .unwrap();
+    let seqs: Vec<_> = session.iter().map(|r| r.session_seq).collect();
+    assert_eq!(seqs, [Some(1), Some(2)]);
+    let all = log
+        .read_runtime_after(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            0,
+        )
+        .await
+        .unwrap();
+    let stored = all
+        .iter()
+        .find(|r| matches!(r.event.kind, EventKind::PolicyDecision(_)))
+        .expect("the decision is stored");
+    assert_eq!(stored.event.kind, EventKind::PolicyDecision(decision));
+    assert_eq!(stored.session_seq, None);
+    assert!(log
+        .recovery_records(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            0
+        )
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| !matches!(r.event.kind, EventKind::PolicyDecision(_))));
+}
+
+/// Decision rows and the Session projection: a decision counts as Session
+/// activity, and its turn is the turn already running, so it adds no turn,
+/// no Session sequence, no prompt and no revision. A decision with no turn
+/// (a typed command between turns) adds no turn either.
+#[tokio::test]
+async fn policy_decision_rows_add_no_phantom_turns_to_the_projection() {
+    async fn check(log: &dyn EventLog) {
+        let s = SessionKey::from("s");
+        log.append_batch(vec![update("s")]).await.unwrap();
+        let before = log
+            .session_summary(&loop_store::Tenant::local(), &s)
+            .await
+            .unwrap()
+            .unwrap();
+        let decision = |turn: Option<&str>, ts_ms| Event {
+            generation: 1,
+            session_key: Some(s.clone()),
+            turn: turn.map(Into::into),
+            ts_ms,
+            kind: EventKind::PolicyDecision(json!({"id": "pd", "outcome": "allow"})),
+            identity: loop_store::Identity::unrecorded(),
+        };
+        log.append_batch(vec![decision(Some("turn-1"), 5_000)])
+            .await
+            .unwrap();
+        log.append_batch(vec![decision(None, 6_000)]).await.unwrap();
+        let after = log
+            .session_summary(&loop_store::Tenant::local(), &s)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.last_seq, before.last_seq);
+        assert_eq!(after.last_revision, before.last_revision);
+        assert_eq!(after.prompts_sent, before.prompts_sent);
+        assert_eq!(after.turn_count, before.turn_count);
+        assert_eq!(after.parent, before.parent);
+        assert_eq!(after.last_activity_ms, 6_000);
+        let turns: Vec<String> = log
+            .turn_ids(&loop_store::Tenant::local(), &s)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.0)
+            .collect();
+        assert_eq!(turns, ["turn-1"]);
+    }
+    check(&MemoryEventLog::new()).await;
+    let dir = tempfile::tempdir().unwrap();
+    check(&SqliteEventLog::open(dir.path()).await.unwrap()).await;
+    // The same after a reopen, from the stored projection.
+    let log = SqliteEventLog::open(dir.path()).await.unwrap();
+    let summary = log
+        .session_summary(&loop_store::Tenant::local(), &SessionKey::from("s"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.turn_count, 1);
+    assert_eq!(summary.last_activity_ms, 6_000);
 }

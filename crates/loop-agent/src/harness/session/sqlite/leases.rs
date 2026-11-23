@@ -7,82 +7,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 use super::store::{begin_immediate, open, SqliteSessionStore};
 use crate::harness::types::SessionError;
 
-/// Owners should renew a live Session lease at this interval.
-pub const LEASE_RENEW_INTERVAL_MS: i64 = 5_000;
-/// Ordinary takeover requires both this age and proof that the pid is dead.
-pub const LEASE_STALE_AFTER_MS: i64 = 30_000;
-
-/// Full fencing identity. Generations must change when an owner restarts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeaseIdentity {
-    /// Owner kind, such as `runtime` or `standalone`.
-    pub owner: String,
-    /// Owning process id.
-    pub pid: u32,
-    /// Fencing generation, distinct across owner restarts.
-    pub generation: i64,
-}
-
-/// Persisted Session lease.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionLease {
-    /// Full identity that must match on every write.
-    pub identity: LeaseIdentity,
-    /// Last renewal in Unix epoch milliseconds.
-    pub heartbeat_ms: i64,
-}
-
-/// Unknown liveness never permits ordinary takeover.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PidLiveness {
-    /// The pid is alive.
-    Alive,
-    /// The probe proved the pid no longer exists.
-    Dead,
-    /// Liveness could not be established (including permission errors).
-    Unknown,
-}
-
-/// Injectable clock and pid probe. Probes run inside the ownership transaction.
-pub trait LeaseEnvironment: Send + Sync {
-    /// Current Unix epoch time in milliseconds.
-    fn now_ms(&self) -> i64;
-    /// Probe the recorded pid without sending it a signal.
-    fn pid_liveness(&self, pid: u32) -> PidLiveness;
-}
-
-pub(super) struct SystemLeaseEnvironment;
-impl LeaseEnvironment for SystemLeaseEnvironment {
-    fn now_ms(&self) -> i64 {
-        loop_ai::now_ms()
-    }
-    fn pid_liveness(&self, pid: u32) -> PidLiveness {
-        pid_liveness(pid)
-    }
-}
-
-fn pid_liveness(pid: u32) -> PidLiveness {
-    // Reject process-group semantics and values that cannot fit pid_t.
-    let Ok(pid) = i32::try_from(pid) else {
-        return PidLiveness::Unknown;
-    };
-    if pid <= 0 {
-        return PidLiveness::Unknown;
-    }
-    unsafe extern "C" {
-        fn kill(pid: std::ffi::c_int, sig: std::ffi::c_int) -> std::ffi::c_int;
-    }
-    // SAFETY: signal 0 only probes a positive pid and does not send a signal.
-    if unsafe { kill(pid, 0) } == 0 {
-        return PidLiveness::Alive;
-    }
-    // ESRCH is 3 on Linux and macOS. EPERM and all other failures are unknown.
-    if std::io::Error::last_os_error().raw_os_error() == Some(3) {
-        PidLiveness::Dead
-    } else {
-        PidLiveness::Unknown
-    }
-}
+pub(super) use crate::harness::session::lease::SystemLeaseEnvironment;
+use crate::harness::session::lease::{
+    check_claimant, check_write_rule, conflict, judge_claim, lost, same_database, sweepable, Claim,
+};
+pub use crate::harness::session::lease::{
+    LeaseEnvironment, LeaseIdentity, PidLiveness, SessionLease, LEASE_RENEW_INTERVAL_MS,
+    LEASE_STALE_AFTER_MS,
+};
 
 fn storage(error: rusqlite::Error) -> SessionError {
     SessionError::Storage(error.to_string())
@@ -109,34 +41,12 @@ pub(super) fn read_lease(
     .optional()
     .map_err(storage)
 }
-fn conflict(id: &str, lease: &SessionLease) -> SessionError {
-    let owner = if lease.identity.owner == "runtime" {
-        "Runtime"
-    } else {
-        &lease.identity.owner
-    };
-    SessionError::InUse(format!(
-        "Session {id} is in use by {owner} {}. Use `loop session attach {id}` instead.",
-        lease.identity.pid
-    ))
-}
-fn lost(id: &str) -> SessionError {
-    SessionError::Invalid(format!(
-        "Session {id} lease ownership was lost; stop writing and cancel work."
-    ))
-}
-
 pub(super) fn check_write(
     conn: &Connection,
     id: &str,
     identity: Option<&LeaseIdentity>,
 ) -> Result<(), SessionError> {
-    match (read_lease(conn, id)?, identity) {
-        (None, None) => Ok(()),
-        (Some(lease), Some(identity)) if &lease.identity == identity => Ok(()),
-        (Some(lease), None) => Err(conflict(id, &lease)),
-        _ => Err(lost(id)),
-    }
+    check_write_rule(read_lease(conn, id)?.as_ref(), id, identity)
 }
 
 impl SqliteSessionStore {
@@ -200,11 +110,7 @@ impl SqliteSessionStore {
         takeover: bool,
         runtime_lock_held: bool,
     ) -> Result<(), SessionError> {
-        if identity.owner.is_empty() || identity.pid == 0 || identity.pid > i32::MAX as u32 {
-            return Err(SessionError::Invalid(
-                "lease requires an owner and a positive process id".into(),
-            ));
-        }
+        check_claimant(identity)?;
         let path = self.path.clone();
         let id = id.to_owned();
         let identity = identity.clone();
@@ -228,13 +134,9 @@ impl SqliteSessionStore {
             if !tx.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)", [&id], |row| row.get::<_, bool>(0)).map_err(storage)? {
                 return Err(SessionError::NotFound(id));
             }
-            if let Some(lease) = read_lease(&tx, &id)? {
-                if lease.identity == identity { return Ok(()); }
-                let reclaim = runtime_lock_held && identity.owner == "runtime" && lease.identity.owner == "runtime";
-                if !takeover || (!reclaim && (
-                    now.saturating_sub(lease.heartbeat_ms) < LEASE_STALE_AFTER_MS
-                    || env.pid_liveness(lease.identity.pid) != PidLiveness::Dead
-                )) { return Err(conflict(&id, &lease)); }
+            let present = read_lease(&tx, &id)?;
+            if judge_claim(&id, present.as_ref(), &identity, takeover, runtime_lock_held, now, env.as_ref())? == Claim::Held {
+                return Ok(());
             }
             tx.execute("INSERT INTO session_leases(session_id, owner, pid, generation, heartbeat_ms) VALUES (?1,?2,?3,?4,?5)
                 ON CONFLICT(session_id) DO UPDATE SET owner=excluded.owner, pid=excluded.pid, generation=excluded.generation, heartbeat_ms=excluded.heartbeat_ms",
@@ -347,11 +249,7 @@ impl SqliteSessionStore {
             };
             let mut swept = 0;
             for (id, lease) in rows {
-                let stale = now.saturating_sub(lease.heartbeat_ms) >= LEASE_STALE_AFTER_MS;
-                if !stale || (lease.identity.owner == "runtime" && !proof) {
-                    continue;
-                }
-                if env.pid_liveness(lease.identity.pid) != PidLiveness::Dead {
+                if !sweepable(&lease, proof, now, env.as_ref()) {
                     continue;
                 }
                 swept += tx
@@ -372,14 +270,6 @@ impl SqliteSessionStore {
         })
         .await
         .map_err(|e| SessionError::Storage(e.to_string()))?
-    }
-}
-
-/// Whether two paths name the same database file.
-fn same_database(a: &std::path::Path, b: &std::path::Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => std::path::absolute(a).ok() == std::path::absolute(b).ok(),
     }
 }
 
@@ -640,5 +530,46 @@ impl SqliteSessionStore {
         let mut store = self.for_lease(identity);
         store.resume_guard = Some(guard);
         store
+    }
+}
+
+/// The lease trait of the Runtime. Each method is the inherent method of the
+/// same name: same SQL, same transactions, same errors.
+#[async_trait::async_trait]
+impl crate::harness::session::lease::SessionLeases for SqliteSessionStore {
+    fn database_path(&self) -> Option<&std::path::Path> {
+        Some(&self.path)
+    }
+    fn for_lease(&self, identity: LeaseIdentity) -> Arc<dyn crate::harness::session::SessionStore> {
+        Arc::new(SqliteSessionStore::for_lease(self, identity))
+    }
+    async fn lease(&self, id: &str) -> Result<Option<SessionLease>, SessionError> {
+        SqliteSessionStore::lease(self, id).await
+    }
+    async fn check_resume(&self, id: &str) -> Result<(), SessionError> {
+        SqliteSessionStore::check_resume(self, id).await
+    }
+    async fn acquire_lease(&self, id: &str, identity: &LeaseIdentity) -> Result<(), SessionError> {
+        SqliteSessionStore::acquire_lease(self, id, identity).await
+    }
+    async fn takeover_lease(
+        &self,
+        id: &str,
+        identity: &LeaseIdentity,
+        runtime_lock_held: bool,
+    ) -> Result<(), SessionError> {
+        SqliteSessionStore::takeover_lease(self, id, identity, runtime_lock_held).await
+    }
+    async fn renew_lease(&self, id: &str, identity: &LeaseIdentity) -> Result<(), SessionError> {
+        SqliteSessionStore::renew_lease(self, id, identity).await
+    }
+    async fn release_lease(&self, id: &str, identity: &LeaseIdentity) -> Result<(), SessionError> {
+        SqliteSessionStore::release_lease(self, id, identity).await
+    }
+    async fn sweep_stale_leases(
+        &self,
+        runtime_lock_for: Option<&std::path::Path>,
+    ) -> Result<usize, SessionError> {
+        SqliteSessionStore::sweep_stale_leases(self, runtime_lock_for).await
     }
 }

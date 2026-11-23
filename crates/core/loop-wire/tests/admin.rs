@@ -59,6 +59,7 @@ fn admin_flags() -> Capabilities {
 struct Fake {
     inner: Arc<NativeBackend>,
     calls: AtomicUsize,
+    lock: Option<loop_protocol::ToolLock>,
 }
 
 #[async_trait]
@@ -193,7 +194,10 @@ impl RuntimeAdmin for Fake {
     }
 
     fn offered(&self) -> Capabilities {
-        admin_flags()
+        Capabilities {
+            tool_lock: self.lock,
+            ..admin_flags()
+        }
     }
     async fn mcp(&self, params: McpParams) -> BackendResult<McpResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -278,21 +282,102 @@ async fn fake() -> Arc<Fake> {
     Arc::new(Fake {
         inner: NativeBackend::new(harness).await,
         calls: AtomicUsize::new(0),
+        lock: None,
     })
 }
 
+#[tokio::test]
+async fn a_tool_lock_is_advertised_and_hides_the_shell_and_workflows() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for authority in [Authority::HostLocal, Authority::Remote] {
+            let mut fake = fake().await;
+            Arc::get_mut(&mut fake).unwrap().lock = Some(loop_protocol::ToolLock::Chat);
+            let remote =
+                RemoteBackend::connect(served(&fake, authority), info("client"), Arc::new(NoHost))
+                    .await
+                    .unwrap();
+            let offered = remote.capabilities();
+            assert_eq!(offered.tool_lock, Some(loop_protocol::ToolLock::Chat));
+            assert!(!offered.local_shell && !offered.workflow);
+            assert!(!offered.host_usage && !offered.host_defaults && !offered.host_providers);
+            // Reads a chat client needs still work.
+            remote
+                .mcp(McpParams {
+                    workspace_id: "w1".into(),
+                    action: AdminAction::List,
+                    name: None,
+                    expected_revision: None,
+                })
+                .await
+                .unwrap();
+        }
+        // Host-only and unknown admin methods are refused with the lock,
+        // before any service runs.
+        let mut locked = fake().await;
+        Arc::get_mut(&mut locked).unwrap().lock = Some(loop_protocol::ToolLock::Chat);
+        let conn = raw(served(&locked, Authority::HostLocal)).await;
+        let before = locked.calls.load(Ordering::SeqCst);
+        for method in [
+            methods::RUNTIME_USAGE,
+            methods::RUNTIME_PROVIDERS,
+            methods::RUNTIME_TRACING,
+            methods::RUNTIME_MCP_AUTH,
+            methods::RUNTIME_DEFAULTS,
+        ] {
+            let refused = conn.request(method, json!({})).await;
+            assert!(
+                matches!(&refused, Err(RpcError::Remote { code, .. })
+                    if *code == loop_protocol::rpc::error_codes::TOOL_LOCKED),
+                "{method}: {refused:?}"
+            );
+        }
+        assert_eq!(locked.calls.load(Ordering::SeqCst), before);
+        let fake = fake().await;
+        let remote = RemoteBackend::connect(
+            served(&fake, Authority::HostLocal),
+            info("client"),
+            Arc::new(NoHost),
+        )
+        .await
+        .unwrap();
+        let offered = remote.capabilities();
+        assert_eq!(offered.tool_lock, None);
+        assert!(offered.workflow, "no lock: the backend's flags stand");
+    })
+    .await
+    .expect("timed out");
+}
+
+/// `fake` served over `authority`. A remote connection is the host's user
+/// with the Runtime token, as the WebSocket acceptor names it: a remote
+/// connection with no caller is served nothing.
 fn served(fake: &Arc<Fake>, authority: Authority) -> loop_wire::Transport {
     let (server_end, client_end) = memory();
-    let _ = serve_with_control(
-        fake.clone(),
-        fake.clone(),
-        server_end,
-        info("server"),
-        ServeOptions {
-            owns_backend: false,
-            authority,
-        },
-    );
+    let options = ServeOptions {
+        owns_backend: false,
+        authority,
+    };
+    match authority {
+        Authority::HostLocal => {
+            let _ = serve_with_control(
+                fake.clone(),
+                fake.clone(),
+                server_end,
+                info("server"),
+                options,
+            );
+        }
+        Authority::Remote => {
+            let _ = loop_wire::server::serve_with_caller(
+                fake.clone(),
+                Some(fake.clone()),
+                server_end,
+                info("server"),
+                options,
+                loop_protocol::Caller::local_token(loop_wire::local_principal()),
+            );
+        }
+    }
     client_end
 }
 
@@ -568,11 +653,13 @@ async fn a_server_without_a_runtime_offers_no_admin() {
         assert!(!remote.capabilities().host_usage);
         let conn = raw({
             let (server_end, client_end) = memory();
-            let _ = loop_wire::server::serve_with_options(
+            let _ = loop_wire::server::serve_with_caller(
                 fake.clone(),
+                None,
                 server_end,
                 info("server"),
                 ServeOptions::default(),
+                loop_protocol::Caller::local_token(loop_wire::local_principal()),
             );
             client_end
         })

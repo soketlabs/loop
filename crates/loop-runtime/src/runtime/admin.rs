@@ -16,6 +16,7 @@ use loop_protocol::admin::*;
 use loop_wire::RuntimeAdmin;
 
 use super::*;
+use crate::access::{Actor, Need};
 
 /// Tools the Runtime adds to its Sessions, kept across a reload.
 const RUNTIME_TOOLS: &[&str] = &[super::subagent::TOOL];
@@ -44,6 +45,14 @@ pub(super) async fn release(generation: Arc<Generation>) {
     if let Some(generation) = Arc::into_inner(generation) {
         generation.released.store(true, Ordering::Release);
         generation.resources.mcp_client.disconnect_all().await;
+        // Nothing uses these resources now and none hands them out again:
+        // their host processes end with them.
+        super::host_cleanup::end_processes(
+            &generation.resources.host_workspace,
+            true,
+            "workspace generation released",
+        )
+        .await;
     }
 }
 
@@ -58,7 +67,7 @@ pub(super) struct PendingSandbox {
     choice: SandboxChoice,
     /// The workspace's shared sandbox when it was chosen, never destroyed
     /// with a Session's own.
-    shared: Option<Arc<dyn loop_agent::harness::Sandbox>>,
+    shared: Option<Arc<dyn loop_agent::harness::sandbox::Workspace>>,
 }
 
 impl PendingSandbox {
@@ -264,11 +273,21 @@ impl Runtime {
 
     /// The workspace an id names: one the Runtime has loaded, or its
     /// startup workspace. Never read as a path.
+    ///
+    /// An outside user names only the folder of a loaded Session it may
+    /// read; any other id is unknown to it, with the same error.
     fn resolve_workspace(&self, id: &str) -> BackendResult<PathBuf> {
-        let mut known: Vec<PathBuf> = self.workspaces.lock().unwrap().keys().cloned().collect();
-        if let Ok(cwd) = self.defaults.cwd.canonicalize() {
-            known.push(cwd);
-        }
+        let known: Vec<PathBuf> = match self.readable_folders(&Actor::current()) {
+            Some(folders) => folders,
+            None => {
+                let mut known: Vec<PathBuf> =
+                    self.workspaces.lock().unwrap().keys().cloned().collect();
+                if let Ok(cwd) = self.defaults.cwd.canonicalize() {
+                    known.push(cwd);
+                }
+                known
+            }
+        };
         known
             .into_iter()
             .find(|cwd| tree::workspace_id(cwd) == id)
@@ -307,6 +326,9 @@ impl Runtime {
         current: &Settings,
         edit: impl FnOnce(&mut WorkspaceOverrides, &Settings),
     ) -> BackendResult<()> {
+        // Every workspace setter writes through here: under a tool lock none
+        // may change what a Session loads.
+        self.refuse_if_locked("changing workspace settings")?;
         let mut store =
             WorkspaceSettingsStore::load(&self.factory.globals.agent_dir).map_err(failed)?;
         let mut overrides = store.get(cwd);
@@ -323,7 +345,7 @@ impl Runtime {
     ) -> BackendResult<(Arc<WorkspaceResources>, u64, Vec<String>, u32)> {
         // Opening Sessions publish under the read side, so none escapes.
         let _publishing = self.reload_gate.write().await;
-        let (fresh, _) = self
+        let (fresh, replaced) = self
             .factory
             .reload_workspace(&self.workspace_opts(cwd))
             .await
@@ -354,11 +376,14 @@ impl Runtime {
             .collect();
         let mut notices: Vec<String> = Vec::new();
         let mut pending = 0;
+        let by = request_caller();
         for live in live {
             let _lifecycle = live.lifecycle.lock().await;
             if live.closing.load(Ordering::Acquire) {
                 continue;
             }
+            // The reload's config changes are this request's.
+            let _claim = live.claim_changes(&by);
             if live.busy.load(Ordering::Acquire) {
                 pending += 1;
                 // A generation it was only going to switch to is not in use.
@@ -389,6 +414,19 @@ impl Runtime {
                 .replace(Arc::clone(&generation));
             if let Some(used) = used {
                 release(used).await;
+            }
+        }
+        // Resources the factory held that no generation of this Runtime
+        // holds (a Session that failed to open); a generation ends its own
+        // host processes when it is released.
+        if let Some(replaced) = replaced {
+            if !Arc::ptr_eq(&replaced, &previous.resources) {
+                super::host_cleanup::end_processes(
+                    &replaced.host_workspace,
+                    true,
+                    "replaced by a reload",
+                )
+                .await;
             }
         }
         release(previous).await;
@@ -492,6 +530,11 @@ impl Runtime {
         workspace: &WorkspaceResources,
         choice: &SandboxChoice,
     ) -> BackendResult<SandboxMode> {
+        // No sandbox process starts under a tool lock, also not to restore
+        // the one a Session chose before.
+        if choice.mode != "off" && choice.mode != "disabled" {
+            self.refuse_if_locked("starting a sandbox")?;
+        }
         use loop_app_core::sandbox_builder::{
             parse_local_sandbox_flags, SandboxBuilder, SandboxRequest,
         };
@@ -537,6 +580,10 @@ impl Runtime {
     /// read-modify-write and the reloads run under the admin lock, so they
     /// never interleave with each other or with a workspace change.
     pub async fn update_defaults(&self, params: DefaultsParams) -> BackendResult<DefaultsResult> {
+        // A change writes the global settings; reading them is fine.
+        if params.patch.is_some() {
+            self.refuse_if_locked("runtime/defaults")?;
+        }
         let _admin = self.admin.lock().await;
         let path = paths::settings_path(&self.factory.globals.agent_dir);
         let mut settings = Settings::load_file(&path).map_err(failed)?;
@@ -601,6 +648,21 @@ impl Runtime {
     }
 }
 
+impl Runtime {
+    /// What `mode` lets a Session do, with the tool lock named when there is
+    /// one: the lock caps every mode.
+    fn effective_policy(&self, mode: loop_app_core::permissions::PermissionMode) -> String {
+        match self.factory.globals.tool_lock() {
+            Some(lock) => format!(
+                "{} The Runtime's `{lock}` tool lock caps it: only reading files in the \
+                 Session's folder and the web tools.",
+                mode.description()
+            ),
+            None => mode.description().into(),
+        }
+    }
+}
+
 #[async_trait]
 impl RuntimeAdmin for Runtime {
     fn offered(&self) -> Capabilities {
@@ -615,6 +677,7 @@ impl RuntimeAdmin for Runtime {
             session_sandbox: true,
             permission_mode: true,
             runtime_sessions: true,
+            tool_lock: self.factory.globals.tool_lock(),
             ..Capabilities::default()
         }
     }
@@ -638,7 +701,16 @@ impl RuntimeAdmin for Runtime {
         })
     }
     async fn sessions(&self) -> BackendResult<RuntimeSessionsResult> {
-        let live: Vec<Arc<LiveSession>> = self.sessions.lock().unwrap().values().cloned().collect();
+        // Only the Sessions this caller may list; the totals count only them.
+        let actor = Actor::current();
+        let live: Vec<Arc<LiveSession>> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|live| Self::may_live(&actor, live, Need::List))
+            .cloned()
+            .collect();
         let mut rows = Vec::with_capacity(live.len());
         let mut totals = RuntimeSessionTotals::default();
         for live in live {
@@ -650,10 +722,17 @@ impl RuntimeAdmin for Runtime {
             } else {
                 "idle"
             };
-            let tokens = SessionStats::stats(self, &live.reference)
-                .await
-                .ok()
-                .map(|s| s.total_tokens);
+            // A row the caller may list but not read (the host's user on
+            // another tenant's Session) shows no model and no tokens.
+            let readable = Self::may_live(&actor, &live, Need::Read);
+            let tokens = if readable {
+                SessionStats::stats(self, &live.reference)
+                    .await
+                    .ok()
+                    .map(|s| s.total_tokens)
+            } else {
+                None
+            };
             totals.sessions += 1;
             totals.busy += u32::from(busy);
             match tokens {
@@ -664,7 +743,9 @@ impl RuntimeAdmin for Runtime {
                 session: live.reference.clone(),
                 workspace_id: tree::workspace_id(&live.opened.workspace.cwd),
                 state: state.into(),
-                model: live.announced.lock().unwrap().latest.config.model.clone(),
+                model: readable
+                    .then(|| live.announced.lock().unwrap().latest.config.model.clone())
+                    .flatten(),
                 tokens,
             });
         }
@@ -679,7 +760,18 @@ impl RuntimeAdmin for Runtime {
     }
 
     async fn mcp(&self, params: McpParams) -> BackendResult<McpResult> {
+        if matches!(params.action, AdminAction::Enable | AdminAction::Disable) {
+            self.refuse_if_locked("workspace/mcp changes")?;
+        }
         let cwd = self.resolve_workspace(&params.workspace_id)?;
+        // A reload changes every Session in the folder (as `reload`).
+        if params.action == AdminAction::Reload && !self.may_change_folder(&Actor::current(), &cwd)
+        {
+            return Err(protocol(format!(
+                "unknown workspace {}",
+                params.workspace_id
+            )));
+        }
         let _admin = self.admin.lock().await;
         let mut pending_sessions = 0;
         let workspace = match params.action {
@@ -718,6 +810,9 @@ impl RuntimeAdmin for Runtime {
     }
 
     async fn web_search(&self, params: WebSearchParams) -> BackendResult<WebSearchResult> {
+        if params.enabled.is_some() || params.provider.is_some() {
+            self.refuse_if_locked("workspace/web_search changes")?;
+        }
         let cwd = self.resolve_workspace(&params.workspace_id)?;
         let _admin = self.admin.lock().await;
         let mut pending_sessions = 0;
@@ -764,6 +859,9 @@ impl RuntimeAdmin for Runtime {
     }
 
     async fn skills(&self, params: SkillsParams) -> BackendResult<SkillsResult> {
+        if matches!(params.action, AdminAction::Enable | AdminAction::Disable) {
+            self.refuse_if_locked("workspace/skills changes")?;
+        }
         let cwd = self.resolve_workspace(&params.workspace_id)?;
         let _admin = self.admin.lock().await;
         let mut pending_sessions = 0;
@@ -844,6 +942,14 @@ impl RuntimeAdmin for Runtime {
 
     async fn reload(&self, params: ReloadParams) -> BackendResult<ReloadResult> {
         let cwd = self.resolve_workspace(&params.workspace_id)?;
+        // A reload changes every Session in the folder: an outside user
+        // reloads only a folder whose loaded Sessions are all its own.
+        if !self.may_change_folder(&Actor::current(), &cwd) {
+            return Err(protocol(format!(
+                "unknown workspace {}",
+                params.workspace_id
+            )));
+        }
         let _admin = self.admin.lock().await;
         self.check_workspace(&cwd, params.expected_revision)?;
         let (_, revision, notices, pending_sessions) = self.reload_workspace(&cwd).await?;
@@ -860,13 +966,16 @@ impl RuntimeAdmin for Runtime {
         let path = paths::trust_path(&self.factory.globals.agent_dir);
         let mut pending_sessions = 0;
         if let Some(trusted) = params.trusted {
+            // A locked Runtime treats every folder as untrusted.
+            self.refuse_if_locked("workspace/trust")?;
             // The wire refuses this without host-local authority.
             self.check_workspace(&cwd, params.expected_revision)?;
             let mut store = TrustStore::load(&path).map_err(failed)?;
             store.set(&cwd, trusted).map_err(failed)?;
             pending_sessions = self.reload_workspace(&cwd).await?.3;
         }
-        let trusted = TrustStore::load(&path).map_err(failed)?.get(&cwd) == Some(true);
+        let trusted = self.factory.globals.tool_lock().is_none()
+            && TrustStore::load(&path).map_err(failed)?.get(&cwd) == Some(true);
         Ok(TrustResult {
             revision: self.workspace_revision(&cwd),
             trusted,
@@ -875,9 +984,16 @@ impl RuntimeAdmin for Runtime {
     }
 
     async fn sandbox(&self, params: SandboxParams) -> BackendResult<SandboxResult> {
+        let need = if params.action == SandboxAction::Set {
+            Need::Write
+        } else {
+            Need::Read
+        };
+        self.check(&params.session, need).await?;
         let live = self.loaded(&params.session).await?;
         let mut mutation = None;
         if params.action == SandboxAction::Set {
+            self.refuse_if_locked("session/sandbox")?;
             let choice = params
                 .config
                 .ok_or_else(|| protocol("give the sandbox config to set"))?;
@@ -925,12 +1041,18 @@ impl RuntimeAdmin for Runtime {
     ) -> BackendResult<PermissionModeResult> {
         use loop_app_core::permissions::PermissionMode;
         let session = &params.session;
+        let need = if params.mode.is_some() {
+            Need::Write
+        } else {
+            Need::Read
+        };
+        self.check(session, need).await?;
         let Some(name) = params.mode else {
             let live = self.loaded(session).await?;
             let mode = live.opened.tool_gate.mode();
             return Ok(PermissionModeResult {
                 mode: mode.as_str().into(),
-                effective_policy: mode.description().into(),
+                effective_policy: self.effective_policy(mode),
                 revision: live.opened.native.revision(),
                 seq: None,
                 pending: false,
@@ -956,7 +1078,7 @@ impl RuntimeAdmin for Runtime {
             .await?;
         Ok(PermissionModeResult {
             mode: mode.as_str().into(),
-            effective_policy: mode.description().into(),
+            effective_policy: self.effective_policy(mode),
             revision: result.revision,
             seq: Some(result.seq),
             pending: false,

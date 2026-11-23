@@ -19,6 +19,9 @@ use crate::harness::utils::sanitize_binary_output;
 /// Local filesystem + shell execution environment.
 pub struct HostExecutionEnv {
     cwd: PathBuf,
+    /// Under a tool lock: the folder every file read must stay in, checked
+    /// on the opened file ([`HostExecutionEnv::confine_reads`]).
+    confined: Option<PathBuf>,
 }
 
 impl HostExecutionEnv {
@@ -26,7 +29,21 @@ impl HostExecutionEnv {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         let cwd = cwd.into();
         let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
-        Self { cwd }
+        Self {
+            cwd,
+            confined: None,
+        }
+    }
+
+    /// Refuse every file read whose opened file is not a regular file with
+    /// one link inside `folder` (resolved now). The check runs on the open
+    /// file, not on its path, so a path that turns into a link to a file
+    /// outside between a caller's check and the open is refused. On a
+    /// platform where Loop cannot name an open file's path, every read is
+    /// refused.
+    pub fn confine_reads(mut self, folder: PathBuf) -> Self {
+        self.confined = Some(std::fs::canonicalize(&folder).unwrap_or(folder));
+        self
     }
 
     /// Create rooted at the process current directory.
@@ -45,6 +62,99 @@ impl HostExecutionEnv {
         };
         FileError::new(code, err.to_string())
     }
+}
+
+/// Read `path` only if the file actually opened is a regular file with one
+/// link inside `folder`.
+async fn read_confined(path: PathBuf, folder: PathBuf) -> Result<Vec<u8>, FileError> {
+    tokio::task::spawn_blocking(move || read_confined_now(&path, &folder))
+        .await
+        .map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))?
+}
+
+fn read_confined_now(path: &Path, folder: &Path) -> Result<Vec<u8>, FileError> {
+    use std::io::Read;
+    let (mut file, meta) = open_confined(path, folder)?;
+    let mut bytes = Vec::with_capacity(meta.len().min(64 * 1024 * 1024) as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(HostExecutionEnv::map_io)?;
+    Ok(bytes)
+}
+
+/// Open `path` for reading only if the file actually opened is a regular
+/// file with one link inside `folder` (the tool lock's rule). Returns the
+/// file and its metadata from `fstat`. Blocking.
+pub(crate) fn open_confined(
+    path: &Path,
+    folder: &Path,
+) -> Result<(std::fs::File, std::fs::Metadata), FileError> {
+    let outside = || {
+        FileError::new(
+            FileErrorCode::PermissionDenied,
+            format!(
+                "{} is outside this Session's folder, or is a link: the tool lock refuses it",
+                path.display()
+            ),
+        )
+    };
+    // Check before the open: a device or a FIFO is not opened at all.
+    if std::fs::metadata(path).is_ok_and(|m| !m.is_file()) {
+        return Err(outside());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A FIFO or device must not block the read.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(HostExecutionEnv::map_io)?;
+    let meta = file.metadata().map_err(HostExecutionEnv::map_io)?;
+    if !meta.is_file() {
+        return Err(outside());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            return Err(outside());
+        }
+    }
+    match opened_path(&file) {
+        Some(real) if real.starts_with(folder) => {}
+        _ => return Err(outside()),
+    }
+    Ok((file, meta))
+}
+
+/// The path of the file `file` has open, as the kernel names it.
+#[cfg(target_os = "macos")]
+pub(crate) fn opened_path(file: &std::fs::File) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::AsRawFd;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize + 1];
+    // SAFETY: `buf` holds PATH_MAX + 1 bytes, as F_GETPATH needs, and the
+    // descriptor stays open for the call.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+    if rc == -1 {
+        return None;
+    }
+    let len = buf.iter().position(|b| *b == 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+}
+
+/// The path of the file `file` has open, as the kernel names it.
+#[cfg(target_os = "linux")]
+pub(crate) fn opened_path(file: &std::fs::File) -> Option<PathBuf> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+}
+
+/// Loop cannot name an open file's path here, so a confined read fails.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn opened_path(_file: &std::fs::File) -> Option<PathBuf> {
+    None
 }
 
 #[async_trait]
@@ -67,11 +177,20 @@ impl FileSystem for HostExecutionEnv {
 
     async fn read_text_file(&self, path: &Path) -> Result<String, FileError> {
         let path = self.absolute_path(path)?;
+        if let Some(folder) = &self.confined {
+            let bytes = read_confined(path, folder.clone()).await?;
+            return String::from_utf8(bytes).map_err(|_| {
+                FileError::new(FileErrorCode::Io, "stream did not contain valid UTF-8")
+            });
+        }
         tokio::fs::read_to_string(&path).await.map_err(Self::map_io)
     }
 
     async fn read_binary_file(&self, path: &Path) -> Result<Vec<u8>, FileError> {
         let path = self.absolute_path(path)?;
+        if let Some(folder) = &self.confined {
+            return read_confined(path, folder.clone()).await;
+        }
         tokio::fs::read(&path).await.map_err(Self::map_io)
     }
 
@@ -99,7 +218,10 @@ impl FileSystem for HostExecutionEnv {
             .open(&path)
             .await
             .map_err(Self::map_io)?;
-        file.write_all(data).await.map_err(Self::map_io)
+        file.write_all(data).await.map_err(Self::map_io)?;
+        // A tokio file hands the bytes to a blocking task. Without a flush,
+        // the call can return before the bytes are in the file.
+        file.flush().await.map_err(Self::map_io)
     }
 
     async fn file_info(&self, path: &Path) -> Result<FileInfo, FileError> {
@@ -118,13 +240,29 @@ impl FileSystem for HostExecutionEnv {
         let mut rd = tokio::fs::read_dir(&path).await.map_err(Self::map_io)?;
         let mut out = Vec::new();
         while let Some(entry) = rd.next_entry().await.map_err(Self::map_io)? {
-            let meta = entry.metadata().await.map_err(Self::map_io)?;
-            out.push(FileInfo {
-                path: entry.path(),
-                is_dir: meta.is_dir(),
-                is_file: meta.is_file(),
-                size: meta.len(),
-            });
+            match entry.metadata().await {
+                Ok(meta) => out.push(FileInfo {
+                    path: entry.path(),
+                    is_dir: meta.is_dir(),
+                    is_file: meta.is_file(),
+                    size: meta.len(),
+                }),
+                // Removed between the listing and the stat: not there.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // One entry whose metadata cannot be read (a folder without
+                // search permission) does not fail the listing: it is listed
+                // with the kind its directory entry gives and size 0, as
+                // `ls -l` shows such an entry with unknown details.
+                Err(_) => {
+                    let kind = entry.file_type().await.ok();
+                    out.push(FileInfo {
+                        path: entry.path(),
+                        is_dir: kind.is_some_and(|k| k.is_dir()),
+                        is_file: kind.is_some_and(|k| k.is_file()),
+                        size: 0,
+                    });
+                }
+            }
         }
         Ok(out)
     }
@@ -167,6 +305,64 @@ impl FileSystem for HostExecutionEnv {
             .then(|| crate::harness::types::FileIdentity::from_metadata(&meta)))
     }
 
+    async fn symlink_metadata(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PathMetadata, FileError> {
+        let path = self.absolute_path(path)?;
+        let meta = tokio::fs::symlink_metadata(&path)
+            .await
+            .map_err(Self::map_io)?;
+        Ok(path_metadata(&meta))
+    }
+
+    async fn read_link(&self, path: &Path) -> Result<PathBuf, FileError> {
+        let path = self.absolute_path(path)?;
+        tokio::fs::read_link(&path).await.map_err(Self::map_io)
+    }
+
+    async fn resolve_for_policy(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PolicyPath, FileError> {
+        let absolute = loop_workspace::lexical(&self.absolute_path(path)?);
+        // Walk the components with lstat: any link on the way is reported.
+        let mut has_link = false;
+        let mut prefix = PathBuf::new();
+        for component in absolute.components() {
+            prefix.push(component.as_os_str());
+            match tokio::fs::symlink_metadata(&prefix).await {
+                Ok(meta) if meta.file_type().is_symlink() => has_link = true,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(Self::map_io(e)),
+            }
+        }
+        match tokio::fs::canonicalize(&absolute).await {
+            Ok(resolved) => {
+                let meta = tokio::fs::metadata(&resolved).await.map_err(Self::map_io)?;
+                let info = path_metadata(&meta);
+                Ok(crate::harness::types::PolicyPath {
+                    resolved,
+                    exists: true,
+                    has_link,
+                    uid: info.uid,
+                    nlink: info.nlink,
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(crate::harness::types::PolicyPath {
+                    resolved: absolute,
+                    exists: false,
+                    has_link,
+                    uid: None,
+                    nlink: None,
+                })
+            }
+            Err(e) => Err(Self::map_io(e)),
+        }
+    }
+
     async fn create_temp_dir(&self, prefix: &str) -> Result<PathBuf, FileError> {
         let base = std::env::temp_dir();
         let name = format!("{prefix}-{}", loop_ai::new_id());
@@ -175,6 +371,39 @@ impl FileSystem for HostExecutionEnv {
             .await
             .map_err(Self::map_io)?;
         Ok(path)
+    }
+}
+
+/// Gate facts of `meta` (from `lstat` or `stat`): kind, size, owner, link
+/// count and permission bits.
+pub(crate) fn path_metadata(meta: &std::fs::Metadata) -> crate::harness::types::PathMetadata {
+    use crate::harness::types::{PathKind, PathMetadata};
+    let kind = if meta.file_type().is_symlink() {
+        PathKind::Symlink
+    } else if meta.is_file() {
+        PathKind::File
+    } else if meta.is_dir() {
+        PathKind::Dir
+    } else {
+        PathKind::Other
+    };
+    #[cfg(unix)]
+    let (uid, nlink, mode) = {
+        use std::os::unix::fs::MetadataExt;
+        (
+            Some(meta.uid()),
+            Some(meta.nlink()),
+            Some(meta.mode() & 0o7777),
+        )
+    };
+    #[cfg(not(unix))]
+    let (uid, nlink, mode) = (None, None, None);
+    PathMetadata {
+        kind,
+        size: meta.len(),
+        uid,
+        nlink,
+        mode,
     }
 }
 
@@ -198,6 +427,9 @@ impl Shell for HostExecutionEnv {
         }
         if let Some(env) = &options.env {
             cmd.envs(env);
+        }
+        for name in &options.remove_env {
+            cmd.env_remove(name);
         }
         exec_command(cmd, options, false, None).await
     }
@@ -561,5 +793,92 @@ mod tests {
     async fn commands_do_not_read_loops_stdin() {
         let out = run("cat; echo end", Some(5_000), None).await.unwrap();
         assert_eq!(out.stdout.trim(), "end");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod list_tests {
+    use super::*;
+
+    /// In a folder that can be read but not searched, every `stat` fails.
+    /// The listing still names each entry, with the kind from the entry
+    /// and size 0, instead of failing as a whole.
+    #[tokio::test]
+    async fn an_entry_without_metadata_does_not_fail_the_listing() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no arguments or preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores the permission bits
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir_all(locked.join("child")).unwrap();
+        std::fs::write(locked.join("file.txt"), "12345").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let env = HostExecutionEnv::new(dir.path());
+        let listed = env.list_dir(&locked).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut listed: Vec<_> = listed
+            .expect("the listing must not fail")
+            .into_iter()
+            .map(|i| {
+                (
+                    i.path.file_name().unwrap().to_string_lossy().into_owned(),
+                    i.is_dir,
+                    i.size,
+                )
+            })
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed,
+            [
+                ("child".to_owned(), true, 0),
+                ("file.txt".to_owned(), false, 0)
+            ]
+        );
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod confined_tests {
+    use super::*;
+
+    /// The check runs on the opened file: a link out, a hard link and a
+    /// FIFO are refused even when nothing checked the path first.
+    #[tokio::test]
+    async fn a_confined_read_checks_the_opened_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let ws = base.join("ws");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::write(ws.join("own.txt"), "OWN").unwrap();
+        std::fs::write(base.join("secret.txt"), "SECRET").unwrap();
+        std::os::unix::fs::symlink(base.join("secret.txt"), ws.join("link.txt")).unwrap();
+        std::fs::hard_link(base.join("secret.txt"), ws.join("hard.txt")).unwrap();
+        let env = HostExecutionEnv::new(&ws).confine_reads(ws.clone());
+        assert_eq!(
+            env.read_text_file(Path::new("own.txt")).await.unwrap(),
+            "OWN"
+        );
+        for path in ["link.txt", "hard.txt", "../secret.txt", "sub"] {
+            let error = env.read_binary_file(Path::new(path)).await.unwrap_err();
+            assert_ne!(error.code, FileErrorCode::NotFound, "{path}: {error:?}");
+        }
+        // The folder swapped for a link after the env was made.
+        std::fs::rename(ws.join("sub"), base.join("sub-old")).unwrap();
+        std::fs::create_dir_all(base.join("bob")).unwrap();
+        std::fs::write(base.join("bob/diary.txt"), "BOB").unwrap();
+        std::os::unix::fs::symlink(base.join("bob"), ws.join("sub")).unwrap();
+        assert!(env
+            .read_text_file(Path::new("sub/diary.txt"))
+            .await
+            .is_err());
+        // Unconfined, the same reads work.
+        let open = HostExecutionEnv::new(&ws);
+        assert_eq!(
+            open.read_text_file(Path::new("link.txt")).await.unwrap(),
+            "SECRET"
+        );
     }
 }

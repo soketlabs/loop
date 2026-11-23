@@ -15,7 +15,7 @@ use std::{
 
 fn denied() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied,
-        "Runtime token requires a user-owned 0700 directory and a regular user-owned 0600 file without links")
+        "a token file requires a user-owned 0700 directory and a regular user-owned 0600 file without links")
 }
 
 fn directory(path: &Path) -> io::Result<File> {
@@ -95,14 +95,14 @@ pub fn read(path: &Path) -> io::Result<String> {
     if token.len() > 4096 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Runtime token file is too large",
+            "token file is too large",
         ));
     }
     let token = token.trim();
     if token.is_empty() || token.len() > 4096 || !token.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid Runtime token file",
+            "invalid token file",
         ));
     }
     Ok(token.to_owned())

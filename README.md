@@ -31,6 +31,8 @@ loop is a **developer preview (alpha)**. Settings, session files and CLI flags c
 | **loop-acp** | [`crates/extend/loop-acp`](crates/extend/loop-acp) | Run any Agent Client Protocol agent (Codex, Claude, Gemini, …) as a backend |
 | **loop-dashboard** | [`crates/extend/loop-dashboard`](crates/extend/loop-dashboard) | Terminal usage view (`/usage`, `loop usage`) built from the anonymous usage log |
 
+The desktop app is developed in a separate repository. It builds on the crates above.
+
 ## Quick start
 
 Install the CLI from GitHub Releases:

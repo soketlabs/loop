@@ -19,7 +19,14 @@ use serde_json::json;
 use tokio::sync::broadcast;
 
 async fn backend(responses: Vec<FauxResponse>, tools: Vec<AgentTool>) -> Arc<NativeBackend> {
-    NativeBackend::new(harness(responses, tools).await).await
+    let backend = NativeBackend::new(harness(responses, tools).await).await;
+    backend.set_command_gate(allow_all());
+    backend
+}
+
+/// A Policy gate that lets every user command run.
+fn allow_all() -> loop_agent::native_backend::CommandGate {
+    Arc::new(|_| Box::pin(async { Ok(()) }))
 }
 
 async fn harness(responses: Vec<FauxResponse>, tools: Vec<AgentTool>) -> Arc<AgentHarness> {
@@ -452,6 +459,104 @@ async fn a_user_command_defaults_to_the_bash_maximum() {
         .await
         .unwrap_err();
     assert!(refused.to_string().contains("30000"), "{refused}");
+}
+
+/// A user command passes the Policy gate before it runs. The gate sees the
+/// Session and the command; a refusal stops it, and a backend with no gate
+/// refuses every command (fail closed).
+#[tokio::test]
+async fn a_user_command_passes_the_policy_gate_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let command = format!("touch {}", marker.display());
+    let harness = harness(Vec::new(), Vec::new()).await;
+    let ungated = NativeBackend::new(Arc::clone(&harness)).await;
+    let session = ungated.current_session().await;
+    let refused = ungated
+        .local_shell()
+        .unwrap()
+        .run(&session, &command, None)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("no permission gate"),
+        "{refused}"
+    );
+    assert!(!marker.exists());
+
+    let backend = NativeBackend::new(Arc::clone(&harness)).await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let gate_seen = Arc::clone(&seen);
+    backend.set_command_gate(Arc::new(move |command| {
+        let refuse = command.command.contains("touch");
+        gate_seen.lock().unwrap().push(command);
+        Box::pin(async move {
+            if refuse {
+                Err(loop_agent::native_backend::CommandRefused(
+                    "Tool `bash` is denied by settings.toolPermissions".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }));
+    // A second gate does not replace the first.
+    backend.set_command_gate(allow_all());
+    let refused = backend
+        .local_shell()
+        .unwrap()
+        .run(&session, &command, None)
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("denied"), "{refused}");
+    assert!(!marker.exists(), "a refused command ran");
+    let ran = backend
+        .run_as(&session, "echo ok", None, None)
+        .await
+        .unwrap();
+    assert_eq!(ran.stdout.trim(), "ok");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].session, session.key);
+    assert_eq!(seen[1].command, "echo ok");
+    assert!(seen[0].caller.is_none(), "an in-process call has no caller");
+}
+
+#[tokio::test]
+async fn a_tool_lock_refuses_user_commands_and_cannot_be_lifted() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let command = format!("touch {}", marker.display());
+    let backend = backend(Vec::new(), Vec::new()).await;
+    let session = backend.current_session().await;
+    // Control: without a lock the command runs.
+    let ran = backend
+        .local_shell()
+        .unwrap()
+        .run(&session, &command, None)
+        .await
+        .unwrap();
+    assert_eq!(ran.exit_code, 0);
+    assert!(marker.exists());
+    std::fs::remove_file(&marker).unwrap();
+
+    backend.lock_tools(loop_protocol::ToolLock::Chat);
+    // A second, different lock does not replace the first.
+    backend.lock_tools(loop_protocol::ToolLock::Unknown);
+    assert_eq!(backend.tool_lock(), Some(loop_protocol::ToolLock::Chat));
+    let locked = BackendError::ToolLocked {
+        what: "session/shell".into(),
+        lock: loop_protocol::ToolLock::Chat,
+    };
+    assert_eq!(backend.shell_timeout(None).unwrap_err(), locked);
+    let refused = backend
+        .local_shell()
+        .unwrap()
+        .run(&session, &command, None)
+        .await
+        .unwrap_err();
+    assert_eq!(refused, locked);
+    assert!(!marker.exists(), "the command ran under the lock");
 }
 
 /// A cancel after the turn's end, while its tree writes are pending, still

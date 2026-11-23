@@ -12,6 +12,7 @@ use crate::harness::env::HostExecutionEnv;
 use crate::harness::sandbox::podman::{
     PodmanClient, PodmanExecOpts, PodmanRunOpts, RealPodmanClient,
 };
+use crate::harness::sandbox::protect::{self, ProtectedMounts};
 use crate::harness::sandbox::traits::{
     Sandbox, SandboxConfig, SandboxError, SandboxFactory, SandboxInfo, SandboxStatus,
 };
@@ -115,9 +116,16 @@ pub struct KrunSandbox {
     cpus: String,
     ram_mib: String,
     client: Arc<dyn PodmanClient>,
+    /// Loop's agent directory, write-protected when it lies in the project.
+    agent_dir: Option<PathBuf>,
+    /// The write-protected paths of the running container, and their stubs.
+    protected: parking_lot::Mutex<Option<ProtectedMounts>>,
     status: RwLock<SandboxStatus>,
     container_id: RwLock<Option<String>>,
     env: RwLock<Option<Arc<dyn ExecutionEnv>>>,
+    /// Set by [`Sandbox::destroy`]: a start still in progress removes the
+    /// container it gets, and a later start is refused.
+    destroyed: std::sync::atomic::AtomicBool,
 }
 
 impl KrunSandbox {
@@ -172,6 +180,12 @@ impl KrunSandbox {
             config.workdir
         };
         let workdir = std::fs::canonicalize(&workdir).unwrap_or(workdir);
+        let agent_dir = config
+            .options
+            .get("agentDir")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
         Self {
             id: loop_ai::new_id(),
             workdir,
@@ -181,10 +195,52 @@ impl KrunSandbox {
             cpus,
             ram_mib,
             client,
+            agent_dir,
+            protected: parking_lot::Mutex::new(None),
             status: RwLock::new(SandboxStatus::Created),
             container_id: RwLock::new(None),
             env: RwLock::new(None),
+            destroyed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn is_destroyed(&self) -> bool {
+        self.destroyed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Release the protected paths of container `id` (`None`: no container
+    /// was made). Only when the container is gone: its mounts hold the
+    /// placeholders. A container that is still there keeps them, and a
+    /// later start of the project removes them.
+    async fn release_protected(&self, id: Option<&str>) {
+        let Some(protected) = self.protected.lock().take() else {
+            return;
+        };
+        let gone = match id {
+            None => true,
+            Some(id) => self.container_gone(id).await,
+        };
+        if !gone {
+            tracing::warn!(
+                container = id,
+                "sandbox: container still exists; keeping its placeholders"
+            );
+            protected.abandon();
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(move || protected.release()).await;
+    }
+
+    /// Whether container `id` no longer exists, waiting a few seconds for a
+    /// removal that `--rm` finishes after the stop returns.
+    async fn container_gone(&self, id: &str) -> bool {
+        for _ in 0..20 {
+            if let Ok(false) = self.client.exists(id).await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        false
     }
 
     /// Host workdir bind-mounted into the guest.
@@ -216,6 +272,27 @@ impl KrunSandbox {
             }),
             labels: Default::default(),
         }
+    }
+}
+
+#[async_trait]
+impl loop_workspace::Workspace for KrunSandbox {
+    fn driver_id(&self) -> &str {
+        super::drivers::PODMAN_DRIVER_ID
+    }
+    fn capabilities(&self) -> loop_workspace::WorkspaceCapabilities {
+        super::drivers::podman_capabilities(
+            &SandboxConfig {
+                workdir: self.workdir.clone(),
+                options: json!({
+                    "isolation": self.isolation.as_str(),
+                    "cpus": self.cpus,
+                    "ram_mib": self.ram_mib,
+                }),
+                labels: Default::default(),
+            }
+            .into(),
+        )
     }
 }
 
@@ -266,6 +343,9 @@ impl Sandbox for KrunSandbox {
         if *self.status.read() == SandboxStatus::Ready {
             return Ok(());
         }
+        if self.is_destroyed() {
+            return Err(SandboxError::NotReady("sandbox was removed".into()));
+        }
         *self.status.write() = SandboxStatus::Starting;
 
         self.client.preflight(&self.runtime).await?;
@@ -276,7 +356,26 @@ impl Sandbox for KrunSandbox {
         // Mount at the same absolute path inside the guest so host and container
         // paths match (e.g. `/home/u/proj/README.md` → `/home/u/proj/README.md`).
         let guest_workdir = self.workdir.to_string_lossy().into_owned();
-        let container_id = self
+        let (workdir, agent) = (self.workdir.clone(), self.agent_dir.clone());
+        let planned =
+            tokio::task::spawn_blocking(move || protect::plan(&workdir, agent.as_deref()))
+                .await
+                .map_err(|e| SandboxError::StartFailed(format!("sandbox: {e}")))
+                .and_then(|r| r);
+        let protected = planned.inspect_err(|_| {
+            *self.status.write() = SandboxStatus::Failed;
+        })?;
+        let binds = protected.binds.clone();
+        let git_entries = Arc::new(protected.git_entries().clone());
+        let read_only: Vec<PathBuf> = binds
+            .iter()
+            .filter(|b| b.read_only)
+            .map(|b| b.path.clone())
+            .collect();
+        if let Some(old) = self.protected.lock().replace(protected) {
+            old.abandon();
+        }
+        let run = self
             .client
             .run(PodmanRunOpts {
                 name,
@@ -286,18 +385,38 @@ impl Sandbox for KrunSandbox {
                 runtime: self.runtime.clone(),
                 cpus: self.cpus.clone(),
                 ram_mib: self.ram_mib.clone(),
+                binds,
             })
-            .await
-            .inspect_err(|_e| {
+            .await;
+        let container_id = match run {
+            Ok(id) => id,
+            Err(e) => {
                 *self.status.write() = SandboxStatus::Failed;
-            })?;
+                self.release_protected(None).await;
+                return Err(e);
+            }
+        };
+        // Destroyed while `podman run` ran (an exit during an image pull):
+        // nothing else will remove this container.
+        if self.is_destroyed() {
+            let _ = self.client.rm(&container_id).await;
+            self.release_protected(Some(&container_id)).await;
+            *self.status.write() = SandboxStatus::Stopped;
+            return Err(SandboxError::NotReady(
+                "sandbox was removed while it started".into(),
+            ));
+        }
 
-        let env: Arc<dyn ExecutionEnv> = Arc::new(KrunExecutionEnv::new(
-            Arc::clone(&self.client),
-            container_id.clone(),
-            self.workdir.clone(),
-            self.isolation,
-        ));
+        let env: Arc<dyn ExecutionEnv> = Arc::new(
+            KrunExecutionEnv::new(
+                Arc::clone(&self.client),
+                container_id.clone(),
+                self.workdir.clone(),
+                self.isolation,
+            )
+            .with_protected(self.agent_dir.clone(), read_only)
+            .with_git_entries(git_entries),
+        );
 
         *self.container_id.write() = Some(container_id);
         *self.env.write() = Some(env);
@@ -305,24 +424,33 @@ impl Sandbox for KrunSandbox {
         Ok(())
     }
 
+    fn outlives_process(&self) -> bool {
+        true
+    }
+
     async fn stop(&self) -> Result<(), SandboxError> {
         *self.status.write() = SandboxStatus::Stopping;
         *self.env.write() = None;
         let id = self.container_id.write().take();
-        if let Some(id) = id {
-            let _ = self.client.stop(&id).await;
+        if let Some(id) = &id {
+            let _ = self.client.stop(id).await;
         }
+        self.release_protected(id.as_deref()).await;
         *self.status.write() = SandboxStatus::Stopped;
         Ok(())
     }
 
     async fn destroy(&self) -> Result<(), SandboxError> {
+        self.destroyed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         *self.env.write() = None;
         let id = self.container_id.write().take();
-        if let Some(id) = id {
-            let _ = self.client.stop(&id).await;
-            let _ = self.client.rm(&id).await;
+        if let Some(id) = &id {
+            // A forced remove stops the container at once; a graceful stop
+            // first only waits for its timeout, which slows every exit.
+            let _ = self.client.rm(id).await;
         }
+        self.release_protected(id.as_deref()).await;
         *self.status.write() = SandboxStatus::Stopped;
         Ok(())
     }
@@ -337,6 +465,16 @@ pub struct KrunExecutionEnv {
     isolation: KrunIsolation,
     /// Present when isolation is Partial.
     host_fs: Option<JailedHostFs>,
+    /// Loop's agent directory, write-protected for file tools.
+    agent_dir: Option<PathBuf>,
+    /// Paths mounted read-only in the container; file tools may not write
+    /// below them either.
+    read_only: Vec<PathBuf>,
+    /// `.git` entries in the project at the start; a shell command that
+    /// adds one gets a warning.
+    git_entries: Option<Arc<std::collections::BTreeSet<PathBuf>>>,
+    /// New `.git` entries already warned about (once each).
+    warned: parking_lot::Mutex<std::collections::BTreeSet<PathBuf>>,
 }
 
 impl KrunExecutionEnv {
@@ -360,7 +498,34 @@ impl KrunExecutionEnv {
             host_workdir,
             isolation,
             host_fs,
+            agent_dir: None,
+            read_only: Vec::new(),
+            git_entries: None,
+            warned: Default::default(),
         }
+    }
+
+    /// Warn after a shell command that adds a `.git` entry to the project
+    /// (one not in `entries`).
+    pub fn with_git_entries(mut self, entries: Arc<std::collections::BTreeSet<PathBuf>>) -> Self {
+        self.git_entries = Some(entries);
+        self
+    }
+
+    /// Also refuse file-tool writes to `agent_dir` and below the paths the
+    /// container mounts read-only.
+    pub fn with_protected(mut self, agent_dir: Option<PathBuf>, read_only: Vec<PathBuf>) -> Self {
+        self.agent_dir = agent_dir;
+        self.read_only = read_only;
+        self
+    }
+
+    /// Refuse a file-tool write, creation or removal of a write-protected
+    /// path ([`protect::write_denied`]) on the host, before either isolation
+    /// touches it.
+    fn check_write(&self, path: &Path) -> Result<(), FileError> {
+        protect::write_denied(&self.host_workdir, self.agent_dir.as_deref(), path)?;
+        protect::under_read_only(&self.host_workdir, &self.read_only, path)
     }
 
     /// Resolve a tool path to the absolute path used inside the guest.
@@ -522,6 +687,7 @@ impl FileSystem for KrunExecutionEnv {
     }
 
     async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
+        self.check_write(path)?;
         if let Some(fs) = &self.host_fs {
             return fs.write_file(path, data).await;
         }
@@ -550,6 +716,7 @@ impl FileSystem for KrunExecutionEnv {
     }
 
     async fn append_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
+        self.check_write(path)?;
         if let Some(fs) = &self.host_fs {
             return fs.append_file(path, data).await;
         }
@@ -670,6 +837,7 @@ impl FileSystem for KrunExecutionEnv {
     }
 
     async fn create_dir(&self, path: &Path) -> Result<(), FileError> {
+        self.check_write(path)?;
         if let Some(fs) = &self.host_fs {
             return fs.create_dir(path).await;
         }
@@ -692,6 +860,8 @@ impl FileSystem for KrunExecutionEnv {
     }
 
     async fn remove(&self, path: &Path) -> Result<(), FileError> {
+        protect::remove_denied(&self.host_workdir, self.agent_dir.as_deref(), path)?;
+        protect::under_read_only(&self.host_workdir, &self.read_only, path)?;
         if let Some(fs) = &self.host_fs {
             return fs.remove(path).await;
         }
@@ -773,6 +943,132 @@ impl FileSystem for KrunExecutionEnv {
             _ => Ok(None),
         }
     }
+
+    async fn symlink_metadata(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PathMetadata, FileError> {
+        use crate::harness::types::{PathKind, PathMetadata};
+        if let Some(fs) = &self.host_fs {
+            return fs.symlink_metadata(path).await;
+        }
+        // `stat` without `-L` describes a final link itself (lstat). GNU
+        // `stat -c` in the guest; BSD `stat -f` for a guest without it.
+        let guest = self.guest_path(path)?;
+        let script = format!(
+            "p={p}; if [ -L \"$p\" ]; then k=l; elif [ -d \"$p\" ]; then k=d; \
+             elif [ -f \"$p\" ]; then k=f; elif [ -e \"$p\" ]; then k=o; \
+             else echo MISSING; exit 0; fi; printf '%s ' \"$k\"; \
+             stat -c '%s %u %h %a' -- \"$p\" 2>/dev/null || stat -f '%z %u %l %Lp' -- \"$p\"",
+            p = sh_quote(&guest.to_string_lossy())
+        );
+        let out = self
+            .exec_sh(&script, None, None)
+            .await
+            .map_err(map_exec_file)?;
+        let line = out.stdout.trim();
+        if line == "MISSING" {
+            return Err(FileError::new(
+                FileErrorCode::NotFound,
+                format!("not found: {}", path.display()),
+            ));
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [kind, size, uid, nlink, mode] = fields.as_slice() else {
+            return Err(FileError::new(
+                FileErrorCode::Io,
+                format!("unexpected stat output for {}: {line:?}", path.display()),
+            ));
+        };
+        Ok(PathMetadata {
+            kind: match *kind {
+                "l" => PathKind::Symlink,
+                "d" => PathKind::Dir,
+                "f" => PathKind::File,
+                _ => PathKind::Other,
+            },
+            size: size.parse().unwrap_or(0),
+            uid: uid.parse().ok(),
+            nlink: nlink.parse().ok(),
+            mode: u32::from_str_radix(mode, 8).ok().map(|m| m & 0o7777),
+        })
+    }
+
+    async fn read_link(&self, path: &Path) -> Result<PathBuf, FileError> {
+        if let Some(fs) = &self.host_fs {
+            return fs.read_link(path).await;
+        }
+        let guest = self.guest_path(path)?;
+        let script = format!(
+            "p={p}; if [ -L \"$p\" ]; then printf L; readlink -- \"$p\"; \
+             elif [ -e \"$p\" ]; then printf N; else printf M; fi",
+            p = sh_quote(&guest.to_string_lossy())
+        );
+        let out = self
+            .exec_sh(&script, None, None)
+            .await
+            .map_err(map_exec_file)?;
+        let text = out.stdout.strip_suffix('\n').unwrap_or(&out.stdout);
+        match text.split_at_checked(1) {
+            Some(("L", target)) if out.exit_code == 0 => Ok(PathBuf::from(target)),
+            Some(("N", _)) => Err(FileError::new(
+                FileErrorCode::InvalidPath,
+                format!("not a link: {}", path.display()),
+            )),
+            Some(("M", _)) => Err(FileError::new(
+                FileErrorCode::NotFound,
+                format!("not found: {}", path.display()),
+            )),
+            _ => Err(FileError::new(
+                FileErrorCode::Io,
+                format!("readlink {}: {}", path.display(), out.stderr.trim()),
+            )),
+        }
+    }
+
+    async fn resolve_for_policy(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PolicyPath, FileError> {
+        if let Some(fs) = &self.host_fs {
+            return fs.resolve_for_policy(path).await;
+        }
+        // `guest_path` refuses `..`, so the lexical path is the path.
+        let guest = self.guest_path(path)?;
+        let script = format!(
+            "p={p}; if r=$(readlink -f -- \"$p\" 2>/dev/null) && [ -e \"$r\" ]; then e=1; \
+             else r=\"$p\"; e=0; fi; l=0; q=; IFS=/; set -f; \
+             for c in $p; do [ -z \"$c\" ] && continue; q=\"$q/$c\"; \
+             if [ -L \"$q\" ]; then l=1; fi; [ -e \"$q\" ] || [ -L \"$q\" ] || break; done; \
+             unset IFS; echo \"$e $l\"; if [ $e = 1 ]; then \
+             stat -L -c '%u %h' -- \"$r\" 2>/dev/null || stat -L -f '%u %l' -- \"$r\"; \
+             else echo '- -'; fi; printf '%s' \"$r\"",
+            p = sh_quote(&guest.to_string_lossy())
+        );
+        let out = self
+            .exec_sh(&script, None, None)
+            .await
+            .map_err(map_exec_file)?;
+        let mut lines = out.stdout.splitn(3, '\n');
+        let (Some(flags), Some(owner), Some(resolved)) = (lines.next(), lines.next(), lines.next())
+        else {
+            return Err(FileError::new(
+                FileErrorCode::Io,
+                format!("resolve {}: {}", path.display(), out.stderr.trim()),
+            ));
+        };
+        let mut flags = flags.split_whitespace();
+        let exists = flags.next() == Some("1");
+        let has_link = flags.next() == Some("1");
+        let mut owner = owner.split_whitespace();
+        Ok(crate::harness::types::PolicyPath {
+            resolved: PathBuf::from(resolved),
+            exists,
+            has_link,
+            uid: owner.next().and_then(|v| v.parse().ok()),
+            nlink: owner.next().and_then(|v| v.parse().ok()),
+        })
+    }
 }
 
 #[async_trait]
@@ -787,14 +1083,43 @@ impl Shell for KrunExecutionEnv {
         options: ShellExecOptions,
     ) -> Result<ShellOutput, ExecutionError> {
         let workdir = self.guest_cwd(&options)?;
-        self.exec_argv(
-            vec!["sh".into(), "-c".into(), command.to_string()],
-            Some(workdir),
-            None,
-            options.timeout_ms,
-            options.cancel,
-        )
-        .await
+        let mut out = self
+            .exec_argv(
+                vec!["sh".into(), "-c".into(), command.to_string()],
+                Some(workdir),
+                None,
+                options.timeout_ms,
+                options.cancel,
+            )
+            .await?;
+        if let Some(before) = &self.git_entries {
+            let project = self.host_workdir.clone();
+            let scan = tokio::task::spawn_blocking(move || protect::scan_git_entries(&project));
+            if let Ok((now, complete)) = scan.await {
+                let added: Vec<_> = {
+                    let mut warned = self.warned.lock();
+                    now.into_iter()
+                        .filter(|p| !before.contains(p))
+                        .filter(|p| warned.insert(p.clone()))
+                        .collect()
+                };
+                if !complete {
+                    tracing::debug!("sandbox: the .git scan of the project stopped early");
+                }
+                if !added.is_empty() {
+                    let list: Vec<String> = added.iter().map(|p| p.display().to_string()).collect();
+                    tracing::warn!(entries = ?list, "sandbox: a command made a git repository in the project");
+                    out.stderr.push_str(&format!(
+                        "\nwarning: this sandbox has created {} in the project: {}. Its hooks and \
+                         config are not write-protected, and git on the host runs them when it works \
+                         in that repository (also through a gitlink in the parent repository).\n",
+                        if added.len() == 1 { "a git repository" } else { "git repositories" },
+                        list.join(", ")
+                    ));
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -813,15 +1138,130 @@ impl JailedHostFs {
                 "path escape (..) rejected",
             ));
         }
-        let root = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
-        let canon = std::fs::canonicalize(&abs).unwrap_or(abs.clone());
-        if !canon.starts_with(&root) && !abs.starts_with(&self.root) {
+        self.resolved(&abs)?;
+        Ok(abs)
+    }
+
+    /// `path` with its folder resolved (inside the root) and the final
+    /// component kept, not followed.
+    fn unfollowed(&self, path: &Path) -> Result<PathBuf, FileError> {
+        if path.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(FileError::new(
+                FileErrorCode::InvalidPath,
+                "path escape (..) rejected",
+            ));
+        }
+        let abs = self.inner.absolute_path(path)?;
+        match (abs.parent(), abs.file_name()) {
+            (Some(parent), Some(name)) => Ok(self.resolved(parent)?.join(name)),
+            _ => self.resolved(&abs),
+        }
+    }
+
+    /// `abs` with every symlink resolved (missing children kept), which
+    /// must stay in the root. A symlink that leads out is refused.
+    fn resolved(&self, abs: &Path) -> Result<PathBuf, FileError> {
+        let root = super::seatbelt::resolve_path(&self.root)?;
+        let resolved = super::seatbelt::resolve_path(abs)?;
+        if !resolved.starts_with(&root) {
             return Err(FileError::new(
                 FileErrorCode::InvalidPath,
                 format!("path escapes sandbox root: {}", abs.display()),
             ));
         }
-        Ok(abs)
+        Ok(resolved)
+    }
+
+    /// Open the resolved form of `path` with no symlink followed in any
+    /// component, so a link swapped in after the check fails the call
+    /// instead of leading out of the root.
+    #[cfg(unix)]
+    fn open(
+        &self,
+        path: &Path,
+        flags: rustix::fs::OFlags,
+        create_parents: bool,
+    ) -> Result<std::fs::File, FileError> {
+        use rustix::fs::{mkdirat, open, openat, Mode, OFlags};
+        let abs = self.assert_in_root(path)?;
+        let resolved = self.resolved(&abs)?;
+        let err = |e: rustix::io::Errno| {
+            let code = match e {
+                rustix::io::Errno::NOENT => FileErrorCode::NotFound,
+                rustix::io::Errno::LOOP | rustix::io::Errno::ACCESS | rustix::io::Errno::PERM => {
+                    FileErrorCode::PermissionDenied
+                }
+                _ => FileErrorCode::Io,
+            };
+            FileError::new(code, format!("{}: {e}", abs.display()))
+        };
+        let mut fd = open(
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(err)?;
+        let parts: Vec<_> = resolved
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(p) => Some(p.to_owned()),
+                _ => None,
+            })
+            .collect();
+        for (i, part) in parts.iter().enumerate() {
+            let last = i + 1 == parts.len();
+            if create_parents && !last {
+                match mkdirat(&fd, part.as_os_str(), Mode::from_raw_mode(0o755)) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(e) => return Err(err(e)),
+                }
+            }
+            let opts = if last {
+                flags
+            } else {
+                OFlags::RDONLY | OFlags::DIRECTORY
+            } | OFlags::NOFOLLOW
+                | OFlags::CLOEXEC
+                // A FIFO must not block the open; it is refused below.
+                | OFlags::NONBLOCK;
+            fd = openat(&fd, part.as_os_str(), opts, Mode::from_raw_mode(0o644)).map_err(err)?;
+        }
+        let file = std::fs::File::from(fd);
+        if !file
+            .metadata()
+            .map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))?
+            .is_file()
+        {
+            return Err(FileError::new(
+                FileErrorCode::InvalidPath,
+                format!("not a regular file: {}", abs.display()),
+            ));
+        }
+        Ok(file)
+    }
+
+    #[cfg(unix)]
+    fn read_all(&self, path: &Path) -> Result<Vec<u8>, FileError> {
+        use std::io::Read;
+        let mut file = self.open(path, rustix::fs::OFlags::RDONLY, false)?;
+        let mut out = Vec::new();
+        file.read_to_end(&mut out)
+            .map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))?;
+        Ok(out)
+    }
+
+    #[cfg(unix)]
+    fn write_all(&self, path: &Path, data: &[u8], append: bool) -> Result<(), FileError> {
+        use rustix::fs::OFlags;
+        use std::io::Write;
+        let mode = if append {
+            OFlags::APPEND
+        } else {
+            OFlags::TRUNC
+        };
+        let mut file = self.open(path, OFlags::WRONLY | OFlags::CREATE | mode, true)?;
+        file.write_all(data)
+            .map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))
     }
 }
 
@@ -839,21 +1279,46 @@ impl FileSystem for JailedHostFs {
         self.inner.join_path(base, child)
     }
 
+    #[cfg(unix)]
+    async fn read_text_file(&self, path: &Path) -> Result<String, FileError> {
+        let bytes = self.read_all(path)?;
+        String::from_utf8(bytes).map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))
+    }
+
+    #[cfg(unix)]
+    async fn read_binary_file(&self, path: &Path) -> Result<Vec<u8>, FileError> {
+        self.read_all(path)
+    }
+
+    #[cfg(unix)]
+    async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
+        self.write_all(path, data, false)
+    }
+
+    #[cfg(unix)]
+    async fn append_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
+        self.write_all(path, data, true)
+    }
+
+    #[cfg(not(unix))]
     async fn read_text_file(&self, path: &Path) -> Result<String, FileError> {
         let path = self.assert_in_root(path)?;
         self.inner.read_text_file(&path).await
     }
 
+    #[cfg(not(unix))]
     async fn read_binary_file(&self, path: &Path) -> Result<Vec<u8>, FileError> {
         let path = self.assert_in_root(path)?;
         self.inner.read_binary_file(&path).await
     }
 
+    #[cfg(not(unix))]
     async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
         let path = self.assert_in_root(path)?;
         self.inner.write_file(&path, data).await
     }
 
+    #[cfg(not(unix))]
     async fn append_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
         let path = self.assert_in_root(path)?;
         self.inner.append_file(&path, data).await
@@ -902,5 +1367,154 @@ impl FileSystem for JailedHostFs {
     ) -> Result<Option<crate::harness::types::FileIdentity>, FileError> {
         let path = self.assert_in_root(path)?;
         self.inner.file_identity(&path).await
+    }
+
+    async fn symlink_metadata(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PathMetadata, FileError> {
+        let target = self.unfollowed(path)?;
+        self.inner.symlink_metadata(&target).await
+    }
+
+    async fn read_link(&self, path: &Path) -> Result<PathBuf, FileError> {
+        let target = self.unfollowed(path)?;
+        self.inner.read_link(&target).await.map_err(|e| {
+            if e.code == FileErrorCode::Io && target.exists() {
+                FileError::new(
+                    FileErrorCode::InvalidPath,
+                    format!("not a link: {}", target.display()),
+                )
+            } else {
+                e
+            }
+        })
+    }
+
+    async fn resolve_for_policy(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PolicyPath, FileError> {
+        let abs = self.assert_in_root(path)?;
+        self.inner.resolve_for_policy(&abs).await
+    }
+}
+
+#[cfg(all(test, unix))]
+mod gate_tests {
+    //! The gate primitives of both isolations, against the host env's
+    //! answers. "Full" runs its guest scripts on this machine through a
+    //! client that executes the argv locally.
+    use super::*;
+    use crate::harness::types::PathKind;
+
+    struct LocalClient;
+
+    #[async_trait]
+    impl PodmanClient for LocalClient {
+        async fn preflight(&self, _runtime: &str) -> Result<(), SandboxError> {
+            Ok(())
+        }
+        async fn run(&self, _opts: super::super::PodmanRunOpts) -> Result<String, SandboxError> {
+            Ok("local".into())
+        }
+        async fn exec(&self, opts: PodmanExecOpts) -> Result<ShellOutput, ExecutionError> {
+            let out = tokio::process::Command::new(&opts.argv[0])
+                .args(&opts.argv[1..])
+                .current_dir(opts.workdir.as_deref().unwrap_or("/"))
+                .output()
+                .await
+                .map_err(|e| ExecutionError::new(ExecutionErrorCode::SpawnFailed, e.to_string()))?;
+            Ok(ShellOutput {
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                exit_code: out.status.code().unwrap_or(-1),
+                truncated: false,
+            })
+        }
+        async fn stop(&self, _container: &str) -> Result<(), SandboxError> {
+            Ok(())
+        }
+        async fn rm(&self, _container: &str) -> Result<(), SandboxError> {
+            Ok(())
+        }
+    }
+
+    fn layout() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("project");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("f.txt"), "x").unwrap();
+        std::fs::hard_link(root.join("f.txt"), root.join("h.txt")).unwrap();
+        std::os::unix::fs::symlink(root.join("f.txt"), root.join("l")).unwrap();
+        std::os::unix::fs::symlink(root.join("sub"), root.join("dl")).unwrap();
+        std::fs::write(base.join("outside.txt"), "out").unwrap();
+        std::os::unix::fs::symlink(base.join("outside.txt"), root.join("out")).unwrap();
+        (dir, root)
+    }
+
+    #[tokio::test]
+    async fn both_isolations_answer_like_the_host_for_paths_inside() {
+        let (_dir, root) = layout();
+        let host = HostExecutionEnv::new(&root);
+        for isolation in [KrunIsolation::Partial, KrunIsolation::Full] {
+            let env = KrunExecutionEnv::new(
+                Arc::new(LocalClient),
+                "local".into(),
+                root.clone(),
+                isolation,
+            );
+            let what = isolation.as_str();
+            let link = env.symlink_metadata(&root.join("l")).await.unwrap();
+            assert_eq!(link.kind, PathKind::Symlink, "{what}");
+            let file = env.symlink_metadata(&root.join("f.txt")).await.unwrap();
+            let want = host.symlink_metadata(&root.join("f.txt")).await.unwrap();
+            assert_eq!(file, want, "{what}: lstat facts with mode");
+            assert!(file.mode.is_some(), "{what}: mode is filled");
+            assert_eq!(
+                env.symlink_metadata(&root.join("sub")).await.unwrap().kind,
+                PathKind::Dir,
+                "{what}"
+            );
+            assert_eq!(
+                env.read_link(&root.join("l")).await.unwrap(),
+                root.join("f.txt"),
+                "{what}"
+            );
+            let not_link = env.read_link(&root.join("f.txt")).await.unwrap_err();
+            assert_eq!(not_link.code, FileErrorCode::InvalidPath, "{what}");
+            let missing = env.symlink_metadata(&root.join("none")).await.unwrap_err();
+            assert_eq!(missing.code, FileErrorCode::NotFound, "{what}");
+
+            for rel in ["l", "f.txt", "h.txt", "dl/x", "none", "sub"] {
+                let got = env.resolve_for_policy(&root.join(rel)).await.unwrap();
+                let want = host.resolve_for_policy(&root.join(rel)).await.unwrap();
+                assert_eq!(got, want, "{what}: resolve {rel}");
+            }
+            assert!(
+                env.read_link(&root.join("../x")).await.is_err(),
+                "{what}: `..` is refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_isolation_refuses_a_link_out_of_the_root() {
+        let (_dir, root) = layout();
+        let env = KrunExecutionEnv::new(
+            Arc::new(LocalClient),
+            "local".into(),
+            root.clone(),
+            KrunIsolation::Partial,
+        );
+        // The link itself is inside: lstat and readlink see it.
+        assert_eq!(
+            env.symlink_metadata(&root.join("out")).await.unwrap().kind,
+            PathKind::Symlink
+        );
+        assert!(env.read_link(&root.join("out")).await.is_ok());
+        // Following it leaves the root: the jail refuses.
+        assert!(env.resolve_for_policy(&root.join("out")).await.is_err());
     }
 }

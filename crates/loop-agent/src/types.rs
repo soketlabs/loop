@@ -632,6 +632,69 @@ pub struct AgentLoopConfig {
     pub thinking_budgets: Option<ThinkingBudgets>,
     /// Labels recorded on the run's trace.
     pub run_labels: RunLabels,
+    /// Automatic context compaction; `None` never compacts.
+    pub compaction: Option<LoopCompaction>,
+}
+
+/// What the loop asks a [`CompactContextFn`] to compact.
+pub struct CompactionRequest {
+    /// The context messages the next request would send.
+    pub messages: Vec<AgentMessage>,
+    /// What started the compaction.
+    pub trigger: crate::harness::compaction::CompactionTrigger,
+    /// The model of the next request (the Session's model).
+    pub model: Model,
+    /// Cancellation of the turn.
+    pub cancel: Option<CancellationToken>,
+    /// Tokens of each request that compaction cannot remove: the system
+    /// prompt and the tool definitions.
+    pub overhead_tokens: u64,
+    /// Progress notices while compacting.
+    pub emit: Option<AgentEventSink>,
+}
+
+/// A compacted context.
+#[derive(Debug, Clone)]
+pub struct CompactionOutcome {
+    /// The new context messages: the summary, then the kept messages.
+    pub messages: Vec<AgentMessage>,
+    /// Estimated tokens before.
+    pub tokens_before: u64,
+    /// Estimated tokens after.
+    pub tokens_after: u64,
+    /// The compaction asked the model for a summary (it did not only
+    /// shorten tool outputs or reuse an earlier summary).
+    pub summarized: bool,
+}
+
+/// Replace the context with a compacted one and record it.
+pub type CompactContextFn = Arc<
+    dyn Fn(
+            CompactionRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            CompactionOutcome,
+                            crate::harness::compaction::AutoCompactionError,
+                        >,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
+/// Automatic compaction in the agent loop: it checks the context size
+/// before each model request and after a request that overflowed.
+#[derive(Clone)]
+pub struct LoopCompaction {
+    /// Enabled flag, reserve and keep-recent tokens.
+    pub settings: crate::harness::compaction::CompactionSettings,
+    /// Usage of assistant messages before this index in the starting
+    /// context predates a compaction and is not used to size the context.
+    pub usage_valid_from: usize,
+    /// Compacts the context.
+    pub compact: CompactContextFn,
 }
 
 /// Labels on a run's trace, for usage views. Names only, never user content, so they are
@@ -674,6 +737,7 @@ impl AgentLoopConfig {
             stream_options: SimpleStreamOptions::default(),
             thinking_budgets: None,
             run_labels: RunLabels::default(),
+            compaction: None,
         }
     }
 }

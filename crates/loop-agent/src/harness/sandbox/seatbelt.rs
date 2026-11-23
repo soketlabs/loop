@@ -35,7 +35,7 @@ fn denied(path: &Path) -> FileError {
 
 // Resolve existing ancestors too: canonicalize(path).unwrap_or(path) would let
 // a symlink followed by a not-yet-created child escape the write jail.
-fn resolve_path(path: &Path) -> Result<PathBuf, FileError> {
+pub(super) fn resolve_path(path: &Path) -> Result<PathBuf, FileError> {
     let absolute = std::path::absolute(path).map_err(io_error)?;
     let mut out = PathBuf::new();
     for part in absolute.components() {
@@ -69,7 +69,7 @@ const GIT_METADATA: &str = r"/\.git/((modules|worktrees)/.+/)?(config|config\.wo
 /// existing pointer file elsewhere.
 const GIT_ENTRY: &str = r"/\.git$";
 
-fn git_metadata(path: &Path) -> bool {
+pub(super) fn git_metadata(path: &Path) -> bool {
     static RE: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(GIT_METADATA).expect("valid pattern"));
     path.to_str().is_none_or(|p| RE.is_match(p))
@@ -77,7 +77,7 @@ fn git_metadata(path: &Path) -> bool {
 
 /// Whether writing `path` would create, replace or remove a `.git` entry, or
 /// write below a `.git` that does not exist yet as a real directory.
-fn git_entry_write(path: &Path) -> bool {
+pub(super) fn git_entry_write(path: &Path) -> bool {
     if path.file_name().is_some_and(|n| n == ".git") {
         return true;
     }
@@ -330,6 +330,88 @@ pub struct SeatbeltPolicy {
     home_reads: Option<(Vec<PathBuf>, Vec<PathBuf>)>,
 }
 
+/// The secrets below the home directory (and the system keychains) that
+/// the Seatbelt profile denies to sandboxed commands, whatever the Policy:
+/// credential stores, shell histories and other agents' configuration. The
+/// edge listener's tool-lock root check reads the same list.
+pub fn sensitive_home_paths(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".git-credentials"),
+        home.join(".config/git/credentials"),
+        home.join(".cargo/credentials"),
+        home.join(".cargo/credentials.toml"),
+        home.join(".gem/credentials"),
+        home.join(".terraform.d/credentials.tfrc.json"),
+        home.join(".azure"),
+        home.join(".config/hub"),
+        home.join(".bash_history"),
+        home.join(".zsh_history"),
+        home.join(".zhistory"),
+        home.join(".sh_history"),
+        home.join(".history"),
+        home.join(".local/share/fish/fish_history"),
+        home.join(".python_history"),
+        home.join(".node_repl_history"),
+        home.join(".psql_history"),
+        home.join(".mysql_history"),
+        home.join(".sqlite_history"),
+        home.join(".lesshst"),
+        home.join(".netrc"),
+        home.join(".docker/config.json"),
+        home.join(".kube/config"),
+        home.join(".npmrc"),
+        home.join(".pypirc"),
+        home.join(".config/gcloud"),
+        home.join("Library/Cookies"),
+        home.join(".codex"),
+        home.join(".claude"),
+        home.join(".claude.json"),
+        home.join(".gemini"),
+        home.join(".qwen"),
+        home.join(".copilot"),
+        home.join(".config/github-copilot"),
+        home.join(".cursor"),
+        home.join(".continue"),
+        home.join(".aider.conf.yml"),
+        home.join(".config/opencode"),
+        home.join(".local/share/opencode"),
+        home.join(".config/goose"),
+        home.join(".config/amp"),
+        home.join(".local/share/amp"),
+        home.join(".ssh"),
+        home.join(".aws"),
+        home.join(".gnupg"),
+        home.join(".config/gh"),
+        home.join("Library/Keychains"),
+        PathBuf::from("/Library/Keychains"),
+    ]
+}
+
+/// [`sensitive_home_paths`] and more folders that hold credentials or
+/// personal data: whole credential stores and browser profiles. The Edge
+/// listener's tool-lock root check uses this wider list; the Seatbelt
+/// profile does not deny these, so tools such as `docker` and `kubectl`
+/// keep working inside the sandbox.
+pub fn sensitive_home_paths_extended(home: &Path) -> Vec<PathBuf> {
+    let mut paths = sensitive_home_paths(home);
+    paths.extend([
+        home.join(".password-store"),
+        home.join(".local/share/keyrings"),
+        home.join(".kube"),
+        home.join(".docker"),
+        home.join(".mozilla"),
+        home.join(".config/google-chrome"),
+        home.join(".config/chromium"),
+        home.join(".config/BraveSoftware"),
+        home.join("Library/Application Support/Google/Chrome"),
+        home.join("Library/Application Support/Firefox"),
+        home.join("Library/Application Support/BraveSoftware"),
+        home.join("Library/Application Support/Microsoft Edge"),
+        home.join("Library/Safari"),
+    ]);
+    paths
+}
+
 impl SeatbeltPolicy {
     /// Build a policy with explicit home, agent directory and Runtime endpoints.
     pub fn new(
@@ -349,66 +431,20 @@ impl SeatbeltPolicy {
         // write its git directory outside the project.
         writes.extend(project_git_writes(&project)?);
         let mut denied_paths = vec![];
-        for path in [
-            home.join(".git-credentials"),
-            home.join(".config/git/credentials"),
-            home.join(".cargo/credentials"),
-            home.join(".cargo/credentials.toml"),
-            home.join(".gem/credentials"),
-            home.join(".terraform.d/credentials.tfrc.json"),
-            home.join(".azure"),
-            home.join(".config/hub"),
-            home.join(".bash_history"),
-            home.join(".zsh_history"),
-            home.join(".zhistory"),
-            home.join(".sh_history"),
-            home.join(".history"),
-            home.join(".local/share/fish/fish_history"),
-            home.join(".python_history"),
-            home.join(".node_repl_history"),
-            home.join(".psql_history"),
-            home.join(".mysql_history"),
-            home.join(".sqlite_history"),
-            home.join(".lesshst"),
-            home.join(".netrc"),
-            home.join(".docker/config.json"),
-            home.join(".kube/config"),
-            home.join(".npmrc"),
-            home.join(".pypirc"),
-            home.join(".config/gcloud"),
-            home.join("Library/Cookies"),
-            home.join(".codex"),
-            home.join(".claude"),
-            home.join(".claude.json"),
-            home.join(".gemini"),
-            home.join(".qwen"),
-            home.join(".copilot"),
-            home.join(".config/github-copilot"),
-            home.join(".cursor"),
-            home.join(".continue"),
-            home.join(".aider.conf.yml"),
-            home.join(".config/opencode"),
-            home.join(".local/share/opencode"),
-            home.join(".config/goose"),
-            home.join(".config/amp"),
-            home.join(".local/share/amp"),
-            home.join(".ssh"),
-            home.join(".aws"),
-            home.join(".gnupg"),
-            home.join(".config/gh"),
-            home.join("Library/Keychains"),
-            PathBuf::from("/Library/Keychains"),
-            agent.join("auth.json"),
-            agent.join("run"),
-            agent.join("mcp-auth"),
-            agent.join("agents"),
-            agent.join("history.json"),
-            agent.join("history"),
-            agent.join("logs"),
-            agent.join("usage"),
-        ]
-        .into_iter()
-        .chain(runtime_paths.iter().cloned())
+        for path in sensitive_home_paths(home)
+            .into_iter()
+            .chain([
+                agent.join("auth.json"),
+                agent.join("audit"),
+                agent.join("run"),
+                agent.join("mcp-auth"),
+                agent.join("agents"),
+                agent.join("history.json"),
+                agent.join("history"),
+                agent.join("logs"),
+                agent.join("usage"),
+            ])
+            .chain(runtime_paths.iter().cloned())
         {
             // Protect both the configured name and its resolved target.
             denied_paths.push(std::path::absolute(&path).map_err(io_error)?);
@@ -757,26 +793,34 @@ impl SeatbeltPolicy {
     }
 }
 
+/// The only variable names Seatbelt commands get (`LC_*` is a prefix).
+pub const SEATBELT_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "TERM",
+    "COLORTERM",
+    "TMPDIR",
+    "TZ",
+    "NO_COLOR",
+    "CLICOLOR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "DEVELOPER_DIR",
+    "SDKROOT",
+    "LC_*",
+];
+
 fn safe_env_key(key: &str) -> bool {
-    matches!(
-        key,
-        "PATH"
-            | "HOME"
-            | "USER"
-            | "LOGNAME"
-            | "SHELL"
-            | "LANG"
-            | "TERM"
-            | "COLORTERM"
-            | "TMPDIR"
-            | "TZ"
-            | "NO_COLOR"
-            | "CLICOLOR"
-            | "CARGO_HOME"
-            | "RUSTUP_HOME"
-            | "DEVELOPER_DIR"
-            | "SDKROOT"
-    ) || key.starts_with("LC_")
+    SEATBELT_ENV_ALLOWLIST
+        .iter()
+        .any(|name| match name.strip_suffix('*') {
+            Some(prefix) => key.starts_with(prefix),
+            None => key == *name,
+        })
 }
 
 /// Host filesystem access with canonical policy checks and no-follow opens.
@@ -852,6 +896,18 @@ impl JailedHostFs {
             return Err(denied(&path));
         }
         Ok(file)
+    }
+
+    /// `path` with its folder resolved in the jail and the final component
+    /// kept (not followed), after the read policy accepted the path (a
+    /// denied path, or a link to one, is refused).
+    fn unfollowed(&self, path: &Path) -> Result<PathBuf, FileError> {
+        let resolved = self.policy.resolve(path, false)?;
+        let absolute = loop_workspace::lexical(&self.policy.project.join(path));
+        match (absolute.parent(), absolute.file_name()) {
+            (Some(parent), Some(name)) => Ok(self.policy.resolve(parent, false)?.join(name)),
+            _ => Ok(resolved),
+        }
     }
 
     fn info(&self, path: &Path) -> Result<FileInfo, FileError> {
@@ -1014,6 +1070,67 @@ impl FileSystem for JailedHostFs {
             .is_file()
             .then(|| crate::harness::types::FileIdentity::from_metadata(&meta)))
     }
+    async fn symlink_metadata(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PathMetadata, FileError> {
+        let target = self.unfollowed(path)?;
+        let meta = std::fs::symlink_metadata(&target).map_err(io_error)?;
+        Ok(crate::harness::env::path_metadata(&meta))
+    }
+    async fn read_link(&self, path: &Path) -> Result<PathBuf, FileError> {
+        let target = self.unfollowed(path)?;
+        std::fs::read_link(&target).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                FileError::new(
+                    FileErrorCode::InvalidPath,
+                    format!("not a link: {}", target.display()),
+                )
+            } else {
+                io_error(e)
+            }
+        })
+    }
+    async fn resolve_for_policy(
+        &self,
+        path: &Path,
+    ) -> Result<crate::harness::types::PolicyPath, FileError> {
+        let resolved = self.policy.resolve(path, false)?;
+        let absolute = loop_workspace::lexical(&self.policy.project.join(path));
+        let mut has_link = false;
+        let mut prefix = PathBuf::new();
+        for component in absolute.components() {
+            prefix.push(component.as_os_str());
+            match std::fs::symlink_metadata(&prefix) {
+                Ok(meta) if meta.file_type().is_symlink() => has_link = true,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(io_error(e)),
+            }
+        }
+        match std::fs::metadata(&resolved) {
+            Ok(meta) => {
+                let facts = crate::harness::env::path_metadata(&meta);
+                Ok(crate::harness::types::PolicyPath {
+                    resolved,
+                    exists: true,
+                    has_link,
+                    uid: facts.uid,
+                    nlink: facts.nlink,
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(crate::harness::types::PolicyPath {
+                    resolved: absolute,
+                    exists: false,
+                    has_link,
+                    uid: None,
+                    nlink: None,
+                })
+            }
+            Err(e) => Err(io_error(e)),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1051,6 +1168,7 @@ impl Shell for JailedHostFs {
                     .map(|(k, v)| (k.clone(), v.clone())),
             );
         }
+        env.retain(|name, _| !options.remove_env.contains(name));
         let (mut cmd, marker) = self.policy.command("/bin/sh", &["-c", command])?;
         cmd.current_dir(cwd).env_clear().envs(env);
         let marker_path = std::fs::canonicalize(marker.dir.path())
@@ -1400,6 +1518,21 @@ impl FileSystem for SeatbeltEnv {
     ) -> Result<Option<crate::harness::types::FileIdentity>, FileError> {
         self.fs.file_identity(p).await
     }
+    async fn symlink_metadata(
+        &self,
+        p: &Path,
+    ) -> Result<crate::harness::types::PathMetadata, FileError> {
+        self.fs.symlink_metadata(p).await
+    }
+    async fn read_link(&self, p: &Path) -> Result<PathBuf, FileError> {
+        self.fs.read_link(p).await
+    }
+    async fn resolve_for_policy(
+        &self,
+        p: &Path,
+    ) -> Result<crate::harness::types::PolicyPath, FileError> {
+        self.fs.resolve_for_policy(p).await
+    }
 }
 
 #[cfg(unix)]
@@ -1454,6 +1587,75 @@ fn shell_quote(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The paths the Seatbelt profile denies below the home directory. A
+    /// change here changes what sandboxed commands can read, so it must be
+    /// deliberate: the Edge listener's wider list is
+    /// [`sensitive_home_paths_extended`].
+    #[test]
+    fn the_seatbelt_sensitive_list_is_pinned() {
+        let home = Path::new("/h");
+        let expected: Vec<PathBuf> = [
+            ".git-credentials",
+            ".config/git/credentials",
+            ".cargo/credentials",
+            ".cargo/credentials.toml",
+            ".gem/credentials",
+            ".terraform.d/credentials.tfrc.json",
+            ".azure",
+            ".config/hub",
+            ".bash_history",
+            ".zsh_history",
+            ".zhistory",
+            ".sh_history",
+            ".history",
+            ".local/share/fish/fish_history",
+            ".python_history",
+            ".node_repl_history",
+            ".psql_history",
+            ".mysql_history",
+            ".sqlite_history",
+            ".lesshst",
+            ".netrc",
+            ".docker/config.json",
+            ".kube/config",
+            ".npmrc",
+            ".pypirc",
+            ".config/gcloud",
+            "Library/Cookies",
+            ".codex",
+            ".claude",
+            ".claude.json",
+            ".gemini",
+            ".qwen",
+            ".copilot",
+            ".config/github-copilot",
+            ".cursor",
+            ".continue",
+            ".aider.conf.yml",
+            ".config/opencode",
+            ".local/share/opencode",
+            ".config/goose",
+            ".config/amp",
+            ".local/share/amp",
+            ".ssh",
+            ".aws",
+            ".gnupg",
+            ".config/gh",
+            "Library/Keychains",
+        ]
+        .iter()
+        .map(|p| home.join(p))
+        .chain([PathBuf::from("/Library/Keychains")])
+        .collect();
+        assert_eq!(sensitive_home_paths(home), expected);
+        let extended = sensitive_home_paths_extended(home);
+        assert!(extended.starts_with(&expected));
+        for wider in [".docker", ".kube", ".password-store", ".mozilla"] {
+            assert!(!expected.contains(&home.join(wider)), "{wider}");
+            assert!(extended.contains(&home.join(wider)), "{wider}");
+        }
+    }
 
     #[test]
     fn paths_are_parameters_not_profile_source() {
@@ -1526,6 +1728,65 @@ mod tests {
                 policy.resolve(&root.path().join(name), true).is_err(),
                 "{name}"
             );
+        }
+    }
+
+    /// The gate primitives answer in the jail: links and modes inside the
+    /// project as the host sees them; a denied path (or a link to one) is
+    /// refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gate_primitives_answer_in_the_jail() {
+        use crate::harness::env::HostExecutionEnv;
+        use crate::harness::types::PathKind;
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let project = base.join("project");
+        let home = base.join("home");
+        std::fs::create_dir_all(project.join("sub")).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/id"), "key").unwrap();
+        std::fs::write(project.join("f.txt"), "x").unwrap();
+        std::fs::hard_link(project.join("f.txt"), project.join("h.txt")).unwrap();
+        std::os::unix::fs::symlink(project.join("f.txt"), project.join("l")).unwrap();
+        std::os::unix::fs::symlink(home.join(".ssh/id"), project.join("key")).unwrap();
+        let policy =
+            SeatbeltPolicy::new(&project, &home, &base.join("agent"), &[], false, &[]).unwrap();
+        let env = JailedHostFs::new(policy);
+        let host = HostExecutionEnv::new(&project);
+
+        assert_eq!(
+            env.symlink_metadata(&project.join("l")).await.unwrap().kind,
+            PathKind::Symlink
+        );
+        let file = env.symlink_metadata(&project.join("f.txt")).await.unwrap();
+        assert_eq!(
+            file,
+            host.symlink_metadata(&project.join("f.txt")).await.unwrap()
+        );
+        assert!(file.mode.is_some());
+        assert_eq!(
+            env.read_link(&project.join("l")).await.unwrap(),
+            project.join("f.txt")
+        );
+        assert_eq!(
+            env.read_link(&project.join("f.txt"))
+                .await
+                .unwrap_err()
+                .code,
+            FileErrorCode::InvalidPath
+        );
+        for rel in ["l", "f.txt", "h.txt", "none", "sub/none", "sub"] {
+            assert_eq!(
+                env.resolve_for_policy(&project.join(rel)).await.unwrap(),
+                host.resolve_for_policy(&project.join(rel)).await.unwrap(),
+                "{rel}"
+            );
+        }
+        // A credential path and a link to it are refused.
+        for path in [home.join(".ssh/id"), project.join("key")] {
+            assert!(env.symlink_metadata(&path).await.is_err(), "{path:?}");
+            assert!(env.resolve_for_policy(&path).await.is_err(), "{path:?}");
         }
     }
 

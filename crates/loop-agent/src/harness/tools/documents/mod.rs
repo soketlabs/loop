@@ -19,7 +19,7 @@ mod rtf;
 mod sheet;
 mod xml;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -160,6 +160,11 @@ async fn read_document(
     if size as u64 > MAX_INPUT_BYTES {
         return Err(too_large(size as u64));
     }
+    // The reader-program check compares host paths: no root for a guest env.
+    let workspace = match env.path_namespace() {
+        loop_workspace::PathNamespace::Host => Some(reader_root(env).await),
+        loop_workspace::PathNamespace::Guest => None,
+    };
     let (converted, extracted_by) = match format {
         Format::Pdf => {
             let reading = child::convert(
@@ -168,7 +173,7 @@ async fn read_document(
                 format,
                 bytes.clone(),
                 cancel,
-                Some(env.cwd()),
+                workspace.as_deref(),
             )
             .await?;
             pdf::finish(reading, &bytes, ocr::Config::from_env(), cancel).await?
@@ -179,7 +184,7 @@ async fn read_document(
             format,
             bytes,
             cancel,
-            Some(env.cwd()),
+            workspace.as_deref(),
         )
         .await?
         {
@@ -242,6 +247,21 @@ pub(super) enum Previous {
     /// It has more text than `read` shows, so the model cannot have seen
     /// all of it.
     TooLong,
+}
+
+/// The Workspace root as the reader-program check compares it, resolved
+/// through `env` (never a host call on a Workspace path). The check only
+/// refuses a reader program that sits inside this root.
+///
+/// The document read passes no root for a `guest`-namespace env
+/// (`FileSystem::path_namespace`). The edit diff (`text_of`) still gets
+/// this guest path for a guest env; the check then compares a host
+/// program with a guest path and can refuse only when both spell the same.
+pub(super) async fn reader_root(env: &dyn ExecutionEnv) -> PathBuf {
+    let cwd = env.cwd();
+    env.canonical_path(cwd)
+        .await
+        .unwrap_or_else(|_| cwd.to_path_buf())
 }
 
 /// The text to diff a write against: what `bytes`, the file's contents

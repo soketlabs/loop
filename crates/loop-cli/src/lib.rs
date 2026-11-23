@@ -102,7 +102,14 @@ impl std::ops::DerefMut for CliRuntime {
 pub async fn bootstrap_cli(opts: BootstrapOpts) -> anyhow::Result<CliRuntime> {
     let inner = bootstrap(opts).await?;
     let keybindings =
-        keybindings::Keybindings::load(&config::paths::keybindings_path(&inner.agent_dir))?;
+        match keybindings::Keybindings::load(&config::paths::keybindings_path(&inner.agent_dir)) {
+            Ok(keybindings) => keybindings,
+            Err(error) => {
+                // Release the Session and remove its sandbox before the exit.
+                let _ = inner.session_shutdown().run().await;
+                return Err(error);
+            }
+        };
     Ok(CliRuntime {
         inner,
         keybindings,

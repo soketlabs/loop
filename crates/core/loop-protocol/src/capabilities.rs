@@ -121,4 +121,75 @@ pub struct Capabilities {
     /// Lists loaded Sessions for the Runtime panel (`runtime/sessions`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub runtime_sessions: bool,
+    /// The Runtime's tool lock (`loop runtime start --tool-lock`), when it
+    /// has one. It holds for every Session for the life of the Runtime: a
+    /// client can hide the shell, file edits and workflows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_lock: Option<ToolLock>,
+}
+
+/// A Runtime-wide tool lock: a fixed set of tools for every Session, which
+/// no setting, Session option or permission mode can widen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ToolLock {
+    /// Chat only: reading files in the Session's workspace and the web
+    /// tools. No shell, file writes, Subagents, workflows, MCP servers or
+    /// hooks.
+    Chat,
+    /// A lock this reader does not know. Treat it as locking everything.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ToolLock {
+    /// The lock named `name` (`chat`); `None` for any other name.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "chat" => Some(Self::Chat),
+            _ => None,
+        }
+    }
+
+    /// The name on the command line and on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for ToolLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_lock_names() {
+        assert_eq!(ToolLock::parse("chat"), Some(ToolLock::Chat));
+        assert_eq!(ToolLock::parse("Chat"), None);
+        assert_eq!(ToolLock::parse(""), None);
+        assert_eq!(ToolLock::parse("unknown"), None);
+        let caps = Capabilities {
+            tool_lock: Some(ToolLock::Chat),
+            ..Capabilities::default()
+        };
+        let wire = serde_json::to_value(caps).unwrap();
+        assert_eq!(wire["tool_lock"], "chat");
+        assert!(serde_json::to_value(Capabilities::default())
+            .unwrap()
+            .get("tool_lock")
+            .is_none());
+        // A newer lock reads as Unknown, which a client treats as locked.
+        let read: Capabilities =
+            serde_json::from_value(serde_json::json!({"tool_lock": "docs"})).unwrap();
+        assert_eq!(read.tool_lock, Some(ToolLock::Unknown));
+    }
 }

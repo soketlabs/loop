@@ -242,6 +242,9 @@ async fn discovery_ignores_stale_sockets_and_bounds_a_silent_peer() {
             .tempdir_in("/tmp")
             .unwrap();
         let socket = loop_cli::config::paths::runtime_socket_path(dir.path()).unwrap();
+        // A stale socket file: whether the probe is refused, or reaches a
+        // listener another thread's fork still holds for a moment and is then
+        // closed, there is no Runtime here.
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         drop(listener);
         assert!(runtime_launch::discover(dir.path())
@@ -263,6 +266,65 @@ async fn discovery_ignores_stale_sockets_and_bounds_a_silent_peer() {
             socket.exists(),
             "discovery must not replace a foreign socket"
         );
+    })
+    .await
+    .unwrap();
+}
+
+/// A peer that accepts the probe and the handshake, then closes both without
+/// a reply (a Runtime that exited just then) is "no Runtime", not an error.
+#[tokio::test]
+async fn discovery_treats_a_peer_that_closes_before_replying_as_no_runtime() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let dir = tempfile::Builder::new()
+            .prefix("s36discclose")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = loop_cli::config::paths::runtime_socket_path(dir.path()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let agent = dir.path().to_owned();
+        let discovery = tokio::spawn(async move { runtime_launch::discover(&agent).await });
+        let (probe, _) = listener.accept().await.unwrap();
+        drop(probe);
+        let (handshake, _) = listener.accept().await.unwrap();
+        drop(handshake);
+        assert!(discovery.await.unwrap().unwrap().is_empty());
+    })
+    .await
+    .unwrap();
+}
+
+/// A peer that answers the handshake with an error is not "no Runtime": the
+/// user must see the error.
+#[tokio::test]
+async fn discovery_reports_a_peer_that_answers_with_a_protocol_error() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let dir = tempfile::Builder::new()
+            .prefix("s36discerror")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = loop_cli::config::paths::runtime_socket_path(dir.path()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let agent = dir.path().to_owned();
+        let discovery = tokio::spawn(async move { runtime_launch::discover(&agent).await });
+        let (_probe, _) = listener.accept().await.unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        let mut peer = BufReader::new(peer);
+        let mut request = String::new();
+        peer.read_line(&mut request).await.unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(&request).unwrap()["id"].clone();
+        let reply = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32600, "message": "not a Loop Runtime" },
+        });
+        peer.get_mut()
+            .write_all(format!("{reply}\n").as_bytes())
+            .await
+            .unwrap();
+        let error = discovery.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("not a Loop Runtime"), "{error}");
     })
     .await
     .unwrap();

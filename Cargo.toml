@@ -13,9 +13,12 @@ members = [
     "crates/ops/loop-update",
     "crates/core/loop-protocol",
     "crates/core/loop-wire",
+    "crates/core/loop-store",
+    "crates/core/loop-store-testkit",
+    "crates/core/loop-workspace",
+    "crates/core/loop-workspace-testkit",
     "crates/extend/loop-acp",
     "crates/extend/loop-dashboard",
-    "crates/loop-desktop"
 ]
 
 default-members = [
@@ -31,6 +34,10 @@ default-members = [
     "crates/ops/loop-update",
     "crates/core/loop-protocol",
     "crates/core/loop-wire",
+    "crates/core/loop-store",
+    "crates/core/loop-store-testkit",
+    "crates/core/loop-workspace",
+    "crates/core/loop-workspace-testkit",
     "crates/extend/loop-acp",
     "crates/extend/loop-dashboard",
 ]
@@ -54,6 +61,8 @@ loop-test-support = { path = "crates/loop-test-support" }
 loop-update = { path = "crates/ops/loop-update" }
 loop-protocol = { path = "crates/core/loop-protocol" }
 loop-wire = { path = "crates/core/loop-wire" }
+loop-store = { path = "crates/core/loop-store" }
+loop-workspace = { path = "crates/core/loop-workspace" }
 loop-acp = { path = "crates/extend/loop-acp" }
 loop-dashboard = { path = "crates/extend/loop-dashboard" }
 agent-client-protocol-schema = { version = "1.11", default-features = false }
@@ -121,17 +130,6 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "3a2ebbc92034f6711e4eac9e93f5de0423be8dfe", default-features = false, features = ["client", "server", "macros", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }
 axum = "0.8"
 tower = "0.5"
-
-# GPUI desktop. Pin gpui-kit: the repo was renamed from gpui-component, and
-# main dropped gpui-component-assets. Leave zed unpinned so it unifies with
-# gpui-kit's zed git dep; after version bumps run `cargo update -w` (not
-# `cargo generate-lockfile`) so HEAD git deps are not re-resolved.
-gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["x11", "wayland"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-kit", rev = "77a6e32a6e19074a8d257783c273271c9ed15f6a", package = "gpui-component" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-kit", rev = "77a6e32a6e19074a8d257783c273271c9ed15f6a", package = "gpui-component-assets" }
-async-channel = "2"
-portable-pty = "0.9"
 
 [profile.release]
 lto = true

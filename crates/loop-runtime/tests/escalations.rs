@@ -18,6 +18,10 @@ struct Surface(
 );
 #[async_trait::async_trait]
 impl EscalationRecipient for Surface {
+    fn caller(&self) -> Option<loop_protocol::Caller> {
+        None
+    }
+
     fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
     async fn interact(
         &self,
@@ -52,12 +56,26 @@ async fn parked_escalation_resumes_on_attach_and_logs_session_grant() {
             key: "s".into(),
             native_id: "s".into(),
         };
-        let host = EscalationHost::new(session.clone(), log.clone(), 1);
+        let host = EscalationHost::new(
+            session.clone(),
+            log.clone(),
+            1,
+            loop_store::Tenant::local(),
+            None,
+        );
         let asking = tokio::spawn({
             let host = host.clone();
             async move { host.interact(request()).await }
         });
-        while log.read_runtime_after(0).await.unwrap().is_empty() {
+        while log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        {
             tokio::task::yield_now().await;
         }
         assert!(!asking.is_finished());
@@ -67,7 +85,13 @@ async fn parked_escalation_resumes_on_attach_and_logs_session_grant() {
         assert_eq!(params.session, Some(session));
         answer.send(selected("accept_session")).unwrap();
         assert_eq!(asking.await.unwrap(), selected("accept_session"));
-        let events = log.read_runtime_after(0).await.unwrap();
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         assert!(matches!(
             events[0].event.kind,
             EventKind::EscalationRaised(_)
@@ -110,13 +134,13 @@ async fn runtime_with_approval(
         agent: None,
     };
     Arc::new(
-        loop_runtime::Runtime::new(
-            loop_app_core::runtime::GlobalResources::with_models(dir.join("agent"), models)
-                .unwrap(),
-            opts,
-            log,
-            Default::default(),
-        )
+        {
+            let globals =
+                loop_app_core::runtime::GlobalResources::with_models(dir.join("agent"), models)
+                    .unwrap();
+            let store = globals.open_runtime_session_store().unwrap();
+            loop_runtime::Runtime::new(globals, opts, log, store, Default::default())
+        }
         .await
         .unwrap(),
     )
@@ -170,7 +194,7 @@ async fn runtime_gate_parks_then_wire_attach_and_answer_resumes_turn() {
         let rt = runtime_with_approval(dir.path(), log.clone()).await;
         let session = rt.new_session(SessionSpec::default()).await.unwrap();
         let turn = rt.prompt(&session, vec![ContentBlock::text("run command")]).await.unwrap();
-        loop { if log.read_runtime_after(0).await.unwrap().iter().any(|e| matches!(e.event.kind, EventKind::EscalationRaised(_))) { break; } tokio::task::yield_now().await; }
+        loop { if log.read_runtime_after(loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()), 0).await.unwrap().iter().any(|e| matches!(e.event.kind, EventKind::EscalationRaised(_))) { break; } tokio::task::yield_now().await; }
         let mut client = peer(&rt, true).await;
         attach(&mut client, &session).await;
         let asked = interaction(&mut client).await;
@@ -190,7 +214,7 @@ async fn two_answers_have_one_winner_and_the_loser_is_withdrawn_even_after_answe
             key: "s".into(),
             native_id: "s".into(),
         };
-        let host = EscalationHost::new(session, log.clone(), 1);
+        let host = EscalationHost::new(session, log.clone(), 1, loop_store::Tenant::local(), None);
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         host.attach(1, Arc::new(Surface(tx1))).await;
@@ -212,7 +236,13 @@ async fn two_answers_have_one_winner_and_the_loser_is_withdrawn_even_after_answe
             assert_eq!(w1.try_recv(), Ok(()));
             assert!(w2.try_recv().is_err());
         }
-        let events = log.read_runtime_after(0).await.unwrap();
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         assert_eq!(events.len(), 2);
         assert!(matches!(
             events[1].event.kind,
@@ -235,6 +265,8 @@ async fn detached_recipient_cannot_answer_after_reattaching_with_the_same_connec
             },
             log.clone(),
             1,
+            loop_store::Tenant::local(),
+            None,
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
         let surface = Arc::new(Surface(tx));
@@ -263,7 +295,10 @@ async fn detached_recipient_cannot_answer_after_reattaching_with_the_same_connec
 async fn wait_raised(log: &MemoryEventLog) {
     loop {
         if log
-            .read_runtime_after(0)
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
             .await
             .unwrap()
             .iter()
@@ -314,7 +349,7 @@ async fn wire_race_withdraws_only_original_interactive_recipients_and_ignores_la
         assert_eq!(withdrawn["params"]["session"], one["params"]["session"]);
         // An answer to an already finished request is harmless.
         a.outgoing.send(serde_json::json!({"jsonrpc":"2.0", "id":one["id"], "result":selected("reject")}).to_string()).unwrap();
-        let events = log.read_runtime_after(0).await.unwrap();
+        let events = log.read_runtime_after(loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()), 0).await.unwrap();
         assert_eq!(events.iter().filter(|e| matches!(e.event.kind, EventKind::EscalationAnswered(_))).count(), 1);
         while let Ok(m) = observer.incoming.try_recv() {
             let m: serde_json::Value = serde_json::from_str(&m).unwrap();
@@ -350,7 +385,10 @@ async fn disconnect_parks_for_a_later_surface_and_cancel_withdraws_in_log_order(
         let outcome = turn.outcome().await;
         assert!(matches!(outcome, TurnOutcome::Cancelled), "{outcome:?}");
         let kinds: Vec<_> = log
-            .read_runtime_after(0)
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
             .await
             .unwrap()
             .into_iter()
@@ -383,7 +421,13 @@ async fn closing_session_withdraws_parked_request_and_rejects_new_requests() {
         wait_raised(&log).await;
         rt.close(&session.key, true).await.unwrap();
         turn.outcome().await;
-        let records = log.read_runtime_after(0).await.unwrap();
+        let records = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         let withdrawn = records
             .iter()
             .position(|e| matches!(e.event.kind, EventKind::EscalationWithdrawn(_)))
@@ -411,6 +455,8 @@ async fn dropping_the_waiting_tool_withdraws_its_escalation() {
             },
             log.clone(),
             1,
+            loop_store::Tenant::local(),
+            None,
         );
         let asking = tokio::spawn(async move { host.interact(request()).await });
         wait_raised(&log).await;
@@ -418,7 +464,10 @@ async fn dropping_the_waiting_tool_withdraws_its_escalation() {
         assert!(asking.await.unwrap_err().is_cancelled());
         loop {
             if log
-                .read_runtime_after(0)
+                .read_runtime_after(
+                    loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                    0,
+                )
                 .await
                 .unwrap()
                 .iter()
@@ -446,6 +495,8 @@ async fn invalid_option_cannot_win_and_cancellation_races_have_one_decision() {
                 },
                 log.clone(),
                 1,
+                loop_store::Tenant::local(),
+                None,
             );
             let (tx1, mut rx1) = mpsc::unbounded_channel();
             let (tx2, mut rx2) = mpsc::unbounded_channel();
@@ -458,18 +509,25 @@ async fn invalid_option_cannot_win_and_cancellation_races_have_one_decision() {
             let (_, invalid, _) = rx1.recv().await.unwrap();
             let (_, valid, _) = rx2.recv().await.unwrap();
             invalid.send(selected("made-up-grant")).unwrap();
+            let runtime = loop_protocol::Caller::host(loop_protocol::Principal::runtime());
             let ((), withdrawn) = tokio::join!(
                 async {
                     let _ = valid.send(selected("accept_session"));
                 },
-                host.withdraw("turn cancelled", false)
+                host.withdraw("turn cancelled", false, &runtime)
             );
             withdrawn.unwrap();
             let result = asking.await.unwrap();
             assert!(
                 result == selected("accept_session") || result == InteractionOutcome::Cancelled
             );
-            let events = log.read_runtime_after(0).await.unwrap();
+            let events = log
+                .read_runtime_after(
+                    loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                    0,
+                )
+                .await
+                .unwrap();
             assert_eq!(events.len(), 2, "there must be one terminal decision");
             assert!(matches!(
                 events[0].event.kind,
@@ -502,6 +560,8 @@ async fn disconnecting_one_recipient_keeps_the_other_answer_valid() {
             },
             log.clone(),
             1,
+            loop_store::Tenant::local(),
+            None,
         );
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
@@ -517,7 +577,16 @@ async fn disconnecting_one_recipient_keeps_the_other_answer_valid() {
         host.detach(1).await;
         answer.send(selected("accept")).unwrap();
         assert_eq!(asking.await.unwrap(), selected("accept"));
-        assert_eq!(log.read_runtime_after(0).await.unwrap().len(), 2);
+        assert_eq!(
+            log.read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0
+            )
+            .await
+            .unwrap()
+            .len(),
+            2
+        );
     })
     .await
     .unwrap();
@@ -546,19 +615,25 @@ impl EventLog for DelayedDecision {
     }
     async fn read_after(
         &self,
+        tenant: &loop_store::Tenant,
         key: &loop_protocol::SessionKey,
         seq: u64,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
-        self.0.read_after(key, seq).await
+        self.0.read_after(tenant, key, seq).await
     }
     async fn read_runtime_after(
         &self,
+        scope: loop_store::Scope<'_>,
         seq: u64,
     ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
-        self.0.read_runtime_after(seq).await
+        self.0.read_runtime_after(scope, seq).await
     }
-    async fn latest_seq(&self, key: &loop_protocol::SessionKey) -> loop_runtime::log::Result<u64> {
-        self.0.latest_seq(key).await
+    async fn latest_seq(
+        &self,
+        tenant: &loop_store::Tenant,
+        key: &loop_protocol::SessionKey,
+    ) -> loop_runtime::log::Result<u64> {
+        self.0.latest_seq(tenant, key).await
     }
     async fn allocate_generation(
         &self,
@@ -575,6 +650,39 @@ impl EventLog for DelayedDecision {
     ) -> loop_runtime::log::Result<()> {
         self.0.finish_generation(generation, stopped).await
     }
+    async fn sync(&self) -> loop_runtime::log::Result<()> {
+        self.0.sync().await
+    }
+    async fn read_session_page(
+        &self,
+        tenant: &loop_store::Tenant,
+        session: &loop_protocol::SessionKey,
+        after_seq: u64,
+        through_seq: Option<u64>,
+        limit: loop_runtime::log::PageLimit,
+    ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
+        self.0
+            .read_session_page(tenant, session, after_seq, through_seq, limit)
+            .await
+    }
+    async fn session_summary(
+        &self,
+        tenant: &loop_store::Tenant,
+        session: &loop_protocol::SessionKey,
+    ) -> loop_runtime::log::Result<Option<loop_runtime::log::SessionSummary>> {
+        self.0.session_summary(tenant, session).await
+    }
+    async fn recovery_page(
+        &self,
+        scope: loop_store::Scope<'_>,
+        from_generation: u64,
+        after_global: u64,
+        limit: loop_runtime::log::PageLimit,
+    ) -> loop_runtime::log::Result<loop_runtime::log::Page<loop_runtime::log::LoggedEvent>> {
+        self.0
+            .recovery_page(scope, from_generation, after_global, limit)
+            .await
+    }
 }
 #[tokio::test]
 async fn cancellation_during_raised_commit_still_logs_withdrawal() {
@@ -588,6 +696,8 @@ async fn cancellation_during_raised_commit_still_logs_withdrawal() {
             },
             log.clone(),
             1,
+            loop_store::Tenant::local(),
+            None,
         );
         let asking = tokio::spawn(async move { host.interact(request()).await });
         wait_raised(&log.0).await;
@@ -595,7 +705,10 @@ async fn cancellation_during_raised_commit_still_logs_withdrawal() {
         assert!(asking.await.unwrap_err().is_cancelled());
         loop {
             if log
-                .read_runtime_after(0)
+                .read_runtime_after(
+                    loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                    0,
+                )
                 .await
                 .unwrap()
                 .iter()
@@ -704,7 +817,10 @@ async fn close_with_delayed_decision(answer: bool, shutdown: bool) {
         client.outgoing.send(serde_json::json!({"jsonrpc":"2.0", "id":asked["id"], "result":selected("accept_session")}).to_string()).unwrap();
         loop {
             if log
-                .read_runtime_after(0)
+                .read_runtime_after(
+                    loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                    0,
+                )
                 .await
                 .unwrap()
                 .iter()
@@ -743,7 +859,13 @@ async fn close_with_delayed_decision(answer: bool, shutdown: bool) {
     )
     .unwrap();
     assert!(store.lease(&session.native_id).await.unwrap().is_none());
-    let records = log.read_runtime_after(0).await.unwrap();
+    let records = log
+        .read_runtime_after(
+            loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+            0,
+        )
+        .await
+        .unwrap();
     let withdrawn = records
         .iter()
         .position(|e| matches!(e.event.kind, EventKind::EscalationWithdrawn(_)))
@@ -804,7 +926,10 @@ async fn a_cancelled_reply_is_a_recipient_leaving_not_an_answer() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(rt.is_busy(&session), "the turn must still wait");
         let answered = log
-            .read_runtime_after(0)
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
             .await
             .unwrap()
             .iter()
@@ -823,6 +948,270 @@ async fn a_cancelled_reply_is_a_recipient_leaving_not_an_answer() {
             .unwrap();
         assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
         rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A connection with a fixed caller, as the wire server's recipient is.
+struct Connection {
+    caller: Option<loop_protocol::Caller>,
+    asked: mpsc::UnboundedSender<(InteractParams, oneshot::Sender<InteractionOutcome>)>,
+}
+#[async_trait::async_trait]
+impl EscalationRecipient for Connection {
+    fn caller(&self) -> Option<loop_protocol::Caller> {
+        self.caller.clone()
+    }
+    fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
+    async fn interact(
+        &self,
+        params: InteractParams,
+        _withdrawn: oneshot::Receiver<()>,
+    ) -> Result<InteractionOutcome, ()> {
+        let (tx, rx) = oneshot::channel();
+        self.asked.send((params, tx)).map_err(|_| ())?;
+        rx.await.map_err(|_| ())
+    }
+}
+fn connection(
+    caller: Option<loop_protocol::Caller>,
+) -> (
+    Arc<Connection>,
+    mpsc::UnboundedReceiver<(InteractParams, oneshot::Sender<InteractionOutcome>)>,
+) {
+    let (asked, rx) = mpsc::unbounded_channel();
+    (Arc::new(Connection { caller, asked }), rx)
+}
+fn edge(id: &str) -> loop_protocol::Caller {
+    let principal = loop_protocol::Principal::new(
+        loop_protocol::PrincipalKind::Person,
+        "https://idp.example",
+        id,
+    )
+    .unwrap();
+    loop_protocol::Caller::asserted(principal, loop_protocol::Tenant::new("acme").unwrap()).unwrap()
+}
+
+/// Who gets and answers an Escalation follows the access rules (I3), not
+/// who started the turn. A `local` Session: the host's user is asked, an
+/// edge user never (also for a turn it started). Alice's Session in tenant
+/// acme: Alice is asked; Bob (same tenant) and the host's user (another
+/// tenant) are not. The answer record names who answered.
+#[tokio::test]
+async fn escalations_go_only_to_callers_who_may_act_in_the_session() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let log = Arc::new(MemoryEventLog::new());
+        let session = SessionRef {
+            instance: "loop".into(),
+            key: "s".into(),
+            native_id: "s".into(),
+        };
+        let host_user = loop_protocol::Caller::host(loop_protocol::Principal::local_uid(501));
+        let host = EscalationHost::new(
+            session.clone(),
+            log.clone(),
+            1,
+            loop_store::Tenant::local(),
+            None,
+        );
+        let (mine, mut mine_rx) = connection(Some(host_user.clone()));
+        let (alice, mut alice_rx) = connection(Some(edge("alice")));
+        host.attach(1, mine).await;
+        host.attach(2, alice.clone()).await;
+        // Even a turn the edge user started: it may not act in a local Session.
+        host.set_turn_caller(Some(edge("alice")));
+        let asking = tokio::spawn({
+            let host = host.clone();
+            async move { host.interact(request()).await }
+        });
+        let (_, answer) = mine_rx.recv().await.unwrap();
+        host.detach(2).await;
+        host.attach(2, alice.clone()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(alice_rx.try_recv().is_err(), "the edge user was asked");
+        answer.send(selected("accept")).unwrap();
+        assert_eq!(asking.await.unwrap(), selected("accept"));
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
+        let EventKind::EscalationAnswered(payload) = &events[1].event.kind else {
+            panic!("missing answer")
+        };
+        assert_eq!(payload["answered_by"]["principal"]["id"], "uid:501");
+        let id = payload["id"].as_str().unwrap();
+        assert_eq!(host.take_answered_by(id), Some(host_user.clone()));
+
+        // Alice's Session in tenant acme.
+        let acme = loop_store::Tenant::new("acme").unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let theirs = EscalationHost::new(session, log.clone(), 1, acme.clone(), None);
+        theirs.set_access(loop_runtime::access::Subject::owned(
+            acme.clone(),
+            edge("alice").principal().clone(),
+        ));
+        let (mine, mut mine_rx) = connection(Some(host_user.clone()));
+        let (alice, mut alice_rx) = connection(Some(edge("alice")));
+        let (bob, mut bob_rx) = connection(Some(edge("bob")));
+        theirs.attach(1, mine).await;
+        theirs.attach(2, alice).await;
+        theirs.attach(3, bob).await;
+        // Whoever started the turn, only Alice is asked.
+        theirs.set_turn_caller(Some(edge("bob")));
+        let asking = tokio::spawn({
+            let host = theirs.clone();
+            async move { host.interact(request()).await }
+        });
+        let (_, from_alice) = alice_rx.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(bob_rx.try_recv().is_err(), "another edge user was asked");
+        assert!(mine_rx.try_recv().is_err(), "the host's user was asked");
+        from_alice.send(selected("accept")).unwrap();
+        assert_eq!(asking.await.unwrap(), selected("accept"));
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
+        let EventKind::EscalationAnswered(payload) = &events.last().unwrap().event.kind else {
+            panic!("missing answer")
+        };
+        assert_eq!(payload["answered_by"]["principal"]["id"], "alice");
+        assert_eq!(payload["answered_by"]["via"], "edge");
+        assert_eq!(
+            events.last().unwrap().event.identity,
+            loop_store::Identity::acting(&edge("alice"), acme)
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// The same outside identity on a new connection (a reconnect) still
+/// answers the Escalation of its own Session.
+#[tokio::test]
+async fn a_reconnected_edge_user_answers_its_own_session() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let log = Arc::new(MemoryEventLog::new());
+        let session = SessionRef {
+            instance: "loop".into(),
+            key: "s".into(),
+            native_id: "s".into(),
+        };
+        let acme = loop_store::Tenant::new("acme").unwrap();
+        let host = EscalationHost::new(session, log.clone(), 1, acme.clone(), None);
+        host.set_access(loop_runtime::access::Subject::owned(
+            acme,
+            edge("alice").principal().clone(),
+        ));
+        let (first, mut first_rx) = connection(Some(edge("alice")));
+        host.attach(2, first).await;
+        host.set_turn_caller(Some(edge("alice")));
+        let asking = tokio::spawn({
+            let host = host.clone();
+            async move { host.interact(request()).await }
+        });
+        let _ = first_rx.recv().await.unwrap();
+        // The connection drops; Alice comes back on a new one.
+        host.detach(2).await;
+        let (again, mut again_rx) = connection(Some(edge("alice")));
+        host.attach(4, again).await;
+        let (_, answer) = again_rx.recv().await.unwrap();
+        answer.send(selected("accept")).unwrap();
+        assert_eq!(asking.await.unwrap(), selected("accept"));
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
+        let EventKind::EscalationAnswered(payload) = &events.last().unwrap().event.kind else {
+            panic!("missing answer")
+        };
+        assert_eq!(payload["answered_by"]["principal"]["id"], "alice");
+    })
+    .await
+    .unwrap();
+}
+
+/// Every record of an Escalation host is in its Session's tenant and has the
+/// Session's `actor`; a withdrawal names who withdrew, and a waiting tool
+/// that goes is withdrawn by the Runtime.
+#[tokio::test]
+async fn escalation_records_are_in_the_session_tenant_and_name_who_acted() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let log = Arc::new(MemoryEventLog::new());
+        let session = SessionRef {
+            instance: "loop".into(),
+            key: "s".into(),
+            native_id: "s".into(),
+        };
+        let acme = loop_store::Tenant::new("acme").unwrap();
+        let host = EscalationHost::new(
+            session,
+            log.clone(),
+            1,
+            acme.clone(),
+            Some("parent-key".into()),
+        );
+        host.set_turn_caller(Some(edge("alice")));
+        let asking = tokio::spawn({
+            let host = host.clone();
+            async move { host.interact(request()).await }
+        });
+        // The request is pending once its record is in the log.
+        while log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let host_user = loop_protocol::Caller::host(loop_protocol::Principal::local_uid(501));
+        host.withdraw("turn cancelled", false, &host_user)
+            .await
+            .unwrap();
+        assert_eq!(asking.await.unwrap(), InteractionOutcome::Cancelled);
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
+        let actor = Some("parent-key".to_owned());
+        assert!(matches!(
+            events[0].event.kind,
+            EventKind::EscalationRaised(_)
+        ));
+        assert_eq!(
+            events[0].event.identity,
+            loop_store::Identity::acting(&edge("alice"), acme.clone()).with_actor(actor.clone())
+        );
+        assert!(matches!(
+            events[1].event.kind,
+            EventKind::EscalationWithdrawn(_)
+        ));
+        assert_eq!(
+            events[1].event.identity,
+            loop_store::Identity::acting(&host_user, acme.clone()).with_actor(actor)
+        );
+        assert!(log
+            .read_runtime_after(loop_store::Scope::Tenant(&loop_store::Tenant::local()), 0)
+            .await
+            .unwrap()
+            .is_empty());
     })
     .await
     .unwrap();

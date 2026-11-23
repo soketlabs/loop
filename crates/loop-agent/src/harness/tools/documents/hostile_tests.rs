@@ -387,3 +387,103 @@ async fn a_damaged_encrypted_pdf_is_not_sent_to_ocr() {
         .unwrap_err();
     assert!(err.contains("encrypted, so it is not sent"), "{err}");
 }
+
+// Malformed XML in a part is a read error, never an empty or partial text.
+
+fn refusal(reading: Reading) -> String {
+    match reading {
+        Reading::Refused { error, .. } => error,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_docx_with_an_unclosed_document_part_is_refused() {
+    // The file the Linux live check made (D1): a valid zip, and a
+    // document.xml that stops inside a run.
+    let bytes = zip(&[(
+        "word/document.xml",
+        b"<w:document xmlns:w='x'><w:body><w:p><w:r><w:t>unclosed",
+    )]);
+    let error = refusal(child::reading(Format::Docx, &bytes));
+    assert!(error.contains("malformed XML"), "{error}");
+    assert!(error.contains("word/document.xml"), "{error}");
+}
+
+#[test]
+fn a_docx_cut_off_after_some_paragraphs_is_not_read_as_partial_text() {
+    let bytes = zip(&[(
+        "word/document.xml",
+        br#"<w:document xmlns:w="x"><w:body><w:p><w:r><w:t>kept?</w:t></w:r></w:p><w:p><w:r><w:t>cut"#,
+    )]);
+    let error = refusal(child::reading(Format::Docx, &bytes));
+    assert!(error.contains("malformed XML"), "{error}");
+}
+
+#[test]
+fn a_docx_with_mismatched_tags_or_no_root_is_refused() {
+    for body in [
+        &b"<w:document xmlns:w='x'><w:body></w:document>"[..],
+        b"<w:document xmlns:w='x'><w:body><w:p></w:body></w:document>",
+        b"",
+        b"<?xml version=\"1.0\"?>",
+        b"not xml at all",
+    ] {
+        let bytes = zip(&[("word/document.xml", body)]);
+        let error = refusal(child::reading(Format::Docx, &bytes));
+        assert!(error.contains("malformed XML"), "{body:?}: {error}");
+    }
+}
+
+#[test]
+fn a_docx_with_a_malformed_side_part_is_refused() {
+    for part in ["word/styles.xml", "word/numbering.xml"] {
+        let bytes = zip(&[
+            (
+                "word/document.xml",
+                br#"<w:document xmlns:w="x"><w:body/></w:document>"#,
+            ),
+            (part, b"<w:styles xmlns:w='x'><w:style w:styleId='a'>"),
+        ]);
+        let error = refusal(child::reading(Format::Docx, &bytes));
+        assert!(error.contains("malformed XML"), "{part}: {error}");
+    }
+}
+
+#[test]
+fn an_empty_but_valid_docx_reads_as_empty_text() {
+    let bytes = zip(&[(
+        "word/document.xml",
+        br#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body/></w:document>"#,
+    )]);
+    match child::reading(Format::Docx, &bytes) {
+        Reading::Done(c) => {
+            assert_eq!(c.text, "");
+            assert!(!c.truncated);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_pptx_slide_or_xlsx_sheet_with_malformed_xml_is_refused() {
+    let broken =
+        r#"<?xml version="1.0"?><p:sld xmlns:p="x" xmlns:a="y"><p:cSld><a:p><a:r><a:t>cut"#;
+    let bytes = pptx(
+        r#"<p:sldId r:id="rId1"/>"#,
+        &[("slide1.xml", broken.to_owned())],
+    );
+    let error = refusal(child::reading(Format::Pptx, &bytes));
+    assert!(error.contains("malformed XML"), "{error}");
+
+    let sheet = br#"<?xml version="1.0"?><worksheet xmlns="x"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>cut"#;
+    let mut parts = XLSX_BASE.to_vec();
+    parts.push(("xl/worksheets/sheet1.xml", sheet));
+    let error = refusal(child::reading(Format::Xlsx, &zip(&parts)));
+    assert!(!error.is_empty());
+    let read_ok = matches!(
+        child::reading(Format::Xlsx, &xlsx("", &[])),
+        Reading::Done(_)
+    );
+    assert!(read_ok, "a valid empty sheet still reads");
+}

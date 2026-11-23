@@ -104,6 +104,16 @@ impl Sandbox for TaggedSandbox {
     }
 }
 
+#[async_trait]
+impl loop_workspace::Workspace for TaggedSandbox {
+    fn driver_id(&self) -> &str {
+        "tagged"
+    }
+    fn capabilities(&self) -> loop_workspace::WorkspaceCapabilities {
+        loop_workspace::WorkspaceCapabilities::default()
+    }
+}
+
 struct TaggedEnv {
     tag: String,
     host: HostExecutionEnv,

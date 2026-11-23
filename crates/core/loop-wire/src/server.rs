@@ -25,9 +25,9 @@ use loop_protocol::rpc::{
     SessionParams, SetEffortParams, SetModeParams, SetModelParams,
 };
 use loop_protocol::{
-    AgentBackend, BackendInstanceId, BackendResult, HostServices, InteractionOutcome,
-    InteractionRequest, NoticeLevel, Origin, SessionKey, SessionUpdate, TurnId, TurnOutcome,
-    UpdateEnvelope,
+    AgentBackend, BackendInstanceId, BackendResult, Caller, HostServices, InteractionOutcome,
+    InteractionRequest, NoticeLevel, Origin, Principal, SessionKey, SessionUpdate, TurnId,
+    TurnOutcome, UpdateEnvelope,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -85,6 +85,77 @@ pub enum Authority {
     Remote,
 }
 
+/// The OS user that runs this process, as a principal in the `local`
+/// issuer: `{ person, local, uid:<euid> }` (ADR-0009), or
+/// [`Principal::local_os_user`] where there is no uid.
+pub fn local_principal() -> Principal {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no arguments or preconditions.
+        Principal::local_uid(unsafe { libc::geteuid() })
+    }
+    // No numeric user id: a distinct id, never `uid:0` (root).
+    #[cfg(not(unix))]
+    {
+        Principal::local_os_user()
+    }
+}
+
+/// The caller a connection gets when its acceptor names none: the host's
+/// user on a host-local connection, and none on any other. A Remote
+/// connection never gets the local identity by default; the acceptor that
+/// checked the bearer token names it with [`serve_with_caller`].
+fn default_caller(authority: Authority) -> Option<Caller> {
+    match authority {
+        Authority::HostLocal => Some(Caller::host(local_principal())),
+        Authority::Remote => None,
+    }
+}
+
+/// Why `method` is refused for this connection's caller when the caller is
+/// a user from outside the host ([`Caller::is_host_user`] is false), such as
+/// an Edge Gateway's end user. `None` serves it.
+///
+/// The rule (H1): an outside user is served only by a Runtime with a tool
+/// lock, and never gets `session/shell`. Without the lock a Session can run
+/// shell commands as the host's OS user, which reach the Runtime's 0600
+/// Unix socket (host-local authority), its credentials and its token files.
+/// The lock turns the shell, file writes and every non-chat tool off and
+/// confines reads to the Session's folder. The check fails closed: no
+/// Runtime, no admin service, or no lock offered all refuse.
+fn outside_user_refusal(
+    host: &ClientHost,
+    runtime: Option<&dyn RuntimeControl>,
+    method: &str,
+) -> Option<RpcErrorBody> {
+    if host.caller.as_ref().is_none_or(Caller::is_host_user) {
+        return None;
+    }
+    let forbidden = |message: &str| {
+        let mut body =
+            RpcErrorBody::from(&loop_protocol::BackendError::Forbidden(method.to_owned()));
+        body.message = format!("{method} is refused: {message}");
+        body
+    };
+    if admin_offered(runtime).tool_lock.is_none() {
+        return Some(forbidden(
+            "an Edge Gateway user is served only by a Runtime with a tool lock",
+        ));
+    }
+    if method == methods::SESSION_SHELL {
+        return Some(forbidden(
+            "an Edge Gateway user cannot run shell commands on the Runtime host",
+        ));
+    }
+    None
+}
+
+/// A remote connection with no caller: it has no identity to check, so the
+/// server serves it nothing but `initialize`.
+fn anonymous(authority: Authority, host: &ClientHost) -> bool {
+    authority != Authority::HostLocal && host.caller.is_none()
+}
+
 /// Whether `method` with `params` needs host-local authority: the host-only
 /// methods, and a `workspace/trust` change.
 fn host_only(method: &str, params: &Value) -> bool {
@@ -106,7 +177,8 @@ pub fn serve_with_options(
     info: PeerInfo,
     options: ServeOptions,
 ) -> Served {
-    start(backend, None, transport, info, options)
+    let caller = default_caller(options.authority);
+    start(backend, None, transport, info, options, caller)
 }
 
 /// Serve one connection of a shared Runtime: multi-Session methods, per-
@@ -119,7 +191,25 @@ pub fn serve_with_control(
     info: PeerInfo,
     options: ServeOptions,
 ) -> Served {
-    start(backend, Some(control), transport, info, options)
+    let caller = default_caller(options.authority);
+    start(backend, Some(control), transport, info, options, caller)
+}
+
+/// [`serve_with_control`] (or, without `control`, [`serve_with_options`])
+/// for a connection whose acceptor authenticated `caller`: the loopback
+/// WebSocket with the bearer token, or an Edge Gateway connection that
+/// asserted a principal at its handshake. The caller is fixed for the
+/// connection's life; no request can change it. It does not change
+/// `options.authority`: only a host-local transport serves host-only methods.
+pub fn serve_with_caller(
+    backend: Arc<dyn AgentBackend>,
+    control: Option<Arc<dyn RuntimeControl>>,
+    transport: Transport,
+    info: PeerInfo,
+    options: ServeOptions,
+    caller: Caller,
+) -> Served {
+    start(backend, control, transport, info, options, Some(caller))
 }
 
 fn start(
@@ -128,6 +218,7 @@ fn start(
     transport: Transport,
     info: PeerInfo,
     options: ServeOptions,
+    caller: Option<Caller>,
 ) -> Served {
     let (conn, incoming) = Connection::new(transport);
     let interact = Arc::new(AtomicBool::new(true));
@@ -136,8 +227,9 @@ fn start(
         interact: Arc::clone(&interact),
         branch_reset: AtomicBool::new(false),
         id: NEXT_TICKET.fetch_add(1, Ordering::Relaxed),
+        caller,
     });
-    let done = tokio::spawn(run(
+    let served = run(
         backend,
         runtime,
         conn,
@@ -145,8 +237,17 @@ fn start(
         info,
         options,
         host.clone(),
-    ));
+    );
+    let done = tokio::spawn(in_scope(host.caller.clone(), served));
     Served { host, done }
+}
+
+/// Run `future` with `caller` as [`Caller::current`], when there is one.
+async fn in_scope<F: std::future::Future>(caller: Option<Caller>, future: F) -> F::Output {
+    match caller {
+        Some(caller) => caller.scope(future).await,
+        None => future.await,
+    }
 }
 
 /// What the request loop tells the forwarder.
@@ -200,6 +301,8 @@ async fn run(
     // missed; forwarding starts once the client is initialized.
     let updates = backend.subscribe();
     let (control, control_rx) = mpsc::unbounded_channel();
+    // Not in the caller's scope: it only forwards updates and registers
+    // this connection for Escalations, and reads no identity.
     let forwarder = tokio::spawn(forward(
         Arc::clone(&conn),
         backend.instance().clone(),
@@ -213,7 +316,10 @@ async fn run(
         match message {
             Incoming::Response { id, result } => conn.resolve(id, result).await,
             Incoming::Notification { method, params } => {
-                if method == methods::SESSION_CANCEL {
+                if method == methods::SESSION_CANCEL
+                    && !anonymous(options.authority, &host)
+                    && outside_user_refusal(&host, runtime.as_deref(), &method).is_none()
+                {
                     if let Ok(SessionParams { session }) = parse::<SessionParams>(params) {
                         backend.cancel(&session);
                     }
@@ -237,6 +343,8 @@ async fn run(
                                 capabilities.efforts = false;
                                 capabilities.modes = false;
                             }
+                            // From the connection, never from `params`.
+                            let caller = host.caller.clone();
                             let offered = admin_offered(runtime.as_deref());
                             let host = options.authority == Authority::HostLocal;
                             capabilities.workspace_settings = offered.workspace_settings;
@@ -255,11 +363,30 @@ async fn run(
                             capabilities.host_usage = offered.host_usage && host;
                             capabilities.host_defaults = offered.host_defaults && host;
                             capabilities.runtime_stop_empty = offered.runtime_stop_empty && host;
+                            // A tool lock holds on every connection: the
+                            // client can hide what it turns off. The backend
+                            // still refuses those calls itself.
+                            capabilities.tool_lock = offered.tool_lock;
+                            if capabilities.tool_lock.is_some() {
+                                capabilities.local_shell = false;
+                                capabilities.workflow = false;
+                                // Host-only services are refused under a lock
+                                // ([`LOCKED_ADMIN`]).
+                                capabilities.host_providers = false;
+                                capabilities.host_tracing = false;
+                                capabilities.host_mcp_auth = false;
+                                capabilities.host_usage = false;
+                                capabilities.host_defaults = false;
+                            }
+                            let caller = caller.as_ref();
                             let result = InitializeResult {
                                 protocol_version: negotiate(params.protocol_version),
                                 server_info: info.clone(),
                                 instance: backend.instance().clone(),
                                 capabilities,
+                                principal: caller.map(|c| c.principal().clone()),
+                                tenant: caller.map(|c| c.tenant().clone()),
+                                via: caller.and_then(|c| c.via().cloned()),
                             };
                             conn.respond(id, Ok(to_value(&result)));
                             if !initialized {
@@ -276,6 +403,26 @@ async fn run(
                         id,
                         Err((codes::INVALID_REQUEST, "call initialize first".into())),
                     );
+                    continue;
+                }
+                // An outside user (an Edge Gateway assertion) is served only
+                // by a tool-locked Runtime, and never gets `session/shell`.
+                if let Some(refused) = outside_user_refusal(&host, runtime.as_deref(), &method) {
+                    respond(&conn, id, Err(refused));
+                    continue;
+                }
+                // A remote connection that no acceptor named a caller for has
+                // no identity to check access with (I3), so it is served
+                // nothing but `initialize`. Without a caller in scope the
+                // Runtime would treat a request as its own in-process work.
+                if anonymous(options.authority, &host) {
+                    let mut body =
+                        RpcErrorBody::from(&loop_protocol::BackendError::Forbidden(method.clone()));
+                    body.message = format!(
+                        "{method} is refused: this connection has no identity, so it cannot \
+                         use Sessions or run shell commands"
+                    );
+                    respond(&conn, id, Err(body));
                     continue;
                 }
                 // Refused before parsing or dispatch, whatever the params.
@@ -298,8 +445,10 @@ async fn run(
                 let control = control.clone();
                 let host = host.clone();
                 // Each request runs on its own, so a long `session/load`
-                // doesn't hold up a `session/cancel`.
-                tokio::spawn(async move {
+                // doesn't hold up a `session/cancel`. The connection's
+                // caller is in scope for the backend and the Runtime.
+                let caller = host.caller.clone();
+                tokio::spawn(in_scope(caller, async move {
                     handle(
                         backend.as_ref(),
                         runtime.as_deref(),
@@ -310,7 +459,7 @@ async fn run(
                         params,
                     )
                     .await;
-                });
+                }));
             }
         }
     }
@@ -506,9 +655,14 @@ async fn handle(
         methods::SESSION_LIST if runtime.is_some() => {
             runtime.unwrap().list().await.map(|l| to_value(&l))
         }
-        methods::RUNTIME_STATUS if runtime.is_some() => {
-            runtime.unwrap().status().await.map(|s| to_value(&s))
-        }
+        methods::RUNTIME_STATUS if runtime.is_some() => match runtime.unwrap().status().await {
+            Ok(status) if host.caller.as_ref().is_some_and(|c| !c.is_host_user()) => {
+                outside_status(runtime.unwrap(), status)
+                    .await
+                    .map(|s| to_value(&s))
+            }
+            other => other.map(|s| to_value(&s)),
+        },
         methods::RUNTIME_STOP_EMPTY if runtime.is_some() => {
             if !admin_offered(runtime).runtime_stop_empty {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
@@ -800,6 +954,21 @@ async fn session_services(
     })
 }
 
+/// The admin methods a Runtime with a tool lock serves. Each one's writes
+/// are refused by the Runtime under the lock; reads stay.
+pub const LOCKED_ADMIN: &[&str] = &[
+    methods::WORKSPACE_SETTINGS,
+    methods::WORKSPACE_MCP,
+    methods::WORKSPACE_WEB_SEARCH,
+    methods::WORKSPACE_SKILLS,
+    methods::WORKSPACE_TEMPLATES,
+    methods::WORKSPACE_RELOAD,
+    methods::WORKSPACE_TRUST,
+    methods::SESSION_SANDBOX,
+    methods::SESSION_PERMISSION_MODE,
+    methods::RUNTIME_SESSIONS,
+];
+
 /// The admin flags the Runtime's admin service offers; none without one.
 fn admin_offered(runtime: Option<&dyn RuntimeControl>) -> loop_protocol::Capabilities {
     runtime
@@ -818,6 +987,17 @@ async fn admin(
     method: &str,
     params: Value,
 ) -> Result<BackendResult<Value>, (i64, String)> {
+    // Under a tool lock only the admin methods a chat client needs are
+    // served; any other one, a new one included, is refused. The Runtime
+    // still refuses their writes itself.
+    if let Some(lock) = capabilities.tool_lock {
+        if !LOCKED_ADMIN.contains(&method) {
+            return Ok(Err(loop_protocol::BackendError::ToolLocked {
+                what: method.into(),
+                lock,
+            }));
+        }
+    }
     let offered = match method {
         methods::RUNTIME_PROVIDERS => capabilities.host_providers,
         methods::RUNTIME_TRACING => capabilities.host_tracing,
@@ -913,10 +1093,15 @@ async fn forward(
                     if feeds.dropped > 0 {
                         // Updates were discarded while this Session was being
                         // made; never skip silently.
-                        lagged(&conn, &instance, feeds.dropped);
+                        let outside = host.caller.as_ref().is_some_and(|c| !c.is_host_user());
+                        lagged(&conn, &instance, (!outside).then_some(feeds.dropped));
                         return;
                     }
-                    register_recipient(runtime.as_deref(), &host, &session, true).await;
+                    // The Runtime checks the caller may read it; a refusal
+                    // keeps the feed off.
+                    if !register_recipient(runtime.as_deref(), &host, &session, true).await {
+                        continue;
+                    }
                     if feeds.own(key.clone()) {
                         for envelope in feeds.take_pending(&key) {
                             if feeds.deliver(&conn, envelope).is_err() {
@@ -931,7 +1116,13 @@ async fn forward(
                     if feeds.finish_attach(&conn, id, key, op, after_seq, *result).is_err() {
                         return;
                     }
-                    if attached && feeds.map.contains_key(&session.key) { register_recipient(runtime.as_deref(), &host, &session, true).await; }
+                    if attached
+                        && feeds.map.contains_key(&session.key)
+                        && !register_recipient(runtime.as_deref(), &host, &session, true).await
+                    {
+                        // The Runtime refused this caller: no live updates.
+                        feeds.map.remove(&session.key);
+                    }
                 }
                 Some(Control::Detach { id, session }) => {
                     register_recipient(runtime.as_deref(), &host, &session, false).await;
@@ -994,8 +1185,11 @@ async fn forward(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
-                    // Never let the client silently miss part of a turn.
-                    lagged(&conn, &instance, missed);
+                    // Never let the client silently miss part of a turn. The
+                    // channel is shared: an outside user is not told how
+                    // many updates (of every Session) went by.
+                    let outside = host.caller.as_ref().is_some_and(|c| !c.is_host_user());
+                    lagged(&conn, &instance, (!outside).then_some(missed));
                     return;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
@@ -1256,7 +1450,7 @@ impl Feeds {
 }
 
 /// Tell the client it missed updates, then close the connection.
-fn lagged(conn: &Connection, instance: &BackendInstanceId, missed: u64) {
+fn lagged(conn: &Connection, instance: &BackendInstanceId, missed: Option<u64>) {
     let notice = UpdateEnvelope::live(
         instance.clone(),
         0,
@@ -1265,13 +1459,22 @@ fn lagged(conn: &Connection, instance: &BackendInstanceId, missed: u64) {
         0,
         SessionUpdate::Notice {
             level: NoticeLevel::Error,
-            text: format!(
-                "this client fell behind and missed {missed} updates; reconnect to continue"
-            ),
+            text: lag_text(missed),
         },
     );
     let _ = conn.notify(methods::SESSION_UPDATE, to_value(&notice));
     conn.close();
+}
+
+/// The lag notice. `None` (an outside user) leaves out the count: the
+/// channel is shared, so the count would tell of other users' updates.
+fn lag_text(missed: Option<u64>) -> String {
+    match missed {
+        Some(missed) => {
+            format!("this client fell behind and missed {missed} updates; reconnect to continue")
+        }
+        None => "this client fell behind and missed updates; reconnect to continue".into(),
+    }
 }
 
 async fn sleep_until(deadline: Option<tokio::time::Instant>) {
@@ -1288,31 +1491,81 @@ struct ClientHost {
     /// Whether the client declared `interact` at `initialize`.
     interact: Arc<AtomicBool>,
     branch_reset: AtomicBool,
+    /// Who this connection acts for. Fixed when the connection was accepted.
+    caller: Option<Caller>,
 }
 
+/// Register this connection as a watcher (and Escalation recipient) of
+/// `session`, with the connection's caller in scope: the forwarder runs
+/// outside it. False when the Runtime refuses the caller (the Session is
+/// "not found" for it): the connection must not keep a feed of it.
 async fn register_recipient(
     runtime: Option<&dyn RuntimeControl>,
     host: &Arc<ClientHost>,
     session: &loop_protocol::SessionRef,
     attached: bool,
-) {
-    if let Some(runtime) = runtime {
-        let recipient = if attached && host.interact.load(Ordering::Acquire) {
-            Some(host.clone() as Arc<dyn crate::control::EscalationRecipient>)
-        } else {
-            None
-        };
-        if let Err(error) = runtime
-            .register(session, host.id, attached, recipient)
-            .await
-        {
-            tracing::debug!(%error, "could not register Escalation recipient");
+) -> bool {
+    let Some(runtime) = runtime else {
+        return true;
+    };
+    let recipient = if attached && host.interact.load(Ordering::Acquire) {
+        Some(host.clone() as Arc<dyn crate::control::EscalationRecipient>)
+    } else {
+        None
+    };
+    let registered = in_scope(
+        host.caller.clone(),
+        runtime.register(session, host.id, attached, recipient),
+    )
+    .await;
+    registered_ok(registered, attached)
+}
+
+/// Whether a connection may keep its feed after `registered`. Fails closed:
+/// any error of an attaching registration (a refusal, or a failure to read
+/// who may see the Session) drops the feed. Stopping a watch never fails.
+fn registered_ok(registered: BackendResult<()>, attached: bool) -> bool {
+    match registered {
+        Ok(()) => true,
+        Err(error) if attached => {
+            tracing::debug!(%error, "registration refused: the feed is dropped");
+            false
+        }
+        Err(error) => {
+            tracing::debug!(%error, "could not unregister an Escalation recipient");
+            true
         }
     }
 }
 
+/// `runtime/status` for a user from outside the host: nothing about the
+/// host (no pid, socket, URL or where the limits came from), and counts of
+/// only the Sessions it may list (`runtime/sessions` filters them).
+async fn outside_status(
+    runtime: &dyn RuntimeControl,
+    mut status: loop_protocol::rpc::RuntimeStatus,
+) -> BackendResult<loop_protocol::rpc::RuntimeStatus> {
+    status.auto_started = false;
+    status.pid = 0;
+    status.socket = std::path::PathBuf::new();
+    status.listen_url = None;
+    status.max_sessions_from = None;
+    status.max_active_turns_from = None;
+    let totals = match runtime.admin() {
+        Some(admin) => admin.sessions().await.map(|r| r.totals).unwrap_or_default(),
+        None => Default::default(),
+    };
+    status.loaded = u64::from(totals.sessions);
+    status.busy = u64::from(totals.busy);
+    Ok(status)
+}
+
 #[async_trait]
 impl crate::control::EscalationRecipient for ClientHost {
+    fn caller(&self) -> Option<Caller> {
+        self.caller.clone()
+    }
+
     fn withdraw(&self, params: loop_protocol::rpc::InteractWithdrawnParams) {
         let _ = self
             .conn
@@ -1436,6 +1689,35 @@ mod tests {
         let id = json!("x".repeat(loop_protocol::rpc::SESSION_RESPONSE_LIMIT));
         assert!(export_response_fits(&id, &json!({})).is_err());
         assert!(export_response_fits(&json!(1), &json!({"jsonl":"small"})).is_ok());
+    }
+
+    #[test]
+    fn an_attaching_registration_fails_closed_on_any_error() {
+        use loop_protocol::{BackendError, ErrorCategory};
+        assert!(registered_ok(Ok(()), true));
+        let refused = || Err(BackendError::SessionNotFound("s".into()));
+        let failed = || {
+            Err(BackendError::failed(
+                ErrorCategory::Internal,
+                "log read failed",
+            ))
+        };
+        assert!(!registered_ok(refused(), true));
+        assert!(
+            !registered_ok(failed(), true),
+            "a failure must drop the feed"
+        );
+        assert!(!registered_ok(Err(BackendError::Busy), true));
+        // A detach is never held back by an error.
+        assert!(registered_ok(failed(), false));
+    }
+
+    #[test]
+    fn an_outside_user_is_not_told_how_many_updates_it_missed() {
+        let outside = lag_text(None);
+        assert!(!outside.chars().any(|c| c.is_ascii_digit()), "{outside}");
+        assert!(outside.contains("fell behind"), "{outside}");
+        assert!(lag_text(Some(4096)).contains("missed 4096 updates"));
     }
 
     #[tokio::test]

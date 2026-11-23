@@ -16,6 +16,7 @@ loop-agent = { workspace = true, features = ["sqlite"] }
 loop-ai.workspace = true
 loop-app-core.workspace = true
 loop-protocol.workspace = true
+loop-store.workspace = true
 loop-wire.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
@@ -27,6 +28,7 @@ tokio.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 loop-orchestration.workspace = true
+loop-store-testkit = { path = "../core/loop-store-testkit", default-features = false, features = ["event-log"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 tokio-util.workspace = true

@@ -1574,7 +1574,18 @@ async fn run_case(base: &Path, case: &Case) -> Outcome {
             });
             let g = globals(&dirs, model(script.clone(), seen.clone(), hook));
             let log = Arc::new(MemoryEventLog::new());
-            match Runtime::new(g, dirs.opts(case.mode), log, RuntimeLimits::default()).await {
+            match {
+                let store = g.open_runtime_session_store().unwrap();
+                Runtime::new(
+                    g,
+                    dirs.opts(case.mode),
+                    log,
+                    store,
+                    RuntimeLimits::default(),
+                )
+            }
+            .await
+            {
                 Ok(rt) => {
                     let rt = rt.into_shared();
                     let spec = SessionSpec {
@@ -2034,6 +2045,8 @@ async fn e3_enforcement() {
     for ((route, verdict), n) in &by {
         println!("E3|COUNT|{route}|{verdict}|{n}");
     }
+    // The leaks still open are listed in docs/probes/e3-results.md
+    // ("Expected leak list"): 086, 087, 089, 122-125. Any other id is new.
     let leaks = rows.iter().filter(|r| r.2 == "LEAK").count();
     assert_eq!(leaks, 0, "{leaks} leaks; see E3|LEAK lines");
 }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::harness::types::{FileError, FileErrorCode, PromptTemplate};
+use crate::harness::types::{FileError, FileErrorCode, FileSystem, PromptTemplate};
 
 /// Template load diagnostic.
 #[derive(Debug, Clone)]
@@ -23,7 +23,9 @@ struct TemplateFrontmatter {
     argument_hint: Option<String>,
 }
 
-/// Load `.md` templates non-recursively from a directory.
+/// Load `.md` templates non-recursively from a directory on the Runtime
+/// host (a global folder). Templates of a Workspace load through
+/// [`load_prompt_templates_in`].
 pub fn load_prompt_templates(dir: &Path) -> (Vec<PromptTemplate>, Vec<PromptTemplateDiagnostic>) {
     let mut templates = Vec::new();
     let mut diags = Vec::new();
@@ -53,10 +55,55 @@ pub fn load_prompt_templates(dir: &Path) -> (Vec<PromptTemplate>, Vec<PromptTemp
     (templates, diags)
 }
 
+/// Load `.md` templates non-recursively from a directory of a Workspace,
+/// through its [`FileSystem`]. Same files, same order and same
+/// diagnostics as [`load_prompt_templates`].
+pub async fn load_prompt_templates_in(
+    fs: &dyn FileSystem,
+    dir: &Path,
+) -> (Vec<PromptTemplate>, Vec<PromptTemplateDiagnostic>) {
+    let mut templates = Vec::new();
+    let mut diags = Vec::new();
+    let entries = match fs.list_dir(dir).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            diags.push(PromptTemplateDiagnostic {
+                path: dir.to_path_buf(),
+                message: e.message,
+            });
+            return (templates, diags);
+        }
+    };
+    for entry in entries {
+        let path = entry.path;
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let loaded = fs
+            .read_text_file(&path)
+            .await
+            .map_err(|e| FileError::new(FileErrorCode::Io, e.message))
+            .map(|text| parse_template(&path, &text));
+        match loaded {
+            Ok(t) => templates.push(t),
+            Err(e) => diags.push(PromptTemplateDiagnostic {
+                path,
+                message: e.to_string(),
+            }),
+        }
+    }
+    (templates, diags)
+}
+
 fn load_template_file(path: &Path) -> Result<PromptTemplate, FileError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| FileError::new(FileErrorCode::Io, e.to_string()))?;
-    let (fm, body) = split_frontmatter(&text);
+    Ok(parse_template(path, &text))
+}
+
+/// The template in the text of the `.md` file at `path`.
+fn parse_template(path: &Path, text: &str) -> PromptTemplate {
+    let (fm, body) = split_frontmatter(text);
     let fm: TemplateFrontmatter = serde_yaml::from_str(&fm).unwrap_or(TemplateFrontmatter {
         name: None,
         argument_hint: None,
@@ -67,12 +114,12 @@ fn load_template_file(path: &Path) -> Result<PromptTemplate, FileError> {
             .unwrap_or("template")
             .to_string()
     });
-    Ok(PromptTemplate {
+    PromptTemplate {
         name,
         body: body.trim().to_string(),
         path: path.to_path_buf(),
         argument_hint: fm.argument_hint,
-    })
+    }
 }
 
 fn split_frontmatter(text: &str) -> (String, String) {

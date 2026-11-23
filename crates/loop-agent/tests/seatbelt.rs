@@ -43,6 +43,8 @@ impl Fixture {
         }
         std::fs::create_dir(agent.join("run")).unwrap();
         std::fs::write(agent.join("auth.json"), "sensitive-sentinel").unwrap();
+        std::fs::create_dir(agent.join("audit")).unwrap();
+        std::fs::write(agent.join("audit/decisions.jsonl"), "sensitive-sentinel").unwrap();
         std::fs::write(agent.join("run/token"), "sensitive-sentinel").unwrap();
         let sandbox = SeatbeltSandboxFactory.create(SandboxConfig {
             workdir: project.clone(),
@@ -134,6 +136,7 @@ async fn shell_and_file_tools_enforce_write_and_secret_boundaries() {
             f.home.join(".config/gh/secret"),
             f.home.join("Library/Keychains/secret"),
             f.agent.join("auth.json"),
+            f.agent.join("audit/decisions.jsonl"),
             f.agent.join("run/token"),
         ] {
             let out = f.sh(&format!("cat {}", q(&secret))).await;

@@ -225,8 +225,18 @@ pub fn compute_session_stats(input: SessionStatsInput<'_>) -> SessionStats {
 
     for entry in input.all_entries {
         match entry {
-            SessionTreeEntry::Compaction { .. } => {
+            SessionTreeEntry::Compaction { details, .. } => {
                 compactions += 1;
+                // The model call that wrote the summary.
+                if let Some(usage) =
+                    crate::harness::compaction::usage_from_details(details.as_ref())
+                {
+                    if calculate_context_tokens(&usage) > 0 || usage.cost.total > 0.0 {
+                        totals.add_usage(&usage);
+                        usage_turns += 1;
+                        add_breakdown(&mut breakdown, "Tools/summaries", &usage);
+                    }
+                }
             }
             SessionTreeEntry::BranchSummary { .. } => {
                 branch_summaries += 1;

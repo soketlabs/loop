@@ -69,7 +69,6 @@ Loop is a Cargo workspace. Put changes in the narrowest crate that fits.
 | `loop-acp` | Runs any Agent Client Protocol agent (Codex, Claude, Gemini, …) as a backend |
 | `loop-app-core` | Shared application runtime: config, tool approval, settings |
 | `loop-cli` | The `loop` binary and its ratatui TUI |
-| `loop-desktop` | GPUI desktop app (experimental, nightly toolchain) |
 | `loop-telemetry` | Optional OpenTelemetry tracing and the anonymous local usage log (`telemetry` feature) |
 | `loop-dashboard` | Terminal usage view over the usage log (`/usage`; `usage` feature of `loop-cli`) |
 | `loop-test-support` | Shared test fixtures and helpers |
@@ -82,7 +81,7 @@ Dependencies flow one way:
 - `loop-mcp`, `loop-orchestration`, and `loop-telemetry` depend only on `loop-ai`.
 - `loop-agent` composes them, through optional features.
 - `loop-app-core` builds on `loop-agent`.
-- The front ends (`loop-cli`, `loop-desktop`) sit on top.
+- The front end (`loop-cli`) sits on top. The desktop app is developed in a separate repository.
 
 Lower crates must not depend on higher ones, and a library crate must never depend on a UI crate.
 
@@ -99,7 +98,7 @@ Lower crates must not depend on higher ones, and a library crate must never depe
 rustup toolchain install stable --component rustfmt,clippy
 ```
 
-There is no root `rust-toolchain.toml`: the workspace builds on stable, as CI does. `crates/loop-desktop` carries its own `rust-toolchain.toml` that pins **nightly**. When you work inside that directory, rustup switches toolchains automatically.
+There is no root `rust-toolchain.toml`: the workspace builds on stable, as CI does.
 
 ## Local workflow
 
@@ -119,10 +118,10 @@ Before pushing, all of the following must pass:
 cargo fmt --all -- --check
 
 # 2. Lints: warnings are errors
-cargo clippy --workspace --exclude loop-desktop --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
 
 # 3. Tests (mirrors .github/workflows/ci.yml)
-cargo test --locked                        # every crate except loop-desktop
+cargo test --locked
 
 # 4. Telemetry feature build + tests (if you touched tracing, spans, or loop-telemetry)
 cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli \
@@ -132,15 +131,14 @@ cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli \
 Notes:
 
 - CI (`.github/workflows/ci.yml`) runs the format and lint checks on Linux, and the tests on Linux and macOS. Run them locally first to avoid a red build. It also lints and tests with `--features loop-cli/orchestration`; if you touch orchestration code, run `cargo clippy -p loop-agent -p loop-runtime -p loop-cli --features loop-cli/orchestration --all-targets --locked -- -D warnings`. See [docs/ci.md](../docs/ci.md).
-- **`--locked` is mandatory.** Do not change `Cargo.lock` unless your PR intentionally adds or updates a dependency. For version bumps use `cargo update -w`, not `cargo generate-lockfile`; the GPUI git dependencies must not be re-resolved (see the comment in `Cargo.toml`).
+- **`--locked` is mandatory.** Do not change `Cargo.lock` unless your PR intentionally adds or updates a dependency. For version bumps use `cargo update -w`, not `cargo generate-lockfile`, so git dependencies are not re-resolved.
 - **Live tests** that call real providers or krun microVMs are opt-in through `LOOP_TEST_*` environment variables (for example `LOOP_TEST_BASE_URL`, `LOOP_TEST_MODEL`, `LOOP_TEST_KRUN`). They must skip cleanly when those variables are unset, and they must never run in default CI.
-- If you touch `loop-desktop`, also run `cargo clippy -p loop-desktop -- -D warnings` from `crates/loop-desktop` (nightly).
 
 ## Code standards
 
 ### Errors
 
-- **Library crates** (`loop-ai`, `loop-agent`, `loop-mcp`, `loop-orchestration`, `loop-app-core`, `loop-telemetry`) expose typed errors built with `thiserror`. `anyhow` is for binaries (`loop-cli`, `loop-desktop`) and tests only.
+- **Library crates** (`loop-ai`, `loop-agent`, `loop-mcp`, `loop-orchestration`, `loop-app-core`, `loop-telemetry`) expose typed errors built with `thiserror`. `anyhow` is for binaries (`loop-cli`) and tests only.
 - Propagate errors with `?` and `map_err` into the crate's error type. Keep the underlying cause in the message, for example `ExecutionError::new(ExecutionErrorCode::SpawnFailed, format!("podman exec: {e}"))`.
 - **No new `.unwrap()` in non-test code.** The agent loop is long-lived: a panic loses the user's session, and in the TUI it corrupts the terminal. Instead:
   - Use `?`, `ok_or_else`, `unwrap_or_else`, or a `match`.
@@ -221,7 +219,7 @@ Signed-off-by: Jane Doe <jane@example.com>
 
 **Types:** `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `build`, `ci`, `chore`, `revert`.
 
-**Scopes** (use the crate or subsystem): `ai`, `agent`, `sandbox`, `mcp`, `orchestration`, `app-core`, `cli`, `desktop`, `telemetry`, `install`, `release`.
+**Scopes** (use the crate or subsystem): `ai`, `agent`, `sandbox`, `mcp`, `orchestration`, `app-core`, `cli`, `telemetry`, `install`, `release`.
 
 **Breaking changes** to public APIs, config files, the session format, or CLI flags: add `!` after the type/scope **and** a `BREAKING CHANGE:` footer that describes the migration.
 
@@ -248,7 +246,7 @@ from start(); wrap the previous return value in SandboxInfo::enabled().
 
 - [ ] Commits are signed off (`git commit -s`) and follow Conventional Commits
 - [ ] `cargo fmt --all -- --check` passes
-- [ ] `cargo clippy --workspace --exclude loop-desktop --all-targets --locked -- -D warnings` passes
+- [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings` passes
 - [ ] Tests pass with `--locked`; new behavior and fixes have tests
 - [ ] No new `.unwrap()` in non-test code; any `unsafe` has a `// SAFETY:` comment
 - [ ] Security invariants upheld (or deviations justified and flagged for maintainer review)

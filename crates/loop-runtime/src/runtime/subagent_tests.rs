@@ -174,11 +174,14 @@ async fn runtime(
 ) -> (Arc<Runtime>, Arc<MemoryEventLog>, Arc<Seen>) {
     let (globals, seen) = globals(dir, script);
     let log = Arc::new(MemoryEventLog::new());
-    let rt = Runtime::new(globals, opts(dir, mode), log.clone(), limits)
-        .await
-        .unwrap()
-        .with_close_grace(Duration::from_millis(500))
-        .into_shared();
+    let rt = {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(globals, opts(dir, mode), log.clone(), store, limits)
+    }
+    .await
+    .unwrap()
+    .with_close_grace(Duration::from_millis(500))
+    .into_shared();
     (rt, log, seen)
 }
 
@@ -269,7 +272,13 @@ async fn parallel_children_complete_and_the_parent_gets_both_answers() {
             assert!(lease.is_none(), "a finished child releases its lease");
         }
 
-        let events = log.read_runtime_after(0).await.unwrap();
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         let parent = kinds(&events, &root.key);
         assert_eq!(
             parent.iter().filter(|k| *k == "subagent_started").count(),
@@ -400,12 +409,16 @@ async fn depth_limit_is_configurable() {
     tokio::time::timeout(LIMIT, async {
         let dir = tempfile::tempdir().unwrap();
         let (globals, seen) = globals(dir.path(), nest());
-        let rt = Runtime::new(
-            globals,
-            opts(dir.path(), "full-access"),
-            Arc::new(MemoryEventLog::new()),
-            RuntimeLimits::default(),
-        )
+        let rt = {
+            let store = globals.open_runtime_session_store().unwrap();
+            Runtime::new(
+                globals,
+                opts(dir.path(), "full-access"),
+                Arc::new(MemoryEventLog::new()),
+                store,
+                RuntimeLimits::default(),
+            )
+        }
         .await
         .unwrap()
         .with_subagent_depth(1)
@@ -506,7 +519,13 @@ async fn logged(
 ) -> SessionKey {
     loop {
         if let Some(key) = session(&rt.list().await.unwrap()) {
-            let events = log.read_runtime_after(0).await.unwrap();
+            let events = log
+                .read_runtime_after(
+                    loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                    0,
+                )
+                .await
+                .unwrap();
             if events.iter().any(|e| {
                 e.event.session_key.as_ref() == Some(&key)
                     && serde_json::to_string(&e.event.kind)
@@ -590,12 +609,16 @@ async fn cancelling_the_parent_cancels_its_descendants() {
         let log = Arc::new(MemoryEventLog::new());
         // The default close grace: a cascade that relied on aborting stuck
         // turns would take seconds per level and record `aborted`.
-        let rt = Runtime::new(
-            globals,
-            opts(dir.path(), "full-access"),
-            log.clone(),
-            RuntimeLimits::default(),
-        )
+        let rt = {
+            let store = globals.open_runtime_session_store().unwrap();
+            Runtime::new(
+                globals,
+                opts(dir.path(), "full-access"),
+                log.clone(),
+                store,
+                RuntimeLimits::default(),
+            )
+        }
         .await
         .unwrap()
         .into_shared();
@@ -630,8 +653,16 @@ async fn cancelling_the_parent_cancels_its_descendants() {
         rt.cancel(&root);
         assert!(matches!(turn.outcome().await, TurnOutcome::Cancelled));
         loop {
-            let ended = kinds(&log.read_runtime_after(0).await.unwrap(), &root.key)
-                .contains(&"subagent_ended".to_owned());
+            let ended = kinds(
+                &log.read_runtime_after(
+                    loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                    0,
+                )
+                .await
+                .unwrap(),
+                &root.key,
+            )
+            .contains(&"subagent_ended".to_owned());
             if ended && rt.sessions.lock().unwrap().len() == 1 {
                 break;
             }
@@ -642,7 +673,13 @@ async fn cancelling_the_parent_cancels_its_descendants() {
             "{:?}",
             started.elapsed()
         );
-        let events = log.read_runtime_after(0).await.unwrap();
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         for key in [&middle, &leaf] {
             let kinds = kinds(&events, key);
             assert!(kinds.contains(&"cancelled".to_owned()), "{kinds:?}");
@@ -691,7 +728,15 @@ async fn ask_mode_spawns_without_asking_and_cancel_withdraws_child_escalations()
         rt.cancel(&other);
         assert!(matches!(turn.outcome().await, TurnOutcome::Cancelled));
         loop {
-            let kinds = kinds(&log.read_runtime_after(0).await.unwrap(), &asker);
+            let kinds = kinds(
+                &log.read_runtime_after(
+                    loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                    0,
+                )
+                .await
+                .unwrap(),
+                &asker,
+            );
             if kinds.contains(&"session_closed".to_owned()) {
                 assert!(
                     kinds.contains(&"escalation_withdrawn".to_owned()),
@@ -726,12 +771,16 @@ async fn the_tool_is_offered_only_inside_a_shared_runtime() {
 
         let other = tempfile::tempdir().unwrap();
         let (globals, _) = globals(other.path(), script);
-        let plain = Runtime::new(
-            globals,
-            opts(other.path(), "full-access"),
-            Arc::new(MemoryEventLog::new()),
-            RuntimeLimits::default(),
-        )
+        let plain = {
+            let store = globals.open_runtime_session_store().unwrap();
+            Runtime::new(
+                globals,
+                opts(other.path(), "full-access"),
+                Arc::new(MemoryEventLog::new()),
+                store,
+                RuntimeLimits::default(),
+            )
+        }
         .await
         .unwrap();
         let session = plain.new_session(SessionSpec::default()).await.unwrap();
@@ -1037,7 +1086,13 @@ async fn only_subagent_children_list_a_parent_and_their_end_says_they_closed() {
             "the task names the child"
         );
 
-        let events = log.read_runtime_after(0).await.unwrap();
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         let ended = payload(&events, &root.key, "subagent_ended").unwrap();
         // `closed` keeps its original meaning: the close error, or null.
         assert_eq!(ended["closed"], json!(null), "{ended}");
@@ -1057,6 +1112,10 @@ type Asked = (
 struct Watcher(tokio::sync::mpsc::UnboundedSender<Asked>);
 #[async_trait]
 impl EscalationRecipient for Watcher {
+    fn caller(&self) -> Option<loop_protocol::Caller> {
+        None
+    }
+
     fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
     async fn interact(
         &self,
@@ -1136,7 +1195,13 @@ async fn a_grandchilds_escalation_reaches_surfaces_watching_any_ancestor() {
         assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
         assert_eq!(seen.results("root"), vec!["middle done".to_owned()]);
 
-        let events = log.read_runtime_after(0).await.unwrap();
+        let events = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         let kinds = kinds(&events, &asker.key);
         assert!(kinds.contains(&"escalation_raised".to_owned()), "{kinds:?}");
         assert!(
@@ -1282,6 +1347,118 @@ async fn an_ancestors_surface_disconnecting_leaves_the_request_parked() {
             .unwrap();
         let (params, answer, _) = next_rx.recv().await.unwrap();
         answer.send(allow(&params)).unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A Subagent's tool calls pass its own gate, and each decision is recorded
+/// on the child Session, acting for the caller that prompted the parent
+/// (ADR-0009: agents act as the person who started the Session).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subagent_s_decisions_are_recorded_for_the_parent_s_caller() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let script: Script = Arc::new(|turn: Turn| match (turn.task.as_str(), turn.call) {
+            ("root", 1) => ready(calls(vec![spawn("child")])),
+            ("child", 1) => ready(calls(vec![("bash", json!({"command": "true"}))])),
+            _ => ready(text("done")),
+        });
+        let (rt, log, _) =
+            runtime(dir.path(), "full-access", RuntimeLimits::default(), script).await;
+        let root = rt.new_session(SessionSpec::default()).await.unwrap();
+        let person = loop_protocol::Caller::host(loop_protocol::Principal::local_uid(4242));
+        let turn = person
+            .scope(rt.prompt(&root, vec![ContentBlock::text("root")]))
+            .await
+            .unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        let records: Vec<(SessionKey, loop_store::PolicyDecisionRecord)> = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| match r.event.kind {
+                EventKind::PolicyDecision(value) => Some((
+                    r.event.session_key.unwrap(),
+                    serde_json::from_value(value).unwrap(),
+                )),
+                _ => None,
+            })
+            .collect();
+        let parent: Vec<_> = records.iter().filter(|(key, _)| *key == root.key).collect();
+        assert_eq!(parent.len(), 1, "{records:?}");
+        assert_eq!(parent[0].1.tool, "subagent");
+        let child: Vec<_> = records
+            .iter()
+            .filter(|(key, record)| *key != root.key && record.tool == "bash")
+            .collect();
+        assert_eq!(child.len(), 1, "{records:?}");
+        let (key, record) = child[0];
+        assert_eq!(record.session.as_deref(), Some(key.as_str()));
+        assert_eq!(record.principal, loop_protocol::Principal::local_uid(4242));
+        assert_eq!(record.outcome, loop_store::DecisionOutcome::Allow);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A child Session's commands pass the child's own gate: the tightening
+/// it got from its parent turns a writing command off and keeps a
+/// read-only one. This is the gate `session/shell` uses for the child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_session_s_commands_obey_its_tightening_layer() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let (b1, b2) = (started.clone(), release.clone());
+        let script: Script = Arc::new(move |turn: Turn| {
+            let (b1, b2) = (b1.clone(), b2.clone());
+            match (turn.task.as_str(), turn.call) {
+                ("root", 1) => ready(calls(vec![spawn("child")])),
+                ("child", 1) => Box::pin(async move {
+                    b1.wait().await;
+                    b2.wait().await;
+                    text("child done")
+                }),
+                _ => ready(text("done")),
+            }
+        });
+        let (rt, _log, _) =
+            runtime(dir.path(), "full-access", RuntimeLimits::default(), script).await;
+        let root = rt.new_session(SessionSpec::default()).await.unwrap();
+        // The parent's Policy turns the shell off except read-only commands;
+        // the child gets it with its own Session layer.
+        let (policy, _) = rt.route(&root).unwrap().opened.tool_gate.policy().with(
+            Layer::new(LayerSource::Session).set(
+                Capability::Shell,
+                PermissionMode::ReadOnly.setting(&Capability::Shell),
+            ),
+        );
+        rt.route(&root).unwrap().opened.tool_gate.set_policy(policy);
+        let turn = rt
+            .prompt(&root, vec![ContentBlock::text("root")])
+            .await
+            .unwrap();
+        started.wait().await;
+        let child = children(&rt.list().await.unwrap(), &root).remove(0);
+        let live = rt.route(&child.r#ref).unwrap();
+        let native = &live.opened.native;
+        let refused = native
+            .run_as(&child.r#ref, "touch made", None, None)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("refused"), "{refused}");
+        assert!(!dir.path().join("made").exists());
+        native.run_as(&child.r#ref, "ls", None, None).await.unwrap();
+        release.wait().await;
         assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
         rt.shutdown().await;
     })

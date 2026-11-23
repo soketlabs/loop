@@ -451,3 +451,75 @@ async fn runtime_admits_seatbelt_and_protects_its_actual_agent_directory() {
     .await
     .expect("sandbox admission timed out");
 }
+
+/// B1: the `compaction` settings reach the Session's harness through the
+/// factory, and a workspace reload applies changed values.
+#[tokio::test]
+async fn compaction_settings_reach_the_harness_and_follow_a_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir(&agent_dir).unwrap();
+    let write = |enabled: bool, reserve: u64, keep: u64| {
+        std::fs::write(
+            settings_path(&agent_dir),
+            format!(
+                r#"{{"compaction":{{"enabled":{enabled},"reserveTokens":{reserve},"keepRecentTokens":{keep}}}}}"#
+            ),
+        )
+        .unwrap();
+    };
+    write(false, 1_234, 567);
+    let factory = factory(&agent_dir);
+    let options = opts(dir.path());
+    let workspace = factory.workspace(&options).await.unwrap();
+    let opened = factory.open(workspace, &options).await.unwrap();
+    let settings = opened.harness.compaction_settings().await;
+    assert!(!settings.enabled);
+    assert_eq!(settings.reserve_tokens, 1_234);
+    assert_eq!(settings.keep_recent_tokens, 567);
+
+    write(true, 2_000, 3_000);
+    let (fresh, _old) = factory.reload_workspace(&options).await.unwrap();
+    opened.apply_workspace(&fresh, &[]).await.unwrap();
+    let settings = opened.harness.compaction_settings().await;
+    assert!(settings.enabled);
+    assert_eq!(settings.reserve_tokens, 2_000);
+    assert_eq!(settings.keep_recent_tokens, 3_000);
+}
+
+/// Every workspace gets its Workspace from the `host` driver, and its host
+/// env is that Workspace's env: with reads confined under the tool lock
+/// (and no process or upload then), open otherwise.
+#[tokio::test]
+async fn the_host_env_is_the_host_drivers_workspace() {
+    use loop_app_core::permissions::tool_lock::{RuntimeToolLock, ToolLock};
+    for locked in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let ws_dir = dir.path().join("ws");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let models = Arc::new(loop_ai::Models::create(Default::default()));
+        models.set_provider(loop_ai::providers::faux_provider(Default::default()));
+        let globals = GlobalResources::with_models(agent_dir.clone(), models)
+            .unwrap()
+            .with_tool_lock(locked.then(|| RuntimeToolLock::new(ToolLock::Chat, &ws_dir).unwrap()));
+        let factory = SessionFactory::new(Arc::new(globals));
+        let workspace = factory.workspace(&opts(&ws_dir)).await.unwrap();
+        let host = &workspace.host_workspace;
+        assert_eq!(host.driver_id(), "host");
+        assert_eq!(
+            host.workspace_status(),
+            loop_agent::harness::sandbox::WorkspaceStatus::Ready
+        );
+        assert!(std::ptr::addr_eq(
+            Arc::as_ptr(&host.env()),
+            Arc::as_ptr(&workspace.host)
+        ));
+        let caps = host.capabilities();
+        assert_eq!(caps.confines_reads, locked);
+        assert_eq!(caps.streaming_exec, cfg!(unix) && !locked);
+        assert_eq!(caps.upload, cfg!(unix) && !locked);
+        assert_eq!(host.root(), ws_dir.canonicalize().unwrap());
+    }
+}

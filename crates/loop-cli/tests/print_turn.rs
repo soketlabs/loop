@@ -416,3 +416,58 @@ async fn a_cut_answer_keeps_its_partial_text() {
     assert_eq!(report.text, "part 0 part 1 part 2 part 3 ");
     assert_eq!(report.partial_text(), Some("part 0 part 1 part 2 part 3 "));
 }
+
+/// `--print` recovers from a context-length error: one automatic compaction
+/// and one retry, then the answer.
+#[tokio::test]
+async fn print_mode_compacts_once_after_a_context_length_error() {
+    let (backend, harness) = backend_with(
+        vec![
+            FauxResponse::Error("400 context_length_exceeded".into()),
+            FauxResponse::Text("SUMMARY: earlier work.".into()),
+            FauxResponse::Text("answer after compaction".into()),
+        ],
+        true,
+        vec![],
+    )
+    .await;
+    harness
+        .append_message(loop_agent::AgentMessage::user_text("w".repeat(8_000)))
+        .await
+        .unwrap();
+    let session = backend.current_session().await;
+    let text = print_turn(backend.as_ref(), &session, "next".into())
+        .await
+        .unwrap();
+    assert_eq!(text, "answer after compaction");
+    let entries = harness.read_session_entries().await.unwrap();
+    assert!(entries
+        .iter()
+        .any(|e| matches!(e, loop_agent::harness::SessionTreeEntry::Compaction { .. })));
+}
+
+/// A second context-length error after the compaction fails the turn with a
+/// clear error; there is no third request.
+#[tokio::test]
+async fn print_mode_fails_clearly_when_the_retry_overflows() {
+    let (backend, harness) = backend_with(
+        vec![
+            FauxResponse::Error("400 context_length_exceeded".into()),
+            FauxResponse::Text("SUMMARY: earlier work.".into()),
+            FauxResponse::Error("400 context_length_exceeded".into()),
+            FauxResponse::Text("never sent".into()),
+        ],
+        true,
+        vec![],
+    )
+    .await;
+    harness
+        .append_message(loop_agent::AgentMessage::user_text("w".repeat(8_000)))
+        .await
+        .unwrap();
+    let session = backend.current_session().await;
+    let err = print_turn(backend.as_ref(), &session, "next".into())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("still too long"), "{err}");
+}

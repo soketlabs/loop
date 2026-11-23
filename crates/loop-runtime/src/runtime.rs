@@ -1,15 +1,12 @@
 //! Session ownership, routing and committed update publication.
+use crate::access::{Actor, Need};
 use crate::log::{Event, EventKind, EventLog};
 use async_trait::async_trait;
 use loop_agent::{
     harness::{
         create_session_repository,
-        session::{
-            sqlite::{LeaseIdentity, SqliteSessionStore},
-            SessionStore,
-        },
+        session::{LeaseIdentity, RuntimeSessionStore, SessionStore},
         types::SessionError,
-        Sandbox,
     },
     native_backend::NATIVE_INSTANCE,
 };
@@ -25,7 +22,10 @@ use loop_protocol::{
     SessionStats, SessionUpdate, ShellResult, StatsSummary, TurnHandle, TurnOutcome,
     UpdateEnvelope,
 };
+use loop_protocol::{Caller, Principal};
+use loop_store::{Deployment, Identity, Scope, SystemScope, Tenant};
 use loop_wire::control::EscalationRecipient;
+use publish::{barrier, fail};
 use serde_json::json;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -66,8 +66,19 @@ mod unload_tests;
 mod admin;
 #[cfg(test)]
 mod admin_tests;
+mod attach;
+mod decisions;
+#[cfg(test)]
+mod gate_tests;
+mod host_cleanup;
+mod leases;
 mod pause;
+mod publish;
+mod reach;
+mod sessions;
+mod shell;
 mod tree;
+mod turns;
 
 /// The host's opaque, stable id for the workspace at canonical `cwd`.
 pub fn workspace_id(cwd: &std::path::Path) -> String {
@@ -83,6 +94,12 @@ pub struct Runtime {
     workspaces: Mutex<HashMap<PathBuf, WorkspaceState>>,
     recipients: AsyncMutex<HashMap<SessionKey, Recipients>>,
     admission: AsyncMutex<()>,
+    /// Per folder: "a Session is published, so its host Workspace runs" is
+    /// ordered with "the last Session closed, so the host Workspace stops".
+    host_gates: host_cleanup::HostGates,
+    /// Tests: how long the stop of a folder's host Workspace takes.
+    #[cfg(test)]
+    host_stop_delay: Mutex<HashMap<PathBuf, Duration>>,
     stopped: AtomicBool,
     idle_epoch: std::sync::atomic::AtomicU64,
     /// In-memory only: caller environments must never enter persistent logs or settings.
@@ -92,9 +109,29 @@ pub struct Runtime {
     sandbox_starter: Mutex<Option<admin::SandboxStarter>>,
     log: Arc<dyn EventLog>,
     generation: u64,
+    /// Decides the tenant of the Runtime's own records. One place for the
+    /// later cell work to change (`Deployment::SharedCell`).
+    deployment: Deployment,
+    /// The cross-tenant read permission, made once here at startup. Only
+    /// recovery, the start-up activity and tenant index, and the Subagent
+    /// keys of the Session list use it; every other read names a tenant.
+    system: SystemScope,
+    /// The tenant of each Session the Event Log knows, read once at start
+    /// (system scope) and kept as Sessions open. A Session key is unique in
+    /// this Runtime's Session store, so one key has one tenant here.
+    tenants: Mutex<HashMap<SessionKey, Tenant>>,
+    /// Session keys with records in more than one tenant, found at start:
+    /// readable in their creating tenant, never loaded.
+    split: HashMap<SessionKey, SplitSessionError>,
+    /// The access [`crate::access::Subject`] of Sessions that are not
+    /// loaded, read once from the Event Log: an owner and a tenant never
+    /// change. A loaded Session's is on it.
+    subjects: Mutex<HashMap<SessionKey, crate::access::Subject>>,
+    /// Requests refused by the access check, for tests and probes.
+    refusals: std::sync::atomic::AtomicU64,
     limits: RuntimeLimits,
     turns: Arc<Semaphore>,
-    store: Arc<SqliteSessionStore>,
+    store: Arc<dyn RuntimeSessionStore>,
     identity: LeaseIdentity,
     updates: broadcast::Sender<UpdateEnvelope>,
     activity: Activity,
@@ -145,62 +182,80 @@ fn touch(activity: &Activity, key: &SessionKey, ts_ms: i64) {
     let slot = map.entry(key.clone()).or_insert(ts_ms);
     *slot = (*slot).max(ts_ms);
 }
+/// A Session key with records in more than one tenant. Only a downgrade
+/// makes one: a Loop from before step B3 writes every row as `local`, also
+/// a row of another tenant's Session. Such a Session is not loaded.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "Session {session} has records in more than one tenant ({tenants}): an older Loop \
+     wrote some of them. It is readable in tenant {creator} but cannot be loaded"
+)]
+pub struct SplitSessionError {
+    /// The Session key.
+    pub session: String,
+    /// The tenants that hold its records.
+    pub tenants: String,
+    /// The tenant its reads use: the one of its creating record.
+    pub creator: Tenant,
+}
+
+/// The start-up index of the Sessions the Event Log knows (all tenants).
+#[derive(Debug, Default, PartialEq)]
+struct SessionIndex {
+    /// Newest activity of each key.
+    activity: HashMap<SessionKey, i64>,
+    /// The tenant each key's reads use.
+    tenants: HashMap<SessionKey, Tenant>,
+    /// Keys with records in more than one tenant.
+    split: HashMap<SessionKey, SplitSessionError>,
+}
+
+/// Build the index from the start-up activity read. A key in more than one
+/// tenant reads in the tenant of its creating record (`creators`: the
+/// tenants whose summary of the key has an owner of record); with none or
+/// several of those, the smallest tenant name. It is reported, and the
+/// Runtime refuses to load it.
+fn session_index(
+    read: HashMap<(Tenant, SessionKey), i64>,
+    creators: &HashMap<SessionKey, Vec<Tenant>>,
+) -> SessionIndex {
+    let mut index = SessionIndex::default();
+    let mut all: HashMap<SessionKey, Vec<Tenant>> = HashMap::new();
+    for ((tenant, key), ts) in read {
+        let slot = index.activity.entry(key.clone()).or_insert(ts);
+        *slot = (*slot).max(ts);
+        all.entry(key).or_default().push(tenant);
+    }
+    for (key, mut tenants) in all {
+        tenants.sort();
+        if tenants.len() == 1 {
+            index.tenants.insert(key, tenants.remove(0));
+            continue;
+        }
+        let creator = match creators.get(&key).map(Vec::as_slice) {
+            Some([one]) => one.clone(),
+            _ => tenants[0].clone(),
+        };
+        let error = SplitSessionError {
+            session: key.0.clone(),
+            tenants: tenants
+                .iter()
+                .map(Tenant::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            creator: creator.clone(),
+        };
+        eprintln!("Runtime: {error}");
+        index.tenants.insert(key.clone(), creator);
+        index.split.insert(key, error);
+    }
+    index
+}
 /// How long a close waits for each settling step before giving up on a stuck turn.
 const CLOSE_GRACE: Duration = Duration::from_secs(10);
-/// Lease renewals run every interval; the lease turns stale at 30 s, so give up
-/// on transient errors a little before that.
-const RENEW_INTERVAL: Duration = Duration::from_secs(5);
-const RENEW_GIVE_UP: Duration = Duration::from_secs(25);
-// Own admission's lease until the pump and Session map take responsibility.
-// A Surface can drop its request future at any await point during construction.
-struct OpeningLease {
-    store: Arc<SqliteSessionStore>,
-    identity: LeaseIdentity,
-    id: String,
-    armed: bool,
-}
-impl OpeningLease {
-    async fn acquire(
-        store: Arc<SqliteSessionStore>,
-        identity: LeaseIdentity,
-        id: String,
-    ) -> BackendResult<Self> {
-        let (tx, rx) = oneshot::channel();
-        tokio::spawn(async move {
-            // Never a live owner: another owner's lease is replaced only when
-            // its heartbeat is stale and its pid is dead (Decision 3).
-            let result = store
-                .takeover_lease(&id, &identity, false)
-                .await
-                .map_err(failed)
-                .map(|()| Self {
-                    store,
-                    identity,
-                    id,
-                    armed: true,
-                });
-            let _ = tx.send(result);
-        });
-        rx.await.map_err(failed)?
-    }
-}
-impl Drop for OpeningLease {
-    fn drop(&mut self) {
-        if self.armed {
-            let store = self.store.clone();
-            let identity = self.identity.clone();
-            let id = self.id.clone();
-            tokio::spawn(async move {
-                if let Err(error) = store.release_lease(&id, &identity).await {
-                    eprintln!("Runtime interrupted Session admission: {error}");
-                }
-            });
-        }
-    }
-}
 struct WorkspaceState {
     resources: Arc<WorkspaceResources>,
-    sandbox: Option<Arc<dyn Sandbox>>,
+    sandbox: Option<Arc<dyn loop_agent::harness::sandbox::Workspace>>,
     /// The current generation, held while it is current.
     generation: Arc<admin::Generation>,
     /// Counts committed admin changes and reloads of this workspace.
@@ -251,6 +306,156 @@ struct LiveSession {
     /// A sandbox chosen during a turn, started and waiting for the turn to
     /// end; the running tool calls keep the one they started in.
     pending_sandbox: Mutex<Option<admin::PendingSandbox>>,
+    /// The caller whose request last LOADED this Session into memory: the
+    /// one that created, forked, cloned or imported it, or the one whose
+    /// load, attach or prompt reloaded it after an unload. A Subagent copies
+    /// its parent's. `None` for an in-process call, and after a restart until
+    /// a caller reloads it. In memory only.
+    ///
+    /// It is NOT the Session's owner and must never be used for
+    /// authorization: another caller's reload replaces it. Ownership comes
+    /// from the record stored when the Session is created (`access`).
+    loaded_by: Option<loop_protocol::Caller>,
+    /// The Session's tenant: the creator's, fixed for its life. Every record
+    /// of the Session is in it, whoever acts (ADR-0009).
+    tenant: Tenant,
+    /// Who may use this Session (task I3): its tenant and the owner of
+    /// record of its root Session. A Subagent's is its parent's.
+    access: crate::access::Subject,
+    /// The `actor` of every record of this Session: a Subagent's parent
+    /// Session key; `None` for a Session a Surface opened.
+    actor: Option<String>,
+    /// Who the pump stamps on the updates it commits (step B3).
+    acting: Mutex<Acting>,
+}
+/// Who caused the updates a Session's backend sends to its pump. The pump
+/// commits them without a request in scope, so the cause is recorded here
+/// first, and each identity is built once, not per update.
+///
+/// - An update with a turn id is the turn's caller's. A turn's caller cannot
+///   change while its updates are in flight: the next prompt is admitted
+///   only after the turn's barrier.
+/// - A `config_changed` is stamped by its revision: the caller that made the
+///   change, recorded under the lifecycle lock before the setter runs
+///   ([`LiveSession::claim_changes`]). So a change waiting in the pump's
+///   queue keeps its caller, also when another caller's prompt is admitted
+///   meanwhile, and a deferred change that takes effect at a turn's end
+///   (same revision) is still its setter's.
+/// - What remains: an update with no turn id that is not a `config_changed`
+///   (a notice, a command's output) is the caller of the last turn or
+///   command. If such an update still waits in the pump's queue when the
+///   next turn is admitted, it gets the next turn's caller. A
+///   `config_changed` whose revision no request claimed (the opening config,
+///   or more than [`CHANGES_KEPT`] changes ago) also falls back to that
+///   caller. The per-Session sequencer (A0) can carry the caller with every
+///   update.
+struct Acting {
+    turn_caller: Caller,
+    turn: Identity,
+    request: Identity,
+    /// Who made each Session revision, newest [`CHANGES_KEPT`].
+    changes: std::collections::BTreeMap<u64, Identity>,
+    /// A setter running now: revisions after the first value are the
+    /// second's, until the claim ends.
+    claim: Option<(u64, Identity)>,
+}
+/// How many revisions [`Acting::changes`] remembers.
+const CHANGES_KEPT: usize = 256;
+impl Acting {
+    fn new(caller: Caller, identity: Identity) -> Self {
+        Self {
+            turn_caller: caller,
+            turn: identity.clone(),
+            request: identity,
+            changes: std::collections::BTreeMap::new(),
+            claim: None,
+        }
+    }
+}
+/// The revisions a setter makes while this lives are its caller's. Ends
+/// (and records them) on drop.
+struct ChangeClaim<'a> {
+    live: &'a LiveSession,
+}
+impl Drop for ChangeClaim<'_> {
+    fn drop(&mut self) {
+        let after = self.live.opened.native.config().revision;
+        let mut acting = self
+            .live
+            .acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((before, identity)) = acting.claim.take() {
+            for revision in before.saturating_add(1)..=after {
+                acting.changes.insert(revision, identity.clone());
+            }
+            while acting.changes.len() > CHANGES_KEPT {
+                acting.changes.pop_first();
+            }
+        }
+    }
+}
+impl LiveSession {
+    /// `caller` acting on this Session, in its tenant.
+    fn identity(&self, caller: &Caller) -> Identity {
+        Identity::acting(caller, self.tenant.clone()).with_actor(self.actor.clone())
+    }
+    /// The Runtime acting on its own on this Session.
+    fn runtime_identity(&self) -> Identity {
+        Identity::runtime_in(self.tenant.clone()).with_actor(self.actor.clone())
+    }
+    /// The identity of an update the pump commits (see [`Acting`]).
+    fn update_identity(&self, envelope: &UpdateEnvelope) -> Identity {
+        let acting = self
+            .acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if envelope.turn.is_some() {
+            return acting.turn.clone();
+        }
+        if let SessionUpdate::ConfigChanged(changed) = &envelope.update {
+            if let Some(identity) = acting.changes.get(&changed.revision) {
+                return identity.clone();
+            }
+            if let Some((before, identity)) = &acting.claim {
+                if changed.revision > *before {
+                    return identity.clone();
+                }
+            }
+        }
+        acting.request.clone()
+    }
+    /// A turn or command of `caller` starts: it causes the updates that follow.
+    fn set_turn_caller(&self, caller: Caller) {
+        let identity = self.identity(&caller);
+        let mut acting = self
+            .acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        acting.turn_caller = caller;
+        acting.turn = identity.clone();
+        acting.request = identity;
+    }
+    /// Claim the revisions the next setter makes for `caller`. Call under
+    /// the lifecycle lock, which serializes setters; keep the claim until
+    /// the setter returns.
+    fn claim_changes(&self, caller: &Caller) -> ChangeClaim<'_> {
+        let identity = self.identity(caller);
+        let before = self.opened.native.config().revision;
+        self.acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .claim = Some((before, identity));
+        ChangeClaim { live: self }
+    }
+    /// The caller of the current (or last) turn.
+    fn turn_caller(&self) -> Caller {
+        self.acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .turn_caller
+            .clone()
+    }
 }
 /// What the pump has committed and published of one Session. The pump is
 /// the only writer of a loaded Session's updates, so `published` and
@@ -300,8 +505,14 @@ impl Drop for Receipt<'_> {
     }
 }
 enum Command {
-    Cancel,
-    Publish(Box<SessionUpdate>, oneshot::Sender<BackendResult<()>>),
+    /// Cancel the turn; the caller is who cancelled.
+    Cancel(Caller),
+    /// Commit an update the Runtime made for a request, as `Identity`.
+    Publish(
+        Box<SessionUpdate>,
+        Identity,
+        oneshot::Sender<BackendResult<()>>,
+    ),
     Barrier(oneshot::Sender<()>),
     Stop(oneshot::Sender<()>),
 }
@@ -311,6 +522,16 @@ pub(crate) fn now() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+/// The caller of work no connection asked for: an in-process call, or work
+/// the Runtime started itself. The Runtime's own principal, host-local.
+pub(crate) fn in_process_caller() -> Caller {
+    Caller::host(Principal::runtime())
+}
+/// The caller of the request served on this task, read at a request's entry
+/// (it does not cross a spawn); an in-process call acts as the Runtime.
+pub(crate) fn request_caller() -> Caller {
+    Caller::current().unwrap_or_else(in_process_caller)
 }
 fn failed(error: impl std::fmt::Display) -> BackendError {
     BackendError::failed(ErrorCategory::Internal, error.to_string())
@@ -323,12 +544,15 @@ fn reference(id: &str) -> SessionRef {
     }
 }
 impl Runtime {
-    /// Construct a Runtime over injected resources and an Event Log. The caller owns
-    /// the process lock; crash recovery/reclamation belongs to the startup layer.
+    /// Construct a Runtime over injected resources, an Event Log and a Session
+    /// store. The Runtime opens no database itself: the caller builds both
+    /// stores. The caller owns the process lock; crash recovery/reclamation
+    /// belongs to the startup layer.
     pub async fn new(
         mut globals: GlobalResources,
         defaults: BootstrapOpts,
         log: Arc<dyn EventLog>,
+        store: Arc<dyn RuntimeSessionStore>,
         limits: RuntimeLimits,
     ) -> BackendResult<Self> {
         if limits.max_sessions == 0 || limits.max_active_turns == 0 {
@@ -346,19 +570,47 @@ impl Runtime {
             pid: std::process::id(),
             generation: i64::try_from(generation).map_err(failed)?,
         };
-        let store = Arc::new(SqliteSessionStore::open(&globals.sessions_db).map_err(failed)?);
-        globals.repository =
-            create_session_repository(Arc::new(store.for_lease(identity.clone())), None);
+        globals.repository = create_session_repository(store.for_lease(identity.clone()), None);
+        let deployment = Deployment::SingleNode;
         log.append_batch(vec![Event {
             generation,
             session_key: None,
             turn: None,
             ts_ms: now(),
             kind: EventKind::RuntimeStarted(json!({"pid": std::process::id()})),
+            identity: deployment.runtime_identity(),
         }])
         .await
         .map_err(failed)?;
-        let activity = Arc::new(Mutex::new(log.last_activity_ms().await.map_err(failed)?));
+        // The one cross-tenant read permission, made at startup.
+        let system = SystemScope::for_runtime_startup();
+        let read = log
+            .last_activity_ms(Scope::System(&system))
+            .await
+            .map_err(failed)?;
+        // Keys in more than one tenant (a downgrade wrote them): which
+        // tenant holds the creating record.
+        let mut seen: HashMap<&SessionKey, usize> = HashMap::new();
+        for (_, key) in read.keys() {
+            *seen.entry(key).or_default() += 1;
+        }
+        let mut creators: HashMap<SessionKey, Vec<Tenant>> = HashMap::new();
+        for (tenant, key) in read.keys() {
+            if seen[key] > 1
+                && log
+                    .session_owner(tenant, key)
+                    .await
+                    .map_err(failed)?
+                    .is_some()
+            {
+                creators
+                    .entry(key.clone())
+                    .or_default()
+                    .push(tenant.clone());
+            }
+        }
+        let index = session_index(read, &creators);
+        let activity = Arc::new(Mutex::new(index.activity));
         let (updates, _) = broadcast::channel(4096);
         Ok(Self {
             instance: NATIVE_INSTANCE.into(),
@@ -368,6 +620,9 @@ impl Runtime {
             workspaces: Mutex::new(HashMap::new()),
             recipients: AsyncMutex::new(HashMap::new()),
             admission: AsyncMutex::new(()),
+            host_gates: Default::default(),
+            #[cfg(test)]
+            host_stop_delay: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
             idle_epoch: std::sync::atomic::AtomicU64::new(0),
             launch_specs: Mutex::new(HashMap::new()),
@@ -375,6 +630,12 @@ impl Runtime {
             sandbox_starter: Mutex::new(None),
             log,
             generation,
+            deployment,
+            system,
+            tenants: Mutex::new(index.tenants),
+            split: index.split,
+            subjects: Mutex::new(HashMap::new()),
+            refusals: std::sync::atomic::AtomicU64::new(0),
             limits,
             turns: Arc::new(Semaphore::new(limits.max_active_turns)),
             store,
@@ -417,7 +678,9 @@ impl Runtime {
     /// since the newest generation whose recovery committed.
     ///
     /// With `lock` (the lock of this Runtime's own Session database), leases of
-    /// an earlier Runtime are reclaimed and released.
+    /// an earlier Runtime are reclaimed and released. The lock must name the
+    /// store's `database_path`; with a store that has no database path,
+    /// `recover(Some(lock))` fails.
     ///
     /// Precondition: call before serving any Session; turns of this generation
     /// are never ended here.
@@ -425,9 +688,15 @@ impl Runtime {
         &self,
         lock: Option<&loop_app_core::runtime_instance::SessionDatabaseLock>,
     ) -> BackendResult<crate::Recovery> {
-        use crate::recovery::{unfinished, REASON};
+        use crate::recovery::{Unfinished, REASON};
         if let Some(lock) = lock {
-            let ours = std::path::absolute(&self.factory.globals.sessions_db).map_err(failed)?;
+            let ours = std::path::absolute(self.store.database_path().ok_or_else(|| {
+                failed(format!(
+                    "the held lock is for {}, but this Runtime's Session store has no database file",
+                    lock.sessions_db().display()
+                ))
+            })?)
+            .map_err(failed)?;
             if lock.sessions_db() != ours {
                 return Err(failed(format!(
                     "the held lock is for {}, not this Runtime's Session database {}",
@@ -436,12 +705,39 @@ impl Runtime {
                 )));
             }
         }
-        let from = self.log.last_recovered_generation().await.map_err(failed)?;
-        let records = self.log.recovery_records(from).await.map_err(failed)?;
-        let (turns, escalations) = unfinished(&records, self.generation);
+        let from = self
+            .log
+            .last_recovered_generation(&self.system)
+            .await
+            .map_err(failed)?;
+        // Page through the records; the fold keeps only the open work.
+        let mut open = Unfinished::new(self.generation);
+        let mut after = 0;
+        loop {
+            let page = self
+                .log
+                .recovery_page(
+                    Scope::System(&self.system),
+                    from,
+                    after,
+                    loop_store::PageLimit::DEFAULT,
+                )
+                .await
+                .map_err(failed)?;
+            for record in &page.items {
+                open.feed(record);
+            }
+            match page.next {
+                Some(loop_store::Cursor(next)) => after = next,
+                None => break,
+            }
+        }
+        let (turns, escalations) = open.finish();
         let ts_ms = now();
         let mut events = Vec::with_capacity(2 * turns.len() + escalations.len());
         for turn in &turns {
+            // The Runtime ends the turn, in the tenant of the Session.
+            let identity = Identity::runtime_in(turn.tenant.clone());
             let update = |update| {
                 Event::update(
                     self.generation,
@@ -454,6 +750,7 @@ impl Runtime {
                         0,
                         update,
                     ),
+                    identity.clone(),
                 )
             };
             // A prompt whose turn start never committed may still have run
@@ -478,6 +775,7 @@ impl Runtime {
                 kind: EventKind::EscalationWithdrawn(
                     json!({"id": open.id, "generation": open.generation, "reason": REASON}),
                 ),
+                identity: Identity::runtime_in(open.tenant.clone()),
             });
         }
         for chunk in events.chunks(crate::log::MAX_BATCH_EVENTS) {
@@ -546,8 +844,50 @@ impl Runtime {
         self.close_grace = grace;
         self
     }
+    /// The caller whose request last loaded the live Session `key`
+    /// (ADR-0009), or `None` when it is not loaded or was loaded in process.
+    /// Not the owner: never use it for authorization (see `LiveSession`;
+    /// access uses the owner of record, `crate::access`).
+    pub fn loaded_by(&self, key: &SessionKey) -> Option<loop_protocol::Caller> {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sessions.get(key).and_then(|live| live.loaded_by.clone())
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+    /// The tenant of Session `key`: a loaded Session's own, else the one the
+    /// Event Log recorded, else `local` (a Session that has no record yet
+    /// was made on this host, by `loop` or an older Runtime). Reads of the
+    /// Session's records use it, and so does the access check
+    /// (`crate::access`).
+    pub fn session_tenant(&self, key: &SessionKey) -> Tenant {
+        if let Some(live) = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+        {
+            return live.tenant.clone();
+        }
+        self.tenants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
+            .unwrap_or_else(Tenant::local)
+    }
+    /// The owner of record of Session `key` (step B3): the identity of the
+    /// `session_opened` that created it, read from the Session summary in
+    /// the Session's tenant. `None` for a Session created before step B3 or
+    /// outside the Runtime. The access check reads the same record
+    /// (`Runtime::subject`).
+    pub async fn session_owner(&self, key: &SessionKey) -> BackendResult<Option<Identity>> {
+        let tenant = self.session_tenant(key);
+        self.log.session_owner(&tenant, key).await.map_err(failed)
     }
     /// This process, its limits and how many Sessions are loaded and busy.
     /// `socket` is empty: the process serving the Runtime fills it in.
@@ -569,6 +909,17 @@ impl Runtime {
             max_active_turns: self.limits.max_active_turns as u64,
             max_sessions_from: None,
             max_active_turns_from: None,
+            tool_lock: self.factory.globals.tool_lock(),
+        }
+    }
+    /// Refuse `what` when the Runtime has a tool lock.
+    pub(crate) fn refuse_if_locked(&self, what: &str) -> BackendResult<()> {
+        match self.factory.globals.tool_lock() {
+            Some(lock) => Err(BackendError::ToolLocked {
+                what: what.to_owned(),
+                lock,
+            }),
+            None => Ok(()),
         }
     }
     pub fn event_log(&self) -> &Arc<dyn EventLog> {
@@ -639,425 +990,6 @@ impl Runtime {
         Some(format!("This shell's {provider} API key differs from the Runtime's credential; the Runtime credential is used."))
     }
 
-    async fn open(
-        &self,
-        existing: Option<&SessionRef>,
-        mut spec: SessionSpec,
-        child: Option<subagent::ChildOpen>,
-    ) -> BackendResult<SessionRef> {
-        // An attach checks this Surface's credentials, but never changes an
-        // existing Session's environment while another Surface may use it.
-        let caller_env = spec.env.clone();
-        if existing.is_some() {
-            spec.env = None;
-        }
-        let _admission = loop {
-            let admission = self.admission.lock().await;
-            if self.stopped.load(Ordering::Acquire) {
-                return Err(failed("Runtime stopped"));
-            }
-            let Some(session) = existing else {
-                break admission;
-            };
-            if session.instance != self.instance || session.key.0 != session.native_id {
-                return Err(BackendError::SessionNotFound(session.key.clone()));
-            }
-            match self.route(session) {
-                // Being closed or unloaded: load it again once that is done,
-                // without holding up other admissions meanwhile.
-                Ok(live) if live.closing.load(Ordering::Acquire) => {
-                    drop(admission);
-                    self.wait_removed(&live).await;
-                }
-                Ok(live) => {
-                    let model = live.opened.native.config().config.model;
-                    let notice = self
-                        .credential_notice(model.as_deref(), caller_env.as_ref())
-                        .await;
-                    *live.credential_notice.lock().unwrap() = notice;
-                    return Ok(live.reference.clone());
-                }
-                Err(_) => break admission,
-            }
-        };
-        if let Some(session) = existing {
-            if let Some(parent) = self.subagent_parent(session).await? {
-                // Reopened alone it would lose its parent's ceiling and depth.
-                return Err(failed(format!(
-                    "Session {} is a Subagent of Session {parent}; a Subagent runs only for its \
-                     parent and cannot be reopened. Its Event Log stays readable with `loop session attach`.",
-                    session.native_id
-                )));
-            }
-        }
-        let full = || self.sessions.lock().unwrap().len() >= self.limits.max_sessions;
-        if full() && (!self.unload_one().await || full()) {
-            return Err(BackendError::Busy);
-        }
-        if let Some(existing) = existing {
-            if let Some(saved) = self
-                .launch_specs
-                .lock()
-                .unwrap()
-                .get(&existing.key)
-                .cloned()
-            {
-                if spec.env.is_none() {
-                    spec.env = saved.env;
-                }
-                if spec.options.is_none() {
-                    spec.options = saved.options;
-                }
-            }
-        }
-        if let Some(child) = &child {
-            spec.env = child.parent.opened.harness.session_environment();
-        }
-        let saved_spec = spec.clone();
-        let mut opts = self.session_opts();
-        if let Some(child) = &child {
-            opts.cwd = child.cwd.clone();
-        } else if let Some(cwd) = spec.cwd {
-            opts.cwd = cwd;
-        } else if let Some(session) = existing {
-            let known = self
-                .factory
-                .globals
-                .repository
-                .list(None)
-                .await
-                .map_err(failed)?;
-            let meta = known
-                .iter()
-                .find(|m| m.id == session.native_id)
-                .ok_or_else(|| BackendError::SessionNotFound(session.key.clone()))?;
-            if let Some(cwd) = &meta.cwd {
-                opts.cwd = PathBuf::from(cwd);
-            }
-        }
-        if let Some(options) = &spec.options {
-            opts.provider = options.provider.clone();
-            opts.model = options.model.clone();
-            opts.system_prompt = options.system_prompt.clone();
-            opts.append_system_prompt = options.append_system_prompt.clone();
-            opts.no_context_files = options.no_context_files;
-            opts.no_web = options.no_web;
-            opts.permission_mode = options.permission_mode.clone();
-        }
-        let session_workspace_flags = spec.options.as_ref().is_some_and(|options| {
-            options.no_context_files
-                || options.no_web
-                || options.system_prompt.is_some()
-                || options.append_system_prompt.is_some()
-        });
-        let workspace = if session_workspace_flags {
-            Arc::new(
-                WorkspaceResources::load(&self.factory.globals, &opts)
-                    .await
-                    .map_err(failed)?,
-            )
-        } else {
-            self.factory.workspace(&opts).await.map_err(failed)?
-        };
-        let created = existing.is_none();
-        let id = match existing {
-            Some(session) => session.native_id.clone(),
-            None if child.is_some() => self
-                .store
-                .create_child(
-                    Some(workspace.cwd.to_string_lossy().into_owned()),
-                    spec.name,
-                    &child.as_ref().unwrap().parent.reference.native_id,
-                )
-                .await
-                .map_err(failed)?
-                .metadata()
-                .id
-                .clone(),
-            None => self
-                .factory
-                .globals
-                .repository
-                .create(
-                    Some(workspace.cwd.to_string_lossy().into_owned()),
-                    spec.name,
-                )
-                .await
-                .map_err(failed)?
-                .metadata()
-                .id
-                .clone(),
-        };
-        let mut lease = match OpeningLease::acquire(
-            self.store.clone(),
-            self.identity.clone(),
-            id.clone(),
-        )
-        .await
-        {
-            Ok(lease) => lease,
-            Err(error) => {
-                self.discard_new_row(created, &id).await;
-                return Err(error);
-            }
-        };
-        opts.session_id = Some(id.clone());
-        let result = async {
-            let mut opened = self
-                .factory
-                .open_with_environment(workspace, &opts, spec.env.as_ref())
-                .await
-                .map_err(failed)?;
-            let credential_notice = self
-                .credential_notice(
-                    opened.native.config().config.model.as_deref(),
-                    caller_env.as_ref(),
-                )
-                .await;
-            let sandbox = opened
-                .harness
-                .ensure_sandbox_ready()
-                .await
-                .map_err(failed)?;
-            let sandbox_choice = Self::sandbox_choice(&opened.settings, sandbox.is_some());
-            {
-                let mut workspaces = self.workspaces.lock().unwrap();
-                let state = workspaces
-                    .entry(opened.workspace.cwd.clone())
-                    .or_insert_with(|| WorkspaceState {
-                        resources: opened.workspace.clone(),
-                        generation: admin::Generation::new(opened.workspace.clone()),
-                        sandbox: None,
-                        revision: 0,
-                    });
-                // A reload keeps its revision; a Session opened meanwhile
-                // brings the resources it was opened with.
-                if state.sandbox.is_none() {
-                    state.sandbox = sandbox;
-                }
-            }
-            let reference = opened.native.current_session().await;
-            if !created && child.is_none() {
-                // The Session's own model and effort win over the Runtime's
-                // startup defaults.
-                opened.native.restore_config().await?;
-            }
-            let mut sandbox_choice = sandbox_choice;
-            if !created && child.is_none() {
-                // The sandbox the Session last chose outlives a restart.
-                let recorded = opened
-                    .native
-                    .recorded_sandbox()
-                    .and_then(|v| {
-                        serde_json::from_value::<loop_protocol::admin::SandboxChoice>(v).ok()
-                    })
-                    .filter(|choice| *choice != sandbox_choice);
-                if let Some(choice) = recorded {
-                    match self.restore_sandbox(&opened, &choice).await {
-                        Ok(()) => {
-                            sandbox_choice = if choice.mode == "local" {
-                                choice
-                            } else {
-                                Self::sandbox_choice(&opened.settings, false)
-                            };
-                        }
-                        Err(error) => opened
-                            .startup_notices
-                            .push(format!("Could not restore this Session's sandbox: {error}")),
-                    }
-                }
-            }
-            if !created {
-                // Turn ids stay unique per Session across Runtime generations.
-                let turns = self.log.turn_ids(&reference.key).await.map_err(failed)?;
-                let last = turns
-                    .iter()
-                    .filter_map(|turn| turn.as_str().strip_prefix("turn-")?.parse::<u64>().ok())
-                    .max()
-                    .unwrap_or(0);
-                // A turn lost before its start was logged left only its prompt.
-                let prompts = self
-                    .log
-                    .prompts_sent(&reference.key)
-                    .await
-                    .map_err(failed)?;
-                opened.native.continue_turns_after(last.max(prompts));
-            }
-            let escalations =
-                crate::EscalationHost::new(reference.clone(), self.log.clone(), self.generation);
-            // Runtime grants are live Session state, never restored after a crash.
-            opened.approval_bridge.clear_session_grants();
-            Arc::make_mut(&mut opened.approval_bridge).set_host(Arc::new(escalations.clone()));
-            opened
-                .tool_gate
-                .set_approver(Some(opened.approval_bridge.clone()));
-            opened
-                .tool_gate
-                .set_mode_recorder(Some(loop_app_core::tool_gate::mode_recorder(
-                    &opened.native,
-                )));
-            let (depth, workspace, child_state) = match &child {
-                Some(child) => (
-                    child.parent.depth + 1,
-                    subagent::confine(&child.parent, &opened).await,
-                    Some(subagent::ChildState::install(&opened, child.max_turns)),
-                ),
-                None => (0, workspace_root(&opened.workspace.cwd), None),
-            };
-            let parent = child.as_ref().map(|c| c.parent.reference.key.clone());
-            let receiver = opened.native.subscribe();
-            let (commands, rx) = mpsc::unbounded_channel();
-            let (cancel, _) = watch::channel(0);
-            let ts_ms = now();
-            self.log
-                .append_batch(vec![Event {
-                    generation: self.generation,
-                    session_key: Some(reference.key.clone()),
-                    turn: None,
-                    ts_ms,
-                    kind: EventKind::SessionOpened(
-                        json!({"cwd": opened.workspace.cwd, "parent": parent, "depth": depth}),
-                    ),
-                }])
-                .await
-                .map_err(failed)?;
-            touch(&self.activity, &reference.key, ts_ms);
-            if parent.is_some() {
-                if let Some(keys) = self.subagents.lock().await.as_mut() {
-                    keys.insert(reference.key.clone());
-                }
-            }
-            let initial_config = opened.native.config();
-            // The tree is written before the Event Log; a change whose
-            // announcement was lost is announced before anyone is served.
-            // A committed rename or branch move whose marker is still pending
-            // is announced by its own update before anyone is served.
-            let marked = !created
-                && self
-                    .store
-                    .control_state(&reference.native_id)
-                    .await
-                    .map_err(failed)?
-                    .pending
-                    .is_some();
-            let unannounced = !created
-                && initial_config.revision
-                    > self.logged_revision(&reference.key).await? + u64::from(marked);
-            let published = self.log.latest_seq(&reference.key).await.map_err(failed)?;
-            let live = Arc::new(LiveSession {
-                lifecycle: AsyncMutex::new(()),
-                committed: AsyncMutex::new(None),
-                turn_start_seq: std::sync::atomic::AtomicU64::new(0),
-                pauses: self.pauses.clone(),
-                opened,
-                escalations,
-                reference: reference.clone(),
-                busy: AtomicBool::new(false),
-                closing: AtomicBool::new(false),
-                failure: Mutex::new(None),
-                permit: AsyncMutex::new(None),
-                cancel,
-                commands,
-                pump: AsyncMutex::new(None),
-                turn_task: Mutex::new(None),
-                activity: Arc::clone(&self.activity),
-                tail: Mutex::new(VecDeque::new()),
-                depth,
-                parent: parent.clone(),
-                workspace,
-                child: child_state,
-                waiting: AsyncMutex::new(0),
-                turn_epoch: std::sync::atomic::AtomicU64::new(0),
-                announced: Mutex::new(Announced {
-                    published,
-                    revision: initial_config.revision,
-                    latest: initial_config.clone(),
-                    receipts: HashMap::new(),
-                }),
-                pending_workspace: Mutex::new(None),
-                credential_notice: Mutex::new(credential_notice),
-                generation: Mutex::new(None),
-                sandbox_choice: Mutex::new(sandbox_choice),
-                pending_sandbox: Mutex::new(None),
-            });
-            if unannounced {
-                publish(
-                    &live,
-                    UpdateEnvelope::live(
-                        self.instance.clone(),
-                        self.generation,
-                        reference.key.clone(),
-                        None,
-                        0,
-                        SessionUpdate::ConfigChanged(initial_config),
-                    ),
-                    self.log.as_ref(),
-                    self.generation,
-                    &self.updates,
-                )
-                .await?;
-            }
-            if depth < self.subagent_depth {
-                if let Some(me) = self.me.get() {
-                    subagent::offer(me.clone(), &live).await.map_err(failed)?;
-                }
-            }
-            // Attachments outlive unloading. Serialize restoration with new
-            // registration and disconnect, so none can miss this host. A
-            // Subagent's Escalations also go to Surfaces watching an ancestor.
-            let recipients = self.recipients.lock().await;
-            let mut lineage = vec![reference.key.clone()];
-            lineage.extend(parent.iter().flat_map(|p| self.lineage(p)));
-            for (connection, recipient) in wanted(&recipients, &lineage) {
-                live.escalations.attach(connection, recipient).await;
-            }
-            let task = tokio::spawn(pump(
-                Arc::clone(&live),
-                receiver,
-                rx,
-                Arc::clone(&self.log),
-                self.generation,
-                self.updates.clone(),
-                Arc::clone(&self.store),
-                self.identity.clone(),
-            ));
-            *live.pump.lock().await = Some(task);
-            self.pauses.wait("open_publishing").await;
-            let _publishing = self.reload_gate.read().await;
-            self.adopt_generation(&live).await;
-            self.sessions
-                .lock()
-                .unwrap()
-                .insert(reference.key.clone(), live.clone());
-            self.unloaded.lock().unwrap().remove(&reference.key);
-            self.launch_specs
-                .lock()
-                .unwrap()
-                .insert(reference.key.clone(), saved_spec);
-            self.idle_epoch.fetch_add(1, Ordering::AcqRel);
-            lease.armed = false;
-            Ok(reference)
-        }
-        .await;
-        if result.is_err()
-            && self
-                .store
-                .lease(&id)
-                .await
-                .map_err(failed)?
-                .is_some_and(|lease| lease.identity == self.identity)
-        {
-            self.store
-                .release_lease(&id, &self.identity)
-                .await
-                .map_err(failed)?;
-            lease.armed = false;
-        }
-        if result.is_err() {
-            self.discard_new_row(created, &id).await;
-        }
-        result
-    }
     /// This live Session and the live Sessions above it, nearest first.
     fn lineage(&self, key: &SessionKey) -> Vec<SessionKey> {
         let sessions = self.sessions.lock().unwrap();
@@ -1097,20 +1029,57 @@ impl Runtime {
         if let Some(keys) = known.as_ref() {
             return Ok(keys.clone());
         }
-        let keys = self.log.subagent_sessions().await.map_err(failed)?;
+        // Runtime-wide: the Session list shows every tenant's Sessions.
+        let keys: HashSet<SessionKey> = self
+            .log
+            .subagent_sessions(Scope::System(&self.system))
+            .await
+            .map_err(failed)?
+            .into_iter()
+            .map(|(_, key)| key)
+            .collect();
         *known = Some(keys.clone());
         Ok(keys)
     }
-    // A failed open of a Session this call created must not leave an empty row.
-    async fn discard_new_row(&self, created: bool, id: &str) {
-        if created {
-            if let Err(error) = self.store.delete(id).await {
-                eprintln!("Runtime could not discard Session {id}: {error}");
-            }
-        }
-    }
     /// Read all known Sessions without acquiring their leases.
     pub async fn list(&self) -> BackendResult<Vec<SessionInfo>> {
+        let all = self.list_all().await?;
+        let actor = Actor::current();
+        if !actor.is_outside() {
+            // The host's user lists another tenant's Sessions but may not
+            // read them: no title, name or model of theirs.
+            let mut all = all;
+            for info in &mut all {
+                if !self.may(&actor, &info.r#ref.key, Need::Read).await? {
+                    info.summary.first_prompt = None;
+                    info.summary.selected_model = None;
+                    info.name = None;
+                }
+            }
+            return Ok(all);
+        }
+        // An outside user sees its own Sessions only, and no reference to
+        // a Session it may not read.
+        let mut shown = Vec::new();
+        for mut info in all {
+            if !self.may(&actor, &info.r#ref.key, Need::List).await? {
+                continue;
+            }
+            if let Some(source) = &info.summary.fork_source {
+                if !self.may(&actor, &source.key, Need::Read).await? {
+                    info.summary.fork_source = None;
+                }
+            }
+            if let Some(parent) = &info.parent {
+                if !self.may(&actor, &parent.key, Need::Read).await? {
+                    info.parent = None;
+                }
+            }
+            shown.push(info);
+        }
+        Ok(shown)
+    }
+    async fn list_all(&self) -> BackendResult<Vec<SessionInfo>> {
         let known = self
             .factory
             .globals
@@ -1194,287 +1163,6 @@ impl Runtime {
             })
             .collect())
     }
-    /// Recent committed updates; the Event Log remains the replay authority.
-    pub fn tail(&self, session: &SessionRef) -> BackendResult<Vec<UpdateEnvelope>> {
-        Ok(self
-            .route(session)?
-            .tail
-            .lock()
-            .unwrap()
-            .iter()
-            .cloned()
-            .collect())
-    }
-    /// A parent waiting for a Subagent releases its active-turn permit.
-    pub async fn release_turn_permit(&self, session: &SessionRef) -> BackendResult<()> {
-        let live = self.route(session)?;
-        live.permit.lock().await.take();
-        Ok(())
-    }
-    /// Rejoin turn admission before the parent continues executing.
-    pub async fn reacquire_turn_permit(&self, session: &SessionRef) -> BackendResult<()> {
-        let live = self.route(session)?;
-        let mut permit = live.permit.lock().await;
-        if permit.is_none() {
-            let mut cancelled = live.cancel.subscribe();
-            if live.closing.load(Ordering::Acquire) || !live.busy.load(Ordering::Acquire) {
-                return Err(failed("Session turn ended"));
-            }
-            let acquired = tokio::select! {
-                p = self.turns.clone().acquire_owned() => p.map_err(failed)?,
-                _ = cancelled.changed() => return Err(failed("Session turn cancelled")),
-            };
-            if live.closing.load(Ordering::Acquire) || !live.busy.load(Ordering::Acquire) {
-                return Err(failed("Session turn ended"));
-            }
-            *permit = Some(acquired);
-        }
-        Ok(())
-    }
-    /// Unload a Session, settling any forced cancellation before releasing ownership.
-    /// Every wait is bounded by the close grace; a turn that ignores cancellation
-    /// is aborted so the lease is always released.
-    pub async fn close(&self, key: &SessionKey, force: bool) -> BackendResult<()> {
-        self.close_inner(key, force).await
-    }
-    async fn close_inner(&self, key: &SessionKey, force: bool) -> BackendResult<()> {
-        let live = self
-            .sessions
-            .lock()
-            .unwrap()
-            .get(key)
-            .cloned()
-            .ok_or_else(|| BackendError::SessionNotFound(key.clone()))?;
-        {
-            // Decided under the lifecycle lock, so no prompt is admitted
-            // between the busy check and `closing`.
-            let _lifecycle = live.lifecycle.lock().await;
-            if !force && live.busy.load(Ordering::Acquire) {
-                return Err(BackendError::Busy);
-            }
-            if live.closing.swap(true, Ordering::AcqRel) {
-                drop(_lifecycle);
-                // Another close owns the teardown; wait for it instead of repeating it.
-                self.wait_removed(&live).await;
-                return Ok(());
-            }
-        }
-        let reason = if self.stopped.load(Ordering::Acquire) {
-            "shutdown"
-        } else {
-            "closed"
-        };
-        self.teardown(key, live, force, reason).await
-    }
-    /// Wait until `live` is no longer the loaded instance of its Session.
-    async fn wait_removed(&self, live: &Arc<LiveSession>) {
-        while self
-            .sessions
-            .lock()
-            .unwrap()
-            .get(&live.reference.key)
-            .is_some_and(|current| Arc::ptr_eq(current, live))
-        {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-    /// Connections watching `key`. For tests that must wait for a watch
-    /// registered after a reply.
-    #[doc(hidden)]
-    pub fn watcher_count(&self, key: &SessionKey) -> usize {
-        self.watchers
-            .lock()
-            .unwrap()
-            .get(key)
-            .map_or(0, HashSet::len)
-    }
-    fn was_unloaded(&self, key: &SessionKey) -> bool {
-        self.unloaded.lock().unwrap().contains(key)
-    }
-    /// Whether nothing needs `live` loaded: no turn, no parked Escalation, no
-    /// attached Surface, no running Subagent below it, and not itself a
-    /// Subagent (its `subagent` call closes it). Call under its lifecycle lock.
-    async fn unloadable(&self, live: &LiveSession) -> bool {
-        let key = &live.reference.key;
-        if live.busy.load(Ordering::Acquire)
-            || live.closing.load(Ordering::Acquire)
-            || live.child.is_some()
-            || live.parent.is_some()
-            || *live.waiting.lock().await > 0
-            || live.escalations.has_pending().await
-        {
-            return false;
-        }
-        if self
-            .watchers
-            .lock()
-            .unwrap()
-            .get(key)
-            .is_some_and(|watching| !watching.is_empty())
-            || self
-                .recipients
-                .lock()
-                .await
-                .get(key)
-                .is_some_and(|attached| !attached.is_empty())
-        {
-            return false;
-        }
-        !self
-            .sessions
-            .lock()
-            .unwrap()
-            .values()
-            .any(|s| s.parent.as_ref() == Some(key))
-    }
-    /// Unload the least recently active Session nothing needs, to make room.
-    /// Runs under admission. Returns whether one was unloaded.
-    async fn unload_one(&self) -> bool {
-        let mut candidates: Vec<(i64, Arc<LiveSession>)> = {
-            let activity = self.activity.lock().unwrap();
-            self.sessions
-                .lock()
-                .unwrap()
-                .values()
-                .map(|live| {
-                    let ts = activity.get(&live.reference.key).copied().unwrap_or(0);
-                    (ts, live.clone())
-                })
-                .collect()
-        };
-        candidates.sort_by_key(|(ts, _)| *ts);
-        for (_, live) in candidates {
-            let Ok(lifecycle) = live.lifecycle.try_lock() else {
-                continue;
-            };
-            if !self.unloadable(&live).await {
-                continue;
-            }
-            let key = live.reference.key.clone();
-            live.closing.store(true, Ordering::Release);
-            self.unloaded.lock().unwrap().insert(key.clone());
-            drop(lifecycle);
-            eprintln!(
-                "Runtime: unloading idle Session {} (least recently active) to make room",
-                key.0
-            );
-            if let Err(error) = self.teardown(&key, live, false, "unloaded").await {
-                eprintln!("Runtime: unloading Session {}: {error}", key.0);
-            }
-            return true;
-        }
-        false
-    }
-    /// Load a Session that was unloaded to make room, for a prompt or attach.
-    async fn reload(&self, session: &SessionRef) -> BackendResult<()> {
-        self.open(Some(session), SessionSpec::default(), None)
-            .await
-            .map(|_| ())
-    }
-    /// Close a Session whose `closing` the caller set. Always removes it.
-    async fn teardown(
-        &self,
-        key: &SessionKey,
-        live: Arc<LiveSession>,
-        force: bool,
-        reason: &str,
-    ) -> BackendResult<()> {
-        if force {
-            live.cancel.send_modify(|n| *n += 1);
-            live.opened.native.cancel(&live.reference);
-        }
-        let grace = self.close_grace;
-        // The host may be holding its decision mutex while an Event Log
-        // acknowledgement stalls. Bound that wait too, then interrupt decisions
-        // without discarding the independent durable withdrawal task.
-        let escalations = live.escalations.clone();
-        let mut withdrawing =
-            tokio::spawn(async move { escalations.withdraw("Session closed", true).await });
-        let withdrawal = match tokio::time::timeout(grace, &mut withdrawing).await {
-            Ok(result) => result
-                .map_err(failed)
-                .and_then(|result| result.map_err(failed)),
-            Err(_) => {
-                live.escalations.interrupt_decisions();
-                match tokio::time::timeout(grace, &mut withdrawing).await {
-                    Ok(result) => result.map_err(failed).and_then(|result| result.map_err(failed)),
-                    Err(_) => Err(failed("Session Escalation withdrawal exceeded close grace; durable cleanup continues")),
-                }
-            }
-        };
-        if force && live.commands.send(Command::Cancel).is_err() {
-            live.cancel.send_modify(|n| *n += 1);
-            live.opened.native.cancel(&live.reference);
-        }
-        let settled = tokio::time::timeout(grace, async {
-            while live.busy.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .is_ok();
-        if !settled {
-            eprintln!(
-                "Runtime close: turn of Session {} ignored cancellation; aborting",
-                key.0
-            );
-            if let Some(turn) = live.turn_task.lock().unwrap().take() {
-                turn.abort();
-            }
-            live.permit.lock().await.take();
-            let _lifecycle = live.lifecycle.lock().await;
-            live.busy.store(false, Ordering::Release);
-        }
-        let _ = tokio::time::timeout(grace, live.opened.native.shutdown()).await;
-        self.release_admin(&live).await;
-        let (tx, rx) = oneshot::channel();
-        let _ = live.commands.send(Command::Stop(tx));
-        let stopped = tokio::time::timeout(grace, rx).await.is_ok();
-        let mut pump_error = None;
-        if let Some(task) = live.pump.lock().await.take() {
-            if !stopped {
-                task.abort();
-            }
-            if let Err(error) = task.await {
-                if !error.is_cancelled() {
-                    pump_error = Some(failed(error));
-                }
-            }
-        }
-        let ts_ms = now();
-        let logged = tokio::time::timeout(
-            grace,
-            self.log.append_batch(vec![Event {
-                generation: self.generation,
-                session_key: Some(key.clone()),
-                turn: None,
-                ts_ms,
-                kind: EventKind::SessionClosed(
-                    json!({"force": force, "aborted": !settled || !stopped, "reason": reason}),
-                ),
-            }]),
-        )
-        .await
-        .map_err(failed)
-        .and_then(|result| result.map_err(failed));
-        touch(&self.activity, key, ts_ms);
-        let released = self
-            .store
-            .release_lease(&key.0, &self.identity)
-            .await
-            .map_err(failed);
-        self.sessions.lock().unwrap().remove(key);
-        if let Some(error) = pump_error {
-            return Err(error);
-        }
-        withdrawal?;
-        logged?;
-        released?;
-        if let Some(error) = live.failure.lock().unwrap().clone() {
-            return Err(failed(error));
-        }
-        Ok(())
-    }
     /// Stop admission, settle work, drain pumps and release all Session leases.
     /// Sessions are cancelled together and settle concurrently, each bounded.
     pub async fn shutdown(&self) {
@@ -1556,6 +1244,10 @@ impl Runtime {
             .drain()
             .map(|(_, value)| value)
             .collect();
+        // Host processes end before anything else of a workspace does: every
+        // host Workspace this Runtime made, and no one else's. The
+        // process-wide kill is left to the exit of the daemon process.
+        self.end_all_host_processes().await;
         for workspace in workspaces {
             workspace.resources.mcp_client.disconnect_all().await;
             if let Some(sandbox) = workspace.sandbox {
@@ -1572,6 +1264,7 @@ impl Runtime {
                 turn: None,
                 ts_ms: now(),
                 kind: EventKind::RuntimeStopped(json!({})),
+                identity: self.deployment.runtime_identity(),
             }])
             .await
         {
@@ -1582,164 +1275,10 @@ impl Runtime {
         }
     }
 }
-impl Runtime {
-    /// Record whether `connection` watches `session`, and its Escalation
-    /// recipient when it answers them. Any watched Session stays loaded.
-    async fn register_watch(
-        &self,
-        session: &SessionRef,
-        connection: u64,
-        attached: bool,
-        recipient: Option<Arc<dyn loop_wire::control::EscalationRecipient>>,
-    ) -> BackendResult<()> {
-        if session.instance != self.instance || session.key.0 != session.native_id {
-            return Err(BackendError::SessionNotFound(session.key.clone()));
-        }
-        self.set_watch(session, connection, attached).await;
-        let mut recipients = self.recipients.lock().await;
-        match &recipient {
-            Some(recipient) => {
-                recipients
-                    .entry(session.key.clone())
-                    .or_default()
-                    .insert(connection, recipient.clone());
-            }
-            None => {
-                if let Some(attached) = recipients.get_mut(&session.key) {
-                    attached.remove(&connection);
-                }
-            }
-        }
-        // The Session itself and every live Subagent below it.
-        let affected: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
-        for live in affected {
-            let lineage = self.lineage(&live.reference.key);
-            if !lineage.contains(&session.key) {
-                continue;
-            }
-            let wanted = wanted(&recipients, &lineage);
-            for old in live.escalations.connections().await {
-                if !wanted.contains_key(&old) {
-                    live.escalations.detach(old).await;
-                }
-            }
-            for (connection, recipient) in wanted {
-                live.escalations.attach(connection, recipient).await;
-            }
-        }
-        Ok(())
-    }
-    /// Add or remove `connection` as a watcher of `session`, under its
-    /// lifecycle lock when it is loaded: an unload either sees the watcher
-    /// and keeps the Session, or has already begun. Returns whether the
-    /// registry changed.
-    async fn set_watch(&self, session: &SessionRef, connection: u64, attached: bool) -> bool {
-        let target = self.route(session).ok();
-        let _lifecycle = match (&target, attached) {
-            (Some(live), true) => Some(live.lifecycle.lock().await),
-            _ => None,
-        };
-        let mut watchers = self.watchers.lock().unwrap();
-        if attached && self.stopped.load(Ordering::Acquire) {
-            return false;
-        }
-        self.idle_epoch.fetch_add(1, Ordering::AcqRel);
-        if attached {
-            watchers
-                .entry(session.key.clone())
-                .or_default()
-                .insert(connection)
-        } else {
-            let removed = watchers
-                .get_mut(&session.key)
-                .is_some_and(|watching| watching.remove(&connection));
-            if watchers.get(&session.key).is_some_and(HashSet::is_empty) {
-                watchers.remove(&session.key);
-            }
-            removed
-        }
-    }
-    /// `session/attach` for `connection`: protect the Session from unloading
-    /// before taking the snapshot, and load it again first if it was
-    /// unloaded to make room. If it cannot be loaded, the attach fails.
-    async fn attach_watched(
-        &self,
-        connection: u64,
-        session: &SessionRef,
-        after_seq: u64,
-        snapshot: bool,
-    ) -> BackendResult<loop_wire::Attachment> {
-        if session.instance != self.instance || session.key.0 != session.native_id {
-            return Err(BackendError::SessionNotFound(session.key.clone()));
-        }
-        let added = self.set_watch(session, connection, true).await;
-        if self.stopped.load(Ordering::Acquire) {
-            return Err(failed("Runtime stopped"));
-        }
-        let result = async {
-            let unloading = self
-                .route(session)
-                .map_or(true, |live| live.closing.load(Ordering::Acquire));
-            // A legacy Surface whose cursor reaches a branch reset cannot
-            // replay through it; give it the current branch instead.
-            let baseline = !snapshot && self.reset_since(session, after_seq).await?;
-            let fresh = snapshot || baseline;
-            if unloading && (fresh || self.was_unloaded(&session.key)) {
-                // Finished Subagents have an audit stream but cannot be reopened
-                // without their parent's policy and cancellation lineage.
-                if self.route(session).is_err() && self.subagent_parent(session).await?.is_some() {
-                    return loop_wire::RuntimeControl::attach(self, session, after_seq).await;
-                }
-                if let Err(error) = self.reload(session).await {
-                    // A Session that cannot be loaded here (for example, owned
-                    // elsewhere) keeps read-only replay; it detaches at the reset.
-                    if snapshot || self.was_unloaded(&session.key) {
-                        return Err(error);
-                    }
-                    return loop_wire::RuntimeControl::attach(self, session, after_seq).await;
-                }
-            }
-            if !fresh {
-                return loop_wire::RuntimeControl::attach(self, session, after_seq).await;
-            }
-            let live = self.route(session)?;
-            let _lifecycle = live.lifecycle.lock().await;
-            self.check_tree_live(&live)?;
-            barrier(&live).await?;
-            self.announce_control(&live, None).await?;
-            // Under the lock already held: read the pump's committed point.
-            let (at_seq, changed) = Self::announced(&live);
-            let public = self.public_snapshot(session, at_seq, changed);
-            let mut attachment = self.attachment(session, after_seq, public.clone()).await?;
-            if snapshot {
-                attachment.snapshot = Some(self.snapshot_locked(&live, public).await?);
-            } else {
-                attachment.baseline = self.baseline_locked(&live, attachment.latest_seq).await?;
-                attachment.replay = Box::new(std::iter::empty());
-            }
-            Ok(attachment)
-        }
-        .await;
-        if result.is_err() && added {
-            self.set_watch(session, connection, false).await;
-        }
-        result
-    }
-    async fn disconnect_recipients(&self, connection: u64) {
-        let mut recipients = self.recipients.lock().await;
-        recipients.retain(|_, attached| {
-            attached.remove(&connection);
-            !attached.is_empty()
-        });
-        let sessions: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
-        for live in sessions {
-            live.escalations.detach(connection).await;
-        }
-    }
-}
 #[async_trait]
 impl loop_wire::RuntimeControl for Runtime {
     async fn config(&self, p: loop_protocol::rpc::SessionParams) -> BackendResult<SessionSnapshot> {
+        self.check(&p.session, Need::Read).await?;
         self.snapshot(&p.session).await
     }
 
@@ -1748,6 +1287,7 @@ impl loop_wire::RuntimeControl for Runtime {
         p: loop_protocol::session_services::SkillParams,
     ) -> BackendResult<MutationResult> {
         let session = p.session.clone();
+        self.check(&session, Need::Write).await?;
         self.set_config(&session, false, |live| async move {
             live.opened.native.skill(p).await
         })
@@ -1758,6 +1298,7 @@ impl loop_wire::RuntimeControl for Runtime {
         &self,
         p: loop_protocol::session_services::WorkflowParams,
     ) -> BackendResult<loop_protocol::session_services::WorkflowResult> {
+        self.check(&p.session, Need::Write).await?;
         let live = self.loaded(&p.session).await?;
         if let Some(result) = live.opened.native.known_workflow(&p)? {
             return Ok(result);
@@ -1766,6 +1307,9 @@ impl loop_wire::RuntimeControl for Runtime {
             let _lifecycle = live.lifecycle.lock().await;
             self.check_tree_live(&live)?;
             self.reserve(&live).await?;
+            live.escalations
+                .set_turn_caller(loop_protocol::Caller::current());
+            live.set_turn_caller(request_caller());
             match live.opened.native.workflow(p).await {
                 Ok(result) => result,
                 Err(error) => {
@@ -1902,6 +1446,7 @@ impl loop_wire::RuntimeControl for Runtime {
         if session.instance != self.instance || session.key.0 != session.native_id {
             return Err(BackendError::SessionNotFound(session.key.clone()));
         }
+        self.check(session, Need::Read).await?;
         let live = self.sessions.lock().unwrap().contains_key(&session.key);
         if !live {
             let known = self
@@ -1919,39 +1464,6 @@ impl loop_wire::RuntimeControl for Runtime {
         // after this read is delivered live; the caller removes the overlap.
         let snapshot = self.snapshot(session).await?;
         self.attachment(session, after_seq, snapshot).await
-    }
-}
-
-impl Runtime {
-    /// Committed updates after `after_seq` through the snapshot's `at_seq`.
-    /// Plain Event Log replay stays read-only, including closed Sessions;
-    /// callers may hold the lifecycle lock.
-    async fn attachment(
-        &self,
-        session: &SessionRef,
-        after_seq: u64,
-        snapshot: SessionSnapshot,
-    ) -> BackendResult<loop_wire::Attachment> {
-        let records = self
-            .log
-            .read_after(&session.key, after_seq)
-            .await
-            .map_err(failed)?;
-        let mut replay = Vec::with_capacity(records.len());
-        for record in records {
-            if let EventKind::Update(envelope) = record.event.kind {
-                if envelope.seq <= snapshot.at_seq {
-                    replay.push(envelope);
-                }
-            }
-        }
-        Ok(loop_wire::Attachment {
-            baseline: Vec::new(),
-            latest_seq: snapshot.at_seq,
-            generation: self.generation,
-            replay: Box::new(replay.into_iter()),
-            snapshot: Some(snapshot),
-        })
     }
 }
 
@@ -1975,7 +1487,14 @@ impl Runtime {
         let (at_seq, changed) = match committed {
             Some(committed) => committed,
             None => {
-                let at_seq = self.log.latest_seq(&session.key).await.map_err(failed)?;
+                // An append abandoned while queued must count before `at_seq`.
+                self.log.sync().await.map_err(failed)?;
+                let tenant = self.session_tenant(&session.key);
+                let at_seq = self
+                    .log
+                    .latest_seq(&tenant, &session.key)
+                    .await
+                    .map_err(failed)?;
                 (at_seq, self.recorded_config(session).await?)
             }
         };
@@ -2080,24 +1599,16 @@ impl Runtime {
             agent: d.agent.clone(),
         }
     }
-    /// The newest Session revision the Event Log announced for `key`.
-    async fn logged_revision(&self, key: &SessionKey) -> BackendResult<u64> {
-        let records = self.log.read_after(key, 0).await.map_err(failed)?;
-        Ok(records
-            .iter()
-            .rev()
-            .find_map(|record| match &record.event.kind {
-                EventKind::Update(UpdateEnvelope {
-                    update: SessionUpdate::ConfigChanged(changed),
-                    ..
-                }) => Some(changed.revision),
-                EventKind::Update(UpdateEnvelope {
-                    update: SessionUpdate::BranchReset { revision, .. },
-                    ..
-                }) => Some(*revision),
-                _ => None,
-            })
-            .unwrap_or(0))
+    /// The newest Session revision the Event Log announced for `key`: the
+    /// revision of its last `config_changed` or `branch_reset`, from the
+    /// Session summary (no read of the Session's history).
+    async fn logged_revision(&self, tenant: &Tenant, key: &SessionKey) -> BackendResult<u64> {
+        let summary = self
+            .log
+            .session_summary(tenant, key)
+            .await
+            .map_err(failed)?;
+        Ok(summary.map_or(0, |summary| summary.last_revision))
     }
     /// The loaded Session, loading it again when it was unloaded to make room.
     async fn loaded(&self, session: &SessionRef) -> BackendResult<Arc<LiveSession>> {
@@ -2134,6 +1645,8 @@ impl Runtime {
             if refuse_busy && live.busy.load(Ordering::Acquire) {
                 return Err(BackendError::Busy);
             }
+            // The revisions the setter makes are this caller's.
+            let _claim = live.claim_changes(&request_caller());
             set(Arc::clone(&live)).await?
         };
         let receipt = Receipt {
@@ -2157,72 +1670,6 @@ impl Runtime {
     }
 }
 
-impl Runtime {
-    /// Mark an idle Session busy for a turn or a user command, capturing
-    /// its settled output for snapshots taken meanwhile. Caller holds the
-    /// lifecycle lock and has checked the Session is open.
-    async fn reserve(&self, live: &LiveSession) -> BackendResult<()> {
-        if self.stopped.load(Ordering::Acquire) {
-            return Err(failed("Runtime stopped"));
-        }
-        self.idle_epoch.fetch_add(1, Ordering::AcqRel);
-        if !live.busy.load(Ordering::Acquire) {
-            self.announce_control(live, None).await?;
-            // The pump's committed point, without waiting on the Event
-            // Log: anything still queued before this turn is a config
-            // update, which transcript views leave out.
-            let published = live.announced.lock().unwrap().published;
-            live.turn_start_seq.store(published, Ordering::Release);
-            *live.committed.lock().await =
-                Some(live.opened.harness.export_session().await.map_err(failed)?);
-        }
-        if live
-            .busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(BackendError::Busy);
-        }
-        Ok(())
-    }
-    /// Run a user command in the Session's environment while it is idle.
-    /// The command holds the Session busy, not its lifecycle lock, and a
-    /// cancel or forced close stops it.
-    async fn shell(
-        &self,
-        session: &SessionRef,
-        command: &str,
-        timeout_ms: Option<u64>,
-    ) -> BackendResult<ShellResult> {
-        let live = self.loaded(session).await?;
-        // Checked before the Session is reserved.
-        let timeout_ms = live.opened.native.shell_timeout(timeout_ms)?;
-        let mut cancelled = live.cancel.subscribe();
-        {
-            let _lifecycle = live.lifecycle.lock().await;
-            self.check_tree_live(&live)?;
-            self.reserve(&live).await?;
-        }
-        // Owned by the Runtime: a dropped request still clears `busy`.
-        let session = session.clone();
-        let command = command.to_owned();
-        let task = tokio::spawn(async move {
-            let result = tokio::select! {
-                result = live.opened.native.run(&session, &command, Some(timeout_ms)) => result,
-                _ = cancelled.changed() => Err(BackendError::failed(
-                    ErrorCategory::Cancelled,
-                    "the command was cancelled",
-                )),
-            };
-            let _lifecycle = live.lifecycle.lock().await;
-            live.busy.store(false, Ordering::Release);
-            live.apply_pending().await;
-            result
-        });
-        task.await.map_err(failed)?
-    }
-}
-
 #[async_trait]
 impl Compaction for Runtime {
     async fn compact(
@@ -2237,6 +1684,7 @@ impl Compaction for Runtime {
 #[async_trait]
 impl SessionStats for Runtime {
     async fn stats(&self, session: &SessionRef) -> BackendResult<StatsSummary> {
+        self.check(session, Need::Read).await?;
         let live = self.loaded(session).await?;
         let mut stats = live.opened.native.stats(session).await?;
         let turn_state = if live.escalations.has_pending().await {
@@ -2266,6 +1714,7 @@ impl LocalShell for Runtime {
 #[async_trait]
 impl ModelControl for Runtime {
     async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        self.check(session, Need::Read).await?;
         let live = self.loaded(session).await?;
         Self::control(&live)?.models(session).await
     }
@@ -2275,6 +1724,7 @@ impl ModelControl for Runtime {
         model: &str,
         expected_revision: Option<u64>,
     ) -> BackendResult<MutationResult> {
+        self.check(session, Need::Write).await?;
         // During a turn the choice waits: the running turn keeps its model.
         self.set_config(session, false, |live| async move {
             Self::control(&live)?
@@ -2284,6 +1734,7 @@ impl ModelControl for Runtime {
         .await
     }
     async fn efforts(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        self.check(session, Need::Read).await?;
         let live = self.loaded(session).await?;
         Self::control(&live)?.efforts(session).await
     }
@@ -2293,6 +1744,7 @@ impl ModelControl for Runtime {
         effort: &str,
         expected_revision: Option<u64>,
     ) -> BackendResult<MutationResult> {
+        self.check(session, Need::Write).await?;
         // During a turn the change waits for the next one.
         self.set_config(session, false, |live| async move {
             Self::control(&live)?
@@ -2302,6 +1754,7 @@ impl ModelControl for Runtime {
         .await
     }
     async fn modes(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        self.check(session, Need::Read).await?;
         let live = self.loaded(session).await?;
         Self::control(&live)?.modes(session).await
     }
@@ -2311,6 +1764,12 @@ impl ModelControl for Runtime {
         change: Option<Option<u64>>,
         expected_revision: Option<u64>,
     ) -> BackendResult<loop_protocol::rpc::TtfbResult> {
+        let need = if change.is_none() {
+            Need::Read
+        } else {
+            Need::Write
+        };
+        self.check(session, need).await?;
         if change.is_none() {
             let live = self.loaded(session).await?;
             return Self::control(&live)?.ttfb(session, None, None).await;
@@ -2351,6 +1810,7 @@ impl ModelControl for Runtime {
         mode: &str,
         expected_revision: Option<u64>,
     ) -> BackendResult<MutationResult> {
+        self.check(session, Need::Write).await?;
         self.set_config(session, false, |live| async move {
             Self::control(&live)?
                 .set_mode(session, mode, expected_revision)
@@ -2366,11 +1826,12 @@ impl AgentBackend for Runtime {
         &self.instance
     }
     fn capabilities(&self) -> Capabilities {
+        let locked = self.factory.globals.tool_lock().is_some();
         Capabilities {
             session_environment: true,
             session_config: true,
             session_skills: true,
-            workflow: cfg!(feature = "orchestration"),
+            workflow: cfg!(feature = "orchestration") && !locked,
             session_tree: true,
             session_rename: true,
             session_fork: true,
@@ -2385,7 +1846,7 @@ impl AgentBackend for Runtime {
             efforts: true,
             compaction: true,
             session_stats: true,
-            local_shell: true,
+            local_shell: !locked,
             session_ttfb: true,
             ..Capabilities::default()
         }
@@ -2413,9 +1874,11 @@ impl AgentBackend for Runtime {
         session: &SessionRef,
         spec: SessionSpec,
     ) -> BackendResult<SessionRef> {
+        self.check(session, Need::Read).await?;
         self.open(Some(session), spec, None).await
     }
     async fn transcript(&self, session: &SessionRef) -> BackendResult<Vec<SessionUpdate>> {
+        self.check(session, Need::Read).await?;
         self.route(session)?.opened.native.transcript(session).await
     }
     async fn prompt(
@@ -2423,6 +1886,9 @@ impl AgentBackend for Runtime {
         session: &SessionRef,
         input: Vec<ContentBlock>,
     ) -> BackendResult<TurnHandle> {
+        // Read before any spawn: the task-local caller does not cross one.
+        let caller = loop_protocol::Caller::current();
+        self.check(session, Need::Write).await?;
         let mut reloads = 0;
         let live = loop {
             let live = match self.route(session) {
@@ -2460,6 +1926,25 @@ impl AgentBackend for Runtime {
             drop(lifecycle);
             break live;
         };
+        // The turn acts for this caller, carried into it explicitly. A
+        // Subagent's turn has no connection: it acts for whoever started its
+        // parent's turn (ADR-0009).
+        let caller = caller.or_else(|| {
+            let parent = live.parent.as_ref()?;
+            let parent = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(parent)
+                .cloned()?;
+            parent.escalations.turn_caller()
+        });
+        // Stamped on the turn's records: the connection's caller, else the
+        // parent turn's, else (in process) the Runtime.
+        let acting = caller.clone().unwrap_or_else(in_process_caller);
+        live.escalations.set_turn_caller(caller);
+        live.set_turn_caller(acting.clone());
+        let identity = live.identity(&acting);
         let (done, handle) = TurnHandle::channel();
         let log = self.log.clone();
         let generation = self.generation;
@@ -2483,6 +1968,7 @@ impl AgentBackend for Runtime {
                     turn: None,
                     ts_ms,
                     kind: EventKind::PromptSent(json!({"content": input})),
+                    identity: identity.clone(),
                 }])
                 .await
                 .map_err(failed)?;
@@ -2528,6 +2014,7 @@ impl AgentBackend for Runtime {
                         turn: None,
                         ts_ms: now(),
                         kind: EventKind::PromptSettled(json!({})),
+                        identity,
                     }])
                     .await;
                 if let Err(error) = settled {
@@ -2562,7 +2049,12 @@ impl AgentBackend for Runtime {
     }
     fn cancel(&self, session: &SessionRef) {
         if let Ok(live) = self.route(session) {
-            let _ = live.commands.send(Command::Cancel);
+            // A caller that may not act in the Session cancels nothing.
+            if Self::may_live(&Actor::current(), &live, Need::Write) {
+                let _ = live.commands.send(Command::Cancel(request_caller()));
+            } else {
+                self.refusals.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     fn is_busy(&self, session: &SessionRef) -> bool {
@@ -2573,193 +2065,10 @@ impl AgentBackend for Runtime {
         Runtime::shutdown(self).await;
     }
 }
-async fn barrier(live: &LiveSession) -> BackendResult<()> {
-    let (tx, rx) = oneshot::channel();
-    let result = match live.commands.send(Command::Barrier(tx)) {
-        Ok(()) => rx.await.map_err(failed),
-        Err(error) => Err(failed(error)),
-    };
-    if let Some(error) = live.failure.lock().unwrap().clone() {
-        return Err(failed(error));
-    }
-    result
-}
-async fn publish(
-    live: &LiveSession,
-    envelope: UpdateEnvelope,
-    log: &dyn EventLog,
-    generation: u64,
-    updates: &broadcast::Sender<UpdateEnvelope>,
-) -> BackendResult<()> {
-    if envelope.origin == Origin::Replay {
-        return Ok(());
-    }
-    let ts_ms = now();
-    let committed = log
-        .append_batch(vec![Event::update(generation, ts_ms, envelope)])
-        .await
-        .map_err(failed)?;
-    touch(&live.activity, &live.reference.key, ts_ms);
-    if let Some(error) = live.failure.lock().unwrap().clone() {
-        return Err(failed(error));
-    }
-    for record in committed {
-        if let EventKind::Update(envelope) = record.event.kind {
-            {
-                let mut announced = live.announced.lock().unwrap();
-                announced.published = envelope.seq;
-                match &envelope.update {
-                    SessionUpdate::ConfigChanged(changed) => {
-                        announced.commit(envelope.seq, changed)
-                    }
-                    // A branch change advances the one Session revision too.
-                    SessionUpdate::BranchReset { revision, .. } => {
-                        announced.revision = announced.revision.max(*revision);
-                        announced.latest.revision = announced.latest.revision.max(*revision);
-                    }
-                    _ => {}
-                }
-            }
-            let mut tail = live.tail.lock().unwrap();
-            if tail.len() == 256 {
-                tail.pop_front();
-            }
-            tail.push_back(envelope.clone());
-            let _ = updates.send(envelope);
-        }
-    }
-    Ok(())
-}
-#[derive(Debug)]
-enum RenewEnd {
-    /// The lease is no longer ours.
-    Lost(String),
-    /// Renewals kept failing for the whole give-up window.
-    Stale(String),
-}
-/// Renew on every tick. Only a lost lease is fatal at once; transient storage
-/// errors are retried until no renewal has succeeded for `give_up`.
-async fn renew_loop<F, Fut>(mut renew: F, interval: Duration, give_up: Duration) -> RenewEnd
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<(), SessionError>>,
-{
-    let mut ticker = tokio::time::interval(interval);
-    let mut last_ok = tokio::time::Instant::now();
-    loop {
-        ticker.tick().await;
-        match renew().await {
-            Ok(()) => last_ok = tokio::time::Instant::now(),
-            Err(SessionError::Storage(error)) => {
-                eprintln!("Runtime: lease renewal failed, will retry: {error}");
-                if last_ok.elapsed() >= give_up {
-                    return RenewEnd::Stale(error);
-                }
-            }
-            Err(error) => return RenewEnd::Lost(error.to_string()),
-        }
-    }
-}
-fn fail(live: &LiveSession, error: impl std::fmt::Display) {
-    *live.failure.lock().unwrap() = Some(error.to_string());
-    live.cancel.send_modify(|n| *n += 1);
-    live.opened.native.cancel(&live.reference);
-}
-#[allow(clippy::too_many_arguments)]
-async fn pump(
-    live: Arc<LiveSession>,
-    mut receiver: broadcast::Receiver<UpdateEnvelope>,
-    mut commands: mpsc::UnboundedReceiver<Command>,
-    log: Arc<dyn EventLog>,
-    generation: u64,
-    updates: broadcast::Sender<UpdateEnvelope>,
-    store: Arc<SqliteSessionStore>,
-    identity: LeaseIdentity,
-) {
-    // Lease maintenance must not wait behind Event Log backpressure.
-    // Dropping the JoinSet stops renewal when the pump drains or fails.
-    let mut renewals = tokio::task::JoinSet::new();
-    let renewing = Arc::downgrade(&live);
-    let id = live.reference.native_id.clone();
-    let key = live.reference.key.clone();
-    let renew_log = Arc::clone(&log);
-    renewals.spawn(async move {
-        let end = renew_loop(
-            || store.renew_lease(&id, &identity),
-            RENEW_INTERVAL,
-            RENEW_GIVE_UP,
-        )
-        .await;
-        let (state, reason) = match end {
-            RenewEnd::Lost(reason) => ("lost", reason),
-            RenewEnd::Stale(reason) => ("stale", reason),
-        };
-        eprintln!("Runtime: lease of Session {id} is {state}: {reason}");
-        if let Some(live) = renewing.upgrade() {
-            fail(&live, format!("lease {state}: {reason}"));
-        }
-        let _ = renew_log
-            .append_batch(vec![Event {
-                generation,
-                session_key: Some(key),
-                turn: None,
-                ts_ms: now(),
-                kind: EventKind::Cancelled(
-                    json!({"reason": format!("lease {state}"), "detail": reason}),
-                ),
-            }])
-            .await;
-    });
-    loop {
-        let result: BackendResult<()> = tokio::select! {
-            envelope = receiver.recv() => match envelope {
-                Ok(envelope) => publish(&live, envelope, log.as_ref(), generation, &updates).await,
-                Err(error) => Err(failed(format!("Session update pump lost activity: {error}"))),
-            },
-            _ = renewals.join_next() => return,
-            command = commands.recv() => {
-                let stop = matches!(&command, Some(Command::Stop(_)));
-                match command {
-                    Some(Command::Publish(update, tx)) => {
-                        let envelope = UpdateEnvelope::live(live.reference.instance.clone(), generation, live.reference.key.clone(), None, 0, *update);
-                        let result = publish(&live,envelope,log.as_ref(),generation,&updates).await;
-                        let _ = tx.send(result.clone());
-                        result
-                    }
-                    Some(Command::Cancel) => {
-                        let result = log.append_batch(vec![Event { generation, session_key: Some(live.reference.key.clone()), turn: None, ts_ms: now(), kind: EventKind::Cancelled(json!({})) }]).await.map_err(failed);
-                        live.cancel.send_modify(|n| *n += 1);
-                        live.opened.native.cancel(&live.reference);
-                        let withdrawn = live.escalations.withdraw("turn cancelled", false).await.map_err(failed);
-                        result.map(|_| ()).and(withdrawn)
-                    }
-                    Some(Command::Barrier(tx) | Command::Stop(tx)) => {
-                        let result = async {
-                            loop { match receiver.try_recv() {
-                                Ok(e) => publish(&live, e, log.as_ref(), generation, &updates).await?,
-                                Err(broadcast::error::TryRecvError::Empty) => break,
-                                Err(error) => return Err(failed(format!("Session update pump lost activity: {error}"))),
-                            } }
-                            Ok(())
-                        }.await;
-                        if let Err(error) = &result { fail(&live, error); }
-                        let _ = tx.send(());
-                        if stop { return; }
-                        result
-                    }
-                    None => return,
-                }
-            }
-        };
-        if let Err(error) = result {
-            fail(&live, error);
-            return;
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
+    use super::leases::{renew_loop, RenewEnd};
     use super::*;
     use crate::log::MemoryEventLog;
 
@@ -2789,6 +2098,34 @@ mod tests {
         .await
         .ok();
         (end, calls.load(Ordering::Acquire))
+    }
+
+    /// A key in two tenants reads in the tenant of its creating record and
+    /// is marked split; with no single creating tenant, the smallest name.
+    #[test]
+    fn session_index_prefers_the_creating_tenant_and_marks_splits() {
+        let local = Tenant::local();
+        let acme = Tenant::new("acme").unwrap();
+        let zeta = Tenant::new("zeta").unwrap();
+        let key = |k: &str| SessionKey::from(k);
+        let read = HashMap::from([
+            ((local.clone(), key("only")), 5),
+            ((local.clone(), key("split")), 9),
+            ((zeta.clone(), key("split")), 7),
+            ((local.clone(), key("unowned")), 1),
+            ((acme.clone(), key("unowned")), 2),
+        ]);
+        // "split" was created in zeta: the larger name wins by its owner row.
+        let creators = HashMap::from([(key("split"), vec![zeta.clone()])]);
+        let index = session_index(read, &creators);
+        assert_eq!(index.tenants[&key("only")], local);
+        assert_eq!(index.tenants[&key("split")], zeta);
+        assert_eq!(index.activity[&key("split")], 9);
+        assert_eq!(index.tenants[&key("unowned")], acme);
+        assert!(!index.split.contains_key(&key("only")));
+        assert_eq!(index.split[&key("split")].creator, zeta);
+        assert_eq!(index.split[&key("split")].tenants, "local, zeta");
+        assert!(index.split.contains_key(&key("unowned")));
     }
 
     #[tokio::test]
@@ -2852,7 +2189,8 @@ mod tests {
             agent: None,
         };
         let log = Arc::new(MemoryEventLog::new());
-        let rt = Runtime::new(globals, opts, log.clone(), RuntimeLimits::default())
+        let store = globals.open_runtime_session_store().unwrap();
+        let rt = Runtime::new(globals, opts, log.clone(), store, RuntimeLimits::default())
             .await
             .unwrap();
         let session = rt.new_session(SessionSpec::default()).await.unwrap();
@@ -2861,7 +2199,13 @@ mod tests {
             .unwrap()
             .outcome()
             .await;
-        let before = log.read_runtime_after(0).await.unwrap();
+        let before = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap();
         let tail = rt.tail(&session).unwrap();
         let mut updates = rt.subscribe();
         let live = rt.route(&session).unwrap();
@@ -2871,7 +2215,15 @@ mod tests {
             .await
             .unwrap();
         barrier(&live).await.unwrap();
-        assert_eq!(log.read_runtime_after(0).await.unwrap(), before);
+        assert_eq!(
+            log.read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0
+            )
+            .await
+            .unwrap(),
+            before
+        );
         assert_eq!(rt.tail(&session).unwrap(), tail);
         assert!(updates.try_recv().is_err());
         rt.shutdown().await;

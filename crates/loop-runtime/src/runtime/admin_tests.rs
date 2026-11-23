@@ -62,11 +62,14 @@ async fn runtime_with(
         agent: None,
     };
     let log = Arc::new(MemoryEventLog::new());
-    let rt = Runtime::new(globals, opts, log.clone(), limits)
-        .await
-        .unwrap()
-        .with_close_grace(Duration::from_millis(500))
-        .into_shared();
+    let rt = {
+        let store = globals.open_runtime_session_store().unwrap();
+        Runtime::new(globals, opts, log.clone(), store, limits)
+    }
+    .await
+    .unwrap()
+    .with_close_grace(Duration::from_millis(500))
+    .into_shared();
     (rt, log)
 }
 
@@ -98,10 +101,18 @@ async fn park(rt: &Runtime, log: &MemoryEventLog, session: &SessionRef) -> TurnH
         .await
         .unwrap();
     loop {
-        let raised = log.read_runtime_after(0).await.unwrap().iter().any(|e| {
-            matches!(e.event.kind, EventKind::EscalationRaised(_))
-                && e.event.session_key.as_ref() == Some(&session.key)
-        });
+        let raised = log
+            .read_runtime_after(
+                loop_store::Scope::System(&loop_store::SystemScope::for_runtime_startup()),
+                0,
+            )
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| {
+                matches!(e.event.kind, EventKind::EscalationRaised(_))
+                    && e.event.session_key.as_ref() == Some(&session.key)
+            });
         if raised {
             break turn;
         }
@@ -959,6 +970,52 @@ async fn differing_provider_environment_warns_without_exposing_either_key() {
     .unwrap();
 }
 
+/// A Session opened without a caller environment (`loop session new`) uses the
+/// Runtime's own environment. It must not hand provider keys to tools either.
+/// The child copy of this binary has the keys in its environment.
+#[cfg(unix)]
+#[test]
+fn a_session_without_a_caller_environment_gets_no_provider_keys() {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runtime::admin_tests::session_without_caller_environment_child",
+            "--nocapture",
+        ])
+        .env("LOOP_TOOLENV_RUNTIME_CHILD", "1")
+        .env("OPENAI_API_KEY", "canary")
+        .env("LOOP_RUNTIME_TOKEN", "canary")
+        .env("GITHUB_TOKEN", "canary")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_without_caller_environment_child() {
+    if std::env::var_os("LOOP_TOOLENV_RUNTIME_CHILD").is_none() {
+        return;
+    }
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let result = LocalShell::run(
+            rt.as_ref(),
+            &session,
+            "printf '%s:%s:%s' \"$OPENAI_API_KEY\" \"$LOOP_RUNTIME_TOKEN\" \"$GITHUB_TOKEN\"",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.stdout, "::canary");
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn credential_warnings_follow_only_the_selected_provider_and_refresh_on_resume() {
     tokio::time::timeout(LIMIT, async {
@@ -1406,6 +1463,10 @@ mod gate_mode {
     struct Watcher(mpsc::UnboundedSender<Asked>);
     #[async_trait::async_trait]
     impl EscalationRecipient for Watcher {
+        fn caller(&self) -> Option<loop_protocol::Caller> {
+            None
+        }
+
         fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
         async fn interact(
             &self,

@@ -74,7 +74,39 @@ pub struct NativeBackend {
     /// Held while a turn is admitted or the model changes, so a model
     /// change never lands between the busy check and a turn's start.
     admission: tokio::sync::Mutex<()>,
+    /// The Runtime's tool lock. Set once, never cleared: it refuses user
+    /// commands and workflows for the life of this backend.
+    tool_lock: std::sync::OnceLock<loop_protocol::ToolLock>,
+    /// The Policy gate's check for user commands (`session/shell`). Set
+    /// once, never cleared. Without one, every user command is refused.
+    command_gate: std::sync::OnceLock<CommandGate>,
 }
+
+/// A command the user typed (`session/shell`, `!command`), for the Policy
+/// gate to check before it runs.
+#[derive(Debug, Clone)]
+pub struct UserCommand {
+    /// The Session it runs in.
+    pub session: SessionKey,
+    /// The command as typed.
+    pub command: String,
+    /// The caller of the connection that sent it; `None` for an in-process
+    /// call.
+    pub caller: Option<loop_protocol::Caller>,
+}
+
+/// Why the Policy gate refused a [`UserCommand`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct CommandRefused(pub String);
+
+/// The Policy gate's check for a [`UserCommand`]: `Ok` runs it, `Err` gives
+/// the refusal. It records its decision before it returns.
+pub type CommandGate = Arc<
+    dyn Fn(UserCommand) -> futures::future::BoxFuture<'static, Result<(), CommandRefused>>
+        + Send
+        + Sync,
+>;
 
 /// Work that waits for the running turn to end. It is called with `true`
 /// when the next turn is about to start, or `false` when a newer job for the
@@ -355,6 +387,8 @@ impl NativeBackend {
             next_turn: Mutex::new(Default::default()),
             cancel_requested: AtomicBool::new(false),
             admission: tokio::sync::Mutex::new(()),
+            tool_lock: std::sync::OnceLock::new(),
+            command_gate: std::sync::OnceLock::new(),
         });
         backend.read_config().await;
         let instance = backend.instance.clone();
@@ -1049,11 +1083,28 @@ impl AgentBackend for NativeBackend {
         let hold = TurnHold::start(instance.clone(), Arc::clone(&stream), Arc::clone(&config));
         tokio::spawn(async move {
             let on_written = Arc::clone(&hold);
+            let (counted, count_instance, count_stream, count_config) = (
+                Arc::clone(&harness),
+                instance.clone(),
+                Arc::clone(&stream),
+                Arc::clone(&config),
+            );
             let written: TurnWritten = Box::new(move |failure| {
                 // The same text `harness_error` gives the returned error.
                 let info = failure
                     .map(|e| ErrorInfo::new(ErrorCategory::Internal, format!("session: {e}")));
                 on_written.written(info.as_ref());
+                // The tree counts each automatic compaction in the Session
+                // revision, as it counts `session/compact`.
+                let compactions = counted.take_turn_compactions();
+                if compactions > 0 {
+                    let update = {
+                        let mut state = count_config.lock();
+                        state.revision += compactions;
+                        state.update()
+                    };
+                    announce(&count_instance, &count_stream, update);
+                }
             });
             let result = harness.prompt_then_written(input, written).await;
             let rejected_busy = matches!(result, Err(AgentHarnessError::Busy));
@@ -1358,9 +1409,104 @@ impl NativeBackend {
     }
 
     /// Check a user command's timeout: by default, and at most, the
-    /// `bash.maxTimeoutMs` limit.
+    /// `bash.maxTimeoutMs` limit. Under a tool lock every command is
+    /// refused here, before the Runtime reserves the Session.
     pub fn shell_timeout(&self, requested: Option<u64>) -> BackendResult<u64> {
+        self.refuse_if_locked("session/shell")?;
         loop_protocol::shell_timeout(requested, self.harness.bash_limits().max_timeout_ms)
+    }
+
+    /// Lock this backend's tools for good: user commands (`session/shell`)
+    /// and workflows are refused from now on. A second lock is ignored; the
+    /// first one stays.
+    pub fn lock_tools(&self, lock: loop_protocol::ToolLock) {
+        let _ = self.tool_lock.set(lock);
+    }
+
+    /// The tool lock in force, if any.
+    pub fn tool_lock(&self) -> Option<loop_protocol::ToolLock> {
+        self.tool_lock.get().copied()
+    }
+
+    /// The turn running now, if any: for decision records.
+    pub fn current_turn(&self) -> Option<TurnId> {
+        self.stream.lock().mapper.current_turn().cloned()
+    }
+
+    /// Check every user command with `gate` from now on. A second gate is
+    /// ignored; the first one stays.
+    pub fn set_command_gate(&self, gate: CommandGate) {
+        let _ = self.command_gate.set(gate);
+    }
+
+    /// Run a user command for `caller`: [`LocalShell::run`] with the caller
+    /// passed in, for a caller that read [`loop_protocol::Caller::current`]
+    /// before it spawned a task.
+    ///
+    /// The outer checks come first: the tool lock refuses every command.
+    /// Then the Policy gate decides as it would for the `bash` tool, and
+    /// records the decision; with no gate installed the command is refused.
+    /// Then the `bash` block list applies, as it does to the tool.
+    pub async fn run_as(
+        &self,
+        session: &SessionRef,
+        command: &str,
+        timeout_ms: Option<u64>,
+        caller: Option<loop_protocol::Caller>,
+    ) -> BackendResult<ShellResult> {
+        // `shell_timeout` refuses under a tool lock; checked again here so
+        // no later change to it can let a command through.
+        self.refuse_if_locked("session/shell")?;
+        let timeout_ms = self.shell_timeout(timeout_ms)?;
+        self.check_session(session).await?;
+        let refused = |reason: String| {
+            BackendError::failed(
+                ErrorCategory::Agent,
+                format!("the command is refused: {reason}"),
+            )
+        };
+        let Some(gate) = self.command_gate.get() else {
+            return Err(refused(
+                "no permission gate checks user commands in this Session".into(),
+            ));
+        };
+        gate(UserCommand {
+            session: session.key.clone(),
+            command: command.to_owned(),
+            caller,
+        })
+        .await
+        .map_err(|refusal| refused(refusal.0))?;
+        crate::harness::tools::check_command_policy(command, &[]).map_err(refused)?;
+        let env = self.harness.tool_env().await.map_err(harness_error)?;
+        let out = env
+            .exec(
+                command,
+                ShellExecOptions {
+                    timeout_ms: Some(timeout_ms),
+                    ..ShellExecOptions::default()
+                },
+            )
+            .await
+            .map_err(|e| BackendError::failed(ErrorCategory::Agent, e.to_string()))?;
+        Ok(ShellResult {
+            stdout: out.stdout,
+            stderr: out.stderr,
+            exit_code: out.exit_code,
+            truncated: out.truncated,
+        }
+        .bounded())
+    }
+
+    /// [`BackendError::ToolLocked`] for `what` when a lock is set.
+    pub(crate) fn refuse_if_locked(&self, what: &str) -> BackendResult<()> {
+        match self.tool_lock() {
+            Some(lock) => Err(BackendError::ToolLocked {
+                what: what.to_owned(),
+                lock,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Prepare a compaction for a caller that commits the returned tree
@@ -1416,26 +1562,14 @@ impl LocalShell for NativeBackend {
         command: &str,
         timeout_ms: Option<u64>,
     ) -> BackendResult<ShellResult> {
-        let timeout_ms = self.shell_timeout(timeout_ms)?;
-        self.check_session(session).await?;
-        let env = self.harness.tool_env().await.map_err(harness_error)?;
-        let out = env
-            .exec(
-                command,
-                ShellExecOptions {
-                    timeout_ms: Some(timeout_ms),
-                    ..ShellExecOptions::default()
-                },
-            )
-            .await
-            .map_err(|e| BackendError::failed(ErrorCategory::Agent, e.to_string()))?;
-        Ok(ShellResult {
-            stdout: out.stdout,
-            stderr: out.stderr,
-            exit_code: out.exit_code,
-            truncated: out.truncated,
-        }
-        .bounded())
+        // The caller of the request in scope; an in-process call has none.
+        self.run_as(
+            session,
+            command,
+            timeout_ms,
+            loop_protocol::Caller::current(),
+        )
+        .await
     }
 }
 

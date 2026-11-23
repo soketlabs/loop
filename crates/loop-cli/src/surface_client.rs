@@ -1126,10 +1126,13 @@ mod runtime_default_tests {
             agent: None,
         };
         let log = Arc::new(loop_runtime::log::MemoryEventLog::new());
-        let rt = loop_runtime::Runtime::new(globals, opts, log, Default::default())
-            .await
-            .unwrap()
-            .into_shared();
+        let rt = {
+            let store = globals.open_runtime_session_store().unwrap();
+            loop_runtime::Runtime::new(globals, opts, log, store, Default::default())
+        }
+        .await
+        .unwrap()
+        .into_shared();
         struct Host(Arc<loop_runtime::Runtime>);
         #[async_trait::async_trait]
         impl RuntimeControl for Host {

@@ -11,6 +11,15 @@ pub struct GlobalResources {
     pub models: Arc<Models>,
     pub sessions_db: PathBuf,
     pub repository: SessionRepository,
+    /// The Runtime's tool lock, fixed for the life of the process: every
+    /// workspace and Session built from these resources is locked
+    /// ([`crate::permissions::tool_lock`]).
+    tool_lock: Option<crate::permissions::tool_lock::RuntimeToolLock>,
+    /// Every host Workspace that workspaces built from these resources made,
+    /// held weakly: the Runtime that owns the resources ends exactly these
+    /// at its shutdown, also those whose Sessions already closed.
+    host_workspaces:
+        std::sync::Mutex<Vec<std::sync::Weak<dyn loop_agent::harness::sandbox::Workspace>>>,
 }
 
 impl GlobalResources {
@@ -61,6 +70,62 @@ impl GlobalResources {
         Self::from_parts(agent_dir, credentials, models)
     }
 
+    /// These resources with the Runtime's tool lock. Call it before the
+    /// resources are shared: no later call can remove the lock.
+    pub fn with_tool_lock(
+        mut self,
+        lock: Option<crate::permissions::tool_lock::RuntimeToolLock>,
+    ) -> Self {
+        if self.tool_lock.is_none() {
+            self.tool_lock = lock;
+        }
+        self
+    }
+
+    /// The tool lock in force for every Session, if any.
+    pub fn tool_lock(&self) -> Option<crate::permissions::tool_lock::ToolLock> {
+        self.tool_lock.as_ref().map(|lock| lock.lock())
+    }
+
+    /// The lock with its root, if any.
+    pub fn tool_lock_config(&self) -> Option<&crate::permissions::tool_lock::RuntimeToolLock> {
+        self.tool_lock.as_ref()
+    }
+
+    /// Refuse a Session folder outside the tool lock's root; without a lock
+    /// every folder is admitted.
+    pub fn admit_cwd(
+        &self,
+        cwd: &Path,
+    ) -> Result<(), crate::permissions::tool_lock::ToolLockError> {
+        match &self.tool_lock {
+            Some(lock) => lock.admit(cwd).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
+    fn track_host_workspace(&self, workspace: &Arc<dyn loop_agent::harness::sandbox::Workspace>) {
+        let mut all = self
+            .host_workspaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        all.retain(|w| w.strong_count() > 0);
+        all.push(Arc::downgrade(workspace));
+    }
+
+    /// The host Workspaces made for workspaces of these resources that still
+    /// exist (loaded, replaced but not yet dropped, or opened for one
+    /// Session). For the Runtime's shutdown, so it ends its own host
+    /// processes and no other Runtime's.
+    pub fn host_workspaces(&self) -> Vec<Arc<dyn loop_agent::harness::sandbox::Workspace>> {
+        let mut all = self
+            .host_workspaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        all.retain(|w| w.strong_count() > 0);
+        all.iter().filter_map(std::sync::Weak::upgrade).collect()
+    }
+
     fn from_parts(
         agent_dir: PathBuf,
         credentials: Arc<FileCredentialStore>,
@@ -75,7 +140,54 @@ impl GlobalResources {
             models,
             sessions_db,
             repository: create_session_repository(store, None),
+            tool_lock: None,
+            host_workspaces: Default::default(),
         })
+    }
+}
+
+/// Store construction at the edge: the Runtime opens no database itself.
+impl GlobalResources {
+    /// Inject a model catalog and the Session store of the shared repository,
+    /// with no SQLite store opened.
+    ///
+    /// The injected store and `sessions_db` can differ: `sessions_db` still
+    /// names the default path, and nothing is created there. The Runtime
+    /// never reads `sessions_db` (it uses its injected store). Code that
+    /// still reads it: the standalone Surface path of
+    /// [`SessionFactory::open`] (`create_sqlite_session_store_for_resume`),
+    /// [`Self::open_runtime_session_store`], and `loop_app_core::Runtime`,
+    /// which copies it for the Surfaces to show. So do not use these
+    /// resources for a standalone Surface.
+    pub fn with_models_and_store(
+        agent_dir: PathBuf,
+        models: Arc<Models>,
+        store: Arc<dyn loop_agent::harness::session::SessionStore>,
+    ) -> anyhow::Result<Self> {
+        ensure_agent_dirs(&agent_dir)?;
+        let credentials = Arc::new(FileCredentialStore::open(auth_path(&agent_dir))?);
+        Ok(Self {
+            sessions_db: sessions_db_path(&agent_dir),
+            agent_dir,
+            credentials,
+            models,
+            repository: create_session_repository(store, None),
+            tool_lock: None,
+            host_workspaces: Default::default(),
+        })
+    }
+
+    /// Open the SQLite Session store at `sessions_db`, with the leases,
+    /// control markers and destinations that a Runtime needs.
+    pub fn open_runtime_session_store(
+        &self,
+    ) -> Result<
+        Arc<dyn loop_agent::harness::session::RuntimeSessionStore>,
+        loop_agent::harness::types::SessionError,
+    > {
+        Ok(Arc::new(
+            loop_agent::harness::session::sqlite::SqliteSessionStore::open(&self.sessions_db)?,
+        ))
     }
 }
 
@@ -93,6 +205,10 @@ pub struct WorkspaceResources {
     pub append_system_prompt: Option<String>,
     pub context_files: Vec<ContextFile>,
     pub host: Arc<dyn ExecutionEnv>,
+    /// The `host` driver's Workspace of this folder; `host` is its env.
+    /// Every Session has it, with the sandbox on or off, for the Workspace
+    /// methods (processes, transfer) that later protocol methods expose.
+    pub host_workspace: Arc<dyn loop_agent::harness::sandbox::Workspace>,
     pub mcp_client: Arc<loop_mcp::McpClientManager>,
     pub startup_notices: Vec<String>,
     // Standalone prompts retain the caller's spelling and lexical ancestors;
@@ -104,6 +220,31 @@ pub struct WorkspaceResources {
     // Shared with the workspace's reloads, so a reload never starts a second sandbox.
     sandbox: Arc<OnceCell<Execution>>,
     standalone: bool,
+}
+
+/// The started Workspace of the `host` driver for `cwd`, with reads confined
+/// under the tool lock.
+async fn host_workspace(
+    cwd: &Path,
+    confine_reads: bool,
+) -> anyhow::Result<Arc<dyn loop_agent::harness::sandbox::Workspace>> {
+    use loop_agent::harness::sandbox::{WorkspaceSource, WorkspaceSpec, HOST_DRIVER_ID};
+    let driver = crate::sandbox_builder::platform_registry()
+        .driver(HOST_DRIVER_ID)
+        .ok_or_else(|| anyhow::anyhow!("the `{HOST_DRIVER_ID}` workspace driver is missing"))?;
+    let workspace = driver
+        .create(WorkspaceSpec {
+            source: WorkspaceSource::HostFolder(cwd.to_path_buf()),
+            options: serde_json::json!({ "confineReads": confine_reads }),
+            ..WorkspaceSpec::default()
+        })
+        .await?;
+    // A replaced host driver must still confine reads under the lock.
+    if confine_reads && !workspace.capabilities().confines_reads {
+        bail!("the `{HOST_DRIVER_ID}` workspace driver does not confine reads for the tool lock");
+    }
+    workspace.start().await?;
+    Ok(workspace)
 }
 
 fn absolute_workspace(cwd: &Path) -> anyhow::Result<PathBuf> {
@@ -140,6 +281,17 @@ impl WorkspaceResources {
         } else {
             absolute_workspace(&opts.cwd)?
         };
+        // Every workspace a locked Runtime loads, for any Session, fork,
+        // child, reload or admin call, passes here: refuse a folder
+        // outside the root, and treat every folder as untrusted, so nothing
+        // from the folder (project settings, skills, prompts, context
+        // files, hooks, system prompt files) loads.
+        let mut project_trusted = project_trusted;
+        if globals.tool_lock.is_some() {
+            globals.admit_cwd(&cwd)?;
+            project_trusted = false;
+            settings = load_settings(&globals.agent_dir, &cwd, false)?;
+        }
         let prompt_cwd = if standalone {
             opts.cwd.clone()
         } else {
@@ -153,24 +305,40 @@ impl WorkspaceResources {
         if settings.sandbox.mode != "local" {
             settings.sandbox.mode = "off".into();
         }
-        let resources = load_resources(&globals.agent_dir, &cwd, project_trusted, &settings);
+        // The workspace env exists before the loaders run: project resources
+        // (skills, prompts, context files, system prompt files) are read
+        // through it, global ones stay host reads.
+        // Under the tool lock the host Workspace confines reads: each file
+        // read is checked on the opened file itself, so a path changed into
+        // a link between the gate's check and the open is refused. It also
+        // starts no process and takes no upload.
+        let host_workspace = host_workspace(&cwd, globals.tool_lock().is_some()).await?;
+        globals.track_host_workspace(&host_workspace);
+        let host: Arc<dyn ExecutionEnv> = host_workspace.env();
+        let mut resources =
+            load_resources_in(&*host, &globals.agent_dir, &cwd, project_trusted, &settings).await;
+        let mut locked_notices = Vec::new();
+        if let Some(lock) = globals.tool_lock() {
+            locked_notices = lock_workspace(lock, &mut settings, &mut resources);
+        }
         let hooks = crate::hooks_load::load_hooks(&resources.hook_paths);
         let context_files = if opts.no_context_files {
             vec![]
         } else if standalone || project_trusted {
-            load_context_files(&prompt_cwd, &globals.agent_dir)
+            load_context_files_in(&*host, &prompt_cwd, &globals.agent_dir).await
         } else {
             crate::system_prompt::load_global_context_files(&globals.agent_dir)
         };
         let (custom_system_prompt, append_system_prompt) =
-            crate::system_prompt::resolve_system_prompt_files_in(
+            crate::system_prompt::resolve_system_prompt_files_via(
+                &*host,
                 &globals.agent_dir,
                 &prompt_cwd,
                 project_trusted,
                 opts.system_prompt.as_deref(),
                 opts.append_system_prompt.as_deref(),
-            );
-        let host: Arc<dyn ExecutionEnv> = Arc::new(HostExecutionEnv::new(&cwd));
+            )
+            .await;
         let web = crate::web_tools::WebTools::from_settings(
             &settings,
             Some(Arc::clone(&globals.credentials)),
@@ -179,8 +347,12 @@ impl WorkspaceResources {
         let mcp_client = Arc::new(loop_mcp::McpClientManager::with_oauth_dir(
             globals.agent_dir.join("mcp-auth"),
         ));
-        let entries =
-            enabled_mcp_server_entries(&settings.mcp_servers, &settings.disabled_mcp_servers);
+        let entries = if globals.tool_lock().is_some() {
+            // No MCP server starts or connects under a tool lock.
+            Vec::new()
+        } else {
+            enabled_mcp_server_entries(&settings.mcp_servers, &settings.disabled_mcp_servers)
+        };
         if !entries.is_empty() {
             for (name, result) in mcp_client.connect_all(&entries).await {
                 match result {
@@ -189,7 +361,8 @@ impl WorkspaceResources {
                 }
             }
         }
-        let mut startup_notices = Vec::new();
+        let mut startup_notices = settings.project_notices.clone();
+        startup_notices.extend(locked_notices);
         if !standalone && !project_trusted {
             startup_notices.push(format!(
                 "Workspace {} has no recorded trust; using global settings and resources only",
@@ -205,6 +378,7 @@ impl WorkspaceResources {
             append_system_prompt,
             context_files,
             host,
+            host_workspace,
             web,
             mcp_client,
             startup_notices,
@@ -230,7 +404,23 @@ impl WorkspaceResources {
                                 match crate::sandbox_builder::SandboxRequest::from_settings(
                                     &settings.sandbox,
                                 ) {
-                                    Ok(request) => builder.start(&self.cwd, &request).await,
+                                    Ok(mut request) => {
+                                        // A locked workspace never starts a
+                                        // sandbox (`lock_workspace` sets the
+                                        // mode off): path rules are the only
+                                        // path policy that can apply here.
+                                        use crate::sandbox_builder::PathPolicyUse;
+                                        let rules = crate::tool_approval::permissions_from_settings(
+                                            &settings.tool_permissions,
+                                        );
+                                        request.path_policy =
+                                            if crate::permissions::has_path_rules(&rules) {
+                                                PathPolicyUse::Rules
+                                            } else {
+                                                PathPolicyUse::None
+                                            };
+                                        builder.start(&self.cwd, &request).await
+                                    }
                                     Err(e) => Err(e),
                                 };
                             match started {
@@ -252,7 +442,13 @@ impl WorkspaceResources {
                                             "required workspace sandbox failed: {platform}{e}"
                                         ));
                                     }
-                                    tracing::warn!("local sandbox disabled at startup: {e}");
+                                    // The line below is the user's warning. The log keeps
+                                    // the record at warn; its target lets a terminal log
+                                    // layer skip it, so it is not printed twice.
+                                    tracing::warn!(
+                                        target: crate::USER_NOTICE_TARGET,
+                                        "local sandbox disabled at startup: {e}"
+                                    );
                                     eprintln!("warning: local sandbox not enabled:\n{e}");
                                     settings.sandbox.mode = "off".into();
                                     (SandboxMode::Disabled, Arc::clone(&self.host))
@@ -269,6 +465,22 @@ impl WorkspaceResources {
                 Ok((sandbox, tool_env, disabled))
             })
             .await
+    }
+}
+
+impl WorkspaceResources {
+    /// Remove this workspace's sandbox container, if one was started. For a
+    /// standalone Surface whose startup failed after the sandbox started;
+    /// a running Session removes it through its harness instead.
+    pub async fn destroy_sandbox(&self) {
+        if let Some((SandboxMode::Enabled { sandbox }, _, _)) = self.sandbox.get() {
+            if !sandbox.outlives_process() {
+                return;
+            }
+            if let Err(error) = sandbox.destroy().await {
+                tracing::warn!(%error, "could not remove the workspace sandbox");
+            }
+        }
     }
 }
 
@@ -339,12 +551,17 @@ impl OpenedSession {
             .map_err(|e| anyhow::anyhow!("tool env: {e}"))?;
         let bash_limits = settings.bash.unwrap_or_default().limits();
         harness.set_bash_limits(bash_limits);
+        harness
+            .set_compaction_settings(settings.compaction.harness_settings())
+            .await;
         let mut tools = build_tools(
             env,
             &workspace.web,
             bash_limits,
             self.tool_gate.search_filter(),
         );
+        let lock = self.tool_gate.tool_lock();
+        retain_locked(lock, &mut tools);
         let snippets = default_tool_snippets();
         let selected: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         let system_prompt = build_system_prompt(BuildSystemPromptOptions {
@@ -362,6 +579,7 @@ impl OpenedSession {
             .await,
         );
         tools.extend(kept);
+        retain_locked(lock, &mut tools);
         harness
             .set_tools(tools)
             .await
@@ -381,6 +599,62 @@ impl OpenedSession {
         notices.extend(workspace.startup_notices.iter().cloned());
         Ok(notices)
     }
+}
+
+/// Keep only the tools `lock` offers; all of them without a lock.
+fn retain_locked(
+    lock: Option<crate::permissions::tool_lock::ToolLock>,
+    tools: &mut Vec<loop_agent::AgentTool>,
+) {
+    if let Some(lock) = lock {
+        tools.retain(|tool| crate::permissions::tool_lock::offers(lock, &tool.name));
+    }
+}
+
+/// Take out of a workspace what can start a process or reach past the
+/// lock without a tool call: hooks, Rhai extensions, skills that run code,
+/// and private web addresses. MCP servers are not started (see
+/// `load_resolved`). Returns the notices for the Session.
+fn lock_workspace(
+    lock: crate::permissions::tool_lock::ToolLock,
+    settings: &mut Settings,
+    resources: &mut LoadedResources,
+) -> Vec<String> {
+    use crate::permissions::tool_lock::skill_runs_code;
+    let mut notices = vec![format!(
+        "Tool lock `{lock}`: this Runtime offers only reading files in the workspace and \
+         the web tools. Shell, file changes, Subagents, workflows, MCP servers and hooks are \
+         off."
+    )];
+    // No sandbox process starts for a locked Session: no tool runs one.
+    settings.sandbox.mode = "off".into();
+    resources.hook_paths.clear();
+    resources.extension_paths.clear();
+    let before = resources.skills.len() + resources.disabled_skills.len();
+    resources.skills.retain(|skill| !skill_runs_code(skill));
+    resources
+        .disabled_skills
+        .retain(|skill| !skill_runs_code(skill));
+    let dropped = before - resources.skills.len() - resources.disabled_skills.len();
+    if dropped > 0 {
+        notices.push(format!(
+            "Tool lock `{lock}`: {dropped} skill(s) with scripts or other files that are not \
+             text are off"
+        ));
+    }
+    if !settings.mcp_servers.is_empty() {
+        notices.push(format!(
+            "Tool lock `{lock}`: {} MCP server(s) are not started",
+            settings.mcp_servers.len()
+        ));
+    }
+    if let Some(fetch) = settings.web_fetch.as_mut() {
+        fetch.allow_private_addresses = false;
+    }
+    if let Some(search) = settings.web_search.as_mut() {
+        search.allow_private_addresses = false;
+    }
+    notices
 }
 
 impl SessionFactory {
@@ -502,6 +776,7 @@ impl SessionFactory {
         if absolute_workspace(&opts.cwd)? != workspace.cwd {
             bail!("Session cwd does not match workspace");
         }
+        self.globals.admit_cwd(&workspace.cwd)?;
         let globals = &self.globals;
         let models = Arc::clone(&globals.models);
         let credentials = Arc::clone(&globals.credentials);
@@ -560,12 +835,15 @@ impl SessionFactory {
 
         let (sandbox, tool_env, disabled) = workspace.execution().await?;
         let sandbox = sandbox.clone();
-        let tool_env = match env {
-            Some(values) => {
-                loop_agent::harness::SessionExecutionEnv::wrap(Arc::clone(tool_env), values)
-            }
-            None => Arc::clone(tool_env),
-        };
+        // One policy for the tools built here and for the harness's own
+        // rebuilds, so a removal note is reported once per turn across both.
+        let tool_env_policy =
+            crate::config::tool_env::tool_env_policy(&globals.agent_dir, &settings);
+        let tool_env = loop_agent::harness::SessionExecutionEnv::for_tools(
+            Arc::clone(tool_env),
+            env,
+            &tool_env_policy,
+        );
         if *disabled {
             settings.sandbox.mode = "off".into();
         }
@@ -625,16 +903,45 @@ impl SessionFactory {
         }
 
         let bash_limits = settings.bash.unwrap_or_default().limits();
-        let tool_gate = crate::tool_gate::ToolGate::new_for_workspace(
+        // The gate checks Workspace paths through an env in the driver's
+        // namespace: the host env for host paths (a sandbox env confines
+        // its own reads and is not a resolver), the Session's env for guest
+        // paths.
+        use loop_agent::harness::sandbox::PathNamespace;
+        let guest = matches!(&sandbox, SandboxMode::Enabled { sandbox }
+            if sandbox.capabilities().path_namespace == PathNamespace::Guest);
+        let gate_paths = if guest {
+            if globals.tool_lock_config().is_some() {
+                bail!("the tool lock needs a workspace driver whose paths are Runtime host paths");
+            }
+            crate::permissions::GatePaths::new(tool_env.clone(), PathNamespace::Guest)
+        } else {
+            crate::permissions::GatePaths::new(workspace.host.clone(), PathNamespace::Host)
+        };
+        let tool_gate = crate::tool_gate::ToolGate::new_for_env(
             crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
             &workspace.cwd,
-        );
-        let tools = build_tools(
+            gate_paths,
+        )
+        .await;
+        if let Some(lock) = globals.tool_lock_config() {
+            tool_gate.lock_tools(lock.lock());
+            // The folder and root as they resolve now: later checks compare
+            // against these, so a folder swapped for a link is refused.
+            tool_gate.confine(crate::permissions::tool_lock::Confinement::new(
+                &workspace.cwd,
+                lock.root(),
+            )?);
+        }
+        let mut tools = build_tools(
             Arc::clone(&tool_env),
             &workspace.web,
             bash_limits,
             tool_gate.search_filter(),
         );
+        // Not built, so the prompt never names them; the gate's tool filter
+        // and its check also remove and refuse them ([`ToolGate::available`]).
+        retain_locked(globals.tool_lock(), &mut tools);
 
         // The prompt lists the tools that were actually built (web_search may be
         // unconfigured), so it can never promise a tool the agent cannot call.
@@ -664,8 +971,12 @@ impl SessionFactory {
             },
         }));
         harness.set_session_environment(env.cloned());
+        harness.set_tool_env_policy(tool_env_policy);
         harness.set_thinking_level(effort).await;
         harness.set_bash_limits(bash_limits);
+        harness
+            .set_compaction_settings(settings.compaction.harness_settings())
+            .await;
         harness
             .set_response_header_timeout_ms(settings.response_header_timeout_ms)
             .await;
@@ -677,10 +988,20 @@ impl SessionFactory {
             .await;
 
         let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
+        if let Some(lock) = globals.tool_lock() {
+            native.lock_tools(lock);
+        }
         native.set_default_effort(default_effort);
         native.set_default_model(default_model);
 
         tool_gate.install(&harness);
+        // Every decision is recorded. Embedded, records go to the agent
+        // directory; the Runtime puts its Event Log sink in place.
+        tool_gate.set_decision_sink(Some(Arc::new(
+            crate::permissions::decision::JsonlDecisionSink::new(&globals.agent_dir),
+        )));
+        // User commands (`session/shell`, `!command`) pass the same gate.
+        native.set_command_gate(tool_gate.command_gate());
         let mut startup_notices = workspace.startup_notices.clone();
         let (hook_notices, hooks) = crate::hooks_load::register_reloadable_hooks(
             &harness,
@@ -713,6 +1034,7 @@ impl SessionFactory {
         if !mcp_tools.is_empty() {
             let mut all_tools = harness.get_tools().await;
             all_tools.extend(mcp_tools);
+            retain_locked(globals.tool_lock(), &mut all_tools);
             harness
                 .set_tools(all_tools)
                 .await
@@ -794,6 +1116,73 @@ impl SessionFactory {
             .await
             .insert(cwd, Arc::new(OnceCell::new_with(Some(Arc::clone(&fresh)))));
         Ok((fresh, old))
+    }
+}
+
+#[cfg(test)]
+mod tool_lock_tests {
+    use super::*;
+
+    /// Global settings cannot widen the lock: hooks, extensions, skills
+    /// with scripts and private web addresses are taken out.
+    #[test]
+    fn a_locked_workspace_drops_what_starts_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = |name: &str, script: bool| {
+            let root = dir.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("SKILL.md"), "x").unwrap();
+            if script {
+                std::fs::write(root.join("run.sh"), "x").unwrap();
+            }
+            loop_agent::harness::types::Skill {
+                name: name.into(),
+                description: String::new(),
+                body: String::new(),
+                path: root.join("SKILL.md"),
+                disable_model_invocation: false,
+            }
+        };
+        let mut resources = LoadedResources {
+            skills: vec![skill("text", false), skill("script", true)],
+            disabled_skills: vec![skill("off-script", true)],
+            hook_paths: vec![dir.path().join("h.json")],
+            extension_paths: vec![dir.path().join("e.rhai")],
+            ..Default::default()
+        };
+        let mut settings: Settings = serde_json::from_value(serde_json::json!({
+            "webFetch": {"allowPrivateAddresses": true},
+            "webSearch": {"allowPrivateAddresses": true},
+            "mcpServers": {"s": {"command": "sh"}}
+        }))
+        .unwrap();
+        let notices = lock_workspace(
+            crate::permissions::tool_lock::ToolLock::Chat,
+            &mut settings,
+            &mut resources,
+        );
+        assert!(resources.hook_paths.is_empty() && resources.extension_paths.is_empty());
+        let names: Vec<_> = resources.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["text"]);
+        assert!(resources.disabled_skills.is_empty());
+        assert!(!settings.web_fetch.unwrap().allow_private_addresses);
+        assert!(!settings.web_search.unwrap().allow_private_addresses);
+        assert_eq!(notices.len(), 3, "{notices:?}");
+    }
+
+    #[test]
+    fn only_offered_tools_are_built() {
+        let mut tools = vec![
+            loop_agent::harness::tools::create_todo_tool(),
+            loop_agent::harness::tools::create_exit_plan_tool(),
+        ];
+        retain_locked(None, &mut tools);
+        assert_eq!(tools.len(), 2);
+        retain_locked(
+            Some(crate::permissions::tool_lock::ToolLock::Chat),
+            &mut tools,
+        );
+        assert!(tools.is_empty());
     }
 }
 

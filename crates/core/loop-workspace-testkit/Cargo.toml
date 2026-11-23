@@ -1,0 +1,21 @@
+[package]
+name = "loop-workspace-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Conformance suite for Loop Workspace drivers, usable by drivers outside this repository"
+publish = false
+
+# Only the contract crate: a driver crate outside this repository can use
+# the kit without the agent, its stores or its model clients.
+[dependencies]
+loop-workspace = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+loop-agent = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

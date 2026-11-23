@@ -1,5 +1,6 @@
 //! Session-tree services. Destination creation never replaces a source harness.
 use super::*;
+use crate::access::{Actor, Need};
 use loop_agent::harness::session::{
     fork_points_from_branch, read_session_entries_for_fork, session_tree_rows, PendingSessionWrite,
     SessionFile, SessionForkSelection, SessionTreeEntry,
@@ -75,6 +76,23 @@ fn fingerprint(params: &impl serde::Serialize) -> BackendResult<String> {
         Sha256::digest(serde_json::to_vec(params).map_err(failed)?)
     ))
 }
+/// The store key of a copy or import receipt: request ids are per user
+/// (tenant and principal), so one user can neither learn nor take another
+/// user's id. The user part is a hash: an id is never stored as given.
+fn receipt_key(kind: &str, request_id: &str, caller: &loop_protocol::Caller) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for part in [
+        caller.tenant().as_str(),
+        caller.principal().issuer(),
+        caller.principal().id(),
+    ] {
+        digest.update(part.as_bytes());
+        digest.update([0]);
+    }
+    let user = format!("{:x}", digest.finalize());
+    format!("{kind}:{}:{request_id}", &user[..32])
+}
 fn destination_result(id: &str, receipt: &str) -> BackendResult<DestinationResult> {
     let receipt: serde_json::Value = serde_json::from_str(receipt).map_err(failed)?;
     Ok(DestinationResult {
@@ -84,10 +102,24 @@ fn destination_result(id: &str, receipt: &str) -> BackendResult<DestinationResul
         draft: receipt["draft"].as_str().map(str::to_owned),
     })
 }
+/// `future` with the current request's caller ([`loop_protocol::Caller`])
+/// in scope, for a task spawned on its behalf: the task-local caller is lost
+/// across `tokio::spawn`.
+fn in_caller_scope<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let caller = loop_protocol::Caller::current();
+    async move {
+        match caller {
+            Some(caller) => caller.scope(future).await,
+            None => future.await,
+        }
+    }
+}
 /// A destination created but not yet admitted. Dropped early, it rolls back
 /// before releasing the destination lock, so no retry reads its receipt first.
 struct Unadmitted {
-    created: Option<loop_agent::harness::session::sqlite::DestinationCreation>,
+    created: Option<loop_agent::harness::session::DestinationCreation>,
     lock: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 impl Drop for Unadmitted {
@@ -205,7 +237,7 @@ impl Runtime {
             let baseline = live.turn_start_seq.load(Ordering::Acquire);
             for record in self
                 .log
-                .read_after(&live.reference.key, baseline)
+                .read_after(&live.tenant, &live.reference.key, baseline)
                 .await
                 .map_err(failed)?
             {
@@ -228,9 +260,10 @@ impl Runtime {
         session: &SessionRef,
         after_seq: u64,
     ) -> BackendResult<bool> {
+        let tenant = self.session_tenant(&session.key);
         Ok(self
             .log
-            .read_after(&session.key, after_seq.saturating_sub(1))
+            .read_after(&tenant, &session.key, after_seq.saturating_sub(1))
             .await
             .map_err(failed)?
             .iter()
@@ -328,6 +361,7 @@ impl Runtime {
     }
     /// Read an immutable transcript page. Expired views fail explicitly.
     pub async fn view(&self, params: ViewParams) -> BackendResult<ViewResult> {
+        self.check(&params.session, Need::Read).await?;
         let views = self.views.lock().unwrap();
         let view = views
             .get(&params.view_id)
@@ -343,6 +377,7 @@ impl Runtime {
     }
     /// Branches, fork points and related Sessions, without replacing the source.
     pub async fn tree(&self, params: TreeParams) -> BackendResult<TreeResult> {
+        self.check(&params.session, Need::Read).await?;
         let live = self.route(&params.session)?;
         let _guard = live.lifecycle.lock().await;
         let (file, busy) = self.capture(&live).await?;
@@ -438,6 +473,15 @@ impl Runtime {
         if family.len() > 1000 {
             return Err(failed("Session family exceeds the page limit"));
         }
+        // Only the relatives this caller may read.
+        let actor = Actor::current();
+        let mut readable = Vec::with_capacity(family.len());
+        for relative in family {
+            if self.may(&actor, &relative.key, Need::Read).await? {
+                readable.push(relative);
+            }
+        }
+        let family = readable;
         Ok(TreeResult {
             entries,
             fork_points,
@@ -448,6 +492,7 @@ impl Runtime {
     }
     /// Rename metadata and publish an ordered ConfigChanged, without a branch reset.
     pub async fn rename(&self, params: RenameParams) -> BackendResult<MutationResult> {
+        self.check(&params.session, Need::Write).await?;
         if params.name.trim().is_empty() || params.name.len() > 4096 {
             return Err(failed("Session name must contain 1 to 4096 bytes"));
         }
@@ -483,6 +528,7 @@ impl Runtime {
     }
     /// Move the active branch while idle, then announce its immutable replacement.
     pub async fn navigate(&self, params: NavigateParams) -> BackendResult<NavigateResult> {
+        self.check(&params.session, Need::Write).await?;
         let live = self.route(&params.session)?;
         let _guard = live.lifecycle.lock().await;
         self.check_tree_live(&live)?;
@@ -533,19 +579,37 @@ impl Runtime {
         session: &SessionRef,
         instructions: Option<&str>,
     ) -> BackendResult<loop_protocol::CompactionReport> {
+        self.check(session, Need::Write).await?;
         let live = self.loaded(session).await?;
+        let head = {
+            let _guard = live.lifecycle.lock().await;
+            self.check_tree_live(&live)?;
+            if live.busy.load(Ordering::Acquire) {
+                return Err(BackendError::Busy);
+            }
+            barrier(&live).await?;
+            live.opened.harness.session_head().await.map_err(failed)?
+        };
+        // The summary is a model call: it runs without the lifecycle lock,
+        // so attach, close and other Session work do not wait for it. The
+        // harness refuses turns meanwhile, and closing cancels it.
+        let (mut report, write) = live
+            .opened
+            .native
+            .prepare_compaction(session, instructions)
+            .await?;
         let _guard = live.lifecycle.lock().await;
         self.check_tree_live(&live)?;
         if live.busy.load(Ordering::Acquire) {
             return Err(BackendError::Busy);
         }
         barrier(&live).await?;
+        if live.opened.harness.session_head().await.map_err(failed)? != head {
+            return Err(failed(
+                "the Session changed while compacting; nothing was written",
+            ));
+        }
         let slot = self.reserve_view(session, true)?;
-        let (mut report, write) = live
-            .opened
-            .native
-            .prepare_compaction(session, instructions)
-            .await?;
         // No `summary` key: that would add a branch summary entry.
         let marker = json!({"id":loop_ai::new_id(),"kind":"compact"}).to_string();
         let state = self
@@ -571,6 +635,8 @@ impl Runtime {
         live: &LiveSession,
         slot: Option<ViewSlot<'_>>,
     ) -> BackendResult<u64> {
+        // `latest_seq` below must count appends abandoned while queued.
+        self.log.sync().await.map_err(failed)?;
         let state = self
             .store
             .control_state(&live.reference.native_id)
@@ -579,14 +645,14 @@ impl Runtime {
         let Some(marker) = state.pending else {
             return self
                 .log
-                .latest_seq(&live.reference.key)
+                .latest_seq(&live.tenant, &live.reference.key)
                 .await
                 .map_err(failed);
         };
         let marker_value: serde_json::Value = serde_json::from_str(&marker).map_err(failed)?;
         let at_seq = self
             .log
-            .latest_seq(&live.reference.key)
+            .latest_seq(&live.tenant, &live.reference.key)
             .await
             .map_err(failed)?;
         // The native backend counted the change, at commit or when the
@@ -611,9 +677,12 @@ impl Runtime {
                 reason: marker_value["kind"].as_str().unwrap_or("navigate").into(),
             }
         };
+        // The request that announces it: a rename, navigation or
+        // compaction, or the admission that finishes a lost announcement.
+        let identity = live.identity(&request_caller());
         let (tx, rx) = oneshot::channel();
         live.commands
-            .send(Command::Publish(Box::new(update), tx))
+            .send(Command::Publish(Box::new(update), identity, tx))
             .map_err(failed)?;
         let result = rx.await.map_err(failed)?;
         if let Err(error) = result {
@@ -627,12 +696,13 @@ impl Runtime {
             .await
             .map_err(failed)?;
         self.log
-            .latest_seq(&live.reference.key)
+            .latest_seq(&live.tenant, &live.reference.key)
             .await
             .map_err(failed)
     }
     /// Return a bounded, consistent payload. The caller writes its own files.
     pub async fn export(&self, session: &SessionRef) -> BackendResult<ExportResult> {
+        self.check(session, Need::Read).await?;
         let live = self.route(session)?;
         let _guard = live.lifecycle.lock().await;
         let file = self.committed_file(&live).await?;
@@ -672,8 +742,11 @@ impl Runtime {
     }
     /// Fork before a user message. Its text is returned to the initiating draft.
     pub async fn fork(&self, params: ForkParams) -> BackendResult<DestinationResult> {
+        // The source first: a copy needs `Read` on it.
+        self.check(&params.session, Need::Read).await?;
         match self.shared() {
-            Some(me) => tokio::spawn(async move { me.fork_owned(params).await })
+            // The caller does not cross the spawn on its own.
+            Some(me) => tokio::spawn(in_caller_scope(async move { me.fork_owned(params).await }))
                 .await
                 .map_err(failed)?,
             None => self.fork_owned(params).await,
@@ -698,10 +771,15 @@ impl Runtime {
     }
     /// Copy a full committed branch into another leased Session.
     pub async fn clone_session(&self, params: CloneParams) -> BackendResult<DestinationResult> {
+        // The source first: a copy needs `Read` on it.
+        self.check(&params.session, Need::Read).await?;
         match self.shared() {
-            Some(me) => tokio::spawn(async move { me.clone_session_owned(params).await })
-                .await
-                .map_err(failed)?,
+            // The caller does not cross the spawn on its own.
+            Some(me) => tokio::spawn(in_caller_scope(async move {
+                me.clone_session_owned(params).await
+            }))
+            .await
+            .map_err(failed)?,
             None => self.clone_session_owned(params).await,
         }
     }
@@ -775,9 +853,12 @@ impl Runtime {
     /// Validate a bounded payload and import into a known workspace.
     pub async fn import(&self, params: ImportParams) -> BackendResult<DestinationResult> {
         match self.shared() {
-            Some(me) => tokio::spawn(async move { me.import_owned(params).await })
-                .await
-                .map_err(failed)?,
+            // The caller does not cross the spawn on its own.
+            Some(me) => tokio::spawn(in_caller_scope(
+                async move { me.import_owned(params).await },
+            ))
+            .await
+            .map_err(failed)?,
             None => self.import_owned(params).await,
         }
     }
@@ -785,6 +866,22 @@ impl Runtime {
         if params.jsonl.len() > SESSION_TRANSFER_LIMIT {
             return Err(failed("Session transfer exceeds 8 MiB"));
         }
+        // An outside user imports only into the folder of a Session it may
+        // read; any other id is unknown to it.
+        let readable = self.readable_folders(&Actor::current());
+        let cwd = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|cwd| {
+                readable
+                    .as_ref()
+                    .is_none_or(|folders| folders.contains(cwd))
+            })
+            .find(|cwd| workspace_id(cwd) == params.workspace_id)
+            .cloned()
+            .ok_or_else(|| failed("unknown workspace id"))?;
         let fingerprint = fingerprint(&params)?;
         if let Some(result) = self
             .retry_destination("import", &params.request_id, &fingerprint)
@@ -792,14 +889,6 @@ impl Runtime {
         {
             return Ok(result);
         }
-        let cwd = self
-            .workspaces
-            .lock()
-            .unwrap()
-            .keys()
-            .find(|cwd| workspace_id(cwd) == params.workspace_id)
-            .cloned()
-            .ok_or_else(|| failed("unknown workspace id"))?;
         let file = SessionFile::from_jsonl(&params.jsonl).map_err(failed)?;
         validate_file(&file)?;
         self.destination(file, cwd, None, params.request_id, fingerprint, None, None)
@@ -828,12 +917,38 @@ impl Runtime {
         if request_id.trim().is_empty() || request_id.len() > 256 {
             return Err(failed("request id must contain 1 to 256 bytes"));
         }
-        self.store
-            .destination_receipt(&format!("{kind}:{request_id}"), fingerprint)
+        let caller = request_caller();
+        let mut found = self
+            .store
+            .destination_receipt(&receipt_key(kind, request_id, &caller), fingerprint)
             .await
-            .map_err(failed)?
+            .map_err(failed)?;
+        // A receipt written before request ids were per user had no user in
+        // its key. The host's user (the only user before) still finds it, so
+        // a retry across an upgrade answers from it.
+        if found.is_none() && caller.tenant().as_str() == Tenant::LOCAL {
+            found = self
+                .store
+                .destination_receipt(&format!("{kind}:{request_id}"), fingerprint)
+                .await
+                .map_err(failed)?;
+        }
+        let result = found
             .map(|(id, receipt)| destination_result(&id, &receipt))
-            .transpose()
+            .transpose()?;
+        // A receipt answers only a caller that may read its Session: the
+        // same request id and payload from another user names nothing.
+        if let Some(result) = &result {
+            if !self
+                .may(&Actor::current(), &result.session.key, Need::Read)
+                .await?
+            {
+                return Err(failed(
+                    "this request id is already used; send the request with a new id",
+                ));
+            }
+        }
+        Ok(result)
     }
     #[allow(clippy::too_many_arguments)]
     async fn destination(
@@ -860,10 +975,7 @@ impl Runtime {
             return Err(BackendError::Busy);
         }
         let receipt = json!({"workspace_id":workspace_id(&cwd),"source_branch_revision":revision,"draft":draft}).to_string();
-        let key = format!(
-            "{}:{request_id}",
-            if parent.is_some() { "copy" } else { "import" }
-        );
+        let key = receipt_key(kind, &request_id, &request_caller());
         let created = self
             .store
             .create_destination(
@@ -887,7 +999,8 @@ impl Runtime {
         let admitted = if injected {
             Err(failed("injected admission failure"))
         } else {
-            self.open(Some(&session), SessionSpec::default(), None)
+            // This request created the destination: it is the creator.
+            self.open_as(Some(&session), SessionSpec::default(), None, true)
                 .await
         };
         let mut created = unadmitted.created.take().unwrap();

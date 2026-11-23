@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use loop_agent::harness::types::FileSystem;
+
 use crate::config::paths::{append_system_md_path, get_agent_dir, get_project_dir, system_md_path};
 
 /// Context file candidates per directory. Every group is loaded; within a group the
@@ -172,6 +174,9 @@ pub fn resolve_system_prompt_files(
 }
 
 /// Resolve prompt files against an explicit global directory, without process configuration.
+///
+/// The project files are read on the Runtime host. A Session on a Workspace
+/// uses [`resolve_system_prompt_files_via`].
 pub fn resolve_system_prompt_files_in(
     agent_dir: &Path,
     cwd: &Path,
@@ -179,20 +184,7 @@ pub fn resolve_system_prompt_files_in(
     cli_system: Option<&str>,
     cli_append: Option<&str>,
 ) -> (Option<String>, Option<String>) {
-    let mut custom = cli_system.map(|s| s.to_string());
-    let mut append = cli_append.map(|s| s.to_string());
-
-    let agent_sys = system_md_path(agent_dir);
-    if custom.is_none() && agent_sys.exists() {
-        custom = std::fs::read_to_string(agent_sys).ok();
-    }
-    let agent_append = append_system_md_path(agent_dir);
-    if let Ok(extra) = std::fs::read_to_string(agent_append) {
-        append = Some(match append {
-            Some(a) => format!("{a}\n\n{extra}"),
-            None => extra,
-        });
-    }
+    let (mut custom, mut append) = global_system_prompt_files(agent_dir, cli_system, cli_append);
 
     if project_trusted {
         let project = get_project_dir(cwd);
@@ -214,7 +206,67 @@ pub fn resolve_system_prompt_files_in(
     (custom, append)
 }
 
+/// [`resolve_system_prompt_files_in`] with the project files (`SYSTEM.md`
+/// and `APPEND_SYSTEM.md` in the project folder) read through `workspace`,
+/// the execution environment of the Workspace. The files of the global
+/// directory stay Runtime host reads.
+pub async fn resolve_system_prompt_files_via(
+    workspace: &dyn FileSystem,
+    agent_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+    cli_system: Option<&str>,
+    cli_append: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let (mut custom, mut append) = global_system_prompt_files(agent_dir, cli_system, cli_append);
+
+    if project_trusted {
+        let project = get_project_dir(cwd);
+        let p_sys = system_md_path(&project);
+        if workspace.exists(&p_sys).await.unwrap_or(false) {
+            if let Ok(s) = workspace.read_text_file(&p_sys).await {
+                custom = Some(s);
+            }
+        }
+        let p_append = append_system_md_path(&project);
+        if let Ok(extra) = workspace.read_text_file(&p_append).await {
+            append = Some(match append {
+                Some(a) => format!("{a}\n\n{extra}"),
+                None => extra,
+            });
+        }
+    }
+
+    (custom, append)
+}
+
+/// The prompt files of the global agent directory over the CLI values.
+fn global_system_prompt_files(
+    agent_dir: &Path,
+    cli_system: Option<&str>,
+    cli_append: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let mut custom = cli_system.map(|s| s.to_string());
+    let mut append = cli_append.map(|s| s.to_string());
+
+    let agent_sys = system_md_path(agent_dir);
+    if custom.is_none() && agent_sys.exists() {
+        custom = std::fs::read_to_string(agent_sys).ok();
+    }
+    let agent_append = append_system_md_path(agent_dir);
+    if let Ok(extra) = std::fs::read_to_string(agent_append) {
+        append = Some(match append {
+            Some(a) => format!("{a}\n\n{extra}"),
+            None => extra,
+        });
+    }
+    (custom, append)
+}
+
 /// Load AGENTS.md / CLAUDE.md from the agent dir, `~/.claude`, and ancestors of cwd.
+///
+/// Every file is read on the Runtime host. A Session on a Workspace uses
+/// [`load_context_files_in`].
 pub fn load_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
     let mut files = load_global_context_files(agent_dir);
     let mut seen_files = files
@@ -234,6 +286,80 @@ pub fn load_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
         }
     }
     files
+}
+
+/// [`load_context_files`] with the project files (the ones in `cwd` and its
+/// parents) read through `workspace`, the execution environment of the
+/// Workspace. The global files (the agent dir and `~/.claude/CLAUDE.md`)
+/// belong to the user of the Runtime and stay host reads. The caller decides
+/// whether project context may load at all (trust and the tool lock).
+pub async fn load_context_files_in(
+    workspace: &dyn FileSystem,
+    cwd: &Path,
+    agent_dir: &Path,
+) -> Vec<ContextFile> {
+    let mut files = load_global_context_files(agent_dir);
+    // The two sets are in two namespaces: a Workspace path may spell like
+    // a host path without being that file. A project file that is a global
+    // file (a link) still drops out below, as its content is equal.
+    let mut seen_files = std::collections::HashSet::new();
+
+    let mut dir = cwd.to_path_buf();
+    let mut seen_dirs = std::collections::HashSet::new();
+    loop {
+        let key = workspace
+            .canonical_path(&dir)
+            .await
+            .unwrap_or_else(|_| dir.clone());
+        if seen_dirs.insert(key) {
+            for group in CONTEXT_NAMES {
+                for name in *group {
+                    if push_workspace_context_file(
+                        workspace,
+                        dir.join(name),
+                        &mut seen_files,
+                        &mut files,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    files
+}
+
+/// [`push_context_file`] for a file of the Workspace.
+async fn push_workspace_context_file(
+    workspace: &dyn FileSystem,
+    path: PathBuf,
+    seen: &mut std::collections::HashSet<PathBuf>,
+    out: &mut Vec<ContextFile>,
+) -> bool {
+    if !workspace
+        .file_info(&path)
+        .await
+        .is_ok_and(|info| info.is_file)
+    {
+        return false;
+    }
+    let Ok(content) = workspace.read_text_file(&path).await else {
+        return false;
+    };
+    // Symlinks (CLAUDE.md -> AGENTS.md) and case-insensitive filesystems.
+    let key = workspace
+        .canonical_path(&path)
+        .await
+        .unwrap_or_else(|_| path.clone());
+    if seen.insert(key) && !out.iter().any(|f| f.content == content) {
+        out.push(ContextFile { path, content });
+    }
+    true
 }
 
 /// Load only global context, for a workspace without recorded trust.
