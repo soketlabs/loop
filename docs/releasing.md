@@ -4,7 +4,7 @@ This page is for maintainers.
 
 ## CI and releases
 
-- **CI** (`.github/workflows/ci.yml`) runs on every PR and push to `main` and `staging`, plus manual **Run workflow**. It lints and tests; it does **not** publish a release. See [CI](ci.md).
+- **CI** (`.github/workflows/ci.yml`) runs on every PR into `main` or `staging`, on pushes to `main`, in the merge queue, and on manual **Run workflow**. Pushes to `staging` do not run CI. It lints and tests; it does **not** publish a release. See [CI](ci.md).
 - **Release** (`.github/workflows/release.yml`) publishes multi-platform binaries only when you cut a version tag (or manually with `create_release`).
 
 This repository releases the CLI only. The desktop app is developed and released from a separate repository.
@@ -20,13 +20,14 @@ Supported release targets:
 
 ## Cut a release
 
-1. Bump `[workspace.package] version` in the root `Cargo.toml` (must match the tag without the `v` prefix).
-2. Commit, push to `main` (or your release branch).
-3. Tag and push the tag:
+1. On a branch from `main` (for example `release/0.7.0`), bump `[workspace.package] version` in the root `Cargo.toml`. It must match the tag without the `v` prefix; the Release workflow stops if they differ. Run `cargo update --workspace` so `Cargo.lock` has the same version (release builds use `--locked`).
+2. Open a PR into `main` and merge it. A ruleset on `main` refuses direct pushes, so the bump goes through a PR.
+3. Tag the merge commit on `main` and push the tag:
 
 ```bash
-git tag v0.6.1
-git push origin v0.6.1
+git fetch origin
+git tag v0.7.0 origin/main
+git push origin v0.7.0
 ```
 
 That starts the Release workflow, builds all targets, and creates a GitHub Release
