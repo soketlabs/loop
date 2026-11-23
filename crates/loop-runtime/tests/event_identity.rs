@@ -80,10 +80,13 @@ fn edge(id: &str) -> Caller {
 }
 
 /// The model's answers: text, or one `subagent` call for a prompt that says
-/// `SPAWN`. A prompt that says `HOLD` waits until `release` is notified.
+/// `SPAWN`. The first prompt that says `HOLD` waits until `release` is
+/// notified; a later request that quotes it (a compaction summary of a
+/// turn that a late cancel did not stop) does not wait.
 struct Script {
     release: tokio::sync::Notify,
     held: tokio::sync::Notify,
+    holding: std::sync::atomic::AtomicBool,
 }
 
 async fn runtime(dir: &std::path::Path, log: Arc<dyn EventLog>) -> (Arc<Runtime>, Arc<Script>) {
@@ -98,6 +101,7 @@ async fn runtime_with(
     let script = Arc::new(Script {
         release: tokio::sync::Notify::new(),
         held: tokio::sync::Notify::new(),
+        holding: std::sync::atomic::AtomicBool::new(false),
     });
     let seen = script.clone();
     let responder: FauxResponder = Arc::new(move |context: &loop_ai::Context| {
@@ -108,7 +112,10 @@ async fn runtime_with(
             .any(|m| matches!(m, loop_ai::Message::Assistant(_)));
         let seen = seen.clone();
         Box::pin(async move {
-            if text.contains("HOLD") && !answered {
+            if text.contains("HOLD")
+                && !answered
+                && !seen.holding.swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
                 seen.held.notify_one();
                 seen.release.notified().await;
             }
