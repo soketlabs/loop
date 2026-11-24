@@ -1,0 +1,26 @@
+{
+  "name": "loop-visual-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "An ephemeral screen-aware companion powered by Loop",
+  "main": "main.cjs",
+  "scripts": {
+    "build:sidecar": "cargo build --manifest-path ../../Cargo.toml -p loop-visual",
+    "start": "electron .",
+    "dev": "npm run build:sidecar && npm start",
+    "check": "node --check main.cjs && node --check preload.cjs && node --check scene-preload.cjs && node --check renderer.js && node --check capture.cjs && node --check scene.js",
+    "test": "node --test *.test.cjs",
+    "test:renderer": "electron renderer-smoke.cjs",
+    "build:visual": "esbuild three-runtime.js --bundle --minify --format=iife --outfile=three-bundle.js",
+    "prestart": "npm run build:visual"
+  },
+  "dependencies": {
+    "@trycua/cua-driver": "0.28.2",
+    "electron": "^42.0.0",
+    "three": "^0.187.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "playwright-core": "^1.58.0"
+  }
+}

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="description" content="Ask Loop to explain something visible on your desktop.">
+    <title>Loop Visual</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <main class="workbench" aria-labelledby="app-title">
+      <header class="topbar">
+        <div class="identity">
+          <span class="loop-mark" aria-hidden="true">L</span>
+          <div>
+            <h1 id="app-title">Loop Visual</h1>
+            <p class="subtitle">A live view of your desktop</p>
+          </div>
+        </div>
+        <button class="icon-button close-button" id="close-visual" type="button" aria-label="Close visual window" title="Close visual">×</button>
+      </header>
+
+      <section class="connection" aria-label="Connection status">
+        <span class="status-mark" id="status-mark" aria-hidden="true"></span>
+        <span id="status-text" role="status" aria-live="polite">Connecting to Loop…</span>
+        <span class="backend" id="backend"></span>
+      </section>
+
+      <form id="prompt-form" class="prompt-form">
+        <label for="question">What should I explain?</label>
+        <textarea id="question" name="question" rows="3" placeholder="Ask about a window, message, or detail on screen…" required></textarea>
+        <div class="actions">
+          <button class="button button-primary" id="submit-button" type="submit">Explain screen</button>
+          <button class="button button-secondary" id="stop-button" type="button" disabled>Stop</button>
+          <button class="text-button" id="permissions-button" type="button">Permissions</button>
+        </div>
+      </form>
+
+      <section class="response" aria-labelledby="response-title">
+        <div class="response-heading">
+          <h2 id="response-title">Response</h2>
+          <span id="response-state">Ready when you are</span>
+        </div>
+        <div id="response-output" class="response-output" role="log" aria-live="polite" aria-relevant="additions text">
+          <p class="empty-copy">Ask a question about what is visible. Loop will respond here.</p>
+        </div>
+      </section>
+      <p class="footnote">Your question uses the current desktop view.</p>
+    </main>
+    <script src="renderer.js"></script>
+  </body>
+</html>
