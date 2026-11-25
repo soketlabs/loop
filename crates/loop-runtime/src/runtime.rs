@@ -1933,13 +1933,15 @@ impl AgentBackend for Runtime {
             // A Subagent's turn has no connection: it acts for whoever
             // started its parent's turn (ADR-0009). Read before the
             // reservation, so a refusal leaves the Session idle. A poisoned
-            // Session map refuses: with no caller the turn would act as the
-            // Runtime, with every right.
+            // Session map or parent turn caller refuses: with no caller the
+            // turn would act as the Runtime, with every right.
             let parent_caller = match (&caller, live.parent.as_ref()) {
                 (None, Some(parent)) => crate::sync::lock(&self.sessions, "sessions")?
                     .get(parent)
                     .cloned()
-                    .and_then(|parent| parent.escalations.turn_caller()),
+                    .map(|parent| parent.escalations.turn_caller())
+                    .transpose()?
+                    .flatten(),
                 _ => None,
             };
             self.reserve(&live).await?;

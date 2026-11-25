@@ -18,7 +18,8 @@ use crate::access::{decide, Actor, Need, Subject};
 use crate::log::{Event, EventKind, EventLog};
 use async_trait::async_trait;
 use loop_protocol::{
-    rpc::InteractParams, Caller, HostServices, InteractionOutcome, InteractionRequest, SessionRef,
+    rpc::InteractParams, BackendResult, Caller, HostServices, InteractionOutcome,
+    InteractionRequest, SessionRef,
 };
 use loop_store::{Identity, Tenant};
 use loop_wire::control::EscalationRecipient;
@@ -48,6 +49,26 @@ struct Inner {
     /// Who answered recent Escalations, by id, until the decision record
     /// takes it. Holds at most [`ANSWERS_KEPT`].
     answered: std::sync::Mutex<std::collections::VecDeque<(String, Option<Caller>)>>,
+}
+
+/// Set `lock` to `value`, also when it is poisoned. A poisoned value is
+/// overwritten through the guard and never read; the poison is cleared
+/// only after the write, so no other thread can see the old value as clean.
+fn replace_poisoned<T>(lock: &std::sync::Mutex<T>, value: T, what: &str) {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "write-only reset: the poisoned value is overwritten, never read"
+    )]
+    let mut guard = match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            eprintln!("Runtime: the {what} lock was poisoned; replacing its value");
+            poisoned.into_inner()
+        }
+    };
+    *guard = value;
+    drop(guard);
+    lock.clear_poison();
 }
 
 /// How many answers [`Inner::answered`] keeps for the decision records.
@@ -147,17 +168,10 @@ impl EscalationHost {
     /// host's user and in-process recipients may.
     ///
     /// The new value replaces the old one whole and never reads it, so a
-    /// poisoned lock is cleared and overwritten: the Subject is clean again.
+    /// poisoned lock is overwritten and then cleared: the Subject is clean
+    /// again.
     pub fn set_access(&self, access: Subject) {
-        let lock = &self.0.access;
-        if lock.is_poisoned() {
-            eprintln!("Runtime: the Escalation access lock was poisoned; replacing its value");
-            lock.clear_poison();
-        }
-        match lock.lock() {
-            Ok(mut current) => *current = access,
-            Err(_) => eprintln!("Runtime: the Escalation access lock is poisoned; not set"),
-        }
+        replace_poisoned(&self.0.access, access, "Escalation access");
     }
     /// Who may see and answer, or `None` when the lock is poisoned. No
     /// [`Subject`] value could stand in for "nobody": [`decide`] lets
@@ -176,28 +190,21 @@ impl EscalationHost {
     /// admission. Escalations raised from now on belong to its turn.
     ///
     /// Replaces the value whole without reading it, so a poisoned lock is
-    /// cleared and overwritten.
+    /// overwritten and then cleared.
     pub fn set_turn_caller(&self, caller: Option<Caller>) {
-        let lock = &self.0.turn_caller;
-        if lock.is_poisoned() {
-            eprintln!("Runtime: the turn caller lock was poisoned; replacing its value");
-            lock.clear_poison();
-        }
-        match lock.lock() {
-            Ok(mut current) => *current = caller,
-            Err(_) => eprintln!("Runtime: the turn caller lock is poisoned; not set"),
-        }
+        replace_poisoned(&self.0.turn_caller, caller, "turn caller");
     }
-    /// The caller that started the current turn, if known. `None` when its
-    /// lock is poisoned (never read).
-    pub fn turn_caller(&self) -> Option<Caller> {
-        match self.0.turn_caller.lock() {
-            Ok(caller) => caller.clone(),
-            Err(_) => {
-                eprintln!("Runtime: the turn caller lock is poisoned; caller unknown");
-                None
-            }
-        }
+    /// The caller that started the current turn: `Ok(None)` for an
+    /// in-process turn, which acts as the Runtime. An internal error when
+    /// the lock is poisoned (never read): callers must not read that as
+    /// "no caller", or the turn's work would act with the Runtime's rights.
+    pub fn turn_caller(&self) -> BackendResult<Option<Caller>> {
+        Ok(crate::sync::lock(&self.0.turn_caller, "turn caller")?.clone())
+    }
+    /// The turn caller's lock, for tests that poison it.
+    #[cfg(test)]
+    pub(crate) fn turn_caller_lock(&self) -> &std::sync::Mutex<Option<Caller>> {
+        &self.0.turn_caller
     }
     /// Who answered the Escalation `id`, once; `None` when it is not known
     /// or the lock is poisoned (never read).
@@ -467,6 +474,17 @@ fn valid(request: &InteractionRequest, answer: &InteractionOutcome) -> bool {
 #[async_trait]
 impl HostServices for EscalationHost {
     async fn interact(&self, request: InteractionRequest) -> InteractionOutcome {
+        // Raised for the caller that started the turn; an in-process turn
+        // is the Runtime's. A poisoned turn caller is not "in process": the
+        // Escalation is refused rather than raised as the Runtime's.
+        let by = match self.turn_caller() {
+            Ok(caller) => caller.unwrap_or_else(crate::runtime::in_process_caller),
+            Err(error) => {
+                return InteractionOutcome::Rejected {
+                    reason: error.to_string(),
+                }
+            }
+        };
         let (tx, rx) = oneshot::channel();
         let waiting = {
             let mut state = self.0.state.lock().await;
@@ -489,11 +507,6 @@ impl HostServices for EscalationHost {
                 host: self.clone(),
                 ticket,
             };
-            // Raised for the caller that started the turn; an in-process
-            // turn is the Runtime's.
-            let by = self
-                .turn_caller()
-                .unwrap_or_else(crate::runtime::in_process_caller);
             if let Err(e) = self
                 .record(
                     EventKind::EscalationRaised(json!({"id": request.id(), "request": request})),
@@ -593,9 +606,30 @@ mod tests {
         let caller = Caller::host(loop_wire::local_principal());
         host.set_turn_caller(Some(caller.clone()));
         poison(&host.0.turn_caller);
-        assert_eq!(host.turn_caller(), None);
+        assert!(host.turn_caller().is_err());
         host.set_turn_caller(Some(caller.clone()));
-        assert_eq!(host.turn_caller(), Some(caller));
+        assert!(!host.0.turn_caller.is_poisoned());
+        assert_eq!(host.turn_caller().unwrap(), Some(caller));
+    }
+
+    /// An Escalation raised while the turn caller is poisoned is refused,
+    /// not raised (and recorded) as the Runtime's.
+    #[tokio::test]
+    async fn a_poisoned_turn_caller_refuses_the_escalation() {
+        let host = host("a");
+        poison(&host.0.turn_caller);
+        let request = loop_app_core::interaction::native_permission_request(
+            loop_app_core::tool_approval::ApprovalKind::Bash,
+            "bash",
+            "run".into(),
+            "echo ok".into(),
+        );
+        let outcome = host.interact(request).await;
+        assert!(
+            matches!(outcome, InteractionOutcome::Rejected { .. }),
+            "{outcome:?}"
+        );
+        assert!(host.0.state.lock().await.pending.is_empty());
     }
 
     /// A poisoned answer list is never read: no answerer is known and new

@@ -39,18 +39,23 @@ async fn runtime(dir: &std::path::Path) -> Arc<Runtime> {
 }
 
 /// A user from outside the host.
-fn outside() -> Actor {
+fn outside_caller() -> Caller {
     let principal = Principal::new(PrincipalKind::Person, "https://idp", "ada").unwrap();
-    Actor::Caller(Caller::asserted(principal, Tenant::new("acme").unwrap()).unwrap())
+    Caller::asserted(principal, Tenant::new("acme").unwrap()).unwrap()
+}
+
+fn outside() -> Actor {
+    Actor::Caller(outside_caller())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_poisoned_session_map_fails_access_closed() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
-    let (x, empty) = (root.join("x"), root.join("empty"));
-    std::fs::create_dir_all(&x).unwrap();
-    std::fs::create_dir_all(&empty).unwrap();
+    let (x, own, empty) = (root.join("x"), root.join("own"), root.join("empty"));
+    for dir in [&x, &own, &empty] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
     let rt = runtime(&root).await;
     let session = rt
         .new_session(SessionSpec {
@@ -59,8 +64,19 @@ async fn a_poisoned_session_map_fails_access_closed() {
         })
         .await
         .unwrap();
+    // A Session the outside user owns, in its own folder.
+    outside_caller()
+        .scope(rt.new_session(SessionSpec {
+            cwd: Some(own.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
     let outside = outside();
-    // Before: an empty folder is the outside user's to change and use.
+    // Before: the outside user reads and may change its own folder, and an
+    // empty one.
+    assert_eq!(rt.readable_folders(&outside), Some(vec![own.clone()]));
+    assert!(rt.may_change_folder(&outside, &own));
     assert!(rt.may_change_folder(&outside, &empty));
     rt.check_folder(&outside, &empty, None).await.unwrap();
 
@@ -72,6 +88,7 @@ async fn a_poisoned_session_map_fails_access_closed() {
         .is_err());
     assert!(rt.check_folder(&outside, &empty, None).await.is_err());
     assert_eq!(rt.readable_folders(&outside), Some(Vec::new()));
+    assert!(!rt.may_change_folder(&outside, &own));
     assert!(!rt.may_change_folder(&outside, &empty));
     // Internal work and the host's user are never limited by these.
     assert_eq!(rt.readable_folders(&Actor::Internal), None);
@@ -98,4 +115,49 @@ async fn a_poisoned_subject_cache_refuses_only_lookups() {
         .await
         .is_err());
     rt.subjects.clear_poison();
+}
+
+/// A Subagent's turn acts for whoever started its parent's turn. When the
+/// parent's turn caller is poisoned, the prompt is refused: it never runs
+/// as the Runtime, and the child stays idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_poisoned_parent_turn_caller_refuses_the_subagent_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let rt = runtime(&root).await;
+    let parent = rt.new_session(SessionSpec::default()).await.unwrap();
+    let parent_live = rt.route(&parent).unwrap();
+    let child = rt
+        .open(
+            None,
+            SessionSpec::default(),
+            Some(subagent::ChildOpen {
+                parent: Arc::clone(&parent_live),
+                cwd: root.clone(),
+                max_turns: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+    poison(parent_live.escalations.turn_caller_lock());
+    let refused = rt
+        .prompt(&child, vec![ContentBlock::text("hello")])
+        .await
+        .err();
+    match refused {
+        Some(BackendError::Failed(info)) => assert_eq!(info.category, ErrorCategory::Internal),
+        other => panic!(
+            "the Subagent prompt was not refused: {:?}",
+            other.map(|_| ())
+        ),
+    }
+    assert!(!rt.route(&child).unwrap().busy.load(Ordering::Acquire));
+
+    // A new parent turn replaces the caller; the child's prompt works again.
+    parent_live.escalations.set_turn_caller(None);
+    assert!(rt
+        .prompt(&child, vec![ContentBlock::text("hello")])
+        .await
+        .is_ok());
 }

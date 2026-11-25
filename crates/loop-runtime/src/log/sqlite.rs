@@ -192,17 +192,21 @@ impl Readers {
     /// reset, not read: its connections may be mid-use or half-pushed, so
     /// they are dropped unread and callers open fresh ones. Only read-only
     /// connections are lost; the database is untouched.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "write-only reset: the poisoned pool is replaced, never read"
+    )]
     fn idle(&self) -> MutexGuard<'_, Vec<Connection>> {
-        loop {
-            // The poisoned guard is dropped unread.
-            if let Ok(pool) = self.idle.lock() {
-                return pool;
-            }
-            eprintln!("Runtime: the Event Log reader pool lock is poisoned; emptying the pool");
-            self.idle.clear_poison();
-            if let Ok(mut pool) = self.idle.lock() {
+        match self.idle.lock() {
+            Ok(pool) => pool,
+            Err(poisoned) => {
+                eprintln!("Runtime: the Event Log reader pool lock is poisoned; emptying the pool");
+                // Replace through the guard, then clear the poison: no other
+                // reader can lock the cleared pool before it is empty.
+                let mut pool = poisoned.into_inner();
                 *pool = Vec::new();
-                return pool;
+                self.idle.clear_poison();
+                pool
             }
         }
     }
