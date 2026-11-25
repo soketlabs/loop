@@ -10,10 +10,8 @@
 //! script without the lock: the shell runs.
 #![cfg(unix)]
 
-use loop_ai::{
-    providers::{faux_provider_fn, FauxResponder, FauxResponse},
-    Context, Message, ToolCall, ToolResultContent, UserContent, UserMessageContent,
-};
+use loop_ai::providers::{faux_provider_fn, FauxResponder, FauxResponse};
+use loop_ai::{Context, Message, ToolCall, ToolResultContent, UserContent, UserMessageContent};
 use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
 use loop_protocol::admin::{
     AdminAction, McpParams, PermissionModeParams, ReloadParams, SkillsParams,
@@ -21,14 +19,13 @@ use loop_protocol::admin::{
 use loop_protocol::{
     AgentBackend, BackendError, ContentBlock, SessionOptions, SessionRef, SessionSpec, ToolLock,
 };
-use loop_runtime::{log::MemoryEventLog, Runtime, RuntimeLimits};
+use loop_runtime::log::MemoryEventLog;
+use loop_runtime::{Runtime, RuntimeLimits};
 use loop_wire::RuntimeAdmin;
 use serde_json::{json, Value};
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// What the model saw on each call: the tools offered and the results.
 #[derive(Default, Clone, Debug)]

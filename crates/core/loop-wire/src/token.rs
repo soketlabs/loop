@@ -1,17 +1,11 @@
 //! Private Runtime bearer-token files. Call `create` while holding the Runtime lock.
 
-use std::{
-    fs::{File, OpenOptions},
-    io::{self, Read, Write},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::{
-            ffi::OsStrExt,
-            fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
-        },
-    },
-    path::{Path, PathBuf},
-};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 
 fn denied() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied,

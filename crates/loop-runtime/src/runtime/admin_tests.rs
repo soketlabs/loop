@@ -3,10 +3,8 @@
 //! settings; permission mode is recorded in the Session tree.
 use super::*;
 use crate::log::{EventLog, MemoryEventLog};
-use loop_ai::{
-    providers::{faux_provider_fn, FauxResponse},
-    Context, Message, ToolCall,
-};
+use loop_ai::providers::{faux_provider_fn, FauxResponse};
+use loop_ai::{Context, Message, ToolCall};
 use loop_protocol::admin::{
     AdminAction, DefaultsParams, DefaultsPatch, PermissionModeParams, ReloadParams, SandboxAction,
     SandboxChoice, SandboxParams, SandboxResult, SkillStatus, SkillsParams, TemplatesParams,
@@ -1457,7 +1455,8 @@ mod gate_mode {
     use loop_protocol::{ConfigChanged, SessionUpdate};
     use loop_wire::control::EscalationRecipient;
     use loop_wire::RuntimeControl;
-    use tokio::sync::{broadcast::Receiver, mpsc, oneshot};
+    use tokio::sync::broadcast::Receiver;
+    use tokio::sync::{mpsc, oneshot};
 
     type Asked = (
         loop_protocol::rpc::InteractParams,

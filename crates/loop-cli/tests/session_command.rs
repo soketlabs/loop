@@ -1,10 +1,10 @@
 use loop_cli::session_cmd::{connect, drive, Input, SessionArgs, Terminal};
-use loop_protocol::{rpc::PeerInfo, AgentBackend, ContentBlock, SessionSpec};
-use loop_runtime::{log::MemoryEventLog, Runtime, RuntimeLimits};
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use loop_protocol::rpc::PeerInfo;
+use loop_protocol::{AgentBackend, ContentBlock, SessionSpec};
+use loop_runtime::log::MemoryEventLog;
+use loop_runtime::{Runtime, RuntimeLimits};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Scripted keyboard: each input carries the time it was "typed".

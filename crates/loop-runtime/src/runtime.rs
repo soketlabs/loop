@@ -2,20 +2,16 @@
 use crate::access::{Actor, Need};
 use crate::log::{Event, EventKind, EventLog};
 use async_trait::async_trait;
-use loop_agent::{
-    harness::{
-        create_session_repository,
-        session::{LeaseIdentity, RuntimeSessionStore, SessionStore},
-        types::SessionError,
-    },
-    native_backend::NATIVE_INSTANCE,
+use loop_agent::harness::create_session_repository;
+use loop_agent::harness::session::{LeaseIdentity, RuntimeSessionStore, SessionStore};
+use loop_agent::harness::types::SessionError;
+use loop_agent::native_backend::NATIVE_INSTANCE;
+use loop_app_core::permissions::workspace_root;
+use loop_app_core::runtime::{
+    BootstrapOpts, GlobalResources, OpenedSession, SessionFactory, WorkspaceResources,
 };
-use loop_app_core::{
-    permissions::workspace_root,
-    runtime::{BootstrapOpts, GlobalResources, OpenedSession, SessionFactory, WorkspaceResources},
-};
+use loop_protocol::rpc::{SessionInfo, SessionSnapshot};
 use loop_protocol::{
-    rpc::{SessionInfo, SessionSnapshot},
     AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, Compaction,
     CompactionReport, ConfigChanged, ContentBlock, ErrorCategory, LocalShell, ModelChoices,
     ModelControl, MutationResult, Origin, SessionKey, SessionMetadata, SessionRef, SessionSpec,
@@ -27,20 +23,16 @@ use loop_store::{Deployment, Identity, Scope, SystemScope, Tenant};
 use loop_wire::control::EscalationRecipient;
 use publish::{barrier, fail};
 use serde_json::json;
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    future::Future,
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock, Weak,
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{
+    broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore,
 };
-use tokio::{
-    sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
-    task::{AbortHandle, JoinHandle},
-};
+use tokio::task::{AbortHandle, JoinHandle};
 
 /// Admission limits. Active turns queue when all permits are occupied.
 #[derive(Debug, Clone, Copy)]

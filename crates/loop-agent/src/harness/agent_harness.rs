@@ -1792,10 +1792,10 @@ impl AgentHarness {
             >,
         >,
     ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
-        use crate::harness::orchestration::{
-            agent_worker::{AgentWorker, ShellWorker, WorkflowToolHooks},
-            WorkflowProgressEvent,
+        use crate::harness::orchestration::agent_worker::{
+            AgentWorker, ShellWorker, WorkflowToolHooks,
         };
+        use crate::harness::orchestration::WorkflowProgressEvent;
         use loop_orchestration::memory::bus::create_memory_bus;
         use loop_orchestration::memory::SharedMemory;
         use loop_orchestration::scheduler::{Scheduler, WorkerPool};

@@ -1,10 +1,10 @@
 //! Detached default-owner startup, using the built CLI with isolated state.
-use loop_cli::{
-    runtime_launch::{self, Target},
-    surface_client::RemoteHost,
-};
+use loop_cli::runtime_launch::{self, Target};
+use loop_cli::surface_client::RemoteHost;
 use loop_protocol::{AgentBackend, SessionSpec};
-use std::{path::Path, sync::Arc, time::Duration};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 #[tokio::test]
 async fn auto_start_and_second_client_reuse_one_owner() {

@@ -2,17 +2,13 @@
 //! concurrent Sessions never take each other's scripted responses.
 use super::*;
 use crate::log::{EventLog, LoggedEvent, MemoryEventLog};
-use loop_ai::{
-    providers::{faux_provider_fn, FauxResponse},
-    Context, Message, ToolCall, ToolResultContent, UserContent, UserMessageContent,
-};
+use loop_ai::providers::{faux_provider_fn, FauxResponse};
+use loop_ai::{Context, Message, ToolCall, ToolResultContent, UserContent, UserMessageContent};
 use loop_app_core::permissions::{Capability, Layer, LayerSource, PermissionMode, Setting, State};
 use serde_json::Value;
-use std::{
-    collections::HashMap,
-    pin::Pin,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const LIMIT: Duration = Duration::from_secs(60);
 

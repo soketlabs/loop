@@ -2,10 +2,8 @@
 //! attach, prompt and Escalation registration.
 use super::*;
 use crate::log::{EventLog, LoggedEvent, MemoryEventLog};
-use loop_ai::{
-    providers::{faux_provider_fn, FauxResponse},
-    Context, Message, ToolCall, UserContent, UserMessageContent,
-};
+use loop_ai::providers::{faux_provider_fn, FauxResponse};
+use loop_ai::{Context, Message, ToolCall, UserContent, UserMessageContent};
 use std::pin::Pin;
 
 const LIMIT: Duration = Duration::from_secs(60);

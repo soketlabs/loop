@@ -4,10 +4,8 @@
 //! the call runs.
 use super::*;
 use crate::log::{EventLog, LoggedEvent, MemoryEventLog};
-use loop_ai::{
-    providers::{faux_provider_fn, FauxResponse},
-    Context, Message, ToolCall,
-};
+use loop_ai::providers::{faux_provider_fn, FauxResponse};
+use loop_ai::{Context, Message, ToolCall};
 use loop_app_core::permissions::decision::{
     DecidedBy, DecisionOutcome, DecisionSource, PolicyDecisionRecord,
 };

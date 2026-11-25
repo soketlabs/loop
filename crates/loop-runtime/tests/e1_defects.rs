@@ -6,26 +6,22 @@
 #![cfg(unix)]
 
 use async_trait::async_trait;
-use loop_ai::{
-    providers::{faux_provider_fn, FauxResponse},
-    Context,
-};
+use loop_ai::providers::{faux_provider_fn, FauxResponse};
+use loop_ai::Context;
 use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
 use loop_protocol::{
     AgentBackend, ContentBlock, SessionKey, SessionSpec, SessionUpdate, StopReason, TurnId,
     TurnOutcome, UpdateEnvelope,
 };
-use loop_runtime::{
-    log::{Event, EventKind, EventLog, LoggedEvent, Result as LogResult, SqliteEventLog},
-    Runtime, RuntimeLimits,
+use loop_runtime::log::{
+    Event, EventKind, EventLog, LoggedEvent, Result as LogResult, SqliteEventLog,
 };
+use loop_runtime::{Runtime, RuntimeLimits};
 use serde_json::json;
-use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const LIMIT: Duration = Duration::from_secs(60);
 
@@ -342,7 +338,8 @@ async fn d3_a_completed_turn_is_in_the_tree() {
 
 async fn d2_a_prompt_whose_turn_start_was_not_logged_is_recovered_as_uncertain() {
     tokio::time::timeout(LIMIT, async {
-        use loop_agent::harness::session::{sqlite::SqliteSessionStore, SessionStore};
+        use loop_agent::harness::session::sqlite::SqliteSessionStore;
+        use loop_agent::harness::session::SessionStore;
         let dir = tempfile::tempdir().unwrap();
         let agent = dir.path().join("agent");
         std::fs::create_dir_all(&agent).unwrap();

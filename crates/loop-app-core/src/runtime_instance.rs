@@ -1,6 +1,7 @@
 //! OS single-instance guard for a Runtime, independent of its socket location.
 
-use std::{io, path::Path};
+use std::io;
+use std::path::Path;
 
 /// Holds the agent directory's exclusive OS file lock until dropped.
 /// The lock inode is never unlinked, so all starters contend on the same file.

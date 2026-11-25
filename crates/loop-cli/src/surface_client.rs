@@ -2,15 +2,13 @@
 //!
 //! The native owner is private. Surfaces receive typed services and immutable views;
 //! neither the host nor mutable settings can be reached through this boundary.
-use loop_protocol::{
-    rpc::{
-        ClientCapabilities, CloneParams, DestinationResult, ExportResult, ForkParams, ImportParams,
-        MutationResult, NavigateParams, NavigateResult, PeerInfo, RenameParams, SessionInfo,
-        SessionParams, SessionSnapshot, TreeParams, TreeResult, ViewParams, ViewResult,
-    },
-    session_services::{SkillParams, WorkflowParams, WorkflowResult},
-    AgentBackend, SessionRef, SessionSpec,
+use loop_protocol::rpc::{
+    ClientCapabilities, CloneParams, DestinationResult, ExportResult, ForkParams, ImportParams,
+    MutationResult, NavigateParams, NavigateResult, PeerInfo, RenameParams, SessionInfo,
+    SessionParams, SessionSnapshot, TreeParams, TreeResult, ViewParams, ViewResult,
 };
+use loop_protocol::session_services::{SkillParams, WorkflowParams, WorkflowResult};
+use loop_protocol::{AgentBackend, SessionRef, SessionSpec};
 use loop_wire::RuntimeControl;
 use std::sync::Arc;
 mod native_admin;
@@ -767,7 +765,8 @@ mod sandbox_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loop_agent::harness::session::{sqlite::SqliteSessionStore, SessionFile, SessionStore};
+    use loop_agent::harness::session::sqlite::SqliteSessionStore;
+    use loop_agent::harness::session::{SessionFile, SessionStore};
     use loop_protocol::rpc::SESSION_TRANSFER_LIMIT;
     use loop_protocol::{ContentBlock, TurnOutcome};
     use std::time::Duration;

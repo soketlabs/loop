@@ -63,17 +63,16 @@ pub async fn run(args: SessionArgs) -> anyhow::Result<()> {
 }
 mod unix {
     use super::SessionArgs;
+    use loop_protocol::rpc::{methods, InteractWithdrawnParams, PeerInfo, SessionInfo};
     use loop_protocol::{
-        rpc::{methods, InteractWithdrawnParams, PeerInfo, SessionInfo},
         AgentBackend, ContentBlock, HostServices, InteractionOutcome, InteractionRequest,
         SessionKey, SessionRef, SessionSpec,
     };
-    use loop_wire::{transport::Transport, RemoteBackend};
-    use std::{
-        collections::VecDeque,
-        io::{BufRead, Write},
-        sync::Arc,
-    };
+    use loop_wire::transport::Transport;
+    use loop_wire::RemoteBackend;
+    use std::collections::VecDeque;
+    use std::io::{BufRead, Write};
+    use std::sync::Arc;
     use tokio::sync::{mpsc, oneshot};
 
     #[derive(Debug)]

@@ -8,12 +8,11 @@ use loop_protocol::{BackendError, SessionKey, SessionRef};
 use loop_runtime::log::{EventLog, LoggedEvent, MemoryEventLog};
 use loop_runtime::{Runtime, RuntimeLimits};
 use loop_wire::server::{serve_with_control, ServeOptions, Served};
-use loop_wire::{transport::memory, Connection, Incoming, RpcError};
+use loop_wire::transport::memory;
+use loop_wire::{Connection, Incoming, RpcError};
 use serde_json::{json, Value};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 

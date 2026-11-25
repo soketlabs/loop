@@ -7,7 +7,8 @@ use super::{
     ViewResult, WorkflowParams, WorkflowResult,
 };
 use loop_protocol::{BackendResult, HostServices, InteractionOutcome, InteractionRequest};
-use loop_wire::{transport::Transport, RemoteBackend};
+use loop_wire::transport::Transport;
+use loop_wire::RemoteBackend;
 
 /// Interaction endpoint installed once the TUI owns its approval queue.
 #[derive(Default)]

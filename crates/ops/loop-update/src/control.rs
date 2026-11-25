@@ -1,7 +1,8 @@
 //! The decision rules for an update: whether a release should be installed, and
 //! cancellation on termination signals.
 
-use std::{cmp::Ordering, future::Future};
+use std::cmp::Ordering;
+use std::future::Future;
 
 use crate::{Error, ReleaseVersion, Result};
 

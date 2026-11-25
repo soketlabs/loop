@@ -1,19 +1,15 @@
 //! A self-contained executable so tests exercise replacement/deletion of a
 //! running program, including the self-replace helper, rather than just file copies.
 use loop_update::{Installation, ReleaseClient, ReleaseVersion};
-use std::{
-    collections::HashMap,
-    fs,
-    io::{Read, Write},
-    net::TcpListener,
-    path::{Path, PathBuf},
-    process::Command,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
-    time::Duration,
-};
+use std::collections::HashMap;
+use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 fn fixture_version() -> String {
     static VERSION: &str = "LOOP_FIXTURE_VERSION=0.3.4";

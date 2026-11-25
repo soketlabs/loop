@@ -1,9 +1,7 @@
 use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
 use loop_protocol::{AgentBackend, ContentBlock, SessionSpec, TurnOutcome};
-use loop_runtime::{
-    log::{EventKind, EventLog, MemoryEventLog},
-    Runtime, RuntimeLimits,
-};
+use loop_runtime::log::{EventKind, EventLog, MemoryEventLog};
+use loop_runtime::{Runtime, RuntimeLimits};
 use std::sync::Arc;
 
 fn opts(cwd: &std::path::Path) -> BootstrapOpts {
@@ -219,11 +217,9 @@ impl loop_protocol::HostServices for Reject {
 #[tokio::test]
 async fn connection_shutdown_keeps_other_sessions_available() {
     use loop_protocol::rpc::PeerInfo;
-    use loop_wire::{
-        server::{serve_with_options, ServeOptions},
-        transport::memory,
-        RemoteBackend,
-    };
+    use loop_wire::server::{serve_with_options, ServeOptions};
+    use loop_wire::transport::memory;
+    use loop_wire::RemoteBackend;
     let dir = tempfile::tempdir().unwrap();
     let rt = Arc::new(
         runtime(

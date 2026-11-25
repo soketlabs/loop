@@ -7,10 +7,8 @@
 //! sits next to `alice` and must never be read.
 #![cfg(unix)]
 
-use loop_ai::{
-    providers::{faux_provider_fn, FauxResponse},
-    Context, Message, ToolCall, ToolResultContent,
-};
+use loop_ai::providers::{faux_provider_fn, FauxResponse};
+use loop_ai::{Context, Message, ToolCall, ToolResultContent};
 use loop_app_core::permissions::tool_lock::RuntimeToolLock;
 use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
 use loop_protocol::admin::{
@@ -20,14 +18,13 @@ use loop_protocol::admin::{
 use loop_protocol::{
     AgentBackend, BackendError, ContentBlock, SessionOptions, SessionRef, SessionSpec, ToolLock,
 };
-use loop_runtime::{log::MemoryEventLog, Runtime, RuntimeLimits};
+use loop_runtime::log::MemoryEventLog;
+use loop_runtime::{Runtime, RuntimeLimits};
 use loop_wire::RuntimeAdmin;
 use serde_json::json;
-use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Default)]
 struct Seen {

@@ -9,8 +9,9 @@
 use std::path::Path;
 
 use loop_agent::harness::SandboxMode;
+use loop_app_core::config::paths;
+use loop_app_core::config::settings::{set_disabled_name, set_skill_disabled};
 use loop_app_core::config::workspace_settings::{WorkspaceOverrides, WorkspaceSettingsStore};
-use loop_app_core::config::{paths, settings::set_disabled_name, settings::set_skill_disabled};
 use loop_app_core::config::{Settings, TrustStore};
 use loop_protocol::admin::{
     AdminAction, DefaultsParams, DefaultsResult, McpParams, McpResult, McpServerStatus,

@@ -17,19 +17,13 @@ use loop_protocol::{
     AgentBackend, ContentBlock, SessionKey, SessionRef, SessionSpec, SessionUpdate, StopReason,
     TurnId, TurnOutcome, UpdateEnvelope,
 };
-use loop_runtime::{
-    log::{Event, EventKind, EventLog, MemoryEventLog},
-    Recovery, Runtime, RuntimeLimits,
-};
+use loop_runtime::log::{Event, EventKind, EventLog, MemoryEventLog};
+use loop_runtime::{Recovery, Runtime, RuntimeLimits};
 use loop_wire::RuntimeControl;
-use std::{
-    path::Path,
-    sync::{
-        atomic::{AtomicI64, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 const LIMIT: Duration = Duration::from_secs(60);
 /// A pid that the environment below reports as dead.

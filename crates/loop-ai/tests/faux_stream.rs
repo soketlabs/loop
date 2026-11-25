@@ -1,8 +1,8 @@
 //! Faux provider stream protocol tests.
 
 use futures::StreamExt;
+use loop_ai::providers::{faux_provider, FauxResponse, FauxScript};
 use loop_ai::{
-    providers::{faux_provider, FauxResponse, FauxScript},
     AssistantContent, AssistantMessageEvent, Context, Message, Models, SimpleStreamOptions,
     StopReason, ToolCall,
 };
