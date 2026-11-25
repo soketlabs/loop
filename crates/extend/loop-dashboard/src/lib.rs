@@ -7,8 +7,10 @@
 //! Nothing is sent anywhere.
 //!
 //! * [`spans`] reads the usage log's files.
-//! * [`aggregate`] turns their spans into a [`Summary`](aggregate::Summary).
+//! * [`aggregate`] turns their spans into a [`Summary`].
 //! * [`tui`] draws it; [`tui::run`] standalone, [`tui::Dashboard`] driven from inside the chat.
+
+#![deny(missing_docs)]
 
 pub mod aggregate;
 pub mod spans;

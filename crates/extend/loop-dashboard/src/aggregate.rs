@@ -40,15 +40,21 @@ pub struct Totals {
     pub sub_agent_runs: u64,
     /// `spawn_task` calls that started a sub-agent.
     pub sub_agents_spawned: u64,
+    /// LLM calls (Langfuse `generation` spans).
     pub llm_calls: u64,
+    /// Tool executions, built-in and MCP.
     pub tool_calls: u64,
     /// Tool calls served by MCP servers.
     pub mcp_calls: u64,
     /// Skills activated for a run or loaded by the model.
     pub skill_uses: u64,
+    /// Input tokens over all LLM calls.
     pub input_tokens: u64,
+    /// Output tokens over all LLM calls.
     pub output_tokens: u64,
+    /// Input tokens read from the provider's cache.
     pub cache_read_tokens: u64,
+    /// Reasoning tokens, for models that report them.
     pub reasoning_tokens: u64,
 }
 
@@ -57,24 +63,38 @@ pub struct Totals {
 pub struct DayRow {
     /// `YYYY-MM-DD`, local time.
     pub date: String,
+    /// LLM calls that day.
     pub llm_calls: u64,
+    /// Tool executions that day.
     pub tool_calls: u64,
+    /// Input tokens that day.
     pub input_tokens: u64,
+    /// Output tokens that day.
     pub output_tokens: u64,
+    /// Runs of the chat's own agent that day.
     pub runs: u64,
+    /// Runs of workflow sub-agents that day.
     pub sub_agent_runs: u64,
 }
 
 /// Usage of one model.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelRow {
+    /// Model name as the provider reports it.
     pub model: String,
+    /// Provider of the model.
     pub provider: String,
+    /// LLM calls to this model.
     pub calls: u64,
+    /// Input tokens over those calls.
     pub input_tokens: u64,
+    /// Output tokens over those calls.
     pub output_tokens: u64,
+    /// Input tokens read from the provider's cache.
     pub cache_read_tokens: u64,
+    /// Mean call duration, in milliseconds.
     pub avg_latency_ms: f64,
+    /// 95th percentile call duration (nearest rank), in milliseconds.
     pub p95_latency_ms: f64,
     /// Average time to first token, over calls that recorded it.
     pub avg_ttft_ms: Option<f64>,
@@ -83,28 +103,37 @@ pub struct ModelRow {
 /// Usage of one tool.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolRow {
+    /// Tool name. MCP tools keep their `mcp__<server>__<tool>` name.
     pub tool: String,
     /// [`BUILT_IN`] or the MCP server name.
     pub source: String,
+    /// Calls of this tool.
     pub calls: u64,
+    /// Mean call duration, in milliseconds.
     pub avg_ms: f64,
+    /// 95th percentile call duration (nearest rank), in milliseconds.
     pub p95_ms: f64,
 }
 
 /// Usage of one MCP server.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct McpRow {
+    /// MCP server name.
     pub server: String,
+    /// Tool calls served by this server.
     pub calls: u64,
     /// Distinct tools of this server that were called.
     pub tools: u64,
+    /// Mean call duration, in milliseconds.
     pub avg_ms: f64,
 }
 
 /// Uses of one skill.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SkillRow {
+    /// Skill name.
     pub skill: String,
+    /// Times the skill was activated for a run or loaded by the model.
     pub uses: u64,
     /// Chat sessions it was used in.
     pub sessions: u64,
@@ -113,14 +142,23 @@ pub struct SkillRow {
 /// One chat session (or a trace without a session id).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionRow {
+    /// Session id from the trace; empty when the trace has none.
     pub session_id: String,
+    /// Start of the session's first span.
     pub started: DateTime<Utc>,
+    /// Start of the session's latest span.
     pub last_active: DateTime<Utc>,
+    /// Runs of the chat's own agent.
     pub runs: u64,
+    /// LLM calls in the session.
     pub llm_calls: u64,
+    /// Tool executions in the session.
     pub tool_calls: u64,
+    /// Sub-agents the session spawned.
     pub sub_agents_spawned: u64,
+    /// Input plus output tokens of the session's LLM calls.
     pub tokens: u64,
+    /// Names of the models used, in order of first use.
     pub models: Vec<String>,
 }
 
@@ -129,19 +167,27 @@ pub struct SessionRow {
 pub struct Summary {
     /// Start of the period (inclusive); `None` for all retained history.
     pub since: Option<DateTime<Utc>>,
+    /// When the summary was built.
     pub generated_at: DateTime<Utc>,
     /// Trace files read.
     pub files: u64,
     /// Lines that could not be parsed (e.g. a file still being written).
     pub skipped_lines: u64,
+    /// Totals over the period.
     pub totals: Totals,
+    /// One row per local day, oldest first.
     pub days: Vec<DayRow>,
     /// LLM calls by local hour of day, 0–23.
     pub hours: [u64; 24],
+    /// Usage by model, most calls first.
     pub models: Vec<ModelRow>,
+    /// Usage by tool, most calls first.
     pub tools: Vec<ToolRow>,
+    /// Usage by MCP server, most calls first.
     pub mcp_servers: Vec<McpRow>,
+    /// Usage by skill, most uses first.
     pub skills: Vec<SkillRow>,
+    /// The 25 most recently active sessions, newest first.
     pub sessions: Vec<SessionRow>,
 }
 

@@ -1,3 +1,5 @@
+//! Tests of the dashboard state, key handling and drawing helpers.
+
 use ratatui::backend::TestBackend;
 
 use super::widgets::*;
