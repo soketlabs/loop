@@ -898,8 +898,28 @@ fn model_key(model: &Model) -> String {
     format!("{}/{}", model.provider, model.id)
 }
 
+/// Lock the learned rejections. When a thread panicked holding the lock, the
+/// list is cleared through the guard (written, never read) and the poison is
+/// cleared: the rejections are forgotten and learned again on the next
+/// rejection, which costs one extra request.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "cache reset: the poisoned list is cleared, never read"
+)]
+fn rejected_models() -> std::sync::MutexGuard<'static, Vec<String>> {
+    match REASONING_REJECTED.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            guard.clear();
+            REASONING_REJECTED.clear_poison();
+            guard
+        }
+    }
+}
+
 fn mark_reasoning_rejected(model: &Model) {
-    let mut rejected = REASONING_REJECTED.lock().unwrap_or_else(|p| p.into_inner());
+    let mut rejected = rejected_models();
     let key = model_key(model);
     if !rejected.contains(&key) {
         rejected.push(key);
@@ -909,19 +929,13 @@ fn mark_reasoning_rejected(model: &Model) {
 /// Whether `model`'s server rejected reasoning parameters earlier in this
 /// process. Requests for it are then sent without them.
 pub fn reasoning_rejected(model: &Model) -> bool {
-    REASONING_REJECTED
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .contains(&model_key(model))
+    rejected_models().contains(&model_key(model))
 }
 
 /// Forget a learned rejection after a model's endpoint or thinking format changes.
 pub fn clear_reasoning_rejection(model: &Model) {
     let key = model_key(model);
-    REASONING_REJECTED
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retain(|rejected| rejected != &key);
+    rejected_models().retain(|rejected| rejected != &key);
 }
 
 /// Whether an error body says a reasoning parameter is not supported.
@@ -1139,5 +1153,36 @@ mod metadata_tests {
         assert!(payload_for("https://api.openai.com/v1")
             .get("metadata")
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod poison_tests {
+    use super::*;
+    use crate::providers::soket_seed_models;
+
+    #[test]
+    fn a_poisoned_rejection_list_is_forgotten_not_read() {
+        let mut model = soket_seed_models()[0].clone();
+        model.id = "poison-test-model".into();
+        mark_reasoning_rejected(&model);
+        assert!(reasoning_rejected(&model));
+
+        let _ = std::thread::spawn(|| {
+            let _guard = REASONING_REJECTED.lock().unwrap();
+            panic!("poison the lock for a test");
+        })
+        .join();
+        assert!(REASONING_REJECTED.is_poisoned());
+
+        assert!(
+            !reasoning_rejected(&model),
+            "the poisoned list must be cleared, not read"
+        );
+        assert!(!REASONING_REJECTED.is_poisoned());
+        mark_reasoning_rejected(&model);
+        assert!(reasoning_rejected(&model));
+        clear_reasoning_rejection(&model);
+        assert!(!reasoning_rejected(&model));
     }
 }

@@ -47,7 +47,7 @@ impl ScriptedEnvironment {
     pub fn set(&self, pid: u32, liveness: PidLiveness) {
         self.liveness
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("scripted liveness lock poisoned: only insert and get run under it, so a panic there is a bug")
             .insert(pid, liveness);
     }
 }
@@ -59,7 +59,7 @@ impl LeaseEnvironment for ScriptedEnvironment {
     fn pid_liveness(&self, pid: u32) -> PidLiveness {
         self.liveness
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("scripted liveness lock poisoned: only insert and get run under it, so a panic there is a bug")
             .get(&pid)
             .copied()
             .unwrap_or(PidLiveness::Alive)

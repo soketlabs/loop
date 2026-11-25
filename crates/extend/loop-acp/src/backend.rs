@@ -163,10 +163,12 @@ impl AcpBackend {
     }
 
     fn lock_state(&self) -> MutexGuard<'_, State> {
-        // A panic while holding the lock leaves plain data; keep going.
+        // A panic while holding the lock may leave the generation, the
+        // pending turns and the pending interactions half-updated. Never
+        // read them: a poisoned lock is a bug and stops here.
         self.state
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+            .expect("ACP backend state lock poisoned: a panic while holding it is a bug")
     }
 
     /// The live connection, starting the agent if needed.

@@ -71,11 +71,29 @@ impl ToolEnvPolicy {
 
     /// Allow the removal notes again: call when a turn starts.
     pub fn begin_turn(&self) {
-        self.0
-            .noted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        self.0.lock_noted().clear();
+    }
+}
+
+impl PolicyState {
+    /// Lock the names already noted this turn. When a thread panicked
+    /// holding the lock, the set is cleared through the guard (written,
+    /// never read) and the poison is cleared. The worst case is that a
+    /// removal note shows twice.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "cache reset: the poisoned set is cleared, never read"
+    )]
+    fn lock_noted(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+        match self.noted.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                guard.clear();
+                self.noted.clear_poison();
+                guard
+            }
+        }
     }
 }
 
@@ -158,12 +176,7 @@ impl Shell for SessionExecutionEnv {
             return None;
         }
         let (_, removed) = self.split();
-        let mut noted = self
-            .policy
-            .0
-            .noted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut noted = self.policy.0.lock_noted();
         let mut names: Vec<String> = removed
             .into_iter()
             .filter(|name| mentions_name(output, name) && !noted.contains(name))

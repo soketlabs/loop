@@ -307,7 +307,7 @@ impl DecisionSink for JsonlDecisionSink {
         tokio::task::spawn_blocking(move || {
             let mut file = file
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .map_err(|_| std::io::Error::other("decision log lock poisoned"))?;
             append_private(&path, &mut file, &line, sync, max, kept)
         })
         .await

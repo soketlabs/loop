@@ -108,7 +108,7 @@ impl GlobalResources {
         let mut all = self
             .host_workspaces
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .expect("host workspaces lock poisoned: only retain and push run under it, so a panic there is a bug");
         all.retain(|w| w.strong_count() > 0);
         all.push(Arc::downgrade(workspace));
     }
@@ -121,7 +121,7 @@ impl GlobalResources {
         let mut all = self
             .host_workspaces
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .expect("host workspaces lock poisoned: only retain and push run under it, so a panic there is a bug");
         all.retain(|w| w.strong_count() > 0);
         all.iter().filter_map(std::sync::Weak::upgrade).collect()
     }
