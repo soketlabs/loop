@@ -15,7 +15,7 @@ async fn harness_prompt_persists() {
     script.push(FauxResponse::Text("harness-ok".into()));
     let models = Arc::new(Models::new());
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
 
     let store = create_in_memory_session_store();
     let repo = create_session_repository(store, None);
@@ -49,7 +49,7 @@ async fn harness_start_new_session_resets_id() {
     script.push(FauxResponse::Text("second".into()));
     let models = Arc::new(Models::new());
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
 
     let store = create_in_memory_session_store();
     let repo = create_session_repository(store, None);
@@ -90,7 +90,7 @@ async fn harness_resume_restores_session_context() {
     script.push(FauxResponse::Text("after-resume".into()));
     let models = Arc::new(Models::new());
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
 
     let store = create_in_memory_session_store();
     let repo = create_session_repository(Arc::clone(&store), None);
@@ -153,7 +153,7 @@ async fn harness_fork_through_user_message() {
     script.push(FauxResponse::Text("forked-reply".into()));
     let models = Arc::new(Models::new());
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
 
     let store = create_in_memory_session_store();
     let repo = create_session_repository(store, None);
@@ -214,7 +214,7 @@ async fn prompt_without_model_fails_cleanly_until_one_is_selected() {
     script.push(FauxResponse::Text("after-select".into()));
     let models = Arc::new(Models::new());
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
 
     let store = create_in_memory_session_store();
     let repo = create_session_repository(store, None);
@@ -305,7 +305,7 @@ async fn tools_snapshot_from_runtime_worker() {
 async fn the_tool_filter_hides_tools_from_the_turn() {
     let models = Arc::new(Models::new());
     models.set_provider(faux_provider(FauxScript::new()));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
     let store = create_in_memory_session_store();
     let repo = create_session_repository(store, None);
     let session = repo.create(None, Some("h".into())).await.unwrap();

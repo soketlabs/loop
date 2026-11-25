@@ -189,7 +189,7 @@ pub fn restored_choice(
         if models.credentials().is_logged_out(provider) {
             None
         } else {
-            models.get_model(provider, id)
+            models.model(provider, id)
         }
     });
     (
@@ -1195,7 +1195,7 @@ impl ModelControl for NativeBackend {
     async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
         self.current_config(session).await?;
         let models = self.harness.models();
-        let available = models.get_available().await;
+        let available = models.available().await;
         let state = self.config.lock();
         Ok(ModelChoices {
             current: state.config.model.clone(),
@@ -1232,7 +1232,7 @@ impl ModelControl for NativeBackend {
         let resolved = self
             .harness
             .models()
-            .get_model(provider, id)
+            .model(provider, id)
             .ok_or_else(|| invalid(format!("model not found: {provider}/{id}")))?;
         self.check_revision(expected_revision)?;
         // A model change never lands in the middle of a turn; holding

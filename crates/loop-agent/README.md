@@ -28,7 +28,7 @@ let script = FauxScript::new();
 script.push(FauxResponse::Text("hi".into()));
 let models = Models::new();
 models.set_provider(faux_provider(script));
-let model = models.get_model("faux", "faux-model").unwrap();
+let model = models.model("faux", "faux-model").unwrap();
 
 let agent = Agent::new(AgentOptions::new(
     AgentState::new(model),

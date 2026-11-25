@@ -244,7 +244,7 @@ impl RuntimeAdmin for NativeAdmin<'_> {
                     }
                     native_model = Some(
                         r.models
-                            .get_model(provider, id)
+                            .model(provider, id)
                             .ok_or_else(|| failed("model not found"))?,
                     );
                 }

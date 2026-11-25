@@ -314,7 +314,7 @@ async fn fixture_with(
     }));
     let models = Arc::new(Models::new());
     models.set_provider(faux);
-    let mut model = models.get_model("faux", "faux-model").unwrap();
+    let mut model = models.model("faux", "faux-model").unwrap();
     model.context_window = window;
     *model_slot.lock() = Some(model.clone());
 

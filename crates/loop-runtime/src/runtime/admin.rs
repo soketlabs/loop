@@ -605,7 +605,7 @@ impl Runtime {
                         )));
                     }
                     models
-                        .get_model(provider, id)
+                        .model(provider, id)
                         .ok_or_else(|| protocol(format!("model not found: {spec}")))?;
                     Some((provider.to_owned(), id.to_owned()))
                 }

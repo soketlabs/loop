@@ -22,7 +22,7 @@ use tokio::sync::broadcast;
 
 fn reasoning(id: &str) -> Model {
     let mut model = faux_provider(FauxScript::new())
-        .get_model("faux-model")
+        .model("faux-model")
         .unwrap();
     model.id = id.into();
     model.name = id.into();
@@ -45,7 +45,7 @@ async fn harness_on(
     provider.set_models(vec![reasoning("one"), reasoning("two/with-slash")]);
     let models = Arc::new(Models::new());
     models.set_provider(provider);
-    let model = models.get_model("faux", "one").unwrap();
+    let model = models.model("faux", "one").unwrap();
     let repo = create_session_repository(store, None);
     let session = repo.create(None, None).await.unwrap();
     let host: Arc<dyn ExecutionEnv> = Arc::new(HostExecutionEnv::new(std::env::temp_dir()));
@@ -620,7 +620,7 @@ async fn a_sessions_model_stays_in_that_session() {
             .unwrap();
         assert_eq!(current(control.models(&second).await.unwrap()), "faux/one");
         // A changed default reaches Sessions without a choice of their own.
-        backend.set_default_model(harness.models().get_model("faux", "two/with-slash"));
+        backend.set_default_model(harness.models().model("faux", "two/with-slash"));
         backend
             .load_session(&second, loop_protocol::SessionSpec::default())
             .await

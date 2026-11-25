@@ -16,7 +16,7 @@ use loop_ai::Models;
 async fn make_harness(script: FauxScript, resources: AgentHarnessResources) -> AgentHarness {
     let models = Arc::new(Models::new());
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
 
     let store = create_in_memory_session_store();
     let repo = create_session_repository(store, None);
@@ -128,7 +128,7 @@ async fn navigate_tree_moves_leaf() {
 
     let models = Arc::new(Models::new());
     models.set_provider(faux_provider(FauxScript::new()));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
     let host = Arc::new(HostExecutionEnv::new(std::env::temp_dir()));
     let harness = AgentHarness::new(AgentHarnessOptions {
         models,

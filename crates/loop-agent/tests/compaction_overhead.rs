@@ -69,7 +69,7 @@ async fn harness_with_history(
     }));
     let models = Arc::new(Models::new());
     models.set_provider(provider);
-    let mut model = models.get_model("faux", "faux-model").unwrap();
+    let mut model = models.model("faux", "faux-model").unwrap();
     model.context_window = 1_000_000;
     *model_slot.lock().unwrap() = Some(model.clone());
 
@@ -143,7 +143,7 @@ async fn per_round_time_with_long_history() {
 fn threshold_check_time() {
     use loop_agent::harness::compaction::context_tokens;
     let model = loop_ai::providers::faux_provider(loop_ai::providers::FauxScript::new())
-        .get_model("faux-model")
+        .model("faux-model")
         .unwrap();
     for messages in [50usize, 500] {
         for with_usage in [true, false] {

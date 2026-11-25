@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 fn setup_faux(script: FauxScript) -> (Models, loop_ai::Model) {
     let models = Models::new();
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
     (models, model)
 }
 

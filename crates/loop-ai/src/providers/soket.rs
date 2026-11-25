@@ -57,7 +57,7 @@ mod tests {
     fn provider_registers_seed() {
         let p = soket_provider();
         assert_eq!(p.id, SOKET_PROVIDER_ID);
-        assert!(p.get_model(SOKET_DEFAULT_MODEL_ID).is_some());
+        assert!(p.model(SOKET_DEFAULT_MODEL_ID).is_some());
         assert!(p.is_dynamic());
     }
 }

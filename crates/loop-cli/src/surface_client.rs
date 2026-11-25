@@ -352,7 +352,7 @@ impl SurfaceClient {
         let config = self.host.inner.native.config();
         self.host.inner.selected_model = config.config.model.as_deref().and_then(|spec| {
             let (provider, id) = spec.split_once('/')?;
-            self.host.inner.models.get_model(provider, id)
+            self.host.inner.models.model(provider, id)
         });
         self.host.inner.model_note = None;
         self.host.inner.active_skills = config.config.active_skills;
@@ -568,7 +568,7 @@ impl SurfaceClient {
             .into_iter()
             .filter_map(|choice| {
                 let (provider, id) = choice.id.split_once('/')?;
-                self.host.inner.models.get_model(provider, id).or_else(|| {
+                self.host.inner.models.model(provider, id).or_else(|| {
                     self.is_remote()
                         .then(|| remote::model_view(&choice.id, &choice.name))
                 })

@@ -109,7 +109,7 @@ async fn factory_preserves_tools_prompt_permission_and_session() {
     let opened = factory.open(workspace.clone(), &opts).await.unwrap();
     let names: Vec<_> = opened
         .harness
-        .get_tools()
+        .tools()
         .await
         .into_iter()
         .map(|t| t.name)
@@ -434,7 +434,7 @@ async fn runtime_admits_seatbelt_and_protects_its_actual_agent_directory() {
         );
         let read = opened
             .harness
-            .get_tools()
+            .tools()
             .await
             .into_iter()
             .find(|tool| tool.name == "read")

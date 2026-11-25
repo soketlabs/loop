@@ -307,7 +307,7 @@ impl SurfaceClient {
             self.host
                 .inner
                 .models
-                .get_model(provider, id)
+                .model(provider, id)
                 .or_else(|| Some(model_view(spec, id)))
         });
         if let Some(view) = &mut self.remote_resources {

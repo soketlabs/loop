@@ -303,7 +303,7 @@ mod tests {
     fn gemini_speaks_its_own_api_with_a_key() {
         let preset = provider_preset("gemini").unwrap();
         assert_eq!(preset.api_key_envs, ["GEMINI_API_KEY", "GOOGLE_API_KEY"]);
-        let models = preset.provider().get_models();
+        let models = preset.provider().models();
         assert!(models
             .iter()
             .all(|m| m.api == crate::types::API_GOOGLE_GENERATIVE_AI));
@@ -313,7 +313,7 @@ mod tests {
     fn anthropic_speaks_messages_natively() {
         let provider = provider_preset("anthropic").unwrap().provider();
         assert!(provider.is_dynamic());
-        let models = provider.get_models();
+        let models = provider.models();
         assert_eq!(models[0].id, "claude-opus-5-5");
         assert!(models
             .iter()
@@ -334,7 +334,7 @@ mod tests {
         assert!(headers.contains_key("HTTP-Referer"));
         assert!(provider.is_dynamic());
         assert!(
-            provider.get_models().is_empty(),
+            provider.models().is_empty(),
             "no fallback models for OpenRouter"
         );
     }
@@ -343,7 +343,7 @@ mod tests {
     fn soket_keeps_its_seed_until_listed() {
         let provider = provider_preset("soket").unwrap().provider();
         assert_eq!(provider.id, SOKET_PROVIDER_ID);
-        assert!(!provider.get_models().is_empty());
+        assert!(!provider.models().is_empty());
     }
 
     #[test]

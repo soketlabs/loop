@@ -983,7 +983,7 @@ impl Runtime {
             .api_key_envs
             .iter()
             .find_map(|key| env?.get(*key).filter(|value| !value.trim().is_empty()))?;
-        let configured = self.factory.globals.models.get_provider(provider)?;
+        let configured = self.factory.globals.models.provider(provider)?;
         let actual = loop_ai::auth::resolve_provider_auth(
             provider,
             &configured.auth,

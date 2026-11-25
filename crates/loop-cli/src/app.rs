@@ -6375,7 +6375,7 @@ mod tests {
         script.push(response);
         let models = loop_ai::Models::new();
         models.set_provider(faux_provider(script));
-        let model = models.get_model("faux", "faux-model").unwrap();
+        let model = models.model("faux", "faux-model").unwrap();
         let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
         run_agent_loop(
@@ -6663,9 +6663,7 @@ mod reasoning_notice_tests {
             models: vec![spec],
             headers: None,
         }));
-        let model = models
-            .get_model("gentle-warning-test", "test-model")
-            .unwrap();
+        let model = models.model("gentle-warning-test", "test-model").unwrap();
         let mut reported = Default::default();
         assert!(take_reasoning_notice(&model, &mut reported).is_none());
         let mut stream = models.stream_simple(

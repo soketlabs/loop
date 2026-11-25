@@ -106,12 +106,12 @@ enum AdapterSet {
 
 impl Provider {
     /// Sync catalog of known models.
-    pub fn get_models(&self) -> Vec<Model> {
+    pub fn models(&self) -> Vec<Model> {
         self.models.read().clone()
     }
 
     /// Lookup a model by id.
-    pub fn get_model(&self, id: &str) -> Option<Model> {
+    pub fn model(&self, id: &str) -> Option<Model> {
         self.models.read().iter().find(|m| m.id == id).cloned()
     }
 
@@ -307,7 +307,7 @@ impl Models {
     /// Refresh dynamic provider catalogs.
     pub async fn refresh(&self, options: ModelsRefreshOptions) -> ModelsRefreshResult {
         let allow_network = options.allow_network.unwrap_or(true);
-        let providers = self.get_providers();
+        let providers = self.providers();
         let mut result = ModelsRefreshResult::default();
 
         for provider in providers {
@@ -345,7 +345,7 @@ impl Models {
         result
     }
 
-    /// Register or replace a provider (a `Provider` or an `Arc` from [`Self::get_provider`]).
+    /// Register or replace a provider (a `Provider` or an `Arc` from [`Self::provider`]).
     pub fn set_provider(&self, provider: impl Into<Arc<Provider>>) {
         let provider = provider.into();
         let id = provider.id.clone();
@@ -358,47 +358,44 @@ impl Models {
     }
 
     /// All providers.
-    pub fn get_providers(&self) -> Vec<Arc<Provider>> {
+    pub fn providers(&self) -> Vec<Arc<Provider>> {
         self.providers.read().values().cloned().collect()
     }
 
     /// Lookup provider by id.
-    pub fn get_provider(&self, id: &str) -> Option<Arc<Provider>> {
+    pub fn provider(&self, id: &str) -> Option<Arc<Provider>> {
         self.providers.read().get(id).cloned()
     }
 
     /// Sync models from one provider or all.
-    pub fn get_models(&self, provider: Option<&str>) -> Vec<Model> {
+    pub fn models(&self, provider: Option<&str>) -> Vec<Model> {
         let providers = self.providers.read();
         match provider {
-            Some(id) => providers
-                .get(id)
-                .map(|p| p.get_models())
-                .unwrap_or_default(),
-            None => providers.values().flat_map(|p| p.get_models()).collect(),
+            Some(id) => providers.get(id).map(|p| p.models()).unwrap_or_default(),
+            None => providers.values().flat_map(|p| p.models()).collect(),
         }
     }
 
     /// Sync model lookup.
-    pub fn get_model(&self, provider: &str, id: &str) -> Option<Model> {
-        self.providers.read().get(provider)?.get_model(id)
+    pub fn model(&self, provider: &str, id: &str) -> Option<Model> {
+        self.providers.read().get(provider)?.model(id)
     }
 
     /// Check auth without network OAuth refresh.
     pub async fn check_auth(&self, provider_id: &str) -> Option<AuthCheck> {
-        let provider = self.get_provider(provider_id)?;
+        let provider = self.provider(provider_id)?;
         Some(check_provider_auth(provider_id, &provider.auth, self.credentials.as_ref()).await)
     }
 
     /// Models whose providers are configured.
-    pub async fn get_available(&self) -> Vec<Model> {
-        let providers = self.get_providers();
+    pub async fn available(&self) -> Vec<Model> {
+        let providers = self.providers();
         let mut out = Vec::new();
         for provider in providers {
             let check =
                 check_provider_auth(&provider.id, &provider.auth, self.credentials.as_ref()).await;
             if check.configured {
-                out.extend(provider.get_models());
+                out.extend(provider.models());
             }
         }
         out
@@ -439,7 +436,7 @@ impl Models {
         context: &Context,
         options: StreamOptions,
     ) -> AssistantMessageEventStream {
-        let Some(provider) = self.get_provider(&model.provider) else {
+        let Some(provider) = self.provider(&model.provider) else {
             return error_stream(model, format!("provider not found: {}", model.provider));
         };
         self.stream_with_provider(provider, model, context, options)
@@ -532,7 +529,7 @@ impl Models {
         context: &Context,
         options: SimpleStreamOptions,
     ) -> AssistantMessageEventStream {
-        let Some(provider) = self.get_provider(&model.provider) else {
+        let Some(provider) = self.provider(&model.provider) else {
             return error_stream(model, format!("provider not found: {}", model.provider));
         };
 

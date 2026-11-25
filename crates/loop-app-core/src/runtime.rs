@@ -514,7 +514,7 @@ impl Runtime {
         }
         let model = self
             .models
-            .get_model(provider, id)
+            .model(provider, id)
             .filter(|m| !self.credentials.is_logged_out(&m.provider));
         self.native.set_default_model(model);
     }
@@ -619,7 +619,7 @@ impl Runtime {
         .await;
         let mut all_tools: Vec<_> = self
             .harness
-            .get_tools()
+            .tools()
             .await
             .into_iter()
             .filter(|tool| !tool.name.starts_with("mcp__"))
@@ -663,16 +663,14 @@ impl Runtime {
                 let candidate = Models::new();
                 candidate.set_provider(entry.provider());
                 load_custom_models_json(&self.agent_dir, &candidate, std::slice::from_ref(entry))?;
-                candidate
-                    .get_provider(&id)
-                    .expect("registered custom provider")
+                candidate.provider(&id).expect("registered custom provider")
             }
             None => self
                 .models
-                .get_provider(&id)
+                .provider(&id)
                 .ok_or_else(|| anyhow::anyhow!("unknown provider {id}"))?,
         };
-        let previous_models = provider.get_models();
+        let previous_models = provider.models();
         // Validate without saving a candidate key or lifting explicit logout.
         provider
             .refresh_models(loop_ai::RefreshModelsContext {
@@ -683,7 +681,7 @@ impl Runtime {
             })
             .await
             .map_err(|e| anyhow::anyhow!("could not list {name} models: {e}"))?;
-        let model_count = provider.get_models().len();
+        let model_count = provider.models().len();
         if model_count == 0 {
             anyhow::bail!("could not list {name} models: no models were listed");
         }
@@ -707,8 +705,8 @@ impl Runtime {
             }
             return Err(error.context("could not save login"));
         }
-        for model in provider.get_models() {
-            let previous = self.models.get_model(&id, &model.id);
+        for model in provider.models() {
+            let previous = self.models.model(&id, &model.id);
             if previous.as_ref().is_none_or(|previous| {
                 previous.base_url != model.base_url
                     || loop_ai::resolve_compat(&previous.base_url, previous.compat.as_ref())
@@ -726,7 +724,7 @@ impl Runtime {
             .filter(|model| model.provider == id)
             .map(|model| model.id.clone())
         {
-            if let Some(model) = self.models.get_model(&id, &model_id) {
+            if let Some(model) = self.models.model(&id, &model_id) {
                 self.harness.set_model(model.clone()).await;
                 self.selected_model = Some(model);
             } else {
@@ -942,7 +940,7 @@ impl Runtime {
     }
 
     async fn refresh_system_prompt(&self) {
-        let tools = self.harness.get_tools().await;
+        let tools = self.harness.tools().await;
         let selected: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
         let snippets = default_tool_snippets();
         let prompt = build_system_prompt(BuildSystemPromptOptions {
@@ -975,7 +973,7 @@ impl Runtime {
         let preset = loop_ai::providers::provider_preset(&id);
         if custom_index.is_none()
             && preset.is_none()
-            && self.models.get_provider(&id).is_none()
+            && self.models.provider(&id).is_none()
             && self.credentials.get(&id).is_none()
         {
             anyhow::bail!("{id} is not connected");
@@ -1024,7 +1022,7 @@ impl Runtime {
         }
         let model = self
             .models
-            .get_model(provider, id)
+            .model(provider, id)
             .ok_or_else(|| anyhow::anyhow!("model not found: {provider}/{id}"))?;
         let session = self.native.current_session().await;
         loop_protocol::ModelControl::set_model(
@@ -1051,7 +1049,7 @@ impl Runtime {
 
     /// Models of connected providers, in picker order (Soket first).
     pub async fn available_models(&self) -> Vec<loop_ai::Model> {
-        crate::config::providers::sort_models_for_picker(self.models.get_available().await)
+        crate::config::providers::sort_models_for_picker(self.models.available().await)
     }
 
     /// Ids of providers usable right now (presets with a key, then custom providers).
@@ -1686,27 +1684,27 @@ mod tests {
         });
         load_custom_models_json(dir.path(), &models, &[]).unwrap();
 
-        let pinned = models.get_model("zai", "glm-5.3-flash").unwrap();
+        let pinned = models.model("zai", "glm-5.3-flash").unwrap();
         assert_eq!(pinned.context_window, 1_000_000);
         assert_eq!(pinned.max_tokens, 65_536);
         assert!(pinned.reasoning);
 
-        let snake = models.get_model("zai", "snake-model").unwrap();
+        let snake = models.model("zai", "snake-model").unwrap();
         assert_eq!(snake.name, "Snake model");
         assert_eq!(snake.context_window, 512_000);
         assert_eq!(snake.max_tokens, 32_768);
         assert!(snake.reasoning);
 
         // Invalid optional values are ignored, and entries without a string id are skipped.
-        let wrong_types = models.get_model("zai", "wrong-types").unwrap();
+        let wrong_types = models.model("zai", "wrong-types").unwrap();
         assert_eq!(wrong_types.name, "wrong-types");
         assert_eq!(wrong_types.context_window, 128_000);
         assert_eq!(wrong_types.max_tokens, 16_384);
         assert!(!wrong_types.reasoning);
-        assert!(models.get_model("zai", "").is_none());
+        assert!(models.model("zai", "").is_none());
 
         // String entries keep the listing defaults.
-        let plain = models.get_model("zai", "plain-model").unwrap();
+        let plain = models.model("zai", "plain-model").unwrap();
         assert_eq!(plain.context_window, 128_000);
     }
 
@@ -1733,8 +1731,8 @@ mod tests {
         let models = Models::new();
         models.set_provider(entry.provider());
         load_custom_models_json(dir.path(), &models, &[entry]).unwrap();
-        assert!(!models.get_model("gateway", "override").unwrap().reasoning);
-        let kept = models.get_model("gateway", "keep").unwrap();
+        assert!(!models.model("gateway", "override").unwrap().reasoning);
+        let kept = models.model("gateway", "keep").unwrap();
         assert!(kept.reasoning);
         assert_eq!(
             kept.compat.unwrap().thinking_format,

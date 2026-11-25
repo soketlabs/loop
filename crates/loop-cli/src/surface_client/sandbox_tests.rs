@@ -36,7 +36,7 @@ fn command_per_prompt(client: &SurfaceClient) {
         };
         Box::pin(std::future::ready(response))
     }));
-    provider.set_models(client.host.inner.models.get_models(Some("faux")));
+    provider.set_models(client.host.inner.models.models(Some("faux")));
     client.host.inner.models.set_provider(provider);
 }
 

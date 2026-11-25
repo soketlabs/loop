@@ -56,7 +56,7 @@ async fn agent_run(response: FauxResponse) -> anyhow::Result<String> {
     script.push(response);
     let models = Models::new();
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
     let messages = run_agent_loop(
         vec![AgentMessage::user_text("hi")],
         AgentContext::default(),

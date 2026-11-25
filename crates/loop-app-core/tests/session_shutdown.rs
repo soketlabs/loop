@@ -101,7 +101,7 @@ async fn setup_with(
     models.set_provider(faux_provider(script));
     let (tool, parts) = stubborn();
     let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
-        model: models.get_model("faux", "faux-model"),
+        model: models.model("faux", "faux-model"),
         models,
         session,
         host_env: Arc::new(HostExecutionEnv::new(dir)),
