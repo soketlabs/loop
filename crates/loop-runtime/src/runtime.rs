@@ -45,7 +45,9 @@ use tokio::{
 /// Admission limits. Active turns queue when all permits are occupied.
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeLimits {
-    /// Session limit of the Runtime, reported in its status. Must be positive.
+    /// Most Sessions loaded at once. Opening, forking or starting a Subagent
+    /// at the cap first unloads one idle Session; if none can be unloaded the
+    /// request fails with `Busy`. Must be positive.
     pub max_sessions: usize,
     /// Most turns that run at once; further turns queue. Must be positive.
     pub max_active_turns: usize,
