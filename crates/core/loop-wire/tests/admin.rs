@@ -710,3 +710,39 @@ async fn skill_and_workflow_services_are_available_over_session_authority() {
     .await
     .unwrap();
 }
+
+/// A Runtime method is served when the connection has a Runtime, and is an
+/// unknown method when it does not.
+#[tokio::test]
+async fn runtime_methods_need_a_runtime() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let fake = fake().await;
+
+        let conn = raw(served(&fake, Authority::HostLocal)).await;
+        let listed = conn.request(methods::SESSION_LIST, json!({})).await;
+        assert_eq!(listed.unwrap(), json!([]));
+
+        let (server_end, client_end) = memory();
+        let _ = loop_wire::server::serve_with_caller(
+            fake.clone(),
+            None,
+            server_end,
+            info("server"),
+            ServeOptions::default(),
+            loop_protocol::Caller::local_token(loop_wire::local_principal()),
+        );
+        let conn = raw(client_end).await;
+        for method in [methods::SESSION_LIST, methods::SESSION_TREE] {
+            let refused = conn.request(method, json!({})).await;
+            assert!(
+                matches!(&refused, Err(RpcError::Remote { code, message, .. })
+                    if *code == loop_wire::codes::METHOD_NOT_FOUND
+                        && *message == format!("unknown method {method}")),
+                "{method}: {refused:?}"
+            );
+        }
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    })
+    .await
+    .expect("timed out");
+}
