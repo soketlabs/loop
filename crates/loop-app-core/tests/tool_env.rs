@@ -109,7 +109,7 @@ async fn start() -> Runtime {
 }
 
 async fn bash(runtime: &Runtime, command: &str) -> String {
-    let tools = runtime.harness.get_tools().await;
+    let tools = runtime.harness.tools().await;
     let tool = tools.iter().find(|tool| tool.name == "bash").unwrap();
     let result = (tool.execute)("c".into(), json!({ "command": command }), None, None)
         .await

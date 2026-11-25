@@ -30,7 +30,7 @@ enum Kind {
 
 fn assistant_call(id: &str) -> AgentMessage {
     let model = loop_ai::providers::faux_provider(loop_ai::providers::FauxScript::new())
-        .get_model("faux-model")
+        .model("faux-model")
         .unwrap();
     let mut a = AssistantMessage::pending(&model);
     a.content.push(AssistantContent::ToolCall(ToolCall {
@@ -45,7 +45,7 @@ fn assistant_call(id: &str) -> AgentMessage {
 
 fn assistant_text(text: &str) -> AgentMessage {
     let model = loop_ai::providers::faux_provider(loop_ai::providers::FauxScript::new())
-        .get_model("faux-model")
+        .model("faux-model")
         .unwrap();
     let mut a = AssistantMessage::pending(&model);
     a.content.push(AssistantContent::Text(TextContent {
@@ -244,7 +244,7 @@ async fn harness_fork_after_compaction_on_the_sqlite_store() {
     ));
     let harness = AgentHarness::new(AgentHarnessOptions {
         models: Arc::clone(&models),
-        model: models.get_model("faux", "faux-model"),
+        model: models.model("faux", "faux-model"),
         session,
         host_env: Arc::new(HostExecutionEnv::new(std::env::temp_dir())),
         tools: vec![],

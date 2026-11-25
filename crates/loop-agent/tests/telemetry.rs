@@ -136,7 +136,7 @@ async fn run_in_session(
     script.extend(responses);
     let models = Models::new();
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
     let mut config = AgentLoopConfig::new(model);
     config.tool_execution = ToolExecutionMode::Parallel;
     config.stream_options.base.session_id = session_id.map(str::to_string);
@@ -388,7 +388,7 @@ async fn harness_prompt_nests_under_callers_span() {
     script.push(FauxResponse::Text("harness-ok".into()));
     let models = Arc::new(Models::new());
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
     let repo = create_session_repository(create_in_memory_session_store(), None);
     let session = repo.create(None, Some("h".into())).await.unwrap();
     let harness = AgentHarness::new(AgentHarnessOptions {

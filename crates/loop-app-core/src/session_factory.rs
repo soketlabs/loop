@@ -533,7 +533,7 @@ impl OpenedSession {
     ) -> anyhow::Result<Vec<String>> {
         let harness = &self.harness;
         let kept: Vec<_> = harness
-            .get_tools()
+            .tools()
             .await
             .into_iter()
             .filter(|tool| keep.contains(&tool.name.as_str()))
@@ -791,7 +791,7 @@ impl SessionFactory {
         });
         if let Some((provider, id)) = explicit {
             if settings.providers.iter().any(|entry| entry.id == provider)
-                && models.get_model(provider, id).is_none()
+                && models.model(provider, id).is_none()
                 && !credentials.is_logged_out(provider)
             {
                 let refreshed = models
@@ -883,9 +883,8 @@ impl SessionFactory {
             if let Ok(recorded) = recorded {
                 if opts.provider.is_none() && opts.model.is_none() {
                     if let Some((p, m)) = &recorded.model {
-                        if let Some(resolved) = models
-                            .get_model(p, m)
-                            .filter(|_| !credentials.is_logged_out(p))
+                        if let Some(resolved) =
+                            models.model(p, m).filter(|_| !credentials.is_logged_out(p))
                         {
                             model = Some(resolved);
                             model_note = None;
@@ -1032,7 +1031,7 @@ impl SessionFactory {
         )
         .await;
         if !mcp_tools.is_empty() {
-            let mut all_tools = harness.get_tools().await;
+            let mut all_tools = harness.tools().await;
             all_tools.extend(mcp_tools);
             retain_locked(globals.tool_lock(), &mut all_tools);
             harness

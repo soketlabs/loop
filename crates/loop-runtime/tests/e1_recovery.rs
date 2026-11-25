@@ -711,7 +711,7 @@ async fn owner_main() {
         },
     );
     let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
-        model: models.get_model("faux", "faux-model"),
+        model: models.model("faux", "faux-model"),
         models,
         session,
         host_env: Arc::new(HostExecutionEnv::new(&work)),

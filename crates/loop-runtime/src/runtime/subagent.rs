@@ -194,7 +194,7 @@ pub(super) async fn offer(rt: Weak<Runtime>, live: &Arc<LiveSession>) -> Result<
         .entry(TOOL.into())
         .or_insert(ToolPermission::Allow);
     gate.set_permissions(permissions);
-    let mut tools = live.opened.harness.get_tools().await;
+    let mut tools = live.opened.harness.tools().await;
     tools.retain(|tool| tool.name != TOOL);
     tools.push(tool(rt, Arc::downgrade(live)));
     live.opened

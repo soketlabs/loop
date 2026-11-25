@@ -15,7 +15,7 @@ pub struct ExtensionCommand {
 }
 
 /// State contributed by extensions.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ExtensionState {
     /// Registered slash commands.
     pub commands: Vec<ExtensionCommand>,
@@ -63,20 +63,7 @@ pub fn load_extensions(paths: &[std::path::PathBuf]) -> ExtensionState {
 
     Arc::try_unwrap(state)
         .map(|m| m.into_inner().unwrap_or_default())
-        .unwrap_or_else(|arc| arc.lock().unwrap().clone_state())
-}
-
-trait CloneState {
-    fn clone_state(&self) -> ExtensionState;
-}
-
-impl CloneState for ExtensionState {
-    fn clone_state(&self) -> ExtensionState {
-        ExtensionState {
-            commands: self.commands.clone(),
-            notices: self.notices.clone(),
-        }
-    }
+        .unwrap_or_else(|arc| arc.lock().unwrap().clone())
 }
 
 fn run_extension(engine: &mut Engine, path: &Path) -> anyhow::Result<()> {

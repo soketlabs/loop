@@ -61,13 +61,23 @@ impl TracingBackend {
             Self::Otlp => "Any OTLP/HTTP collector · Jaeger, Phoenix, Tempo, OTel Collector",
         }
     }
+}
 
-    /// Parse a `/tracing setup <backend>` argument.
-    pub fn parse(raw: &str) -> Option<Self> {
+/// A string that names no [`TracingBackend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("unknown tracing backend")]
+pub struct ParseTracingBackendError;
+
+impl std::str::FromStr for TracingBackend {
+    type Err = ParseTracingBackendError;
+
+    /// Parse a `/tracing setup <backend>` argument. Case-insensitive;
+    /// `otel` is an alias for `otlp`.
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "langfuse" => Some(Self::Langfuse),
-            "otlp" | "otel" => Some(Self::Otlp),
-            _ => None,
+            "langfuse" => Ok(Self::Langfuse),
+            "otlp" | "otel" => Ok(Self::Otlp),
+            _ => Err(ParseTracingBackendError),
         }
     }
 }
@@ -140,12 +150,12 @@ mod tests {
 
     #[test]
     fn backend_parse_and_labels() {
-        assert_eq!(
-            TracingBackend::parse("Langfuse"),
-            Some(TracingBackend::Langfuse)
-        );
-        assert_eq!(TracingBackend::parse("otel"), Some(TracingBackend::Otlp));
-        assert_eq!(TracingBackend::parse("jaeger"), None);
+        assert_eq!("Langfuse".parse(), Ok(TracingBackend::Langfuse));
+        assert_eq!(" langfuse ".parse(), Ok(TracingBackend::Langfuse));
+        assert_eq!("otlp".parse(), Ok(TracingBackend::Otlp));
+        assert_eq!("otel".parse(), Ok(TracingBackend::Otlp));
+        assert!("jaeger".parse::<TracingBackend>().is_err());
+        assert!("".parse::<TracingBackend>().is_err());
         assert_eq!(TracingBackend::ALL.len(), 2);
     }
 

@@ -132,7 +132,7 @@ async fn runtime_with(
         })
     });
     let provider = loop_ai::providers::faux_provider_fn(responder);
-    let template = provider.get_model("faux-model").unwrap();
+    let template = provider.model("faux-model").unwrap();
     let mut second = template.clone();
     second.id = "second".into();
     second.name = "second".into();

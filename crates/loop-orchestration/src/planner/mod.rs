@@ -16,7 +16,7 @@ pub use task_graph::{TaskConfig, TaskEdge, TaskGraph, TaskId, TaskKind, TaskNode
 use crate::workflow::types::TaskResult;
 
 /// Context available to the planner when decomposing or replanning.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PlannerContext {
     /// Working directory for the workflow.
     pub cwd: Option<String>,
@@ -26,17 +26,6 @@ pub struct PlannerContext {
     pub available_models: Vec<String>,
     /// Additional context (file contents, prior results, etc).
     pub extra: Value,
-}
-
-impl Default for PlannerContext {
-    fn default() -> Self {
-        Self {
-            cwd: None,
-            available_tools: Vec::new(),
-            available_models: Vec::new(),
-            extra: Value::Null,
-        }
-    }
 }
 
 /// Error from the planner.

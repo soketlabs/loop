@@ -671,7 +671,7 @@ impl AgentHarness {
     }
 
     /// Get the current set of tools (cloned, async).
-    pub async fn get_tools(&self) -> Vec<AgentTool> {
+    pub async fn tools(&self) -> Vec<AgentTool> {
         self.tools.read().clone()
     }
 
@@ -762,7 +762,7 @@ impl AgentHarness {
     }
 
     /// Get resources (clone).
-    pub async fn get_resources(&self) -> AgentHarnessResources {
+    pub async fn resources(&self) -> AgentHarnessResources {
         self.resources.read().await.clone()
     }
 

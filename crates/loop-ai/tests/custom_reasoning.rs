@@ -39,7 +39,7 @@ async fn check_format(format: ThinkingFormat) {
                 ..Default::default()
             })],
     }));
-    let model = models.get_model("payload-test", "glm").unwrap();
+    let model = models.model("payload-test", "glm").unwrap();
     for (level, effort) in [
         (Some(ThinkingLevel::Minimal), "minimal"),
         (Some(ThinkingLevel::Low), "low"),

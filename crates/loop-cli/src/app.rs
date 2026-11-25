@@ -1069,7 +1069,7 @@ async fn run_loop(
                         &text,
                         runtime,
                         &mut input,
-                        &pending_setup,
+                        pending_setup.as_ref(),
                         &mut model_picker,
                         &mut fork_picker,
                         &mut skill_picker,
@@ -1105,7 +1105,7 @@ async fn run_loop(
                             &text,
                             runtime,
                             &mut input,
-                            &pending_setup,
+                            pending_setup.as_ref(),
                             &mut model_picker,
                             &mut fork_picker,
                             &mut skill_picker,
@@ -2385,7 +2385,7 @@ fn insert_pasted_text(
     text: &str,
     runtime: &SurfaceClient,
     input: &mut InputBuffer,
-    pending_setup: &Option<SetupPrompt>,
+    pending_setup: Option<&SetupPrompt>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
     skill_picker: &mut Option<SkillPickerState>,
@@ -2444,7 +2444,7 @@ fn insert_pasted_text(
         }
         return;
     }
-    if let Some(prompt) = pending_setup.as_ref() {
+    if let Some(prompt) = pending_setup {
         if prompt.options().is_some() {
             return;
         }
@@ -6375,7 +6375,7 @@ mod tests {
         script.push(response);
         let models = loop_ai::Models::new();
         models.set_provider(faux_provider(script));
-        let model = models.get_model("faux", "faux-model").unwrap();
+        let model = models.model("faux", "faux-model").unwrap();
         let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
         run_agent_loop(
@@ -6663,9 +6663,7 @@ mod reasoning_notice_tests {
             models: vec![spec],
             headers: None,
         }));
-        let model = models
-            .get_model("gentle-warning-test", "test-model")
-            .unwrap();
+        let model = models.model("gentle-warning-test", "test-model").unwrap();
         let mut reported = Default::default();
         assert!(take_reasoning_notice(&model, &mut reported).is_none());
         let mut stream = models.stream_simple(

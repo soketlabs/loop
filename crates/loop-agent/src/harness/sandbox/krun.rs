@@ -28,6 +28,11 @@ pub const LOCAL_DEFAULT_RUNTIME: &str = "runc";
 /// Legacy alias — prefer [`LOCAL_DEFAULT_RUNTIME`].
 pub const KRUN_DEFAULT_RUNTIME: &str = LOCAL_DEFAULT_RUNTIME;
 
+/// A string that names no value of the sandbox option type it was parsed as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("unknown {0}")]
+pub struct ParseSandboxOptionError(&'static str);
+
 /// OCI runtime used by the local Podman sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalSandboxRuntime {
@@ -41,18 +46,23 @@ pub enum LocalSandboxRuntime {
     Krun,
 }
 
-impl LocalSandboxRuntime {
+impl std::str::FromStr for LocalSandboxRuntime {
+    type Err = ParseSandboxOptionError;
+
     /// Parse from settings / CLI (`crun`, `runc`, `runsc`/`gvisor`, `krun`).
-    pub fn parse(s: &str) -> Option<Self> {
+    /// Case-insensitive; surrounding whitespace is ignored.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "crun" => Some(Self::Crun),
-            "runc" => Some(Self::Runc),
-            "runsc" | "gvisor" => Some(Self::Runsc),
-            "krun" => Some(Self::Krun),
-            _ => None,
+            "crun" => Ok(Self::Crun),
+            "runc" => Ok(Self::Runc),
+            "runsc" | "gvisor" => Ok(Self::Runsc),
+            "krun" => Ok(Self::Krun),
+            _ => Err(ParseSandboxOptionError("sandbox runtime")),
         }
     }
+}
 
+impl LocalSandboxRuntime {
     /// Value passed to `podman --runtime`.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -73,16 +83,21 @@ pub enum KrunIsolation {
     Partial,
 }
 
-impl KrunIsolation {
-    /// Parse from settings / options string.
-    pub fn parse(s: &str) -> Option<Self> {
+impl std::str::FromStr for KrunIsolation {
+    type Err = ParseSandboxOptionError;
+
+    /// Parse from settings / options string (`full` or `partial`).
+    /// Case-insensitive; surrounding whitespace is ignored.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "full" => Some(Self::Full),
-            "partial" => Some(Self::Partial),
-            _ => None,
+            "full" => Ok(Self::Full),
+            "partial" => Ok(Self::Partial),
+            _ => Err(ParseSandboxOptionError("sandbox isolation")),
         }
     }
+}
 
+impl KrunIsolation {
     /// Stable string for settings.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -140,7 +155,7 @@ impl KrunSandbox {
             .options
             .get("isolation")
             .and_then(|v| v.as_str())
-            .and_then(KrunIsolation::parse)
+            .and_then(|v| v.parse::<KrunIsolation>().ok())
             .unwrap_or(KrunIsolation::Full);
         let image = config
             .options
@@ -152,7 +167,7 @@ impl KrunSandbox {
             .options
             .get("runtime")
             .and_then(|v| v.as_str())
-            .and_then(LocalSandboxRuntime::parse)
+            .and_then(|v| v.parse::<LocalSandboxRuntime>().ok())
             .unwrap_or(LocalSandboxRuntime::Runc)
             .as_str()
             .to_string();
@@ -1522,5 +1537,29 @@ mod gate_tests {
         assert!(env.read_link(&root.join("out")).await.is_ok());
         // Following it leaves the root: the jail refuses.
         assert!(env.resolve_for_policy(&root.join("out")).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod from_str_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_from_str_accepts_aliases_and_rejects_unknown() {
+        assert_eq!("crun".parse(), Ok(LocalSandboxRuntime::Crun));
+        assert_eq!(" RUNC ".parse(), Ok(LocalSandboxRuntime::Runc));
+        assert_eq!("runsc".parse(), Ok(LocalSandboxRuntime::Runsc));
+        assert_eq!("gvisor".parse(), Ok(LocalSandboxRuntime::Runsc));
+        assert_eq!("Krun".parse(), Ok(LocalSandboxRuntime::Krun));
+        assert!("docker".parse::<LocalSandboxRuntime>().is_err());
+        assert!("".parse::<LocalSandboxRuntime>().is_err());
+    }
+
+    #[test]
+    fn isolation_from_str_accepts_case_and_rejects_unknown() {
+        assert_eq!("full".parse(), Ok(KrunIsolation::Full));
+        assert_eq!(" Partial ".parse(), Ok(KrunIsolation::Partial));
+        assert!("none".parse::<KrunIsolation>().is_err());
+        assert!("".parse::<KrunIsolation>().is_err());
     }
 }

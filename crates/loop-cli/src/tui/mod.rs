@@ -2068,13 +2068,13 @@ mod tests {
     #[test]
     fn banner_omits_an_unknown_endpoint_instead_of_guessing() {
         let model = loop_ai::Models::new()
-            .get_model("faux", "faux-model")
+            .model("faux", "faux-model")
             .unwrap_or_else(|| {
                 let models = loop_ai::Models::new();
                 models.set_provider(loop_ai::providers::faux_provider(
                     loop_ai::providers::FauxScript::new(),
                 ));
-                models.get_model("faux", "faux-model").unwrap()
+                models.model("faux", "faux-model").unwrap()
             });
         let known = banner_text_at(Some(&model), None, "http://e");
         assert!(known.contains("Endpoint"), "{known}");

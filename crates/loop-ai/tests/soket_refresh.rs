@@ -29,7 +29,7 @@ async fn offline_refresh_keeps_seed_or_cache() {
         .await;
     assert!(result.errors.is_empty() || !result.errors.is_empty()); // may error without cache; seed remains
     assert!(models
-        .get_model(SOKET_PROVIDER_ID, SOKET_DEFAULT_MODEL_ID)
+        .model(SOKET_PROVIDER_ID, SOKET_DEFAULT_MODEL_ID)
         .is_some());
 
     // Write a cache entry and refresh offline — should load cache.
@@ -66,6 +66,6 @@ async fn offline_refresh_keeps_seed_or_cache() {
         })
         .await;
     assert!(models2
-        .get_model(SOKET_PROVIDER_ID, "extra-from-cache")
+        .model(SOKET_PROVIDER_ID, "extra-from-cache")
         .is_some());
 }

@@ -91,7 +91,7 @@ async fn logout_blocks_soket_keys_until_verified_login() {
         .iter()
         .any(|m| m.provider == "soket"));
     assert!(runtime.select_model("soket", &model.id).await.is_err());
-    let provider = runtime.models.get_provider("soket").unwrap();
+    let provider = runtime.models.provider("soket").unwrap();
     assert!(loop_ai::auth::resolve_provider_auth(
         "soket",
         &provider.auth,
@@ -106,7 +106,7 @@ async fn logout_blocks_soket_keys_until_verified_login() {
         &["SOKET_API_KEY"]
     ));
     // A forced catalog refresh must not contact a logged-out provider.
-    let original_provider = runtime.models.get_provider("soket").unwrap();
+    let original_provider = runtime.models.provider("soket").unwrap();
     runtime
         .models
         .set_provider(loop_ai::providers::custom_provider(

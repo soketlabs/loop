@@ -37,7 +37,7 @@ fn live_models() -> (Arc<Models>, Model) {
         models: vec![CustomModelSpec::new(model_id.clone())],
         headers: None,
     }));
-    let model = models.get_model("live", &model_id).unwrap();
+    let model = models.model("live", &model_id).unwrap();
     (Arc::new(models), model)
 }
 

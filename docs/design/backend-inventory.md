@@ -43,7 +43,7 @@ agent. Callers reach them through the native backend's own services.
 | Provider tuning | `set_response_header_timeout_ms`, `response_header_timeout_ms` | `loop-cli/src/app.rs:3932,3948` |
 | Sandbox | `sandbox_info`, `set_sandbox`, `clear_sandbox`, `set_tools` | `loop-cli/src/app.rs:3720,3740,3782,3787` |
 | Skills and resources | `activate_skill`, `clear_active_skills`, `set_resources` | `loop-cli/src/app.rs:4268`, `loop-app-core/src/runtime.rs:91,109,113` |
-| Tools and MCP | `get_tools`, `tools_snapshot` | `loop-app-core/src/runtime.rs:790`, `loop-cli/src/mcp_serve.rs:87` |
+| Tools and MCP | `tools`, `tools_snapshot` | `loop-app-core/src/runtime.rs:790`, `loop-cli/src/mcp_serve.rs:87` |
 | JSON hooks | `on` | `loop-app-core/src/hooks_load.rs:64` |
 | Workflows | `start_workflow_from_goal` | `loop-cli/src/app.rs:4394` |
 | Forking | `fork_points`, `fork_session` | `loop-cli/src/app.rs:3098,3142` |

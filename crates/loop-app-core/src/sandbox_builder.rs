@@ -107,13 +107,13 @@ pub fn parse_local_sandbox_flags(args: &[&str]) -> Result<LocalSandboxFlags, Str
                 if flags.isolation.is_some() {
                     return Err("specify only one of --full / --partial".into());
                 }
-                flags.isolation = KrunIsolation::parse(&key);
+                flags.isolation = key.parse::<KrunIsolation>().ok();
             }
             "crun" | "runc" | "runsc" | "gvisor" | "krun" => {
                 if flags.runtime.is_some() {
                     return Err("specify only one runtime (--crun|--runc|--runsc|--krun)".into());
                 }
-                flags.runtime = LocalSandboxRuntime::parse(&key);
+                flags.runtime = key.parse::<LocalSandboxRuntime>().ok();
             }
             other => {
                 return Err(format!(
@@ -173,21 +173,25 @@ impl SandboxRequest {
             .isolation
             .as_deref()
             .map(|value| {
-                KrunIsolation::parse(value).ok_or_else(|| SandboxBuildError::InvalidSetting {
-                    key: "sandbox.isolation",
-                    value: value.into(),
-                    expected: "full or partial",
-                })
+                value
+                    .parse::<KrunIsolation>()
+                    .map_err(|_| SandboxBuildError::InvalidSetting {
+                        key: "sandbox.isolation",
+                        value: value.into(),
+                        expected: "full or partial",
+                    })
             })
             .transpose()?;
         let runtime = settings
             .runtime
             .as_deref()
             .map(|value| {
-                LocalSandboxRuntime::parse(value).ok_or_else(|| SandboxBuildError::InvalidSetting {
-                    key: "sandbox.runtime",
-                    value: value.into(),
-                    expected: "crun, runc, runsc or krun",
+                value.parse::<LocalSandboxRuntime>().map_err(|_| {
+                    SandboxBuildError::InvalidSetting {
+                        key: "sandbox.runtime",
+                        value: value.into(),
+                        expected: "crun, runc, runsc or krun",
+                    }
                 })
             })
             .transpose()?;

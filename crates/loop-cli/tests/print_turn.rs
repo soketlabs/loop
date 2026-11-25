@@ -25,7 +25,7 @@ async fn backend_with(
     script.extend(responses);
     let models = Arc::new(Models::new());
     models.set_provider(faux_provider(script));
-    let model = with_model.then(|| models.get_model("faux", "faux-model").unwrap());
+    let model = with_model.then(|| models.model("faux", "faux-model").unwrap());
     let repo = create_session_repository(create_in_memory_session_store(), None);
     let session = repo.create(None, None).await.unwrap();
     let host: Arc<dyn ExecutionEnv> = Arc::new(HostExecutionEnv::new(std::env::temp_dir()));
@@ -312,7 +312,7 @@ fn length_stop(text: &str) -> FauxResponse {
     use loop_ai::{AssistantContent, AssistantMessage, AssistantMessageEvent, StopReason};
     let model = Models::new();
     model.set_provider(faux_provider(FauxScript::new()));
-    let model = model.get_model("faux", "faux-model").unwrap();
+    let model = model.model("faux", "faux-model").unwrap();
     let mut message = AssistantMessage::pending(&model);
     if !text.is_empty() {
         message

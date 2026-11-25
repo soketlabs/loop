@@ -45,9 +45,7 @@ async fn live_openai_compatible_stream() {
         headers: None,
     }));
 
-    let model = models
-        .get_model("live", &model_id)
-        .expect("model registered");
+    let model = models.model("live", &model_id).expect("model registered");
     let context = Context {
         messages: vec![Message::user_text("Reply with the single word: pong")],
         ..Default::default()

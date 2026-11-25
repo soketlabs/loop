@@ -12,6 +12,7 @@ use crate::planner::task_graph::TaskId;
 use crate::workflow::types::{Artifact, ArtifactKind};
 
 /// In-memory artifact store tracking outputs per task.
+#[derive(Default)]
 pub struct ArtifactStore {
     artifacts: RwLock<HashMap<TaskId, Vec<Artifact>>>,
 }
@@ -19,9 +20,7 @@ pub struct ArtifactStore {
 impl ArtifactStore {
     /// Create an empty artifact store.
     pub fn new() -> Self {
-        Self {
-            artifacts: RwLock::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     /// Store an artifact for a task.
@@ -54,12 +53,6 @@ impl ArtifactStore {
     /// Get all artifacts across all tasks.
     pub async fn all_artifacts(&self) -> HashMap<TaskId, Vec<Artifact>> {
         self.artifacts.read().await.clone()
-    }
-}
-
-impl Default for ArtifactStore {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

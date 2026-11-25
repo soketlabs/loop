@@ -82,12 +82,12 @@ async fn custom_provider_lists_models_with_saved_key() {
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 
     let ids: Vec<_> = models
-        .get_models(Some("gateway"))
+        .models(Some("gateway"))
         .into_iter()
         .map(|m| m.id)
         .collect();
     assert_eq!(ids, ["alpha", "beta"]);
-    let beta = models.get_model("gateway", "beta").unwrap();
+    let beta = models.model("gateway", "beta").unwrap();
     assert_eq!(beta.context_window, 32_000);
 
     let listing = &server.requests()[0];
@@ -106,14 +106,14 @@ async fn pinned_models_survive_listing_and_keep_their_metadata() {
     let models = models_with(gateway(server.base_url(), vec![pinned, extra]), None);
     refresh(&models).await;
     let mut ids: Vec<_> = models
-        .get_models(Some("gateway"))
+        .models(Some("gateway"))
         .into_iter()
         .map(|m| m.id)
         .collect();
     ids.sort();
     assert_eq!(ids, ["alpha", "beta", "local-only"]);
     assert_eq!(
-        models.get_model("gateway", "alpha").unwrap().context_window,
+        models.model("gateway", "alpha").unwrap().context_window,
         8_000
     );
 }
@@ -129,7 +129,7 @@ async fn listing_failure_is_reported_on_forced_refresh() {
     let result = refresh(&models).await;
     let err = &result.errors["gateway"];
     assert!(err.contains("401"), "{err}");
-    assert!(models.get_models(Some("gateway")).is_empty());
+    assert!(models.models(Some("gateway")).is_empty());
 }
 
 #[tokio::test]
@@ -137,7 +137,7 @@ async fn chat_requests_carry_key_and_provider_headers() {
     let server = FakeHttpServer::start(route);
     let models = models_with(gateway(server.base_url(), vec![]), Some("k-123"));
     refresh(&models).await;
-    let model = models.get_model("gateway", "alpha").unwrap();
+    let model = models.model("gateway", "alpha").unwrap();
     let context = Context {
         system_prompt: None,
         messages: vec![Message::user_text("hello")],
@@ -175,7 +175,7 @@ async fn listing_skips_models_without_tool_support() {
     let models = models_with(gateway(server.base_url(), vec![]), None);
     refresh(&models).await;
     let ids: Vec<_> = models
-        .get_models(Some("gateway"))
+        .models(Some("gateway"))
         .into_iter()
         .map(|m| m.id)
         .collect();

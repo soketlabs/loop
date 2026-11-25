@@ -21,7 +21,7 @@
 //!     headers: None,
 //! }));
 //!
-//! let model = models.get_model("ollama", "llama3.2").unwrap();
+//! let model = models.model("ollama", "llama3.2").unwrap();
 //! let context = Context {
 //!     system_prompt: Some("You are helpful.".into()),
 //!     messages: vec![Message::user_text("Hello")],

@@ -140,8 +140,9 @@ fn asserted_caller(request: &Request) -> Result<loop_protocol::Caller, String> {
         }
     };
     // An unknown kind is refused by `Caller::asserted`.
-    let kind =
-        PrincipalKind::parse(one(edge_headers::PRINCIPAL_KIND)?).map_err(|e| e.to_string())?;
+    let kind = one(edge_headers::PRINCIPAL_KIND)?
+        .parse::<PrincipalKind>()
+        .map_err(|e| e.to_string())?;
     let principal = Principal::new(
         kind,
         one(edge_headers::PRINCIPAL_ISSUER)?,
