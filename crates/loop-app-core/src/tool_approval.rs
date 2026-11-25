@@ -116,7 +116,10 @@ pub enum ApprovalDecision {
     /// Accept this and all further calls in the same group for this session.
     AcceptSession,
     /// Reject; optional reason guides the model.
-    Reject { reason: Option<String> },
+    Reject {
+        /// Text passed back to the model to explain the rejection.
+        reason: Option<String>,
+    },
 }
 
 /// Kind of approval prompt.

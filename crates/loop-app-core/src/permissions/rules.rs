@@ -130,7 +130,7 @@ pub fn search_may_show(
 /// Whether a search tool (`grep`, `glob`, `ls`) may show or read the file
 /// at `path`: not when a `read` rule, or the tool's own rule, denies that
 /// path. The rules see the path as the walk built it and the file it names
-/// ([`PathForms`]), so a symlink or `..` into a denied tree is hidden too.
+/// (`PathForms`), so a symlink or `..` into a denied tree is hidden too.
 /// Relative patterns match against `cwd`, `workspace` and `bases`
 /// ([`Call::rule_bases`]). The search root is checked separately, as the
 /// call's subject. Paths resolve on the Runtime host.
@@ -195,7 +195,7 @@ const READ_ONLY_GIT: &[&str] = &[
 ];
 
 /// Whether every part of `command` only reads: a command from
-/// [`READ_ONLY_COMMANDS`] or a read-only `git` subcommand, with no output
+/// `READ_ONLY_COMMANDS` or a read-only `git` subcommand, with no output
 /// redirect, command substitution or variable assignment.
 pub fn read_only_command(command: &str) -> bool {
     // Only a command the reader models ([`parse`]); an unreadable one can
@@ -646,7 +646,7 @@ fn system_prefix(_paths: &PathFacts, _path: &Path) -> (PathBuf, usize) {
 ///
 /// A path pattern (`read`, `write`, `edit`, `grep`, `glob`, `ls`) sees the
 /// path as written and the file it names through symlinks and `..`
-/// ([`PathForms`]); only then does this look at the filesystem.
+/// (`PathForms`); only then does this look at the filesystem.
 pub fn rule_for(rules: &BTreeMap<String, ToolPermission>, call: &Call) -> Rule {
     rule_with(rules, call, &OnceCell::new())
 }
