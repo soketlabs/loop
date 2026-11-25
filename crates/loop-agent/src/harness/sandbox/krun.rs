@@ -332,6 +332,12 @@ impl Sandbox for KrunSandbox {
         )
     }
 
+    /// The container's env.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called before a successful [`Sandbox::start`]: the env only
+    /// exists once the container is running.
     fn env(&self) -> Arc<dyn ExecutionEnv> {
         self.env
             .read()

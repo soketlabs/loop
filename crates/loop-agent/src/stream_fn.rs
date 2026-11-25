@@ -7,6 +7,8 @@ use std::sync::Arc;
 use loop_ai::{AssistantMessageEventStream, Context, Model, Models, SimpleStreamOptions};
 use parking_lot::RwLock;
 
+use crate::agent_loop::AgentLoopError;
+
 /// Stream function used by the agent loop.
 ///
 /// Contract:
@@ -49,9 +51,14 @@ pub fn stream_fn_from_models(models: Arc<Models>) -> StreamFn {
     })
 }
 
-/// Resolve an explicit stream fn or the default; panics if neither is set.
-pub(crate) fn resolve_stream_fn(stream_fn: Option<StreamFn>) -> StreamFn {
+/// Resolve an explicit stream fn or the process-wide default.
+///
+/// # Errors
+///
+/// Returns [`AgentLoopError::NoStreamFn`] if `stream_fn` is `None` and no
+/// default was installed with [`set_default_stream_fn`].
+pub(crate) fn resolve_stream_fn(stream_fn: Option<StreamFn>) -> Result<StreamFn, AgentLoopError> {
     stream_fn
         .or_else(get_default_stream_fn)
-        .expect("stream_fn required: pass one or call set_default_stream_fn")
+        .ok_or(AgentLoopError::NoStreamFn)
 }
