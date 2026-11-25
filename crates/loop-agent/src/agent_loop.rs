@@ -30,6 +30,9 @@ use crate::types::{
 pub type AgentEventStream = tokio_stream::wrappers::UnboundedReceiverStream<AgentEvent>;
 
 /// Start an observational agent loop with new prompt messages.
+///
+/// If `stream_fn` is `None` and no default is installed, the stream carries one
+/// assistant message with `stop_reason` `error` and then `agent_end`.
 pub fn agent_loop(
     prompts: Vec<AgentMessage>,
     context: AgentContext,
@@ -38,7 +41,13 @@ pub fn agent_loop(
     stream_fn: Option<StreamFn>,
 ) -> AgentEventStream {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let stream_fn = resolve_stream_fn(stream_fn);
+    let stream_fn = match resolve_stream_fn(stream_fn) {
+        Ok(stream_fn) => stream_fn,
+        Err(error) => {
+            send_setup_failure(&tx, &config.model, &error);
+            return tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        }
+    };
     tokio::spawn(
         async move {
             let emit: AgentEventSink = Arc::new(move |event| {
@@ -55,6 +64,9 @@ pub fn agent_loop(
 }
 
 /// Continue an observational loop from existing context (no new prompt).
+///
+/// If `stream_fn` is `None` and no default is installed, the stream carries one
+/// assistant message with `stop_reason` `error` and then `agent_end`.
 pub fn agent_loop_continue(
     context: AgentContext,
     config: AgentLoopConfig,
@@ -62,7 +74,13 @@ pub fn agent_loop_continue(
     stream_fn: Option<StreamFn>,
 ) -> AgentEventStream {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let stream_fn = resolve_stream_fn(stream_fn);
+    let stream_fn = match resolve_stream_fn(stream_fn) {
+        Ok(stream_fn) => stream_fn,
+        Err(error) => {
+            send_setup_failure(&tx, &config.model, &error);
+            return tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        }
+    };
     tokio::spawn(
         async move {
             let emit: AgentEventSink = Arc::new(move |event| {
@@ -79,6 +97,11 @@ pub fn agent_loop_continue(
 }
 
 /// Run the agent loop with an awaited event sink.
+///
+/// # Errors
+///
+/// Returns [`AgentLoopError::NoStreamFn`] before emitting any event if
+/// `stream_fn` is `None` and no default is installed.
 pub async fn run_agent_loop(
     prompts: Vec<AgentMessage>,
     context: AgentContext,
@@ -87,7 +110,7 @@ pub async fn run_agent_loop(
     cancel: Option<CancellationToken>,
     stream_fn: Option<StreamFn>,
 ) -> Result<Vec<AgentMessage>, AgentLoopError> {
-    let stream_fn = resolve_stream_fn(stream_fn);
+    let stream_fn = resolve_stream_fn(stream_fn)?;
     let mut new_messages = prompts.clone();
     let mut current_context = AgentContext {
         system_prompt: context.system_prompt,
@@ -126,6 +149,12 @@ pub async fn run_agent_loop(
 }
 
 /// Continue with an awaited sink.
+///
+/// # Errors
+///
+/// Returns [`AgentLoopError::CannotContinue`] if the context is empty or ends
+/// with an assistant message, and [`AgentLoopError::NoStreamFn`] if
+/// `stream_fn` is `None` and no default is installed. No event is emitted.
 pub async fn run_agent_loop_continue(
     context: AgentContext,
     config: AgentLoopConfig,
@@ -144,7 +173,7 @@ pub async fn run_agent_loop_continue(
         ));
     }
 
-    let stream_fn = resolve_stream_fn(stream_fn);
+    let stream_fn = resolve_stream_fn(stream_fn)?;
     let mut new_messages = Vec::new();
     let mut current_context = context;
 
@@ -176,6 +205,42 @@ pub enum AgentLoopError {
     /// Continue validation failed.
     #[error("cannot continue: {0}")]
     CannotContinue(String),
+    /// No stream fn was passed and no default is installed.
+    #[error("no stream fn: pass one or call set_default_stream_fn")]
+    NoStreamFn,
+}
+
+/// Report a failure found before the loop could start on an observational
+/// stream: one assistant message with `stop_reason` `error`, then `agent_end`.
+fn send_setup_failure(
+    tx: &tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+    model: &loop_ai::Model,
+    error: &AgentLoopError,
+) {
+    let mut message = AssistantMessage::pending(model);
+    message.stop_reason = StopReason::Error;
+    message.error_message = Some(error.to_string());
+    let message = AgentMessage::assistant(message);
+    let events = [
+        AgentEvent::AgentStart,
+        AgentEvent::TurnStart,
+        AgentEvent::MessageStart {
+            message: message.clone(),
+        },
+        AgentEvent::MessageEnd {
+            message: message.clone(),
+        },
+        AgentEvent::TurnEnd {
+            message: message.clone(),
+            tool_results: vec![],
+        },
+        AgentEvent::AgentEnd {
+            messages: vec![message],
+        },
+    ];
+    for event in events {
+        let _ = tx.send(event);
+    }
 }
 
 async fn emit_ev(emit: &AgentEventSink, event: AgentEvent) {

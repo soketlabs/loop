@@ -430,3 +430,61 @@ async fn a_context_overflow_is_not_continued() {
         "{msgs:?}"
     );
 }
+
+// No test in this binary installs a default stream fn, so the global stays
+// unset here. A test that sets it must live in its own test binary.
+#[tokio::test]
+async fn a_missing_stream_fn_ends_the_stream_with_an_error() {
+    let (_models, model) = setup_faux(FauxScript::new());
+    let context = AgentContext {
+        system_prompt: "sys".into(),
+        messages: vec![],
+        tools: None,
+    };
+    let events = collect_agent_events(agent_loop(
+        vec![AgentMessage::user_text("hi")],
+        context,
+        AgentLoopConfig::new(model),
+        None,
+        None,
+    ))
+    .await;
+    let types: Vec<_> = events.iter().map(|e| e.type_name()).collect();
+    assert_eq!(types.first(), Some(&"agent_start"));
+    let Some(AgentEvent::AgentEnd { messages }) = events.last() else {
+        panic!("expected agent_end last: {types:?}");
+    };
+    let message = messages
+        .last()
+        .and_then(|m| m.as_assistant())
+        .expect("an assistant message");
+    assert_eq!(message.stop_reason, loop_ai::StopReason::Error);
+    assert!(message
+        .error_message
+        .as_deref()
+        .is_some_and(|e| e.contains("set_default_stream_fn")));
+}
+
+#[tokio::test]
+async fn run_agent_loop_without_a_stream_fn_returns_an_error() {
+    let (_models, model) = setup_faux(FauxScript::new());
+    let context = AgentContext {
+        system_prompt: "sys".into(),
+        messages: vec![],
+        tools: None,
+    };
+    let emit: loop_agent::AgentEventSink = Arc::new(|_| Box::pin(async {}));
+    let result = run_agent_loop(
+        vec![AgentMessage::user_text("hi")],
+        context,
+        AgentLoopConfig::new(model),
+        emit,
+        None,
+        None,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(loop_agent::AgentLoopError::NoStreamFn)
+    ));
+}
