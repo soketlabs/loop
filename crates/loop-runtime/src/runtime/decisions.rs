@@ -72,16 +72,26 @@ impl DecisionSink for LogDecisions {
                 .and_then(|native| native.current_turn())
                 .map(|turn| turn.0),
             // A decision with no caller (an in-process prompt, work the
-            // Runtime started) is the Runtime's own.
+            // Runtime started) is the Runtime's own. A poisoned turn caller
+            // also lands here, but `record` then refuses to write it, and
+            // the gate refuses the call: it is never recorded as the
+            // Runtime's.
             caller: self
                 .escalations
                 .turn_caller()
+                .ok()
+                .flatten()
                 .unwrap_or_else(|| Caller::host(Principal::runtime())),
             answered_by: escalation.and_then(|id| self.escalations.take_answered_by(id)),
         }
     }
 
     async fn record(&self, record: &PolicyDecisionRecord) -> Result<(), DecisionError> {
+        // Who acts is unknown (see `context`): refuse rather than record
+        // the decision as the Runtime's.
+        if let Err(error) = self.escalations.turn_caller() {
+            return Err(DecisionError::Write(error.to_string()));
+        }
         // `tool_call` first: commit what the backend already sent. An
         // allowed read has no effect to order, so it skips the barrier.
         let barrier_first = !loop_app_core::permissions::decision::has_no_effect(record);
