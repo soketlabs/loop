@@ -20,35 +20,60 @@ pub const SPAN_TARGET: &str = "loop_telemetry";
 
 /// Langfuse / OTel attribute keys.
 pub mod keys {
+    /// Observation type (`agent`, `generation`, `tool` or `span`).
     pub const OBSERVATION_TYPE: &str = "langfuse.observation.type";
+    /// JSON input of the observation.
     pub const INPUT: &str = "langfuse.observation.input";
+    /// JSON output of the observation.
     pub const OUTPUT: &str = "langfuse.observation.output";
+    /// Model name of a generation.
     pub const MODEL_NAME: &str = "langfuse.observation.model.name";
+    /// JSON request parameters of a generation.
     pub const MODEL_PARAMETERS: &str = "langfuse.observation.model.parameters";
+    /// JSON map of token counts of a generation.
     pub const USAGE_DETAILS: &str = "langfuse.observation.usage_details";
+    /// JSON map of costs of a generation.
     pub const COST_DETAILS: &str = "langfuse.observation.cost_details";
+    /// RFC 3339 time the first output token arrived.
     pub const COMPLETION_START_TIME: &str = "langfuse.observation.completion_start_time";
+    /// Observation level; `ERROR` marks a failed observation.
     pub const LEVEL: &str = "langfuse.observation.level";
+    /// Message that explains the status of the observation.
     pub const STATUS_MESSAGE: &str = "langfuse.observation.status_message";
+    /// Prefix of observation metadata keys; the metadata key follows it.
     pub const METADATA_PREFIX: &str = "langfuse.observation.metadata.";
+    /// Session id of the trace.
     pub const SESSION_ID: &str = "langfuse.session.id";
+    /// Name of the trace.
     pub const TRACE_NAME: &str = "langfuse.trace.name";
+    /// Tags of the trace, as a string array.
     pub const TRACE_TAGS: &str = "langfuse.trace.tags";
+    /// Prefix of trace metadata keys; the metadata key follows it.
     pub const TRACE_METADATA_PREFIX: &str = "langfuse.trace.metadata.";
+    /// User id of the trace.
     pub const USER_ID: &str = "langfuse.user.id";
+    /// Version of Loop that produced the trace.
     pub const RELEASE: &str = "langfuse.release";
+    /// Deployment environment of the trace.
     pub const ENVIRONMENT: &str = "langfuse.environment";
+    /// Provider of a generation (OpenTelemetry GenAI convention).
     pub const GEN_AI_SYSTEM: &str = "gen_ai.system";
+    /// Name of the tool a tool span ran (OpenTelemetry GenAI convention).
     pub const GEN_AI_TOOL_NAME: &str = "gen_ai.tool.name";
+    /// Id of the tool call a tool span ran (OpenTelemetry GenAI convention).
     pub const GEN_AI_TOOL_CALL_ID: &str = "gen_ai.tool.call.id";
 }
 
 /// Langfuse observation types used by Loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObservationType {
+    /// An agent run.
     Agent,
+    /// One LLM call.
     Generation,
+    /// One tool execution.
     Tool,
+    /// A plain grouping span.
     Span,
 }
 
@@ -99,12 +124,19 @@ pub fn span(name: &str) -> Span {
 /// Trace-level attributes; set once, usually on the root span.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TraceAttrs {
+    /// Trace name.
     pub name: Option<String>,
+    /// Loop Session id, so Langfuse groups the traces of one Session.
     pub session_id: Option<String>,
+    /// User id.
     pub user_id: Option<String>,
+    /// Free-form tags. Not recorded when empty.
     pub tags: Vec<String>,
+    /// Trace metadata, one attribute per entry.
     pub metadata: BTreeMap<String, String>,
+    /// Deployment environment name.
     pub environment: Option<String>,
+    /// Version of Loop.
     pub release: Option<String>,
 }
 

@@ -24,7 +24,7 @@ pub const USAGE_LOG_VERSION: u32 = 1;
 /// How long usage log files are kept.
 pub const TRACE_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Whether `path` is a trace file written by [`trace_file_path`].
+/// Whether `path` is a usage log file: `loop-<timestamp>-<pid>.jsonl`.
 pub fn is_trace_file(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "jsonl")
         && path

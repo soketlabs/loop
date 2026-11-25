@@ -19,11 +19,16 @@ use crate::aggregate::{summarize_since, Summary};
 /// One span as written by the file exporter; unknown fields are ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpanRecord {
+    /// Hex id of the trace the span belongs to.
     pub trace_id: String,
+    /// Span name.
     pub name: String,
+    /// When the span started.
     pub start_time: DateTime<Utc>,
+    /// Span duration in milliseconds; 0 when the line has none.
     #[serde(default)]
     pub duration_ms: f64,
+    /// Span attributes, keyed by the names in [`loop_telemetry::obs::keys`].
     #[serde(default)]
     pub attributes: Map<String, Value>,
 }
