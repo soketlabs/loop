@@ -122,7 +122,7 @@ impl EventLog for MemoryEventLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::planner::task_graph::*;
+    use crate::planner::task_graph::{TaskGraph, TaskKind, TaskNode, TaskStatus};
 
     fn test_graph() -> TaskGraph {
         let mut g = TaskGraph::new();

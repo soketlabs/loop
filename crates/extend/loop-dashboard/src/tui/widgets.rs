@@ -1,6 +1,6 @@
 //! Small drawing helpers and number formatting shared by the views.
 
-use super::*;
+use super::{Alignment, Cell, Color, DateTime, DayRow, Line, NaiveDate, Range, Rect, Summary, Utc};
 
 /// A table column. A leading `>` in `header` right-aligns it; on narrow terminals the
 /// columns with the lowest `keep` are dropped first.

@@ -676,7 +676,7 @@ async fn detaching_mid_turn_clears_observed_busy() {
 #[tokio::test]
 async fn tree_wire_reset_detaches_only_legacy_session_and_rename_is_metadata() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        use loop_protocol::rpc::*;
+        use loop_protocol::rpc::{ClientCapabilities, ForkParams, ImportParams, NavigateParams, RenameParams, SessionParams, TreeParams, ViewParams, };
         use loop_protocol::SessionUpdate;
         let dir = tempfile::tempdir().unwrap();
         let log = Arc::new(MemoryEventLog::new());
@@ -753,7 +753,7 @@ fn detach_notices(events: &[UpdateEnvelope]) -> usize {
 #[tokio::test]
 async fn a_legacy_reattach_recovers_the_current_branch() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        use loop_protocol::rpc::*;
+        use loop_protocol::rpc::{ClientCapabilities, NavigateParams, TreeParams};
         let dir = tempfile::tempdir().unwrap();
         let log = Arc::new(MemoryEventLog::new());
         let rt = runtime(dir.path(), log.clone()).await;

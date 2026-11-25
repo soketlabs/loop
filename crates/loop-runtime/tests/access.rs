@@ -292,7 +292,10 @@ fn ok<T>(_: T) {}
 /// Call `method` on `session` for the caller in scope. `write` picks the
 /// changing form of a method that reads or writes.
 async fn call(rt: &Arc<Runtime>, method: &str, s: &SessionRef, write: bool) -> BackendResult<()> {
-    use loop_protocol::rpc::*;
+    use loop_protocol::rpc::{
+        methods, CloneParams, ForkParams, NavigateParams, RenameParams, SessionParams, TreeParams,
+        ViewParams,
+    };
     let r = rt.as_ref();
     let session = s.clone();
     match method {

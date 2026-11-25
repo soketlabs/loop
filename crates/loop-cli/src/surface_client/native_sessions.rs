@@ -8,7 +8,17 @@ use loop_agent::{
     },
     native_backend::NativeBackend,
 };
-use loop_protocol::{rpc::*, *};
+use loop_protocol::{
+    rpc::{
+        CloneParams, DestinationResult, ExportResult, ForkParams, ForkPoint, ImportParams,
+        MutationResult, NavigateParams, NavigateResult, RenameParams, SessionInfo,
+        SessionListSummary, SessionParams, SessionSnapshot, TreeEntry, TreeParams, TreeResult,
+        TtfbResult, SESSION_RESPONSE_LIMIT, SESSION_TRANSFER_LIMIT,
+    },
+    AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, Compaction,
+    ContentBlock, ErrorCategory, LocalShell, ModelChoices, ModelControl, SessionRef, SessionSpec,
+    SessionStats, SessionUpdate, TurnHandle, UpdateEnvelope,
+};
 use loop_wire::{control::Attachment, RuntimeControl};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;

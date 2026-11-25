@@ -7,7 +7,11 @@ use loop_ai::{
     providers::{faux_provider_fn, FauxResponse},
     Context, Message, ToolCall,
 };
-use loop_protocol::admin::*;
+use loop_protocol::admin::{
+    AdminAction, DefaultsParams, DefaultsPatch, PermissionModeParams, ReloadParams, SandboxAction,
+    SandboxChoice, SandboxParams, SandboxResult, SkillStatus, SkillsParams, TemplatesParams,
+    TrustParams,
+};
 use loop_wire::RuntimeAdmin;
 
 const LIMIT: Duration = Duration::from_secs(60);

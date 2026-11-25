@@ -1445,7 +1445,7 @@ async fn closing_a_parent_with_a_running_subagent_needs_force_and_cascades() {
 #[tokio::test]
 async fn the_daemon_serves_workspace_admin_and_host_only_methods_on_its_socket() {
     bounded(async {
-        use loop_protocol::admin::*;
+        use loop_protocol::admin::{DefaultsParams, DefaultsPatch, ReloadParams, UsageParams};
         use loop_wire::RuntimeAdmin;
         let fx = Fixture::new();
         let serve = fx.serve().await;

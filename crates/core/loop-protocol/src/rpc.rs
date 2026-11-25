@@ -853,8 +853,17 @@ pub fn json_schema() -> Value {
         reference(generator.subschema_for::<crate::session_services::WorkflowResult>());
     let snapshot = reference(generator.subschema_for::<SessionSnapshot>());
     let admin = {
-        use crate::admin::*;
-        use crate::host::*;
+        use crate::admin::{
+            DefaultsParams, DefaultsResult, McpParams, McpResult, PermissionModeParams,
+            PermissionModeResult, ReloadParams, ReloadResult, RuntimeSessionsResult, SandboxParams,
+            SandboxResult, SettingsParams, SettingsResult, SkillsParams, SkillsResult,
+            TemplatesParams, TemplatesResult, TrustParams, TrustResult, UsageParams, UsageResult,
+            WebSearchParams, WebSearchResult,
+        };
+        use crate::host::{
+            McpAuthParams, McpAuthResult, ProvidersParams, ProvidersResult, TracingParams,
+            TracingResult,
+        };
         let r = |schema| reference(schema);
         vec![
             (

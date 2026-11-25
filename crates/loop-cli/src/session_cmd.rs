@@ -62,7 +62,7 @@ pub async fn run(args: SessionArgs) -> anyhow::Result<()> {
     drive(backend, events, args, &mut terminal).await
 }
 mod unix {
-    use super::*;
+    use super::SessionArgs;
     use loop_protocol::{
         rpc::{methods, InteractWithdrawnParams, PeerInfo, SessionInfo},
         AgentBackend, ContentBlock, HostServices, InteractionOutcome, InteractionRequest,

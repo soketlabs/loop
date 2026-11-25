@@ -104,7 +104,7 @@ impl PermissionMode {
 
     /// The Setting this mode's preset gives `capability`.
     pub fn setting(self, capability: &Capability) -> Setting {
-        use Capability::*;
+        use Capability::{Mcp, Other, ReadFiles, Shell, WebFetch, WebSearch, WriteFiles};
         use State::{Ask as AskFirst, Off, On};
         match (self, capability) {
             (Self::Plan, _) => Self::ReadOnly.setting(capability),

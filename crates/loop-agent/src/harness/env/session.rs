@@ -1,5 +1,8 @@
 //! A Session's caller environment layered over its confined filesystem and shell.
-use super::super::types::*;
+use super::super::types::{
+    ExecutionEnv, ExecutionError, FileError, FileInfo, FileSystem, PathMetadata, PolicyPath, Shell,
+    ShellExecOptions, ShellOutput,
+};
 use async_trait::async_trait;
 use std::{
     collections::{BTreeMap, BTreeSet},

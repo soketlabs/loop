@@ -1,6 +1,7 @@
 //! Workflow admission, deduplication and ordered publication for NativeBackend.
-use super::*;
-use loop_protocol::session_services::*;
+use loop_protocol::session_services::{
+    WorkflowCompletion, WorkflowParams, WorkflowProgress, WorkflowResult, WorkflowState,
+};
 
 pub(super) struct WorkflowRun {
     pub fingerprint: String,
