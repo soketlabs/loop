@@ -31,8 +31,9 @@ pub type AgentEventStream = tokio_stream::wrappers::UnboundedReceiverStream<Agen
 
 /// Start an observational agent loop with new prompt messages.
 ///
-/// If `stream_fn` is `None` and no default is installed, the stream carries one
-/// assistant message with `stop_reason` `error` and then `agent_end`.
+/// If `stream_fn` is `None` and no default is installed, the stream carries the
+/// prompts, one assistant message with `stop_reason` `error`, and then
+/// `agent_end` with the prompts first.
 pub fn agent_loop(
     prompts: Vec<AgentMessage>,
     context: AgentContext,
@@ -44,7 +45,7 @@ pub fn agent_loop(
     let stream_fn = match resolve_stream_fn(stream_fn) {
         Ok(stream_fn) => stream_fn,
         Err(error) => {
-            send_setup_failure(&tx, &config.model, &error);
+            send_setup_failure(&tx, prompts, &config.model, &error);
             return tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
         }
     };
@@ -65,7 +66,8 @@ pub fn agent_loop(
 
 /// Continue an observational loop from existing context (no new prompt).
 ///
-/// If `stream_fn` is `None` and no default is installed, the stream carries one
+/// If the context cannot be continued, the stream ends with no event. Else, if
+/// `stream_fn` is `None` and no default is installed, the stream carries one
 /// assistant message with `stop_reason` `error` and then `agent_end`.
 pub fn agent_loop_continue(
     context: AgentContext,
@@ -76,8 +78,11 @@ pub fn agent_loop_continue(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let stream_fn = match resolve_stream_fn(stream_fn) {
         Ok(stream_fn) => stream_fn,
+        Err(_) if check_can_continue(&context).is_err() => {
+            return tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        }
         Err(error) => {
-            send_setup_failure(&tx, &config.model, &error);
+            send_setup_failure(&tx, Vec::new(), &config.model, &error);
             return tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
         }
     };
@@ -162,16 +167,7 @@ pub async fn run_agent_loop_continue(
     cancel: Option<CancellationToken>,
     stream_fn: Option<StreamFn>,
 ) -> Result<Vec<AgentMessage>, AgentLoopError> {
-    if context.messages.is_empty() {
-        return Err(AgentLoopError::CannotContinue(
-            "no messages in context".into(),
-        ));
-    }
-    if context.messages.last().map(|m| m.role()) == Some("assistant") {
-        return Err(AgentLoopError::CannotContinue(
-            "cannot continue from message role: assistant".into(),
-        ));
-    }
+    check_can_continue(&context)?;
 
     let stream_fn = resolve_stream_fn(stream_fn)?;
     let mut new_messages = Vec::new();
@@ -210,10 +206,28 @@ pub enum AgentLoopError {
     NoStreamFn,
 }
 
+/// Check that `context` can be continued: it has messages and does not end
+/// with an assistant message.
+fn check_can_continue(context: &AgentContext) -> Result<(), AgentLoopError> {
+    if context.messages.is_empty() {
+        return Err(AgentLoopError::CannotContinue(
+            "no messages in context".into(),
+        ));
+    }
+    if context.messages.last().map(|m| m.role()) == Some("assistant") {
+        return Err(AgentLoopError::CannotContinue(
+            "cannot continue from message role: assistant".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Report a failure found before the loop could start on an observational
-/// stream: one assistant message with `stop_reason` `error`, then `agent_end`.
+/// stream, in the order of a normal run: the prompts, one assistant message
+/// with `stop_reason` `error`, then `agent_end` with the prompts first.
 fn send_setup_failure(
     tx: &tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+    prompts: Vec<AgentMessage>,
     model: &loop_ai::Model,
     error: &AgentLoopError,
 ) {
@@ -221,9 +235,18 @@ fn send_setup_failure(
     message.stop_reason = StopReason::Error;
     message.error_message = Some(error.to_string());
     let message = AgentMessage::assistant(message);
-    let events = [
-        AgentEvent::AgentStart,
-        AgentEvent::TurnStart,
+    let mut events = vec![AgentEvent::AgentStart, AgentEvent::TurnStart];
+    for prompt in &prompts {
+        events.push(AgentEvent::MessageStart {
+            message: prompt.clone(),
+        });
+        events.push(AgentEvent::MessageEnd {
+            message: prompt.clone(),
+        });
+    }
+    let mut messages = prompts;
+    messages.push(message.clone());
+    events.extend([
         AgentEvent::MessageStart {
             message: message.clone(),
         },
@@ -231,13 +254,11 @@ fn send_setup_failure(
             message: message.clone(),
         },
         AgentEvent::TurnEnd {
-            message: message.clone(),
+            message,
             tool_results: vec![],
         },
-        AgentEvent::AgentEnd {
-            messages: vec![message],
-        },
-    ];
+        AgentEvent::AgentEnd { messages },
+    ]);
     for event in events {
         let _ = tx.send(event);
     }

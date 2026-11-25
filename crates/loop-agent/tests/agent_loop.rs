@@ -441,8 +441,9 @@ async fn a_missing_stream_fn_ends_the_stream_with_an_error() {
         messages: vec![],
         tools: None,
     };
+    let prompt = AgentMessage::user_text("hi");
     let events = collect_agent_events(agent_loop(
-        vec![AgentMessage::user_text("hi")],
+        vec![prompt.clone()],
         context,
         AgentLoopConfig::new(model),
         None,
@@ -454,6 +455,19 @@ async fn a_missing_stream_fn_ends_the_stream_with_an_error() {
     let Some(AgentEvent::AgentEnd { messages }) = events.last() else {
         panic!("expected agent_end last: {types:?}");
     };
+    let prompt_events: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::MessageStart { message } => Some(("message_start", message)),
+            AgentEvent::MessageEnd { message } => Some(("message_end", message)),
+            _ => None,
+        })
+        .filter(|(_, message)| **message == prompt)
+        .map(|(kind, _)| kind)
+        .collect();
+    assert_eq!(prompt_events, ["message_start", "message_end"], "{types:?}");
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert_eq!(messages[0], prompt);
     let message = messages
         .last()
         .and_then(|m| m.as_assistant())
@@ -463,6 +477,24 @@ async fn a_missing_stream_fn_ends_the_stream_with_an_error() {
         .error_message
         .as_deref()
         .is_some_and(|e| e.contains("set_default_stream_fn")));
+}
+
+#[tokio::test]
+async fn continue_checks_the_context_before_the_missing_stream_fn() {
+    let (_models, model) = setup_faux(FauxScript::new());
+    let context = AgentContext {
+        system_prompt: "sys".into(),
+        messages: vec![],
+        tools: None,
+    };
+    let events = collect_agent_events(loop_agent::agent_loop_continue(
+        context,
+        AgentLoopConfig::new(model),
+        None,
+        None,
+    ))
+    .await;
+    assert!(events.is_empty(), "{events:?}");
 }
 
 #[tokio::test]
