@@ -54,9 +54,10 @@ struct Inner {
 const ANSWERS_KEPT: usize = 64;
 
 /// Whether `recipient` may see and answer an Escalation of the Session
-/// that `access` describes: the same rule as every other act in it.
-fn may_answer(recipient: &dyn EscalationRecipient, access: &Subject) -> bool {
-    decide(&Actor::of(recipient.caller()), access, Need::Write)
+/// that `access` describes: the same rule as every other act in it. No
+/// `access` (its lock is poisoned, see [`EscalationHost::access`]): nobody.
+fn may_answer(recipient: &dyn EscalationRecipient, access: Option<&Subject>) -> bool {
+    access.is_some_and(|access| decide(&Actor::of(recipient.caller()), access, Need::Write))
 }
 #[derive(Default)]
 struct State {
@@ -144,53 +145,77 @@ impl EscalationHost {
     /// Set who may see and answer this Session's Escalations: the Session's
     /// access subject (for a Subagent, its root's). Before this, only the
     /// host's user and in-process recipients may.
+    ///
+    /// The new value replaces the old one whole and never reads it, so a
+    /// poisoned lock is cleared and overwritten: the Subject is clean again.
     pub fn set_access(&self, access: Subject) {
-        *self
-            .0
-            .access
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = access;
+        let lock = &self.0.access;
+        if lock.is_poisoned() {
+            eprintln!("Runtime: the Escalation access lock was poisoned; replacing its value");
+            lock.clear_poison();
+        }
+        match lock.lock() {
+            Ok(mut current) => *current = access,
+            Err(_) => eprintln!("Runtime: the Escalation access lock is poisoned; not set"),
+        }
     }
-    fn access(&self) -> Subject {
-        self.0
-            .access
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    /// Who may see and answer, or `None` when the lock is poisoned. No
+    /// [`Subject`] value could stand in for "nobody": [`decide`] lets
+    /// [`Actor::Internal`] (an in-process recipient) do everything to any
+    /// Subject. So callers deny on `None` ([`may_answer`]).
+    fn access(&self) -> Option<Subject> {
+        match self.0.access.lock() {
+            Ok(access) => Some(access.clone()),
+            Err(_) => {
+                eprintln!("Runtime: the Escalation access lock is poisoned; nobody may answer");
+                None
+            }
+        }
     }
     /// Set the caller that started the turn about to run, at prompt
     /// admission. Escalations raised from now on belong to its turn.
+    ///
+    /// Replaces the value whole without reading it, so a poisoned lock is
+    /// cleared and overwritten.
     pub fn set_turn_caller(&self, caller: Option<Caller>) {
-        *self
-            .0
-            .turn_caller
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = caller;
+        let lock = &self.0.turn_caller;
+        if lock.is_poisoned() {
+            eprintln!("Runtime: the turn caller lock was poisoned; replacing its value");
+            lock.clear_poison();
+        }
+        match lock.lock() {
+            Ok(mut current) => *current = caller,
+            Err(_) => eprintln!("Runtime: the turn caller lock is poisoned; not set"),
+        }
     }
-    /// The caller that started the current turn, if known.
+    /// The caller that started the current turn, if known. `None` when its
+    /// lock is poisoned (never read).
     pub fn turn_caller(&self) -> Option<Caller> {
-        self.0
-            .turn_caller
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        match self.0.turn_caller.lock() {
+            Ok(caller) => caller.clone(),
+            Err(_) => {
+                eprintln!("Runtime: the turn caller lock is poisoned; caller unknown");
+                None
+            }
+        }
     }
-    /// Who answered the Escalation `id`, once; `None` when it is not known.
+    /// Who answered the Escalation `id`, once; `None` when it is not known
+    /// or the lock is poisoned (never read).
     pub fn take_answered_by(&self, id: &str) -> Option<Caller> {
-        let mut answered = self
-            .0
-            .answered
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Ok(mut answered) = self.0.answered.lock() else {
+            eprintln!("Runtime: the Escalation answers lock is poisoned; answerer unknown");
+            return None;
+        };
         let at = answered.iter().position(|(answered, _)| answered == id)?;
         answered.remove(at).and_then(|(_, caller)| caller)
     }
+    /// Remember who answered `id`. On a poisoned lock the answer is
+    /// dropped (logged): the deque is never read or written again.
     fn remember_answer(&self, id: String, caller: Option<Caller>) {
-        let mut answered = self
-            .0
-            .answered
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Ok(mut answered) = self.0.answered.lock() else {
+            eprintln!("Runtime: the Escalation answers lock is poisoned; not remembering {id}");
+            return;
+        };
         if answered.len() >= ANSWERS_KEPT {
             answered.pop_front();
         }
@@ -238,7 +263,7 @@ impl EscalationHost {
         let mut next = state.delivery;
         for (&ticket, pending) in &mut state.pending {
             if !pending.deliveries.contains_key(&connection)
-                && may_answer(recipient.as_ref(), &access)
+                && may_answer(recipient.as_ref(), access.as_ref())
             {
                 next += 1;
                 self.dispatch(ticket, pending, connection, next, recipient.clone());
@@ -333,7 +358,7 @@ impl EscalationHost {
         };
         let answered_by = delivery.recipient.caller();
         if !valid(&pending.request, &answer)
-            || !may_answer(delivery.recipient.as_ref(), &self.access())
+            || !may_answer(delivery.recipient.as_ref(), self.access().as_ref())
         {
             return;
         }
@@ -487,7 +512,7 @@ impl HostServices for EscalationHost {
             let recipients = state.recipients.clone();
             let access = self.access();
             for (connection, recipient) in recipients {
-                if !may_answer(recipient.as_ref(), &access) {
+                if !may_answer(recipient.as_ref(), access.as_ref()) {
                     continue;
                 }
                 state.delivery += 1;
@@ -499,5 +524,91 @@ impl HostServices for EscalationHost {
         let outcome = rx.await.unwrap_or(InteractionOutcome::Cancelled);
         drop(waiting);
         outcome
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log::MemoryEventLog;
+    use crate::sync::poison;
+
+    /// A recipient that never answers; `caller` is who it acts for.
+    struct Recipient(Option<Caller>);
+    #[async_trait]
+    impl EscalationRecipient for Recipient {
+        fn caller(&self) -> Option<Caller> {
+            self.0.clone()
+        }
+        fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
+        async fn interact(
+            &self,
+            _: InteractParams,
+            _: oneshot::Receiver<()>,
+        ) -> Result<InteractionOutcome, ()> {
+            Err(())
+        }
+    }
+
+    fn host(key: &str) -> EscalationHost {
+        let session = SessionRef {
+            instance: "loop".into(),
+            key: key.into(),
+            native_id: key.into(),
+        };
+        let log = Arc::new(MemoryEventLog::new());
+        EscalationHost::new(session, log, 1, Tenant::local(), None)
+    }
+
+    /// A poisoned access lock lets nobody answer, not even an in-process
+    /// recipient (which every Subject would admit); setting the access
+    /// again recovers it. Another Session's host is not affected.
+    #[test]
+    fn a_poisoned_access_lock_denies_every_recipient() {
+        let poisoned = host("a");
+        let other = host("b");
+        let in_process = Recipient(None);
+        let host_user = Recipient(Some(Caller::host(loop_wire::local_principal())));
+        let access = poisoned.access();
+        assert!(may_answer(&in_process, access.as_ref()));
+        assert!(may_answer(&host_user, access.as_ref()));
+
+        poison(&poisoned.0.access);
+        let access = poisoned.access();
+        assert_eq!(access, None);
+        assert!(!may_answer(&in_process, access.as_ref()));
+        assert!(!may_answer(&host_user, access.as_ref()));
+        assert!(may_answer(&host_user, other.access().as_ref()));
+
+        poisoned.set_access(Subject::unowned(Tenant::local()));
+        assert!(!poisoned.0.access.is_poisoned());
+        assert!(may_answer(&host_user, poisoned.access().as_ref()));
+    }
+
+    /// A poisoned turn caller is unknown, and a new turn's caller replaces
+    /// it cleanly.
+    #[test]
+    fn a_poisoned_turn_caller_is_unknown_until_set_again() {
+        let host = host("a");
+        let caller = Caller::host(loop_wire::local_principal());
+        host.set_turn_caller(Some(caller.clone()));
+        poison(&host.0.turn_caller);
+        assert_eq!(host.turn_caller(), None);
+        host.set_turn_caller(Some(caller.clone()));
+        assert_eq!(host.turn_caller(), Some(caller));
+    }
+
+    /// A poisoned answer list is never read: no answerer is known and new
+    /// answers are dropped, without a panic.
+    #[test]
+    fn a_poisoned_answer_list_knows_no_answerer() {
+        let host = host("a");
+        let caller = Caller::host(loop_wire::local_principal());
+        host.remember_answer("e1".into(), Some(caller.clone()));
+        poison(&host.0.answered);
+        assert_eq!(host.take_answered_by("e1"), None);
+        host.remember_answer("e2".into(), Some(caller));
+        assert_eq!(host.take_answered_by("e2"), None);
+        assert!(host.0.answered.is_poisoned());
     }
 }

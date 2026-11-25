@@ -1,0 +1,101 @@
+//! A poisoned lock never decides access: the access checks of
+//! [`super::reach`] fail closed, and a Session the poisoned map does not
+//! hold still answers from its own state.
+use super::*;
+use crate::log::MemoryEventLog;
+use crate::sync::poison;
+use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
+use loop_protocol::{PrincipalKind, SessionSpec};
+
+async fn runtime(dir: &std::path::Path) -> Arc<Runtime> {
+    let models = Arc::new(loop_ai::Models::create(Default::default()));
+    models.set_provider(loop_ai::providers::faux_provider(Default::default()));
+    let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
+    let opts = BootstrapOpts {
+        cwd: dir.into(),
+        provider: Some("faux".into()),
+        model: Some("faux-model".into()),
+        theme: None,
+        system_prompt: None,
+        append_system_prompt: None,
+        no_context_files: true,
+        interactive: false,
+        session_id: None,
+        no_web: true,
+        permission_mode: Some("ask".into()),
+        agent: None,
+    };
+    let store = globals.open_runtime_session_store().unwrap();
+    Runtime::new(
+        globals,
+        opts,
+        Arc::new(MemoryEventLog::new()),
+        store,
+        RuntimeLimits::default(),
+    )
+    .await
+    .unwrap()
+    .into_shared()
+}
+
+/// A user from outside the host.
+fn outside() -> Actor {
+    let principal = Principal::new(PrincipalKind::Person, "https://idp", "ada").unwrap();
+    Actor::Caller(Caller::asserted(principal, Tenant::new("acme").unwrap()).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_poisoned_session_map_fails_access_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let (x, empty) = (root.join("x"), root.join("empty"));
+    std::fs::create_dir_all(&x).unwrap();
+    std::fs::create_dir_all(&empty).unwrap();
+    let rt = runtime(&root).await;
+    let session = rt
+        .new_session(SessionSpec {
+            cwd: Some(x.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let outside = outside();
+    // Before: an empty folder is the outside user's to change and use.
+    assert!(rt.may_change_folder(&outside, &empty));
+    rt.check_folder(&outside, &empty, None).await.unwrap();
+
+    poison(&rt.sessions);
+    assert!(rt.subject(&session.key).await.is_err());
+    assert!(rt
+        .check_as(&outside, &session.key, Need::Read)
+        .await
+        .is_err());
+    assert!(rt.check_folder(&outside, &empty, None).await.is_err());
+    assert_eq!(rt.readable_folders(&outside), Some(Vec::new()));
+    assert!(!rt.may_change_folder(&outside, &empty));
+    // Internal work and the host's user are never limited by these.
+    assert_eq!(rt.readable_folders(&Actor::Internal), None);
+    assert!(rt.may_change_folder(&Actor::Internal, &empty));
+
+    // The test thread changed nothing in the map: let the Runtime shut down.
+    rt.sessions.clear_poison();
+}
+
+/// A poisoned subject cache refuses a Session it would have to look up,
+/// while a loaded Session still answers from its own state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_poisoned_subject_cache_refuses_only_lookups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let rt = runtime(&root).await;
+    let loaded = rt.new_session(SessionSpec::default()).await.unwrap();
+
+    poison(&rt.subjects);
+    assert!(rt.subject(&SessionKey::from("unknown")).await.is_err());
+    assert!(rt.subject(&loaded.key).await.is_ok());
+    assert!(rt
+        .check_as(&outside(), &SessionKey::from("unknown"), Need::Read)
+        .await
+        .is_err());
+    rt.subjects.clear_poison();
+}

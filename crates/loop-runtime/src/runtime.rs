@@ -73,6 +73,8 @@ mod gate_tests;
 mod host_cleanup;
 mod leases;
 mod pause;
+#[cfg(test)]
+mod poison_tests;
 mod publish;
 mod reach;
 mod sessions;
@@ -380,11 +382,12 @@ struct ChangeClaim<'a> {
 impl Drop for ChangeClaim<'_> {
     fn drop(&mut self) {
         let after = self.live.opened.native.config().revision;
-        let mut acting = self
-            .live
-            .acting
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Never panic in a drop (a panic during unwinding aborts): on a
+        // poisoned map, log and leave the revisions unattributed.
+        let Ok(mut acting) = self.live.acting.lock() else {
+            eprintln!("Runtime: the acting lock is poisoned; config changes stay unattributed");
+            return;
+        };
         if let Some((before, identity)) = acting.claim.take() {
             for revision in before.saturating_add(1)..=after {
                 acting.changes.insert(revision, identity.clone());
@@ -409,7 +412,7 @@ impl LiveSession {
         let acting = self
             .acting
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .expect("acting lock poisoned: a thread panicked mid-update of who acts");
         if envelope.turn.is_some() {
             return acting.turn.clone();
         }
@@ -431,7 +434,7 @@ impl LiveSession {
         let mut acting = self
             .acting
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .expect("acting lock poisoned: a thread panicked mid-update of who acts");
         acting.turn_caller = caller;
         acting.turn = identity.clone();
         acting.request = identity;
@@ -444,7 +447,7 @@ impl LiveSession {
         let before = self.opened.native.config().revision;
         self.acting
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("acting lock poisoned: a thread panicked mid-update of who acts")
             .claim = Some((before, identity));
         ChangeClaim { live: self }
     }
@@ -452,7 +455,7 @@ impl LiveSession {
     fn turn_caller(&self) -> Caller {
         self.acting
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("acting lock poisoned: a thread panicked mid-update of who acts")
             .turn_caller
             .clone()
     }
@@ -852,7 +855,7 @@ impl Runtime {
         let sessions = self
             .sessions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .expect("sessions lock poisoned: a thread panicked mid-update");
         sessions.get(key).and_then(|live| live.loaded_by.clone())
     }
 
@@ -864,21 +867,26 @@ impl Runtime {
     /// was made on this host, by `loop` or an older Runtime). Reads of the
     /// Session's records use it, and so does the access check
     /// (`crate::access`).
+    ///
+    /// # Panics
+    ///
+    /// When the Session or tenant map is poisoned. Falling back to `local`
+    /// would hand an unknown Session to the host's user; the access check
+    /// uses [`Runtime::try_session_tenant`], which refuses instead.
     pub fn session_tenant(&self, key: &SessionKey) -> Tenant {
-        if let Some(live) = self
-            .sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(key)
-        {
-            return live.tenant.clone();
+        self.try_session_tenant(key)
+            .expect("Session or tenant map poisoned: a thread panicked mid-update")
+    }
+    /// [`Runtime::session_tenant`], or an internal error when the Session or
+    /// tenant map is poisoned (never read: it may be half-updated).
+    pub(crate) fn try_session_tenant(&self, key: &SessionKey) -> BackendResult<Tenant> {
+        if let Some(live) = crate::sync::lock(&self.sessions, "sessions")?.get(key) {
+            return Ok(live.tenant.clone());
         }
-        self.tenants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        Ok(crate::sync::lock(&self.tenants, "tenants")?
             .get(key)
             .cloned()
-            .unwrap_or_else(Tenant::local)
+            .unwrap_or_else(Tenant::local))
     }
     /// The owner of record of Session `key` (step B3): the identity of the
     /// `session_opened` that created it, read from the Session summary in
@@ -1890,7 +1898,7 @@ impl AgentBackend for Runtime {
         let caller = loop_protocol::Caller::current();
         self.check(session, Need::Write).await?;
         let mut reloads = 0;
-        let live = loop {
+        let (live, parent_caller) = loop {
             let live = match self.route(session) {
                 Ok(live) => live,
                 // Unloaded to make room: load it again rather than refuse.
@@ -1922,23 +1930,24 @@ impl AgentBackend for Runtime {
             if let Some(error) = live.failure.lock().unwrap().clone() {
                 return Err(failed(error));
             }
+            // A Subagent's turn has no connection: it acts for whoever
+            // started its parent's turn (ADR-0009). Read before the
+            // reservation, so a refusal leaves the Session idle. A poisoned
+            // Session map refuses: with no caller the turn would act as the
+            // Runtime, with every right.
+            let parent_caller = match (&caller, live.parent.as_ref()) {
+                (None, Some(parent)) => crate::sync::lock(&self.sessions, "sessions")?
+                    .get(parent)
+                    .cloned()
+                    .and_then(|parent| parent.escalations.turn_caller()),
+                _ => None,
+            };
             self.reserve(&live).await?;
             drop(lifecycle);
-            break live;
+            break (live, parent_caller);
         };
-        // The turn acts for this caller, carried into it explicitly. A
-        // Subagent's turn has no connection: it acts for whoever started its
-        // parent's turn (ADR-0009).
-        let caller = caller.or_else(|| {
-            let parent = live.parent.as_ref()?;
-            let parent = self
-                .sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(parent)
-                .cloned()?;
-            parent.escalations.turn_caller()
-        });
+        // The turn acts for this caller, carried into it explicitly.
+        let caller = caller.or(parent_caller);
         // Stamped on the turn's records: the connection's caller, else the
         // parent turn's, else (in process) the Runtime.
         let acting = caller.clone().unwrap_or_else(in_process_caller);

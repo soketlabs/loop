@@ -436,9 +436,7 @@ impl Runtime {
                 .await
                 .map_err(failed)?;
             touch(&self.activity, &reference.key, ts_ms);
-            self.tenants
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            crate::sync::lock(&self.tenants, "tenants")?
                 .insert(reference.key.clone(), tenant.clone());
             if parent.is_some() {
                 if let Some(keys) = self.subagents.lock().await.as_mut() {

@@ -41,10 +41,12 @@ pub(super) struct HostGuard {
 impl HostGates {
     pub(super) async fn lock(&self, cwd: &Path) -> HostGuard {
         let gate = {
+            // A second gate for one folder would let a stop and a publish
+            // race; never guess the map's state after a panic.
             let mut map = self
                 .map
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .expect("host gate map poisoned: a thread panicked mid-update");
             Arc::clone(map.entry(cwd.to_path_buf()).or_default())
         };
         let guard = gate.lock_owned().await;
@@ -57,10 +59,7 @@ impl HostGates {
 
     #[cfg(test)]
     pub(super) fn entries(&self) -> usize {
-        self.map
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.map.lock().expect("host gate map poisoned").len()
     }
 }
 
@@ -68,10 +67,15 @@ impl Drop for HostGuard {
     fn drop(&mut self) {
         // Release first; an entry that nobody else holds or awaits goes.
         drop(self.guard.take());
-        let mut map = self
-            .map
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Cleanup never panics (a drop may run while unwinding): on a
+        // poisoned map, log and leave the entry; it only costs memory.
+        let Ok(mut map) = self.map.lock() else {
+            eprintln!(
+                "Runtime: the host gate map is poisoned; leaving the gate of {}",
+                self.cwd.display()
+            );
+            return;
+        };
         if map
             .get(&self.cwd)
             .is_some_and(|gate| Arc::strong_count(gate) == 1)
@@ -107,7 +111,7 @@ impl Runtime {
         let current = live
             .generation
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("generation lock poisoned: a reload panicked mid-swap")
             .as_ref()
             .map(|generation| Arc::clone(&generation.resources.host_workspace));
         current.unwrap_or_else(|| Arc::clone(&live.opened.workspace.host_workspace))
