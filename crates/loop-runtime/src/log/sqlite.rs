@@ -1,3 +1,9 @@
+//! SQLite Event Log: the durable `EventLog` implementation.
+//!
+//! One writer task owns the write connection and commits each append before
+//! it replies. Reads run on a pool of read connections, each on a snapshot
+//! that must include every append already acknowledged.
+
 use super::*;
 use async_trait::async_trait;
 use loop_protocol::{SessionKey, TurnId};

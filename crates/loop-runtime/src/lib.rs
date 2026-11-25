@@ -1,4 +1,7 @@
 //! Runtime Session ownership and durable Event Log.
+
+#![deny(missing_docs)]
+
 pub mod access;
 pub mod log;
 mod recovery;

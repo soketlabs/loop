@@ -1,3 +1,9 @@
+//! In-memory Event Log: the `EventLog` implementation with no persistence.
+//!
+//! Used where durability is not needed. It keeps each Session's records and
+//! summary in a map behind one lock and follows the same contract as the
+//! SQLite implementation.
+
 use super::*;
 use async_trait::async_trait;
 use loop_protocol::{SessionKey, TurnId};
@@ -104,6 +110,7 @@ pub struct MemoryEventLog {
     state: Mutex<State>,
 }
 impl MemoryEventLog {
+    /// Creates an empty log.
     pub fn new() -> Self {
         Self::default()
     }

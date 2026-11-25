@@ -45,7 +45,9 @@ use tokio::{
 /// Admission limits. Active turns queue when all permits are occupied.
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeLimits {
+    /// Session limit of the Runtime, reported in its status. Must be positive.
     pub max_sessions: usize,
+    /// Most turns that run at once; further turns queue. Must be positive.
     pub max_active_turns: usize,
 }
 impl Default for RuntimeLimits {
@@ -859,6 +861,8 @@ impl Runtime {
         sessions.get(key).and_then(|live| live.loaded_by.clone())
     }
 
+    /// The generation number this Runtime instance got from the Event Log at
+    /// start. It is stamped into the events the Runtime writes.
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -872,7 +876,7 @@ impl Runtime {
     ///
     /// When the Session or tenant map is poisoned. Falling back to `local`
     /// would hand an unknown Session to the host's user; the access check
-    /// uses [`Runtime::try_session_tenant`], which refuses instead.
+    /// uses `Runtime::try_session_tenant`, which refuses instead.
     pub fn session_tenant(&self, key: &SessionKey) -> Tenant {
         self.try_session_tenant(key)
             .expect("Session or tenant map poisoned: a thread panicked mid-update")
@@ -930,6 +934,7 @@ impl Runtime {
             None => Ok(()),
         }
     }
+    /// The Event Log this Runtime writes to.
     pub fn event_log(&self) -> &Arc<dyn EventLog> {
         &self.log
     }
