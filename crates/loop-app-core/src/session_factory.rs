@@ -6,10 +6,15 @@ use tokio::sync::{Mutex, OnceCell};
 
 /// Process-wide credentials, model catalog and Session repository. Never reads stdin.
 pub struct GlobalResources {
+    /// Loop's per-user state directory (credentials, settings, trust, Session store).
     pub agent_dir: PathBuf,
+    /// The credential store under `agent_dir`.
     pub credentials: Arc<FileCredentialStore>,
+    /// The model catalog, with the providers built from the configured credentials.
     pub models: Arc<Models>,
+    /// Path of the SQLite Session store under `agent_dir`.
     pub sessions_db: PathBuf,
+    /// The Session repository that Sessions opened from these resources use.
     pub repository: SessionRepository,
     /// The Runtime's tool lock, fixed for the life of the process: every
     /// workspace and Session built from these resources is locked
@@ -197,19 +202,30 @@ type Execution = (SandboxMode, Arc<dyn ExecutionEnv>, bool);
 /// Immutable workspace definitions and shared connections, cached by absolute cwd.
 /// Gates, hooks registries, selected tools and grants belong to each Session.
 pub struct WorkspaceResources {
+    /// Absolute, normalized working directory that identifies this workspace.
     pub cwd: PathBuf,
+    /// Whether the project's own settings, hooks and context files are trusted.
+    /// Forced to `false` when the Runtime's tool lock is active.
     pub project_trusted: bool,
+    /// The merged settings for this workspace.
     pub settings: Settings,
+    /// Skills, prompt templates and other loaded resources.
     pub resources: LoadedResources,
+    /// A system prompt that replaces the default one, if one was given.
     pub custom_system_prompt: Option<String>,
+    /// Text appended to the system prompt, if any.
     pub append_system_prompt: Option<String>,
+    /// Context files (such as project instructions) added to the system prompt.
     pub context_files: Vec<ContextFile>,
+    /// The execution env of the host folder. Tools run in it when the sandbox is off.
     pub host: Arc<dyn ExecutionEnv>,
     /// The `host` driver's Workspace of this folder; `host` is its env.
     /// Every Session has it, with the sandbox on or off, for the Workspace
     /// methods (processes, transfer) that later protocol methods expose.
     pub host_workspace: Arc<dyn loop_agent::harness::sandbox::Workspace>,
+    /// The MCP connections of this workspace, shared by its Sessions.
     pub mcp_client: Arc<loop_mcp::McpClientManager>,
+    /// Notices to show when a Session opens here (settings problems, trust, tool lock).
     pub startup_notices: Vec<String>,
     // Standalone prompts retain the caller's spelling and lexical ancestors;
     // cwd is separately normalized for workspace identity and execution.
@@ -486,11 +502,11 @@ impl WorkspaceResources {
 
 /// Builds independent Sessions over shared global and workspace resources.
 pub struct SessionFactory {
+    /// The process-wide resources every Session built here shares.
     pub globals: Arc<GlobalResources>,
     workspaces: Mutex<HashMap<PathBuf, Arc<OnceCell<Arc<WorkspaceResources>>>>>,
 }
 
-/// One Session's mutable harness, gate and approval state.
 /// A Session store error for people: a Session owned by another process
 /// is reported as is; anything else names what failed.
 fn session_error(context: &str, error: loop_agent::harness::types::SessionError) -> anyhow::Error {
@@ -500,18 +516,31 @@ fn session_error(context: &str, error: loop_agent::harness::types::SessionError)
     }
 }
 
+/// One Session's mutable harness, gate and approval state.
 pub struct OpenedSession {
+    /// The workspace resources this Session was opened over.
     pub workspace: Arc<WorkspaceResources>,
+    /// The agent harness that holds the Session's tree and runs turns.
     pub harness: Arc<AgentHarness>,
+    /// The native model backend the harness drives.
     pub native: Arc<loop_agent::native_backend::NativeBackend>,
+    /// Decides whether each tool call is allowed, asked about or denied.
     pub tool_gate: Arc<crate::tool_gate::ToolGate>,
+    /// Sends approval requests from the gate to the Surface; installed as the gate's approver.
     pub approval_bridge: Arc<crate::tool_approval::ToolApprovalBridge>,
+    /// Receives the prompts `approval_bridge` raises. The Surface answers them.
     pub approval_prompts:
         tokio::sync::mpsc::UnboundedReceiver<crate::tool_approval::ApprovalPrompt>,
+    /// This Session's own copy of the settings, with the selected model applied.
     pub settings: Settings,
+    /// Id of the Session, new or resumed.
     pub session_id: String,
+    /// The model the Session starts with, or `None` if none could be chosen.
     pub selected_model: Option<loop_ai::Model>,
+    /// Why `selected_model` is not what the user asked for (for example a
+    /// logged-out provider), if that applies.
     pub model_note: Option<String>,
+    /// Notices to show to the user at startup.
     pub startup_notices: Vec<String>,
     /// The standalone Surface's own Session store, which holds its leases.
     /// `None` when the Runtime owns ownership (and non-Unix standalone).
@@ -658,6 +687,7 @@ fn lock_workspace(
 }
 
 impl SessionFactory {
+    /// Creates a factory over `globals`, with an empty workspace cache.
     pub fn new(globals: Arc<GlobalResources>) -> Self {
         Self {
             globals,
@@ -739,6 +769,8 @@ impl SessionFactory {
         (model, effort)
     }
 
+    /// Opens a Session in `workspace` with the settings in `opts`, using the
+    /// process environment for tools. See `open_with_environment`.
     pub async fn open(
         &self,
         workspace: Arc<WorkspaceResources>,

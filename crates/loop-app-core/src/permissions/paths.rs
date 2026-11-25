@@ -21,8 +21,8 @@
 //!   and ask rules apply and allow rules and scopes do not (fail closed).
 //!   The sync search filter of a guest-namespace Session uses it.
 //!
-//! An answer is [`Got::Yes`], [`Got::No`] (no such path, or not a link) or
-//! [`Got::Unknown`] (the env could not say). Unknown fails closed in every
+//! An answer is `Got::Yes`, `Got::No` (no such path, or not a link) or
+//! `Got::Unknown` (the env could not say). Unknown fails closed in every
 //! check: a path that cannot be resolved is not inside the workspace, is
 //! protected, is outside the tool lock's folder, no allow rule applies to
 //! it, and a deny or ask path rule that could not be compared with it
