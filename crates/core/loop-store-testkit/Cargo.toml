@@ -7,6 +7,9 @@ rust-version.workspace = true
 description = "Shared conformance suites for Loop stores (Event Log and Session store), usable by stores outside this repository"
 publish = false
 
+[lints]
+workspace = true
+
 [features]
 default = ["event-log", "session-store"]
 # Event Log suite. Needs the `EventLog` contract from loop-store.

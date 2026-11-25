@@ -1,11 +1,9 @@
 //! Discovery and detached startup for the default interactive Runtime client.
 use loop_protocol::AgentBackend;
 use loop_wire::RemoteBackend;
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 const CONNECT_WAIT: Duration = Duration::from_secs(15);
 

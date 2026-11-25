@@ -1,10 +1,8 @@
 //! `loop runtime start|stop|status` end to end: spawn the built binary with an isolated agent dir.
 
-use std::{
-    path::{Path, PathBuf},
-    process::Stdio,
-    time::Duration,
-};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::{Child, Command};
 
 fn serve(agent: &Path, args: &[&str]) -> Command {

@@ -7,6 +7,9 @@ rust-version.workspace = true
 description = "Shared bootstrap, config, and runtime wiring for Loop applications"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 # Tracing control (`TracingControl`, `Runtime::attach_telemetry`). Off by default.

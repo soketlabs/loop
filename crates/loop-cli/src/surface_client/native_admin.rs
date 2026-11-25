@@ -1,7 +1,21 @@
 //! Native implementation of the same typed admin requests used by a Runtime.
-use super::*;
-use loop_protocol::host::*;
-use loop_protocol::{admin::*, BackendError, BackendResult, Capabilities, ErrorCategory};
+use super::{AgentBackend, Arc, SessionRef};
+use loop_protocol::admin::{
+    AdminAction, DefaultsParams, DefaultsResult, McpParams, McpResult, McpServerStatus,
+    PermissionModeParams, PermissionModeResult, ReloadParams, ReloadResult, RuntimeSessionRow,
+    RuntimeSessionTotals, RuntimeSessionsResult, SandboxAction, SandboxChoice, SandboxParams,
+    SandboxResult, SettingsParams, SettingsResult, SkillStatus, SkillsParams, SkillsResult,
+    TemplateInfo, TemplatesParams, TemplatesResult, TrustParams, TrustResult, WebSearchParams,
+    WebSearchResult,
+};
+#[cfg(feature = "usage")]
+use loop_protocol::admin::{UsageParams, UsageResult};
+use loop_protocol::host::{
+    HostAction, McpAuthParams, McpAuthResult, ProviderInfo, ProvidersParams, ProvidersResult,
+};
+#[cfg(feature = "telemetry")]
+use loop_protocol::host::{TracingParams, TracingResult};
+use loop_protocol::{BackendError, BackendResult, Capabilities, ErrorCategory};
 use loop_wire::RuntimeAdmin;
 
 pub(super) struct NativeAdmin<'a>(

@@ -18,7 +18,8 @@
 //!   other Session. There is no sharing yet.
 //! - No owner of record: host-only. A Subagent's [`Subject`] is its root
 //!   parent's.
-use loop_protocol::{rpc::methods, BackendError, Caller, Principal, SessionKey, Tenant};
+use loop_protocol::rpc::methods;
+use loop_protocol::{BackendError, Caller, Principal, SessionKey, Tenant};
 
 /// The right a request needs on its Session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

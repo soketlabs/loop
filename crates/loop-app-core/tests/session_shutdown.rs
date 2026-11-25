@@ -2,27 +2,21 @@
 //! turn, with the tools, hooks and writes it runs, has finished.
 #![cfg(unix)]
 
+use loop_agent::harness::session::sqlite::SqliteSessionStore;
+use loop_agent::harness::session::SessionStore;
+use loop_agent::harness::types::{ExecutionError, ShellOutput};
 use loop_agent::harness::{
-    create_session_repository,
-    session::{sqlite::SqliteSessionStore, SessionStore},
-    types::{ExecutionError, ShellOutput},
-    AgentHarness, AgentHarnessOptions, AgentHarnessResources, HostExecutionEnv, KrunIsolation,
-    KrunSandbox, LocalSandboxRuntime, PodmanClient, PodmanExecOpts, PodmanRunOpts, Sandbox,
-    SandboxError, SandboxMode, TaggedSandbox,
+    create_session_repository, AgentHarness, AgentHarnessOptions, AgentHarnessResources,
+    HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime, PodmanClient,
+    PodmanExecOpts, PodmanRunOpts, Sandbox, SandboxError, SandboxMode, TaggedSandbox,
 };
-use loop_ai::{
-    providers::{faux_provider, FauxResponse, FauxScript},
-    Models, ToolCall,
-};
+use loop_ai::providers::{faux_provider, FauxResponse, FauxScript};
+use loop_ai::{Models, ToolCall};
 use loop_app_core::runtime::SessionShutdown;
 use serde_json::json;
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Notify;
 
 /// A tool that ignores cancellation and finishes only when told.

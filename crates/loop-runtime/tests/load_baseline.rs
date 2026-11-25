@@ -57,8 +57,8 @@
 #![cfg(unix)]
 
 use async_trait::async_trait;
+use loop_ai::providers::{faux_provider_fn, FauxResponder, FauxResponse};
 use loop_ai::{
-    providers::{faux_provider_fn, FauxResponder, FauxResponse},
     AssistantContent, AssistantMessage, AssistantMessageEvent, InputModality, Model, ModelCost,
     StopReason as AiStopReason, TextContent,
 };
@@ -66,24 +66,18 @@ use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
 use loop_protocol::{
     AgentBackend, ContentBlock, SessionKey, SessionSpec, SessionUpdate, TurnOutcome, UpdateEnvelope,
 };
-use loop_runtime::{
-    log::{
-        Event, EventKind, EventLog, LoggedEvent, MemoryEventLog, Result as LogResult,
-        SqliteEventLog,
-    },
-    Runtime, RuntimeLimits,
+use loop_runtime::log::{
+    Event, EventKind, EventLog, LoggedEvent, MemoryEventLog, Result as LogResult, SqliteEventLog,
 };
+use loop_runtime::{Runtime, RuntimeLimits};
 use serde_json::json;
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    path::Path,
-    sync::{
-        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
-    time::{Duration, Instant},
-};
-use tokio::{sync::watch, time::timeout};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::watch;
+use tokio::time::timeout;
 
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)

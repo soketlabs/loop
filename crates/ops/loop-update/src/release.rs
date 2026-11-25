@@ -1,11 +1,9 @@
 //! Release lookup and download: version types, the release host client, and
 //! checksum-verified archive extraction.
 
-use std::{
-    io::{Read, Write},
-    path::Path,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::io::{Read, Write};
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Url;
 use semver::Version;

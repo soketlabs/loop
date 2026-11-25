@@ -1,5 +1,5 @@
 //! Turn admission: the active-turn permit and marking a Session busy.
-use super::*;
+use super::{failed, BackendError, BackendResult, LiveSession, Ordering, Runtime, SessionRef};
 
 impl Runtime {
     /// A parent waiting for a Subagent releases its active-turn permit.

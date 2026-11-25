@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "OpenTelemetry tracing for Loop, exported to Langfuse over OTLP/HTTP"
 
+[lints]
+workspace = true
+
 [dependencies]
 loop-ai = { workspace = true }
 anyhow = { workspace = true }

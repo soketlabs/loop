@@ -1,7 +1,13 @@
 //! Opening, closing and unloading Sessions, and the Session cap.
 use super::leases::OpeningLease;
 use super::publish::{publish, pump};
-use super::*;
+use super::{
+    admin, decisions, failed, in_process_caller, json, mpsc, now, oneshot, subagent, touch, wanted,
+    watch, workspace_root, Acting, AgentBackend, Announced, Arc, AsyncMutex, AtomicBool,
+    BackendError, BackendResult, Caller, Command, Duration, Event, EventKind, HashMap, Identity,
+    LiveSession, Mutex, Ordering, PathBuf, Runtime, SessionKey, SessionRef, SessionSpec,
+    SessionUpdate, UpdateEnvelope, VecDeque, WorkspaceResources, WorkspaceState,
+};
 
 impl Runtime {
     pub(super) async fn open(

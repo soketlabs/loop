@@ -8,19 +8,19 @@
 //! processes of the whole test process, tests of other Runtimes included.
 #![cfg(unix)]
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use loop_agent::harness::sandbox::{
     HostWorkspaceDriver, SandboxStatus, SpawnRequest, Workspace, WorkspaceDriver, WorkspaceSource,
     WorkspaceSpec,
 };
 use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
-use loop_protocol::{admin::ReloadParams, AgentBackend, BackendError, SessionRef, SessionSpec};
-use loop_runtime::{log::MemoryEventLog, Runtime, RuntimeLimits};
+use loop_protocol::admin::ReloadParams;
+use loop_protocol::{AgentBackend, BackendError, SessionRef, SessionSpec};
+use loop_runtime::log::MemoryEventLog;
+use loop_runtime::{Runtime, RuntimeLimits};
 use loop_wire::RuntimeAdmin;
 
 static PROCESSES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

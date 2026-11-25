@@ -12,7 +12,11 @@ use loop_agent::harness::{
 };
 use loop_agent::native_backend::NativeBackend;
 use loop_ai::Models;
-use loop_protocol::admin::*;
+use loop_protocol::admin::{
+    AdminAction, DefaultsParams, DefaultsPatch, DefaultsResult, McpParams, McpResult,
+    McpServerStatus, ReloadParams, ReloadResult, SkillsParams, TrustParams, TrustResult,
+    UsageParams, UsageResult,
+};
 use loop_protocol::rpc::{methods, PeerInfo, SessionInfo};
 use loop_protocol::{
     AgentBackend, BackendError, BackendResult, Capabilities, ContentBlock, HostServices,
@@ -467,7 +471,7 @@ async fn admin_is_the_same_over_the_wire_on_a_host_local_connection() {
                 "{method}"
             );
         }
-        use loop_protocol::host::*;
+        use loop_protocol::host::{HostAction, McpAuthParams, ProvidersParams, TracingParams};
         assert_eq!(
             remote
                 .providers(ProvidersParams {

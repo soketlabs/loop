@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "Run any Agent Client Protocol agent as a Loop backend"
 
+[lints]
+workspace = true
+
 [dependencies]
 agent-client-protocol-schema = { workspace = true }
 loop-protocol = { workspace = true }

@@ -9,13 +9,25 @@
 use std::path::Path;
 
 use loop_agent::harness::SandboxMode;
+use loop_app_core::config::paths;
+use loop_app_core::config::settings::{set_disabled_name, set_skill_disabled};
 use loop_app_core::config::workspace_settings::{WorkspaceOverrides, WorkspaceSettingsStore};
-use loop_app_core::config::{paths, settings::set_disabled_name, settings::set_skill_disabled};
 use loop_app_core::config::{Settings, TrustStore};
-use loop_protocol::admin::*;
+use loop_protocol::admin::{
+    AdminAction, DefaultsParams, DefaultsResult, McpParams, McpResult, McpServerStatus,
+    PermissionModeParams, PermissionModeResult, ReloadParams, ReloadResult, RuntimeSessionRow,
+    RuntimeSessionTotals, RuntimeSessionsResult, SandboxAction, SandboxChoice, SandboxParams,
+    SandboxResult, SettingsParams, SettingsResult, SkillStatus, SkillsParams, SkillsResult,
+    TemplateInfo, TemplatesParams, TemplatesResult, TrustParams, TrustResult, WebSearchParams,
+    WebSearchResult,
+};
 use loop_wire::RuntimeAdmin;
 
-use super::*;
+use super::{
+    async_trait, failed, request_caller, tree, Arc, AtomicBool, BackendError, BackendResult,
+    BootstrapOpts, Capabilities, ErrorCategory, HashMap, LiveSession, MutationResult,
+    OpenedSession, Ordering, PathBuf, Runtime, SessionStats, WorkspaceResources, WorkspaceState,
+};
 use crate::access::{Actor, Need};
 
 /// Tools the Runtime adds to its Sessions, kept across a reload.

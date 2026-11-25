@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use loop_app_core::config::paths::settings_path;
 use loop_app_core::runtime::{BootstrapOpts, GlobalResources, SessionFactory};
-use loop_app_core::{config::paths::settings_path, Settings};
+use loop_app_core::Settings;
 
 fn opts(cwd: &std::path::Path) -> BootstrapOpts {
     BootstrapOpts {

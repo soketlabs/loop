@@ -25,41 +25,33 @@
 #![cfg(unix)]
 
 use async_trait::async_trait;
+use loop_agent::harness::session::sqlite::{
+    create_sqlite_session_store_for_resume, LeaseIdentity, SqliteSessionStore,
+};
+use loop_agent::harness::session::{
+    PendingSessionWrite, SessionForkSelection, SessionMetadata, SessionReader, SessionStore,
+    SessionTreeEntry,
+};
+use loop_agent::harness::types::SessionError;
 use loop_agent::harness::{
-    create_session_repository,
-    session::{
-        sqlite::{create_sqlite_session_store_for_resume, LeaseIdentity, SqliteSessionStore},
-        PendingSessionWrite, SessionForkSelection, SessionMetadata, SessionReader, SessionStore,
-        SessionTreeEntry,
-    },
-    types::SessionError,
-    AgentHarness, AgentHarnessOptions, AgentHarnessResources, HostExecutionEnv, SandboxMode,
+    create_session_repository, AgentHarness, AgentHarnessOptions, AgentHarnessResources,
+    HostExecutionEnv, SandboxMode,
 };
-use loop_ai::{
-    providers::{faux_provider_fn, FauxResponse},
-    Context, Message, ToolCall,
-};
+use loop_ai::providers::{faux_provider_fn, FauxResponse};
+use loop_ai::{Context, Message, ToolCall};
 use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
 use loop_protocol::{AgentBackend, ContentBlock, SessionRef, SessionSpec, TurnId};
-use loop_runtime::{
-    log::{Event, EventKind, EventLog, LoggedEvent, SqliteEventLog},
-    Runtime, RuntimeLimits,
-};
+use loop_runtime::log::{Event, EventKind, EventLog, LoggedEvent, SqliteEventLog};
+use loop_runtime::{Runtime, RuntimeLimits};
 use serde_json::{json, Value};
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    io::Write,
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
-    },
-    time::{Duration, Instant},
-};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, Command},
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, Command};
 
 // ---------------------------------------------------------------- utilities
 

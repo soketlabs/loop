@@ -2,7 +2,13 @@
 //!
 //! The native owner is private. Surfaces receive typed services and immutable views;
 //! neither the host nor mutable settings can be reached through this boundary.
-use loop_protocol::{rpc::*, session_services::*, AgentBackend, SessionRef, SessionSpec};
+use loop_protocol::rpc::{
+    ClientCapabilities, CloneParams, DestinationResult, ExportResult, ForkParams, ImportParams,
+    MutationResult, NavigateParams, NavigateResult, PeerInfo, RenameParams, SessionInfo,
+    SessionParams, SessionSnapshot, TreeParams, TreeResult, ViewParams, ViewResult,
+};
+use loop_protocol::session_services::{SkillParams, WorkflowParams, WorkflowResult};
+use loop_protocol::{AgentBackend, SessionRef, SessionSpec};
 use loop_wire::RuntimeControl;
 use std::sync::Arc;
 mod native_admin;
@@ -759,7 +765,9 @@ mod sandbox_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loop_agent::harness::session::{sqlite::SqliteSessionStore, SessionFile, SessionStore};
+    use loop_agent::harness::session::sqlite::SqliteSessionStore;
+    use loop_agent::harness::session::{SessionFile, SessionStore};
+    use loop_protocol::rpc::SESSION_TRANSFER_LIMIT;
     use loop_protocol::{ContentBlock, TurnOutcome};
     use std::time::Duration;
     use test_support::{fixture, pause_provider};
@@ -1599,7 +1607,7 @@ impl SurfaceClient {
         }
     }
     pub async fn set_skill_enabled(&mut self, name: &str, enabled: bool) -> anyhow::Result<bool> {
-        use loop_protocol::admin::*;
+        use loop_protocol::admin::{AdminAction, SkillsParams};
         use loop_wire::RuntimeAdmin;
         if !self.resource_view().skills.iter().any(|s| s.name == name) {
             return Ok(false);
@@ -1625,7 +1633,7 @@ impl SurfaceClient {
         name: &str,
         args: &str,
     ) -> anyhow::Result<Option<String>> {
-        use loop_protocol::admin::*;
+        use loop_protocol::admin::TemplatesParams;
         use loop_wire::RuntimeAdmin;
         if !self
             .resource_view()

@@ -8,16 +8,12 @@ use loop_protocol::{
 use loop_runtime::log::{EventKind, EventLog, SqliteEventLog};
 use loop_test_support::{FakeHttpServer, FakeResponse, RecordedRequest};
 use serde_json::{json, Value};
-use std::{
-    path::PathBuf,
-    process::Stdio,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::{Child, ChildStdin, Command},
-};
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin, Command};
 
 const TEST_LIMIT: Duration = Duration::from_secs(120);
 const WAIT: Duration = Duration::from_secs(30);
@@ -1445,7 +1441,7 @@ async fn closing_a_parent_with_a_running_subagent_needs_force_and_cascades() {
 #[tokio::test]
 async fn the_daemon_serves_workspace_admin_and_host_only_methods_on_its_socket() {
     bounded(async {
-        use loop_protocol::admin::*;
+        use loop_protocol::admin::{DefaultsParams, DefaultsPatch, ReloadParams};
         use loop_wire::RuntimeAdmin;
         let fx = Fixture::new();
         let serve = fx.serve().await;
@@ -1503,7 +1499,10 @@ async fn the_daemon_serves_workspace_admin_and_host_only_methods_on_its_socket()
         assert!(settings.contains("45000"), "{settings}");
         #[cfg(feature = "usage")]
         {
-            let usage = client.usage(UsageParams::default()).await.unwrap();
+            let usage = client
+                .usage(loop_protocol::admin::UsageParams::default())
+                .await
+                .unwrap();
             assert!(usage.next_cursor.is_none());
         }
         serve.stop().await;

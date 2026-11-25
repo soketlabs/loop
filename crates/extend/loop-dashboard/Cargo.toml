@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "Terminal usage dashboard for Loop, built from the anonymous usage log"
 
+[lints]
+workspace = true
+
 [dependencies]
 loop-protocol = { workspace = true }
 loop-telemetry = { workspace = true }

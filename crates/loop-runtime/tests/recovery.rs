@@ -1,20 +1,18 @@
 //! Crash recovery on Runtime start (design §12).
-use loop_agent::harness::session::{
-    sqlite::{LeaseIdentity, SqliteSessionStore},
-    SessionStore,
-};
+use loop_agent::harness::session::sqlite::{LeaseIdentity, SqliteSessionStore};
+use loop_agent::harness::session::SessionStore;
 use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
 use loop_protocol::{
     AgentBackend, ContentBlock, SessionKey, SessionRef, SessionSpec, SessionUpdate, StopReason,
     TurnId, TurnOutcome, UpdateEnvelope,
 };
-use loop_runtime::{
-    log::{Event, EventKind, EventLog, SqliteEventLog},
-    Recovery, Runtime, RuntimeLimits,
-};
+use loop_runtime::log::{Event, EventKind, EventLog, SqliteEventLog};
+use loop_runtime::{Recovery, Runtime, RuntimeLimits};
 use loop_wire::RuntimeControl;
 use serde_json::json;
-use std::{path::Path, sync::Arc, time::Duration};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 const LIMIT: Duration = Duration::from_secs(60);
 

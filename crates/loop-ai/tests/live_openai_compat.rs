@@ -13,8 +13,8 @@
 //! Set `LOOP_TEST_PRINT=1` (or `true`) to print streamed model output.
 
 use futures::StreamExt;
+use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
 use loop_ai::{
-    providers::{custom_provider, CustomModelSpec, CustomProviderConfig},
     AssistantContent, AssistantMessageEvent, Context, Message, Models, SimpleStreamOptions,
     StopReason,
 };

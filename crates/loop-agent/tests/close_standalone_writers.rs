@@ -1,13 +1,9 @@
 //! `close_standalone_writers` is process-wide, so it has its own test binary.
 #![cfg(feature = "sqlite")]
 
-use loop_agent::harness::{
-    session::{
-        sqlite::{close_standalone_writers, SqliteSessionStore},
-        PendingSessionWrite,
-    },
-    SessionStore,
-};
+use loop_agent::harness::session::sqlite::{close_standalone_writers, SqliteSessionStore};
+use loop_agent::harness::session::PendingSessionWrite;
+use loop_agent::harness::SessionStore;
 
 #[tokio::test]
 async fn closing_every_writer_releases_them_and_refuses_later_claims() {

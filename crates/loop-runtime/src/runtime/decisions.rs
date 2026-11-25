@@ -12,7 +12,10 @@
 //!
 //! The record is a log-only, audit-only row: it takes no Session sequence,
 //! so attach and replay never see it.
-use super::*;
+use super::{
+    async_trait, barrier, Arc, Event, EventKind, EventLog, Identity, LiveSession, SessionKey,
+    Tenant,
+};
 use loop_app_core::permissions::decision::{
     DecisionContext, DecisionError, DecisionSink, PolicyDecisionRecord,
 };

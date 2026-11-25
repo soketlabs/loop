@@ -4,10 +4,8 @@
 //! the call runs.
 use super::*;
 use crate::log::{EventLog, LoggedEvent, MemoryEventLog};
-use loop_ai::{
-    providers::{faux_provider_fn, FauxResponse},
-    Context, Message, ToolCall,
-};
+use loop_ai::providers::{faux_provider_fn, FauxResponse};
+use loop_ai::{Context, Message, ToolCall};
 use loop_app_core::permissions::decision::{
     DecidedBy, DecisionOutcome, DecisionSource, PolicyDecisionRecord,
 };
@@ -310,7 +308,9 @@ async fn a_tool_call_s_decision_commits_after_its_tool_call_and_before_it_runs()
 /// of every answer.
 #[tokio::test]
 async fn workspace_reads_return_no_secrets() {
-    use loop_protocol::admin::*;
+    use loop_protocol::admin::{
+        AdminAction, McpParams, SettingsParams, SkillsParams, TemplatesParams, WebSearchParams,
+    };
     use loop_wire::RuntimeAdmin;
     tokio::time::timeout(LIMIT, async {
         let dir = tempfile::tempdir().unwrap();

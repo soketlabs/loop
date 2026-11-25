@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "Workspace driver contract for Loop: where a Session's files and commands live (files, shell, lifecycle, drivers), with no backend"
 
+[lints]
+workspace = true
+
 [dependencies]
 async-trait = { workspace = true }
 parking_lot = { workspace = true }

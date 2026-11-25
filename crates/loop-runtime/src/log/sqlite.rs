@@ -4,7 +4,10 @@
 //! it replies. Reads run on a pool of read connections, each on a snapshot
 //! that must include every append already acknowledged.
 
-use super::*;
+use super::{
+    stamp, validate, Event, EventKind, EventLog, EventLogError, LoggedEvent, Result,
+    MAX_BATCH_EVENTS, WRITER_QUEUE_CAPACITY,
+};
 use async_trait::async_trait;
 use loop_protocol::{SessionKey, TurnId};
 use loop_store::{

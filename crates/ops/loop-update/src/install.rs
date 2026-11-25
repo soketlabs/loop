@@ -1,13 +1,11 @@
 //! The managed installation: the `loop` binary, its `.loop-update/` state folder,
 //! the operation lock, and install, rollback and uninstall.
 
-use std::{
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-    process::Stdio,
-    time::Duration,
-};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 

@@ -324,7 +324,7 @@ pub enum UserMessageContent {
 }
 
 mod user_content_serde {
-    use super::*;
+    use super::{Deserialize, Serialize, UserMessageContent};
     use serde::{Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(

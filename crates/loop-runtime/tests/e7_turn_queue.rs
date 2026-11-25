@@ -39,31 +39,27 @@
 #![cfg(unix)]
 
 use async_trait::async_trait;
-use loop_ai::{
-    providers::{faux_provider_fn, FauxResponder, FauxResponse},
-    Context, Message, ToolCall,
-};
+use loop_ai::providers::{faux_provider_fn, FauxResponder, FauxResponse};
+use loop_ai::{Context, Message, ToolCall};
 use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
 use loop_protocol::{
     AgentBackend, BackendError, ContentBlock, SessionRef, SessionSpec, SessionUpdate, StopReason,
     TurnOutcome,
 };
-use loop_runtime::{
-    log::{Event, EventKind, EventLog, LoggedEvent, MemoryEventLog, Result as LogResult},
-    Runtime, RuntimeLimits,
+use loop_runtime::log::{
+    Event, EventKind, EventLog, LoggedEvent, MemoryEventLog, Result as LogResult,
 };
+use loop_runtime::{Runtime, RuntimeLimits};
 use loop_wire::RuntimeControl;
 use serde_json::json;
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
-    time::{Duration, Instant},
-};
-use tokio::{sync::watch, task::JoinHandle, time::timeout};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 /// Longest wait for one prompt call, one outcome or one admin operation.
 const DEADLINE: Duration = Duration::from_secs(30);

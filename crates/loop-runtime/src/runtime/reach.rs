@@ -2,7 +2,10 @@
 //! [`Subject`] of a Session and ask [`decide`]. Every entry point calls
 //! [`Runtime::check`] (or a filter here) before it reads anything else about
 //! the Session.
-use super::*;
+use super::{
+    failed, reference, BackendError, BackendResult, LiveSession, Ordering, PathBuf, Runtime,
+    SessionKey, SessionRef, Tenant,
+};
 use crate::access::{decide, refusal, Actor, Need, Subject};
 use crate::sync;
 

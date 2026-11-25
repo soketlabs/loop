@@ -254,14 +254,14 @@ const RUNTIME_TOKEN_FILE: &str = "runtime.token";
 /// Run the Runtime until SIGINT, SIGTERM or `loop runtime stop`.
 pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     use anyhow::Context;
-    use loop_app_core::{
-        config::{paths, Settings},
-        permissions::PermissionMode,
-        runtime::{BootstrapOpts, GlobalResources},
-        runtime_instance::RuntimeInstanceLock,
-    };
-    use loop_protocol::{rpc::PeerInfo, AgentBackend};
-    use loop_runtime::{log::SqliteEventLog, Runtime, RuntimeLimits};
+    use loop_app_core::config::{paths, Settings};
+    use loop_app_core::permissions::PermissionMode;
+    use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
+    use loop_app_core::runtime_instance::RuntimeInstanceLock;
+    use loop_protocol::rpc::PeerInfo;
+    use loop_protocol::AgentBackend;
+    use loop_runtime::log::SqliteEventLog;
+    use loop_runtime::{Runtime, RuntimeLimits};
     use loop_wire::server::{serve_with_caller, serve_with_control, ServeOptions};
 
     if args.listen.is_some_and(|addr| !addr.ip().is_loopback()) {

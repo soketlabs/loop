@@ -1,7 +1,14 @@
 //! Remote services behind the same SurfaceClient used by native and ACP.
-use super::*;
+use super::{
+    keybindings, AgentBackend, Arc, ClientCapabilities, CloneParams, DestinationResult,
+    ExportResult, ForkParams, ImportParams, MutationResult, NavigateParams, NavigateResult,
+    PeerInfo, RenameParams, ResourceView, RuntimeControl, SessionInfo, SessionParams, SessionRef,
+    SessionSnapshot, SkillParams, SurfaceClient, Theme, TreeParams, TreeResult, ViewParams,
+    ViewResult, WorkflowParams, WorkflowResult,
+};
 use loop_protocol::{BackendResult, HostServices, InteractionOutcome, InteractionRequest};
-use loop_wire::{transport::Transport, RemoteBackend};
+use loop_wire::transport::Transport;
+use loop_wire::RemoteBackend;
 
 /// Interaction endpoint installed once the TUI owns its approval queue.
 #[derive(Default)]
@@ -243,7 +250,9 @@ impl SurfaceClient {
         }) || self.remote_resources.is_none();
         self.adopt_snapshot(snapshot);
         if refresh_workspace {
-            use loop_protocol::admin::*;
+            use loop_protocol::admin::{
+                AdminAction, McpParams, SkillsParams, TemplatesParams, TrustParams,
+            };
             use loop_wire::RuntimeAdmin;
             let workspace_id = self.workspace_id.clone();
             let mut view = ResourceView {
@@ -479,7 +488,7 @@ impl SurfaceClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loop_protocol::{ContentBlock, SessionUpdate};
+    use loop_protocol::{ContentBlock, SessionSpec, SessionUpdate};
     use loop_wire::server::{serve_with_control, ServeOptions};
     use std::time::Duration;
     fn opts(dir: &std::path::Path) -> crate::BootstrapOpts {

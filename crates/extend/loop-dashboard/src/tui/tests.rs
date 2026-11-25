@@ -2,7 +2,10 @@
 
 use ratatui::backend::TestBackend;
 
-use super::widgets::*;
+use super::widgets::{
+    bar, compact, duration, fill_days, fit_columns, gauge, nice_max, thousands, Column, Histogram,
+    Legend,
+};
 use super::*;
 use crate::aggregate::{McpRow, SessionRow, SkillRow, Totals};
 

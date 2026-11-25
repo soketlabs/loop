@@ -131,6 +131,15 @@ rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "3a2ebb
 axum = "0.8"
 tower = "0.5"
 
+[workspace.lints.clippy]
+wildcard_imports = "warn"
+enum_glob_use = "warn"
+ptr_arg = "warn"
+borrowed_box = "warn"
+should_implement_trait = "warn"
+derivable_impls = "warn"
+len_without_is_empty = "warn"
+
 [profile.release]
 lto = true
 codegen-units = 1

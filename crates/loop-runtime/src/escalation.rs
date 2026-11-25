@@ -17,14 +17,15 @@
 use crate::access::{decide, Actor, Need, Subject};
 use crate::log::{Event, EventKind, EventLog};
 use async_trait::async_trait;
+use loop_protocol::rpc::InteractParams;
 use loop_protocol::{
-    rpc::InteractParams, BackendResult, Caller, HostServices, InteractionOutcome,
-    InteractionRequest, SessionRef,
+    BackendResult, Caller, HostServices, InteractionOutcome, InteractionRequest, SessionRef,
 };
 use loop_store::{Identity, Tenant};
 use loop_wire::control::EscalationRecipient;
 use serde_json::json;
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::{oneshot, watch, Mutex};
 
 /// The approver host of one live Session. Disconnected Surfaces never decide a request.

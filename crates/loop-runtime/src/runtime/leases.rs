@@ -1,5 +1,8 @@
 //! Session lease ownership: the admission lease and the renewal loop.
-use super::*;
+use super::{
+    failed, oneshot, Arc, BackendResult, Duration, Future, LeaseIdentity, RuntimeSessionStore,
+    SessionError,
+};
 
 /// Lease renewals run every interval; the lease turns stale at 30 s, so give up
 /// on transient errors a little before that.

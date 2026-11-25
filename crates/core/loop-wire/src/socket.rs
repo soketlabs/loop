@@ -468,7 +468,8 @@ mod tests {
     #[tokio::test]
     async fn a_websocket_without_the_token_is_refused() {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Error};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Error;
         for (expected, given) in [("secret", None), ("secret", Some("wrong")), ("", Some(""))] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
