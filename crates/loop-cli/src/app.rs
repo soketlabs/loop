@@ -1069,7 +1069,7 @@ async fn run_loop(
                         &text,
                         runtime,
                         &mut input,
-                        &pending_setup,
+                        pending_setup.as_ref(),
                         &mut model_picker,
                         &mut fork_picker,
                         &mut skill_picker,
@@ -1105,7 +1105,7 @@ async fn run_loop(
                             &text,
                             runtime,
                             &mut input,
-                            &pending_setup,
+                            pending_setup.as_ref(),
                             &mut model_picker,
                             &mut fork_picker,
                             &mut skill_picker,
@@ -2385,7 +2385,7 @@ fn insert_pasted_text(
     text: &str,
     runtime: &SurfaceClient,
     input: &mut InputBuffer,
-    pending_setup: &Option<SetupPrompt>,
+    pending_setup: Option<&SetupPrompt>,
     model_picker: &mut Option<ModelPickerState>,
     fork_picker: &mut Option<ForkPickerState>,
     skill_picker: &mut Option<SkillPickerState>,
@@ -2444,7 +2444,7 @@ fn insert_pasted_text(
         }
         return;
     }
-    if let Some(prompt) = pending_setup.as_ref() {
+    if let Some(prompt) = pending_setup {
         if prompt.options().is_some() {
             return;
         }

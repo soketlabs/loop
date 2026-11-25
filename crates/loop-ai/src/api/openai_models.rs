@@ -121,17 +121,16 @@ impl RemoteModel {
 impl RemotePricing {
     /// Per-token USD strings → per-million [`ModelCost`] (unparseable or negative = 0).
     fn to_cost(&self) -> ModelCost {
-        let per_million = |v: &Option<String>| {
-            v.as_deref()
-                .and_then(|s| s.trim().parse::<f64>().ok())
+        let per_million = |v: Option<&str>| {
+            v.and_then(|s| s.trim().parse::<f64>().ok())
                 .filter(|p| p.is_finite() && *p > 0.0)
                 .map_or(0.0, |p| p * 1_000_000.0)
         };
         ModelCost {
-            input: per_million(&self.prompt),
-            output: per_million(&self.completion),
-            cache_read: per_million(&self.input_cache_read),
-            cache_write: per_million(&self.input_cache_write),
+            input: per_million(self.prompt.as_deref()),
+            output: per_million(self.completion.as_deref()),
+            cache_read: per_million(self.input_cache_read.as_deref()),
+            cache_write: per_million(self.input_cache_write.as_deref()),
             tiers: None,
         }
     }

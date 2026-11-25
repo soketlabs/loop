@@ -1101,20 +1101,15 @@ pub async fn status(socket: Option<PathBuf>, json: bool) -> anyhow::Result<bool>
         if let Some(url) = &status.listen_url {
             println!("listen:  {url}");
         }
-        let from = |source: &Option<String>| {
-            source
-                .as_deref()
-                .map(|s| format!(" ({s})"))
-                .unwrap_or_default()
-        };
+        let from = |source: Option<&str>| source.map(|s| format!(" ({s})")).unwrap_or_default();
         println!(
             "Sessions: {} loaded of {}{}, {} busy; at most {} turns at once{}",
             status.loaded,
             status.max_sessions,
-            from(&status.max_sessions_from),
+            from(status.max_sessions_from.as_deref()),
             status.busy,
             status.max_active_turns,
-            from(&status.max_active_turns_from)
+            from(status.max_active_turns_from.as_deref())
         );
         if let Some(lock) = status.tool_lock {
             println!("tool lock: {lock} (fixed until the Runtime stops)");
