@@ -1,3 +1,6 @@
+//! The managed installation: the `loop` binary, its `.loop-update/` state folder,
+//! the operation lock, and install, rollback and uninstall.
+
 use std::{
     fs,
     io::Write,
@@ -10,6 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{sha256_file, Error, Result};
 
+/// The directory that holds the installed `loop` binary: `LOOP_INSTALL_DIR` when
+/// set, otherwise `~/.loop/bin`. Returns an error when there is no home
+/// directory.
 pub fn default_install_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("LOOP_INSTALL_DIR") {
         return Ok(PathBuf::from(dir));
@@ -64,6 +70,9 @@ impl Installation {
         Self::managed_executable().is_ok()
     }
 
+    /// The path of the running executable, if it is the `loop` binary in
+    /// [`default_install_dir`] and the directory has the `.loop-update/` marker.
+    /// Returns an error that tells the user how to update otherwise.
     pub fn managed_executable() -> Result<PathBuf> {
         let executable = std::env::current_exe()?;
         let dir = default_install_dir()?;
@@ -77,10 +86,15 @@ impl Installation {
         Ok(executable)
     }
 
+    /// Take the lock for the running executable. Fails when it is not managed
+    /// (see [`Installation::managed_executable`]).
     pub fn current() -> Result<Self> {
         Self::at(Self::managed_executable()?)
     }
 
+    /// The file where the startup update check caches the latest release, in
+    /// the `.loop-update/` folder. Creates the folder if it is missing and
+    /// fails when the executable is not managed.
     pub fn notification_cache_path() -> Result<PathBuf> {
         let executable = Self::managed_executable()?;
         let state = executable
@@ -131,12 +145,15 @@ impl Installation {
         Ok(installation)
     }
 
+    /// A new temporary directory inside `.loop-update/`, for downloads. It is
+    /// deleted when dropped.
     pub fn staging(&self) -> Result<tempfile::TempDir> {
         Ok(tempfile::Builder::new()
             .prefix("stage-")
             .tempdir_in(&self.state_dir)?)
     }
 
+    /// The path of the managed executable.
     pub fn executable(&self) -> &Path {
         &self.executable
     }
@@ -302,6 +319,10 @@ impl Installation {
         Ok(())
     }
 
+    /// Reinstall the binary that the last [`Installation::install`] replaced.
+    /// Refuses when the rollback record is missing or invalid, or when the
+    /// installed binary or the saved one does not match its recorded SHA-256.
+    /// Returns the version that was restored.
     pub async fn rollback(&self) -> Result<String> {
         let record_path = self.state_dir.join("rollback.json");
         regular(&record_path).map_err(|_| Error::Invalid("No rollback record found".into()))?;
@@ -328,6 +349,8 @@ impl Installation {
         Ok(record.previous_version)
     }
 
+    /// Remove the binary and everything in `.loop-update/`, and the folder
+    /// itself. The lock is released last. Consumes the installation.
     pub fn uninstall(mut self) -> Result<()> {
         regular(&self.executable)?;
         if fs::canonicalize(std::env::current_exe()?)? == fs::canonicalize(&self.executable)? {
