@@ -1936,7 +1936,7 @@ fn ensure_forwarding(
     let fresh = runtime
         .forwarded
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .expect("forwarded lock poisoned: only insert runs under it, so a panic there is a bug")
         .insert(backend.instance().to_string());
     if fresh {
         forward_updates(

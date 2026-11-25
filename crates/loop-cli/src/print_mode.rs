@@ -181,14 +181,15 @@ pub async fn run_print(
             None => Ok(report.text.clone()),
             Some(error) => Err(anyhow::anyhow!(error)),
         };
-        *report_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(report);
+        store_report(&report_slot, report);
         traced
     })
     .await;
     if let Some(trace_id) = &outcome.trace_id {
         eprintln!("{TRACE_ID_PREFIX}{trace_id}");
     }
-    let report = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    // A poisoned slot reads as no report, without looking inside it.
+    let report = slot.lock().ok().and_then(|mut slot| slot.take());
     let Some(report) = report else {
         // The run never reached the turn.
         return outcome.result.map(|_| 1);
@@ -582,6 +583,22 @@ pub fn final_text(message: &AgentMessage) -> anyhow::Result<String> {
             _ => None,
         })
         .collect())
+}
+
+/// Put `report` in `slot`, also when the lock is poisoned: the slot is
+/// overwritten and never read, and the poison is cleared after the write.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "write-only reset: the poisoned value is overwritten, never read"
+)]
+fn store_report(slot: &std::sync::Mutex<Option<TurnReport>>, report: TurnReport) {
+    let mut guard = match slot.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(report);
+    drop(guard);
+    slot.clear_poison();
 }
 
 #[cfg(test)]

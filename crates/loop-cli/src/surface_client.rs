@@ -1878,7 +1878,9 @@ impl SurfaceClient {
             let backend = agents.backend(&id).await.map_err(|e| format!("{e:#}"))?;
             if forwarded
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
+                .expect(
+                    "forwarded lock poisoned: only insert runs under it, so a panic there is a bug",
+                )
                 .insert(id.clone())
             {
                 forward(backend.as_ref());

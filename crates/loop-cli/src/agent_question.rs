@@ -233,7 +233,9 @@ impl AgentQuestion {
     }
 
     fn answer(&self, outcome: InteractionOutcome) {
-        if let Some(reply) = self.reply.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        // A poisoned lock sends no reply, without looking inside it.
+        let reply = self.reply.lock().ok().and_then(|mut reply| reply.take());
+        if let Some(reply) = reply {
             let _ = reply.send(outcome);
         }
     }

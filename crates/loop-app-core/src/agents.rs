@@ -217,14 +217,38 @@ impl AgentManager {
     }
 
     /// Where agents ask the user. Applies to agents started afterwards.
+    /// Replaces the value whole without reading it, so a poisoned lock is
+    /// overwritten and then cleared.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "write-only reset: the poisoned value is overwritten, never read"
+    )]
     pub fn set_host(&self, host: Arc<dyn HostServices>) {
-        *self.host.lock().unwrap_or_else(|p| p.into_inner()) = host;
+        let mut guard = match self.host.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = host;
+        drop(guard);
+        self.host.clear_poison();
     }
 
     /// Run agents' permission requests and finished tool calls through
-    /// `gate`'s hooks. Applies to agents started afterwards.
+    /// `gate`'s hooks. Applies to agents started afterwards. Replaces the
+    /// value whole without reading it, so a poisoned lock is overwritten and
+    /// then cleared.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "write-only reset: the poisoned value is overwritten, never read"
+    )]
     pub fn set_gate(&self, gate: Arc<crate::tool_gate::ToolGate>) {
-        *self.gate.lock().unwrap_or_else(|p| p.into_inner()) = Some(gate);
+        let mut guard = match self.gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(gate);
+        drop(guard);
+        self.gate.clear_poison();
     }
 
     /// Every subscription Loop knows.
@@ -320,8 +344,19 @@ impl AgentManager {
         if let Some(backend) = started.get(id) {
             return Ok(Arc::clone(backend));
         }
-        let mut host = Arc::clone(&self.host.lock().unwrap_or_else(|p| p.into_inner()));
-        let gate = self.gate.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let mut host = Arc::clone(
+            &*self
+                .host
+                .lock()
+                .map_err(|_| anyhow!("the agent host lock is poisoned; not starting `{id}`"))?,
+        );
+        // The gate is the permission hook: without it an agent would run
+        // ungated, so a poisoned lock refuses to start one.
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow!("the agent gate lock is poisoned; not starting `{id}`"))?
+            .clone();
         if let Some(gate) = &gate {
             host = Arc::new(crate::agent_gate::GatedHost::new(
                 host,
@@ -647,6 +682,52 @@ mod tests {
             mine.config().env,
             [("PROFILE".to_owned(), "work".to_owned())]
         );
+    }
+
+    fn poison<T: Send>(mutex: &Mutex<T>) {
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _guard = mutex.lock().unwrap();
+                    panic!("poison the lock for a test");
+                })
+                .join();
+        });
+        assert!(mutex.is_poisoned());
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_gate_or_host_lock_refuses_to_start_an_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AgentManager::new(builtin_agents(), dir.path().into(), dir.path());
+        poison(&manager.gate);
+        let Err(error) = manager.backend("chatgpt").await else {
+            panic!("an agent started without its lock");
+        };
+        assert!(
+            error.to_string().contains("gate lock is poisoned"),
+            "{error}"
+        );
+        assert!(manager.started.lock().await.is_empty());
+
+        let manager = AgentManager::new(builtin_agents(), dir.path().into(), dir.path());
+        poison(&manager.host);
+        let Err(error) = manager.backend("chatgpt").await else {
+            panic!("an agent started without its lock");
+        };
+        assert!(
+            error.to_string().contains("host lock is poisoned"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn setting_the_host_clears_a_poisoned_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AgentManager::new(Vec::new(), dir.path().into(), dir.path());
+        poison(&manager.host);
+        manager.set_host(Arc::new(HeadlessHost));
+        assert!(!manager.host.is_poisoned());
     }
 
     #[test]
