@@ -906,7 +906,9 @@ fn identity_of(
         serde_json::from_value(Value::String(tenant)).map_err(|e| bad("tenant", &e))?;
     let principal = match (kind, issuer, id) {
         (Some(kind), Some(issuer), Some(id)) => {
-            let kind = PrincipalKind::parse(&kind).map_err(|e| bad("principal kind", &e))?;
+            let kind = kind
+                .parse::<PrincipalKind>()
+                .map_err(|e| bad("principal kind", &e))?;
             Principal::new(kind, issuer, id).map_err(|e| bad("principal", &e))?
         }
         _ => Identity::unrecorded().principal,

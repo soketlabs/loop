@@ -103,10 +103,14 @@ impl PrincipalKind {
             Self::Unknown(kind) => kind,
         }
     }
+}
+
+impl std::str::FromStr for PrincipalKind {
+    type Err = IdentityError;
 
     /// A kind from its wire text. `person` and `service` are known; any
     /// other valid text is [`PrincipalKind::Unknown`].
-    pub fn parse(value: &str) -> Result<Self, IdentityError> {
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         Ok(match value {
             "person" => Self::Person,
             "service" => Self::Service,
@@ -132,7 +136,9 @@ impl Serialize for PrincipalKind {
 
 impl<'de> Deserialize<'de> for PrincipalKind {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        PrincipalKind::parse(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+        String::deserialize(deserializer)?
+            .parse::<PrincipalKind>()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -616,6 +622,21 @@ mod tests {
 
     fn google(id: &str) -> Principal {
         Principal::new(PrincipalKind::Person, "https://accounts.google.com", id).unwrap()
+    }
+
+    #[test]
+    fn principal_kind_from_str() {
+        assert_eq!("person".parse::<PrincipalKind>(), Ok(PrincipalKind::Person));
+        assert_eq!(
+            "service".parse::<PrincipalKind>(),
+            Ok(PrincipalKind::Service)
+        );
+        assert_eq!(
+            "robot".parse::<PrincipalKind>(),
+            Ok(PrincipalKind::Unknown("robot".to_owned()))
+        );
+        assert!("".parse::<PrincipalKind>().is_err());
+        assert!("two words".parse::<PrincipalKind>().is_err());
     }
 
     #[test]

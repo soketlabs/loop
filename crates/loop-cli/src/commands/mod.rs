@@ -496,11 +496,12 @@ pub fn parse_tracing(args: &str) -> Result<TracingCommand, String> {
         ["enable" | "on"] => Ok(TracingCommand::Enable),
         ["disable" | "off"] => Ok(TracingCommand::Disable),
         ["setup"] => Ok(TracingCommand::Setup { backend: None }),
-        ["setup", backend] => TracingBackend::parse(backend)
+        ["setup", backend] => backend
+            .parse::<TracingBackend>()
             .map(|backend| TracingCommand::Setup {
                 backend: Some(backend),
             })
-            .ok_or_else(|| TRACING_USAGE.to_string()),
+            .map_err(|_| TRACING_USAGE.to_string()),
         _ => Err(TRACING_USAGE.into()),
     }
 }

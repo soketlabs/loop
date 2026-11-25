@@ -78,10 +78,11 @@ fn option_bool(spec: &WorkspaceSpec, key: &str) -> bool {
 /// Capabilities of a Podman Workspace for `spec` (the defaults of
 /// [`super::KrunSandbox::new`]).
 pub fn podman_capabilities(spec: &WorkspaceSpec) -> WorkspaceCapabilities {
-    let isolation = match option_str(spec, "isolation").and_then(KrunIsolation::parse) {
-        Some(KrunIsolation::Partial) => Isolation::Partial,
-        _ => Isolation::Full,
-    };
+    let isolation =
+        match option_str(spec, "isolation").and_then(|v| v.parse::<KrunIsolation>().ok()) {
+            Some(KrunIsolation::Partial) => Isolation::Partial,
+            _ => Isolation::Full,
+        };
     WorkspaceCapabilities {
         isolation,
         persistent: true,

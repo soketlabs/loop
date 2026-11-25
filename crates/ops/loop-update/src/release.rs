@@ -26,9 +26,18 @@ pub struct ReleaseVersion {
 }
 
 impl ReleaseVersion {
+    /// Parse a version or a tag; see the [`FromStr`](std::str::FromStr) impl.
+    pub fn parse(value: &str) -> Result<Self> {
+        value.parse()
+    }
+}
+
+impl std::str::FromStr for ReleaseVersion {
+    type Err = Error;
+
     /// Parse a version or a tag. A leading `v` is optional. Returns an error
     /// when the rest is not valid SemVer.
-    pub fn parse(value: &str) -> Result<Self> {
+    fn from_str(value: &str) -> Result<Self> {
         let version = Version::parse(value.strip_prefix('v').unwrap_or(value))?;
         Ok(Self {
             tag: format!("v{version}"),
@@ -382,6 +391,17 @@ fn extract_binary(archive: &Path, binary: &Path, target: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_version_from_str() {
+        let with_tag: ReleaseVersion = "v0.7.0".parse().unwrap();
+        let bare: ReleaseVersion = "0.7.0".parse().unwrap();
+        assert_eq!(with_tag.tag, "v0.7.0");
+        assert_eq!(bare.tag, "v0.7.0");
+        assert_eq!(with_tag.version, bare.version);
+        assert!("latest".parse::<ReleaseVersion>().is_err());
+        assert!("".parse::<ReleaseVersion>().is_err());
+    }
 
     #[test]
     fn compare_versions_numerically_and_reject_paths() {

@@ -35,40 +35,7 @@ impl WorkspacePath {
     /// a `..` that stays inside the root is folded; an absolute path, a `..`
     /// above the root and a NUL byte are errors.
     pub fn parse(raw: &str) -> Result<Self, WorkspaceError> {
-        let invalid = |reason| WorkspaceError::InvalidPath {
-            path: raw.to_owned(),
-            reason,
-        };
-        if raw.contains('\0') {
-            return Err(invalid("contains a NUL byte"));
-        }
-        if raw.contains('\\') {
-            return Err(invalid("contains a backslash; use `/`"));
-        }
-        if raw.starts_with('/') {
-            return Err(invalid(
-                "is absolute; use a path relative to the workspace root",
-            ));
-        }
-        let mut parts: Vec<&str> = Vec::new();
-        for segment in raw.split('/') {
-            match segment {
-                "" | "." => {}
-                ".." => {
-                    if parts.pop().is_none() {
-                        return Err(invalid("leaves the workspace root"));
-                    }
-                }
-                other => {
-                    let bytes = other.as_bytes();
-                    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
-                        return Err(invalid("has a drive prefix"));
-                    }
-                    parts.push(other)
-                }
-            }
-        }
-        Ok(Self(parts.join("/")))
+        raw.parse()
     }
 
     /// The path of `native` relative to `root`, both in the driver's own
@@ -143,6 +110,47 @@ impl WorkspacePath {
     }
 }
 
+impl std::str::FromStr for WorkspacePath {
+    type Err = WorkspaceError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let invalid = |reason| WorkspaceError::InvalidPath {
+            path: raw.to_owned(),
+            reason,
+        };
+        if raw.contains('\0') {
+            return Err(invalid("contains a NUL byte"));
+        }
+        if raw.contains('\\') {
+            return Err(invalid("contains a backslash; use `/`"));
+        }
+        if raw.starts_with('/') {
+            return Err(invalid(
+                "is absolute; use a path relative to the workspace root",
+            ));
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        for segment in raw.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    if parts.pop().is_none() {
+                        return Err(invalid("leaves the workspace root"));
+                    }
+                }
+                other => {
+                    let bytes = other.as_bytes();
+                    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+                        return Err(invalid("has a drive prefix"));
+                    }
+                    parts.push(other)
+                }
+            }
+        }
+        Ok(Self(parts.join("/")))
+    }
+}
+
 impl fmt::Display for WorkspacePath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_root() {
@@ -169,6 +177,15 @@ impl From<WorkspacePath> for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_str_matches_parse() {
+        let parsed: WorkspacePath = "a//./b/".parse().unwrap();
+        assert_eq!(parsed.as_str(), "a/b");
+        assert_eq!(parsed, WorkspacePath::parse("a//./b/").unwrap());
+        assert!("/abs".parse::<WorkspacePath>().is_err());
+        assert!("a/../..".parse::<WorkspacePath>().is_err());
+    }
 
     #[test]
     fn parse_normalises() {
