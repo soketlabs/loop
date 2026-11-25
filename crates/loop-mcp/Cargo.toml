@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "MCP client and server for Loop agent"
 
+[lints]
+workspace = true
+
 [dependencies]
 loop-ai = { workspace = true }
 rmcp = { workspace = true }

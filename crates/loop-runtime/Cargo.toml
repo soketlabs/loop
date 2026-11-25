@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "Runtime ownership and durable Session Event Log"
 
+[lints]
+workspace = true
+
 [features]
 orchestration = ["loop-agent/orchestration"]
 

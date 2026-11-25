@@ -7,4 +7,7 @@ rust-version.workspace = true
 description = "Test helpers shared across Loop crates (dev-dependency only)"
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]

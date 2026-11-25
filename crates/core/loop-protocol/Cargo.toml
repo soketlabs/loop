@@ -7,6 +7,9 @@ rust-version.workspace = true
 description = "Versioned event model shared by every Loop agent backend and surface"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [features]
 # `json_schema()` and `JsonSchema` on every wire type, for the checked-in
 # schema and the SDK generated from it.
