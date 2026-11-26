@@ -580,16 +580,39 @@ fn models_server() -> loop_test_support::FakeHttpServer {
     })
 }
 
-/// The model of the newest Session, read over the socket.
-async fn newest_model(agent: &Path) -> Option<String> {
-    use loop_protocol::ModelControl;
-    let remote = loop_cli::runtime_launch::connect(
+/// The permission mode of the newest Session, read over the socket.
+async fn newest_mode(agent: &Path) -> String {
+    use loop_wire::RuntimeAdmin;
+    let remote = connect_runtime(agent).await;
+    let mut sessions = remote.list().await.unwrap();
+    sessions.sort_by_key(|s| s.created_ms);
+    let newest = sessions.pop().unwrap();
+    let result = remote
+        .permission_mode(loop_protocol::admin::PermissionModeParams {
+            session: newest.r#ref,
+            mode: None,
+            expected_revision: None,
+        })
+        .await
+        .unwrap();
+    remote.disconnect();
+    result.mode
+}
+
+async fn connect_runtime(agent: &Path) -> std::sync::Arc<loop_wire::RemoteBackend> {
+    loop_cli::runtime_launch::connect(
         &loop_cli::runtime_launch::Target::Unix(agent.join("run/runtime.sock")),
         None,
         std::sync::Arc::new(loop_cli::surface_client::RemoteHost::default()),
     )
     .await
-    .unwrap();
+    .unwrap()
+}
+
+/// The model of the newest Session, read over the socket.
+async fn newest_model(agent: &Path) -> Option<String> {
+    use loop_protocol::ModelControl;
+    let remote = connect_runtime(agent).await;
     let mut sessions = remote.list().await.unwrap();
     sessions.sort_by_key(|s| s.created_ms);
     let newest = sessions.pop().unwrap();
@@ -689,6 +712,32 @@ async fn runtime_start_refuses_an_unknown_provider_or_model() {
             assert!(error.contains(wanted), "{args:?}: {error}");
             assert!(!agent.join("run/runtime.sock").exists(), "{args:?}");
         }
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn a_session_with_model_flags_keeps_the_runtime_permission_mode() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let (_dir, agent) = agent_dir();
+        let socket = agent.join("run/runtime.sock");
+        let server = models_server();
+        write_settings(&agent, &model_settings(server.base_url()));
+        let mut child = serve(&agent, &["--permission-mode", "read-only"])
+            .spawn()
+            .unwrap();
+        wait_for(&socket, &mut child).await;
+        let output = new_session(&agent, &[]).await;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(newest_mode(&agent).await, "read-only");
+        // `session new --model` sends options; they name no mode.
+        let output = new_session(&agent, &["--model", "fake/alpha"]).await;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(newest_model(&agent).await.as_deref(), Some("fake/alpha"));
+        assert_eq!(newest_mode(&agent).await, "read-only");
+        signal(&child, "-TERM");
+        child.wait().await.unwrap();
     })
     .await
     .expect("test timed out");

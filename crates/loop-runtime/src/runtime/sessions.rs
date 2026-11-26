@@ -200,7 +200,10 @@ impl Runtime {
             opts.append_system_prompt = options.append_system_prompt.clone();
             opts.no_context_files = options.no_context_files;
             opts.no_web = options.no_web;
-            opts.permission_mode = options.permission_mode.clone();
+            // No mode in the options keeps the Runtime's `--permission-mode`.
+            if options.permission_mode.is_some() {
+                opts.permission_mode = options.permission_mode.clone();
+            }
         }
         let session_workspace_flags = spec.options.as_ref().is_some_and(|options| {
             options.no_context_files
