@@ -15,6 +15,7 @@ pub mod hooks_load;
 pub mod interaction;
 pub mod model_selection;
 pub mod permissions;
+pub mod provider_login;
 pub mod resources;
 pub mod runtime;
 pub mod runtime_instance;

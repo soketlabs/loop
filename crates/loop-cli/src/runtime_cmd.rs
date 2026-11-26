@@ -764,6 +764,12 @@ impl loop_wire::RuntimeAdmin for Control {
     async fn defaults(&self, p: admin::DefaultsParams) -> BackendResult<admin::DefaultsResult> {
         self.runtime.update_defaults(p).await
     }
+    async fn providers(
+        &self,
+        p: loop_protocol::host::ProvidersParams,
+    ) -> BackendResult<loop_protocol::host::ProvidersResult> {
+        self.runtime.providers(p).await
+    }
 }
 use loop_protocol::{admin, BackendResult};
 
