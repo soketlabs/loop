@@ -108,6 +108,7 @@ running after you close the terminal, use your usual tool, such as `nohup`,
 | `--max-sessions N` | `runtime.maxSessions`, else 16 | Most Sessions loaded at once. At the limit, the least recently active idle Session is unloaded to make room |
 | `--max-active-turns N` | `runtime.maxActiveTurns`, else 8 | Most turns running at once. More turns wait in a queue; they are not refused |
 | `--permission-mode MODE` | from settings | `read-only`, `ask`, `accept-edits`, `full-access` or `plan` |
+| `--provider P --model M` | `defaultProvider`/`defaultModel` in settings | The global flags set the model new Sessions start with, for this process only. `--model` takes `provider/id` or a bare id one provider serves; `--provider` needs `--model`. An unknown choice stops startup. A Session that names its own model (`loop --model`, `loop session new --model`) wins. `loop runtime restart` passes them on; an auto-started Runtime never gets them |
 | `--cwd DIR` | current folder | Folder for Sessions that name none |
 | `--tool-lock LOCK` | `LOOP_TOOL_LOCK`, else off | `chat`: lock the tools of every Session for the life of the Runtime. See [Tool lock](#tool-lock) |
 | `--tool-lock-root DIR` | `LOOP_TOOL_LOCK_ROOT` | Required with a lock: every Session folder must be in it |
@@ -706,6 +707,7 @@ loop session list --json        # the same Sessions as JSON, for scripts
 loop session attach 3f2a        # attach to a Session by id or unique id prefix
 loop session new                # create a Session in the current folder and attach
 loop session new --cwd DIR      # create a Session in DIR and attach
+loop --provider P --model M session new   # create a Session that uses this model
 loop session close 3f2a         # unload a Session from the Runtime; its history is kept
 ```
 

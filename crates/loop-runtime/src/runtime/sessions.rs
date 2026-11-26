@@ -190,8 +190,12 @@ impl Runtime {
         self.check_folder(&who, &opts.cwd, existing.map(|s| &s.key))
             .await?;
         if let Some(options) = &spec.options {
-            opts.provider = options.provider.clone();
-            opts.model = options.model.clone();
+            // A Session's own choice replaces the Runtime's default model as a
+            // pair; one that names neither keeps the default.
+            if options.provider.is_some() || options.model.is_some() {
+                opts.provider = options.provider.clone();
+                opts.model = options.model.clone();
+            }
             opts.system_prompt = options.system_prompt.clone();
             opts.append_system_prompt = options.append_system_prompt.clone();
             opts.no_context_files = options.no_context_files;
