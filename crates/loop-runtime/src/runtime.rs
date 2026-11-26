@@ -71,6 +71,7 @@ mod leases;
 mod pause;
 #[cfg(test)]
 mod poison_tests;
+mod providers;
 mod publish;
 mod reach;
 mod sessions;

@@ -21,6 +21,7 @@ use loop_protocol::admin::{
     TemplateInfo, TemplatesParams, TemplatesResult, TrustParams, TrustResult, WebSearchParams,
     WebSearchResult,
 };
+use loop_protocol::host::{ProvidersParams, ProvidersResult};
 use loop_wire::RuntimeAdmin;
 
 use super::{
@@ -642,11 +643,7 @@ impl Runtime {
             }
             settings.save_file(&path).map_err(failed)?;
             self.defaults_revision.fetch_add(1, Ordering::AcqRel);
-            // Loaded workspaces cache settings; new Sessions read them there.
-            let loaded: Vec<PathBuf> = self.workspaces.lock().unwrap().keys().cloned().collect();
-            for cwd in loaded {
-                self.reload_workspace(&cwd).await?;
-            }
+            self.reload_loaded_workspaces().await?;
         }
         Ok(DefaultsResult {
             revision: self.defaults_revision.load(Ordering::Acquire),
@@ -661,6 +658,16 @@ impl Runtime {
 }
 
 impl Runtime {
+    /// Reload every loaded workspace after a global settings change: loaded
+    /// workspaces cache settings, and new Sessions read them there.
+    pub(super) async fn reload_loaded_workspaces(&self) -> BackendResult<()> {
+        let loaded: Vec<PathBuf> = self.workspaces.lock().unwrap().keys().cloned().collect();
+        for cwd in loaded {
+            self.reload_workspace(&cwd).await?;
+        }
+        Ok(())
+    }
+
     /// What `mode` lets a Session do, with the tool lock named when there is
     /// one: the lock caps every mode.
     fn effective_policy(&self, mode: loop_app_core::permissions::PermissionMode) -> String {
@@ -689,9 +696,16 @@ impl RuntimeAdmin for Runtime {
             session_sandbox: true,
             permission_mode: true,
             runtime_sessions: true,
+            // Host-only: the wire offers it only host-locally and never
+            // under a tool lock.
+            host_providers: true,
             tool_lock: self.factory.globals.tool_lock(),
             ..Capabilities::default()
         }
+    }
+
+    async fn providers(&self, p: ProvidersParams) -> BackendResult<ProvidersResult> {
+        self.manage_providers(p).await
     }
 
     async fn settings(&self, p: SettingsParams) -> BackendResult<SettingsResult> {
