@@ -31,7 +31,7 @@ pub fn removed_tool_env_names(custom_key_envs: &[String]) -> BTreeSet<String> {
         .iter()
         .flat_map(|preset| preset.api_key_envs.iter().map(|name| (*name).to_owned()))
         .chain(
-            crate::harness::tools::web::WEB_SEARCH_BACKENDS
+            crate::harness::tools::web_backends::WEB_SEARCH_BACKENDS
                 .iter()
                 .flat_map(|backend| backend.default_api_key_envs.iter())
                 .map(|name| (*name).to_owned()),
@@ -425,6 +425,21 @@ mod tests {
             "GH_TOKEN",
         ] {
             assert!(!removed_tool_env_names(&[]).contains(kept), "{kept}");
+        }
+    }
+
+    #[test]
+    fn web_search_key_names_are_removed_without_the_web_feature() {
+        // The registry lives outside the `web` feature, so this test and the
+        // scrubbed set are the same in a `--no-default-features` build.
+        let removed = removed_tool_env_names(&[]);
+        for name in ["TAVILY_API_KEY", "TINYFISH_API_KEY", "BRAVE_API_KEY"] {
+            assert!(removed.contains(name), "{name}");
+        }
+        for backend in crate::harness::tools::web_backends::WEB_SEARCH_BACKENDS {
+            for name in backend.default_api_key_envs {
+                assert!(removed.contains(*name), "{name}");
+            }
         }
     }
 

@@ -1,3 +1,5 @@
+#![cfg(feature = "web")]
+
 use loop_agent::harness::{create_web_fetch_tool, WebFetchConfig, WebFetchProvider};
 use loop_ai::ToolResultContent;
 use loop_test_support::{FakeHttpServer, FakeResponse};

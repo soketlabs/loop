@@ -5,6 +5,8 @@
 //! developer machine cannot change the results. The fake server listens on
 //! 127.0.0.1, so its base URLs need `allowPrivateAddresses`.
 
+#![cfg(feature = "web")]
+
 use loop_agent::harness::{
     create_web_fetch_tool, create_web_search_tool, verify_web_search_key, SoketWebApi,
     WebFetchConfig, WebFetchProvider, WebSearchConfig,

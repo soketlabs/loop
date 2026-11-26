@@ -114,6 +114,12 @@ jobs:
       - name: clippy (without the usage view)
         run: cargo clippy -p loop-cli --no-default-features --features telemetry --all-targets --locked -- -D warnings
 
+      # loop-agent is also built alone, with no default features, by
+      # embedders. Code behind the sqlite, proxy and web features must stay
+      # out of the always-on paths.
+      - name: clippy (loop-agent without default features)
+        run: cargo clippy -p loop-agent --no-default-features --all-targets --locked -- -D warnings
+
       # `orchestration` is off by default, so the default clippy run never
       # compiles the code behind it. loop-cli/orchestration turns it on in
       # loop-agent and loop-runtime too.

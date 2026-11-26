@@ -20,10 +20,10 @@ mod guard;
 mod html;
 mod search;
 
-pub use search::{
-    create_web_search_tool, verify_web_search_key, web_search_backend, WebSearchBackendInfo,
-    WebSearchConfig, DEFAULT_WEB_SEARCH_PROVIDER, WEB_SEARCH_BACKENDS,
+pub use crate::harness::tools::web_backends::{
+    web_search_backend, WebSearchBackendInfo, DEFAULT_WEB_SEARCH_PROVIDER, WEB_SEARCH_BACKENDS,
 };
+pub use search::{create_web_search_tool, verify_web_search_key, WebSearchConfig};
 
 use std::sync::OnceLock;
 use std::time::Duration;
