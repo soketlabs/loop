@@ -422,6 +422,8 @@ async fn real_main() -> anyhow::Result<()> {
                             max_sessions: *max_sessions,
                             max_active_turns: *max_active_turns,
                             permission_mode: cli.permission_mode.clone(),
+                            provider: cli.provider.clone(),
+                            model: cli.model.clone(),
                             cwd,
                             tool_lock: tool_lock.clone(),
                             tool_lock_root: tool_lock_root.clone(),
@@ -433,7 +435,15 @@ async fn real_main() -> anyhow::Result<()> {
                     RuntimeCommand::Stop { socket } => runtime_cmd::stop(socket.clone()).await,
                     RuntimeCommand::Restart { socket } => {
                         let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
-                        loop_cli::runtime_launch::restart(socket.clone(), &cwd).await
+                        loop_cli::runtime_launch::restart(
+                            socket.clone(),
+                            &cwd,
+                            loop_cli::runtime_launch::ModelFlags {
+                                provider: cli.provider.clone(),
+                                model: cli.model.clone(),
+                            },
+                        )
+                        .await
                     }
                     RuntimeCommand::Status { socket, json } => {
                         if !runtime_cmd::status(socket.clone(), *json).await? {
@@ -465,6 +475,8 @@ async fn real_main() -> anyhow::Result<()> {
                         new: true,
                         cwd: cwd.clone().or(cli.cwd.clone()),
                         socket: socket.clone(),
+                        provider: cli.provider.clone(),
+                        model: cli.model.clone(),
                         ..Default::default()
                     },
                     SessionCommand::Attach {

@@ -24,6 +24,12 @@ pub struct StartArgs {
     pub max_active_turns: Option<usize>,
     /// `--permission-mode`; `full-access` only takes effect through this flag.
     pub permission_mode: Option<String>,
+    /// `--provider`: with `model`, the default for new Sessions instead of
+    /// the saved one.
+    pub provider: Option<String>,
+    /// `--model`: the default model for new Sessions instead of the saved
+    /// one (`provider/id`, or a bare id one provider serves).
+    pub model: Option<String>,
     /// Folder for Sessions that name none.
     pub cwd: PathBuf,
     /// `--tool-lock`; without it, the `LOOP_TOOL_LOCK` environment variable.
@@ -69,6 +75,38 @@ fn edge_options(
         ),
         (Some(address), Some(path)) => Ok(Some((address, path.to_path_buf()))),
     }
+}
+
+/// Refuse a bad `--provider`/`--model` before the Runtime listens, with the
+/// same rules the terminal UI uses: both flags, or a `provider/id` or unique
+/// bare id in `--model`. A provider from settings.json may need a catalog
+/// refresh, so a name it defines is checked when a Session opens.
+fn check_default_model(
+    models: &loop_ai::Models,
+    custom_providers: &[String],
+    subscriptions: &[String],
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> anyhow::Result<()> {
+    if provider.is_none() && model.is_none() {
+        return Ok(());
+    }
+    if provider.is_some() && model.is_none() {
+        anyhow::bail!("--provider needs --model");
+    }
+    let named = provider.or_else(|| model.and_then(|m| m.split_once('/').map(|(p, _)| p)));
+    if let Some(name) = named.filter(|n| subscriptions.iter().any(|s| s == n)) {
+        anyhow::bail!(
+            "`{name}` is a subscription agent; a Runtime serves Loop's own providers, so choose a \
+             provider with an API key"
+        );
+    }
+    if named.is_some_and(|n| custom_providers.iter().any(|c| c == n)) {
+        return Ok(());
+    }
+    loop_app_core::model_selection::resolve_startup_model(models, None, provider, model)
+        .map(|_| ())
+        .map_err(|error| error.context("invalid --provider/--model for `loop runtime start`"))
 }
 
 /// Refuse a tool-lock root from which a locked Session could read the
@@ -344,6 +382,18 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     let globals = GlobalResources::load(agent_dir.clone(), &settings.providers, true)
         .await?
         .with_tool_lock(tool_lock);
+    // Refused before the socket appears, not at the first new Session.
+    check_default_model(
+        &globals.models,
+        &settings
+            .providers
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>(),
+        &loop_app_core::agents::subscription_ids(&agent_dir),
+        args.provider.as_deref(),
+        args.model.as_deref(),
+    )?;
     let log = Arc::new(
         SqliteEventLog::open(&agent_dir)
             .await
@@ -355,8 +405,8 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("could not start the Runtime: {e}"))?;
     let defaults = BootstrapOpts {
         cwd: args.cwd.clone(),
-        provider: None,
-        model: None,
+        provider: args.provider.clone(),
+        model: args.model.clone(),
         theme: None,
         system_prompt: None,
         append_system_prompt: None,
