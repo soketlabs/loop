@@ -20,14 +20,14 @@ Supported release targets:
 
 ## Cut a release
 
-1. On a branch from `main` (for example `release/0.7.0`), bump `[workspace.package] version` in the root `Cargo.toml`. It must match the tag without the `v` prefix; the Release workflow stops if they differ. Run `cargo update --workspace` so `Cargo.lock` has the same version (release builds use `--locked`).
+1. On a branch from `main` (for example `release/0.7.1`), bump `[workspace.package] version` in the root `Cargo.toml`. It must match the tag without the `v` prefix; the Release workflow stops if they differ. Run `cargo update --workspace` so `Cargo.lock` has the same version (release builds use `--locked`).
 2. Open a PR into `main` and merge it. A ruleset on `main` refuses direct pushes, so the bump goes through a PR.
 3. Tag the merge commit on `main` and push the tag:
 
 ```bash
 git fetch origin
-git tag v0.7.0 origin/main
-git push origin v0.7.0
+git tag v0.7.1 origin/main
+git push origin v0.7.1
 ```
 
 That starts the Release workflow, builds all targets, and creates a GitHub Release
