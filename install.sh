@@ -25,11 +25,11 @@ Loop Installer (macOS, Linux, WSL)
 Usage:
     ./install.sh [options]
     curl -fsSL https://loop.soket.ai/install | bash
-    curl -fsSL https://loop.soket.ai/install | bash -s -- --version 0.7.0
+    curl -fsSL https://loop.soket.ai/install | bash -s -- --version 0.7.1
 
 Options:
     -h, --help              Display this help message
-    -v, --version <version> Install a specific version (e.g., 0.7.0 or v0.7.0)
+    -v, --version <version> Install a specific version (e.g., 0.7.1 or v0.7.1)
     -b, --binary <path>     Install from a local binary instead of downloading
         --checksum <hash>   Required SHA-256 for --binary
     -f, --force             Reinstall even if the requested version is already installed
