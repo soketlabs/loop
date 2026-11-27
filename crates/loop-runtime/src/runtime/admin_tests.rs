@@ -3,11 +3,13 @@
 //! settings; permission mode is recorded in the Session tree.
 use super::*;
 use crate::log::{EventLog, MemoryEventLog};
-use loop_ai::{
-    providers::{faux_provider_fn, FauxResponse},
-    Context, Message, ToolCall,
+use loop_ai::providers::{faux_provider_fn, FauxResponse};
+use loop_ai::{Context, Message, ToolCall};
+use loop_protocol::admin::{
+    AdminAction, DefaultsParams, DefaultsPatch, PermissionModeParams, ReloadParams, SandboxAction,
+    SandboxChoice, SandboxParams, SandboxResult, SkillStatus, SkillsParams, TemplatesParams,
+    TrustParams,
 };
-use loop_protocol::admin::*;
 use loop_wire::RuntimeAdmin;
 
 const LIMIT: Duration = Duration::from_secs(60);
@@ -40,7 +42,7 @@ async fn runtime_with(
         };
         Box::pin(std::future::ready(response))
     }));
-    let first = provider.get_model("faux-model").unwrap();
+    let first = provider.model("faux-model").unwrap();
     let mut second = first.clone();
     second.id = "faux-two".into();
     second.name = "Faux Two".into();
@@ -90,7 +92,7 @@ fn workspace(dir: &std::path::Path) -> String {
 /// Whether `session` is offered the test's `notes` skill.
 async fn has_notes(rt: &Runtime, session: &SessionRef) -> bool {
     let live = rt.route(session).unwrap();
-    let resources = live.opened.harness.get_resources().await;
+    let resources = live.opened.harness.resources().await;
     resources.skills.iter().any(|s| s.name == "notes")
 }
 
@@ -410,7 +412,7 @@ async fn tools_and_prompt(rt: &Runtime, session: &SessionRef) -> (Vec<String>, S
     let mut names: Vec<String> = live
         .opened
         .harness
-        .get_tools()
+        .tools()
         .await
         .into_iter()
         .map(|t| t.name)
@@ -523,7 +525,7 @@ async fn a_session_opening_across_a_reload_adopts_the_new_workspace() {
                 let names: Vec<String> = live
                     .opened
                     .harness
-                    .get_resources()
+                    .resources()
                     .await
                     .skills
                     .into_iter()
@@ -623,7 +625,7 @@ async fn reload_rereads_model_definitions() {
         let path = dir.path().join("agent/models.json");
         std::fs::write(&path, models(&["first"])).unwrap();
         let catalog = &rt.factory.globals.models;
-        assert!(catalog.get_model("local", "first").is_none());
+        assert!(catalog.model("local", "first").is_none());
         let reload = || {
             admin(&rt).reload(ReloadParams {
                 workspace_id: workspace(dir.path()),
@@ -631,10 +633,10 @@ async fn reload_rereads_model_definitions() {
             })
         };
         reload().await.unwrap();
-        assert!(catalog.get_model("local", "first").is_some());
+        assert!(catalog.model("local", "first").is_some());
         std::fs::write(&path, models(&["second"])).unwrap();
         reload().await.unwrap();
-        assert!(catalog.get_model("local", "second").is_some());
+        assert!(catalog.model("local", "second").is_some());
         let fresh = rt.new_session(SessionSpec::default()).await.unwrap();
         let offered = ModelControl::models(&*rt, &fresh).await.unwrap();
         assert!(
@@ -902,7 +904,7 @@ fn install_openai_fixture(rt: &Runtime) -> String {
         Box::pin(std::future::ready(FauxResponse::Text("offline".into())))
     }));
     provider.id = "openai".into();
-    let mut models = provider.get_models();
+    let mut models = provider.models();
     models[0].provider = "openai".into();
     let id = models[0].id.clone();
     provider.set_models(models);
@@ -1453,7 +1455,8 @@ mod gate_mode {
     use loop_protocol::{ConfigChanged, SessionUpdate};
     use loop_wire::control::EscalationRecipient;
     use loop_wire::RuntimeControl;
-    use tokio::sync::{broadcast::Receiver, mpsc, oneshot};
+    use tokio::sync::broadcast::Receiver;
+    use tokio::sync::{mpsc, oneshot};
 
     type Asked = (
         loop_protocol::rpc::InteractParams,

@@ -1,7 +1,13 @@
 //! Opening, closing and unloading Sessions, and the Session cap.
 use super::leases::OpeningLease;
 use super::publish::{publish, pump};
-use super::*;
+use super::{
+    admin, decisions, failed, in_process_caller, json, mpsc, now, oneshot, subagent, touch, wanted,
+    watch, workspace_root, Acting, AgentBackend, Announced, Arc, AsyncMutex, AtomicBool,
+    BackendError, BackendResult, Caller, Command, Duration, Event, EventKind, HashMap, Identity,
+    LiveSession, Mutex, Ordering, PathBuf, Runtime, SessionKey, SessionRef, SessionSpec,
+    SessionUpdate, UpdateEnvelope, VecDeque, WorkspaceResources, WorkspaceState,
+};
 
 impl Runtime {
     pub(super) async fn open(
@@ -184,13 +190,20 @@ impl Runtime {
         self.check_folder(&who, &opts.cwd, existing.map(|s| &s.key))
             .await?;
         if let Some(options) = &spec.options {
-            opts.provider = options.provider.clone();
-            opts.model = options.model.clone();
+            // A Session's own choice replaces the Runtime's default model as a
+            // pair; one that names neither keeps the default.
+            if options.provider.is_some() || options.model.is_some() {
+                opts.provider = options.provider.clone();
+                opts.model = options.model.clone();
+            }
             opts.system_prompt = options.system_prompt.clone();
             opts.append_system_prompt = options.append_system_prompt.clone();
             opts.no_context_files = options.no_context_files;
             opts.no_web = options.no_web;
-            opts.permission_mode = options.permission_mode.clone();
+            // No mode in the options keeps the Runtime's `--permission-mode`.
+            if options.permission_mode.is_some() {
+                opts.permission_mode = options.permission_mode.clone();
+            }
         }
         let session_workspace_flags = spec.options.as_ref().is_some_and(|options| {
             options.no_context_files
@@ -436,9 +449,7 @@ impl Runtime {
                 .await
                 .map_err(failed)?;
             touch(&self.activity, &reference.key, ts_ms);
-            self.tenants
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            crate::sync::lock(&self.tenants, "tenants")?
                 .insert(reference.key.clone(), tenant.clone());
             if parent.is_some() {
                 if let Some(keys) = self.subagents.lock().await.as_mut() {

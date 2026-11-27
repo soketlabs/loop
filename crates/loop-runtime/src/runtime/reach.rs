@@ -2,8 +2,12 @@
 //! [`Subject`] of a Session and ask [`decide`]. Every entry point calls
 //! [`Runtime::check`] (or a filter here) before it reads anything else about
 //! the Session.
-use super::*;
+use super::{
+    failed, reference, BackendError, BackendResult, LiveSession, Ordering, PathBuf, Runtime,
+    SessionKey, SessionRef, Tenant,
+};
 use crate::access::{decide, refusal, Actor, Need, Subject};
+use crate::sync;
 
 /// The deepest Subagent nesting followed to a root; deeper is host-only.
 const MAX_LINEAGE: usize = 64;
@@ -49,7 +53,7 @@ impl Runtime {
         let subject = match actor {
             Actor::Internal => return Ok(true),
             Actor::Caller(caller) => {
-                let tenant = self.session_tenant(key);
+                let tenant = self.try_session_tenant(key)?;
                 if caller.is_host_user() || &tenant != caller.tenant() {
                     Subject::unowned(tenant)
                 } else {
@@ -72,29 +76,15 @@ impl Runtime {
     pub(crate) async fn subject(&self, key: &SessionKey) -> BackendResult<Subject> {
         let mut current = key.clone();
         for _ in 0..MAX_LINEAGE {
-            if let Some(live) = self
-                .sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&current)
-            {
+            // Access control fails closed: a poisoned map refuses (`?`),
+            // never reads what a panicking thread may have half-written.
+            if let Some(live) = sync::lock(&self.sessions, "sessions")?.get(&current) {
                 return Ok(live.access.clone());
             }
-            if let Some(known) = self
-                .subjects
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&current)
-            {
+            if let Some(known) = sync::lock(&self.subjects, "subjects")?.get(&current) {
                 return Ok(known.clone());
             }
-            let Some(tenant) = self
-                .tenants
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&current)
-                .cloned()
-            else {
+            let Some(tenant) = sync::lock(&self.tenants, "tenants")?.get(&current).cloned() else {
                 return Ok(Subject::unowned(Tenant::local()));
             };
             let owner = self
@@ -117,13 +107,14 @@ impl Runtime {
                 Some(owner) => Subject::owned(tenant, owner.principal),
                 None => Subject::unowned(tenant),
             };
-            self.subjects
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(key.clone(), subject.clone());
+            // `subject` came from the Event Log, not from the cache: on a
+            // poisoned cache it is still right, only not remembered.
+            if let Ok(mut subjects) = sync::lock(&self.subjects, "subjects") {
+                subjects.insert(key.clone(), subject.clone());
+            }
             return Ok(subject);
         }
-        Ok(Subject::unowned(self.session_tenant(key)))
+        Ok(Subject::unowned(self.try_session_tenant(key)?))
     }
 
     /// The folder rule for an outside user's Session in `cwd` (other than
@@ -151,10 +142,7 @@ impl Runtime {
             .await
             .unwrap_or_else(|_| cwd.to_path_buf());
         let overlaps = |other: &std::path::Path| cwd.starts_with(other) || other.starts_with(&cwd);
-        let mut folders: Vec<(SessionKey, PathBuf)> = self
-            .sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let mut folders: Vec<(SessionKey, PathBuf)> = sync::lock(&self.sessions, "sessions")?
             .values()
             .map(|live| {
                 (
@@ -187,15 +175,16 @@ impl Runtime {
 
     /// The folders an actor may name by workspace id: for an outside user,
     /// only the folders of loaded Sessions it may read; `None` for everyone
-    /// else (no limit).
+    /// else (no limit). Fails closed: none when the Session map is poisoned.
     pub(crate) fn readable_folders(&self, actor: &Actor) -> Option<Vec<PathBuf>> {
         if !actor.is_outside() {
             return None;
         }
+        let Ok(sessions) = sync::lock(&self.sessions, "sessions") else {
+            return Some(Vec::new());
+        };
         Some(
-            self.sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            sessions
                 .values()
                 .filter(|live| Self::may_live(actor, live, Need::Read))
                 .map(|live| live.opened.workspace.cwd.clone())
@@ -204,14 +193,16 @@ impl Runtime {
     }
 
     /// Whether `actor` may change workspace `cwd` as a whole (a reload): for
-    /// an outside user, every loaded Session in it must be its own.
+    /// an outside user, every loaded Session in it must be its own. Fails
+    /// closed: `false` when the Session map is poisoned.
     pub(crate) fn may_change_folder(&self, actor: &Actor, cwd: &std::path::Path) -> bool {
         if !actor.is_outside() {
             return true;
         }
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let Ok(sessions) = sync::lock(&self.sessions, "sessions") else {
+            return false;
+        };
+        sessions
             .values()
             .filter(|live| live.opened.workspace.cwd == cwd)
             .all(|live| Self::may_live(actor, live, Need::Write))

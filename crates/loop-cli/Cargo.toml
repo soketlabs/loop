@@ -7,6 +7,9 @@ rust-version.workspace = true
 description = "Interactive coding agent CLI"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "loop"
 path = "src/main.rs"

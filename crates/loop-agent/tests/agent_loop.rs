@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 fn setup_faux(script: FauxScript) -> (Models, loop_ai::Model) {
     let models = Models::new();
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
     (models, model)
 }
 
@@ -429,4 +429,94 @@ async fn a_context_overflow_is_not_continued() {
         1,
         "{msgs:?}"
     );
+}
+
+// No test in this binary installs a default stream fn, so the global stays
+// unset here. A test that sets it must live in its own test binary.
+#[tokio::test]
+async fn a_missing_stream_fn_ends_the_stream_with_an_error() {
+    let (_models, model) = setup_faux(FauxScript::new());
+    let context = AgentContext {
+        system_prompt: "sys".into(),
+        messages: vec![],
+        tools: None,
+    };
+    let prompt = AgentMessage::user_text("hi");
+    let events = collect_agent_events(agent_loop(
+        vec![prompt.clone()],
+        context,
+        AgentLoopConfig::new(model),
+        None,
+        None,
+    ))
+    .await;
+    let types: Vec<_> = events.iter().map(|e| e.type_name()).collect();
+    assert_eq!(types.first(), Some(&"agent_start"));
+    let Some(AgentEvent::AgentEnd { messages }) = events.last() else {
+        panic!("expected agent_end last: {types:?}");
+    };
+    let prompt_events: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::MessageStart { message } => Some(("message_start", message)),
+            AgentEvent::MessageEnd { message } => Some(("message_end", message)),
+            _ => None,
+        })
+        .filter(|(_, message)| **message == prompt)
+        .map(|(kind, _)| kind)
+        .collect();
+    assert_eq!(prompt_events, ["message_start", "message_end"], "{types:?}");
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert_eq!(messages[0], prompt);
+    let message = messages
+        .last()
+        .and_then(|m| m.as_assistant())
+        .expect("an assistant message");
+    assert_eq!(message.stop_reason, loop_ai::StopReason::Error);
+    assert!(message
+        .error_message
+        .as_deref()
+        .is_some_and(|e| e.contains("set_default_stream_fn")));
+}
+
+#[tokio::test]
+async fn continue_checks_the_context_before_the_missing_stream_fn() {
+    let (_models, model) = setup_faux(FauxScript::new());
+    let context = AgentContext {
+        system_prompt: "sys".into(),
+        messages: vec![],
+        tools: None,
+    };
+    let events = collect_agent_events(loop_agent::agent_loop_continue(
+        context,
+        AgentLoopConfig::new(model),
+        None,
+        None,
+    ))
+    .await;
+    assert!(events.is_empty(), "{events:?}");
+}
+
+#[tokio::test]
+async fn run_agent_loop_without_a_stream_fn_returns_an_error() {
+    let (_models, model) = setup_faux(FauxScript::new());
+    let context = AgentContext {
+        system_prompt: "sys".into(),
+        messages: vec![],
+        tools: None,
+    };
+    let emit: loop_agent::AgentEventSink = Arc::new(|_| Box::pin(async {}));
+    let result = run_agent_loop(
+        vec![AgentMessage::user_text("hi")],
+        context,
+        AgentLoopConfig::new(model),
+        emit,
+        None,
+        None,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(loop_agent::AgentLoopError::NoStreamFn)
+    ));
 }

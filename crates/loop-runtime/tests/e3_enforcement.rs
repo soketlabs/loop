@@ -37,10 +37,8 @@
 #![cfg(unix)]
 
 use async_trait::async_trait;
-use loop_ai::{
-    providers::{faux_provider_fn, FauxResponse},
-    Context, Message, ToolCall, ToolResultContent, UserContent, UserMessageContent,
-};
+use loop_ai::providers::{faux_provider_fn, FauxResponse};
+use loop_ai::{Context, Message, ToolCall, ToolResultContent, UserContent, UserMessageContent};
 use loop_app_core::permissions::{Capability, Layer, LayerSource, Setting, State};
 use loop_app_core::runtime::{BootstrapOpts, GlobalResources, SessionFactory};
 use loop_protocol::{
@@ -48,14 +46,13 @@ use loop_protocol::{
     InteractionRequest, PermissionKind, PermissionOption, SessionSpec, ToolCallId, ToolCallUpdate,
     ToolKind,
 };
-use loop_runtime::{log::MemoryEventLog, Runtime, RuntimeLimits};
+use loop_runtime::log::MemoryEventLog;
+use loop_runtime::{Runtime, RuntimeLimits};
 use serde_json::{json, Value};
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------- utilities
 

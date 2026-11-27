@@ -129,8 +129,8 @@ async fn ignore_level(fs: &dyn FileSystem, dir: &Path) -> IgnoreLevel {
 }
 
 /// What `rules` say about `path`: `Some(true)` ignore, `Some(false)` whitelist.
-fn verdict(rules: &Option<Gitignore>, path: &Path, is_dir: bool) -> Option<bool> {
-    let found = rules.as_ref()?.matched(path, is_dir);
+fn verdict(rules: Option<&Gitignore>, path: &Path, is_dir: bool) -> Option<bool> {
+    let found = rules?.matched(path, is_dir);
     (!found.is_none()).then(|| found.is_ignore())
 }
 
@@ -164,14 +164,14 @@ fn hidden_by_rules(
             _ => path,
         };
         if ignore.is_none() {
-            ignore = verdict(&level.ignore, seen, is_dir);
+            ignore = verdict(level.ignore.as_ref(), seen, is_dir);
         }
         if any_git && !saw_git {
             if gitignore.is_none() {
-                gitignore = verdict(&level.gitignore, seen, is_dir);
+                gitignore = verdict(level.gitignore.as_ref(), seen, is_dir);
             }
             if exclude.is_none() {
-                exclude = verdict(&level.exclude, seen, is_dir);
+                exclude = verdict(level.exclude.as_ref(), seen, is_dir);
             }
         }
         saw_git = saw_git || level.has_git;

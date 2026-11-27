@@ -1,10 +1,8 @@
 //! `loop runtime start|stop|status` end to end: spawn the built binary with an isolated agent dir.
 
-use std::{
-    path::{Path, PathBuf},
-    process::Stdio,
-    time::Duration,
-};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::{Child, Command};
 
 fn serve(agent: &Path, args: &[&str]) -> Command {
@@ -553,6 +551,193 @@ async fn an_invalid_limit_in_settings_stops_startup_and_names_its_key() {
             assert!(stderr.contains(key), "{json}: {stderr}");
             assert!(!agent.join("run/runtime.sock").exists());
         }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Settings with two custom models, `alpha` the saved default, served by a
+/// local fake `/v1/models` so an unknown model fails with a plain answer.
+fn model_settings(base_url: &str) -> String {
+    format!(
+        r#"{{
+  "defaultProvider": "fake",
+  "defaultModel": "alpha",
+  "providers": [{{
+    "id": "fake", "name": "Fake", "baseUrl": "{base_url}/v1",
+    "models": [{{"id": "alpha"}}, {{"id": "beta"}}]
+  }}]
+}}"#
+    )
+}
+
+fn models_server() -> loop_test_support::FakeHttpServer {
+    loop_test_support::FakeHttpServer::start(|request| match request.path.as_str() {
+        "/v1/models" => {
+            loop_test_support::FakeResponse::json(r#"{"data":[{"id":"alpha"},{"id":"beta"}]}"#)
+        }
+        _ => loop_test_support::FakeResponse::new(404, "text/plain", "nope"),
+    })
+}
+
+/// The permission mode of the newest Session, read over the socket.
+async fn newest_mode(agent: &Path) -> String {
+    use loop_wire::RuntimeAdmin;
+    let remote = connect_runtime(agent).await;
+    let mut sessions = remote.list().await.unwrap();
+    sessions.sort_by_key(|s| s.created_ms);
+    let newest = sessions.pop().unwrap();
+    let result = remote
+        .permission_mode(loop_protocol::admin::PermissionModeParams {
+            session: newest.r#ref,
+            mode: None,
+            expected_revision: None,
+        })
+        .await
+        .unwrap();
+    remote.disconnect();
+    result.mode
+}
+
+async fn connect_runtime(agent: &Path) -> std::sync::Arc<loop_wire::RemoteBackend> {
+    loop_cli::runtime_launch::connect(
+        &loop_cli::runtime_launch::Target::Unix(agent.join("run/runtime.sock")),
+        None,
+        std::sync::Arc::new(loop_cli::surface_client::RemoteHost::default()),
+    )
+    .await
+    .unwrap()
+}
+
+/// The model of the newest Session, read over the socket.
+async fn newest_model(agent: &Path) -> Option<String> {
+    use loop_protocol::ModelControl;
+    let remote = connect_runtime(agent).await;
+    let mut sessions = remote.list().await.unwrap();
+    sessions.sort_by_key(|s| s.created_ms);
+    let newest = sessions.pop().unwrap();
+    let choices = remote.models(&newest.r#ref).await.unwrap();
+    remote.disconnect();
+    choices.current
+}
+
+async fn new_session(agent: &Path, extra: &[&str]) -> std::process::Output {
+    let mut args = vec!["session", "new"];
+    args.extend_from_slice(extra);
+    run(agent, &args).await
+}
+
+#[tokio::test]
+async fn runtime_flags_set_the_default_and_session_flags_override_it() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let (_dir, agent) = agent_dir();
+        let socket = agent.join("run/runtime.sock");
+        let server = models_server();
+        write_settings(&agent, &model_settings(server.base_url()));
+
+        // No flags: the saved default.
+        let mut child = serve(&agent, &[]).spawn().unwrap();
+        wait_for(&socket, &mut child).await;
+        let output = new_session(&agent, &[]).await;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(newest_model(&agent).await.as_deref(), Some("fake/alpha"));
+        signal(&child, "-TERM");
+        child.wait().await.unwrap();
+
+        // Runtime flags replace the saved default for its new Sessions.
+        let mut child = serve(&agent, &["--provider", "fake", "--model", "beta"])
+            .spawn()
+            .unwrap();
+        wait_for(&socket, &mut child).await;
+        let output = new_session(&agent, &[]).await;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(newest_model(&agent).await.as_deref(), Some("fake/beta"));
+
+        // A Session's own flags win over the Runtime's; a bare `--model`
+        // resolves like it does in the terminal UI.
+        let output = new_session(&agent, &["--provider", "fake", "--model", "alpha"]).await;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(newest_model(&agent).await.as_deref(), Some("fake/alpha"));
+        let output = new_session(&agent, &["--model", "fake/alpha"]).await;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(newest_model(&agent).await.as_deref(), Some("fake/alpha"));
+
+        // An unknown choice is an error, not a fallback, and creates nothing.
+        let before = run(&agent, &["session", "list", "--json"]).await.stdout;
+        for extra in [
+            &["--provider", "fake", "--model", "nope"][..],
+            &["--model", "nope"][..],
+            &["--provider", "fake"][..],
+        ] {
+            let output = new_session(&agent, extra).await;
+            assert!(!output.status.success(), "{extra:?}: {output:?}");
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                error.contains("unknown model") || error.contains("needs --model"),
+                "{extra:?}: {error}"
+            );
+        }
+        assert_eq!(
+            run(&agent, &["session", "list", "--json"]).await.stdout,
+            before
+        );
+        signal(&child, "-TERM");
+        child.wait().await.unwrap();
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn runtime_start_refuses_an_unknown_provider_or_model() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let (_dir, agent) = agent_dir();
+        let server = models_server();
+        write_settings(&agent, &model_settings(server.base_url()));
+        for (args, wanted) in [
+            (&["--model", "nope"][..], "unknown model"),
+            (
+                &["--provider", "nowhere", "--model", "alpha"][..],
+                "unknown model",
+            ),
+            (&["--provider", "fake"][..], "needs --model"),
+            (
+                &["--provider", "chatgpt", "--model", "gpt"][..],
+                "subscription",
+            ),
+        ] {
+            let output = serve(&agent, args).output().await.unwrap();
+            assert!(!output.status.success(), "{args:?}");
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains(wanted), "{args:?}: {error}");
+            assert!(!agent.join("run/runtime.sock").exists(), "{args:?}");
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn a_session_with_model_flags_keeps_the_runtime_permission_mode() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let (_dir, agent) = agent_dir();
+        let socket = agent.join("run/runtime.sock");
+        let server = models_server();
+        write_settings(&agent, &model_settings(server.base_url()));
+        let mut child = serve(&agent, &["--permission-mode", "read-only"])
+            .spawn()
+            .unwrap();
+        wait_for(&socket, &mut child).await;
+        let output = new_session(&agent, &[]).await;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(newest_mode(&agent).await, "read-only");
+        // `session new --model` sends options; they name no mode.
+        let output = new_session(&agent, &["--model", "fake/alpha"]).await;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(newest_model(&agent).await.as_deref(), Some("fake/alpha"));
+        assert_eq!(newest_mode(&agent).await, "read-only");
+        signal(&child, "-TERM");
+        child.wait().await.unwrap();
     })
     .await
     .expect("test timed out");

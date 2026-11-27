@@ -44,6 +44,8 @@
 //!   `ProjectionAdmin`, `Store` (B1 to B7). `StoreCapabilities` is returned
 //!   by `EventLog::capabilities`.
 
+#![deny(missing_docs)]
+
 pub mod append;
 pub mod class;
 pub mod delta;

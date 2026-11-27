@@ -1,17 +1,13 @@
 //! Lease behavior at the SQLite store boundary, with deterministic time and pid checks.
 #![cfg(feature = "sqlite")]
 
-use loop_agent::harness::{
-    session::{
-        sqlite::{LeaseEnvironment, LeaseIdentity, PidLiveness, SqliteSessionStore},
-        PendingSessionWrite,
-    },
-    SessionStore,
+use loop_agent::harness::session::sqlite::{
+    LeaseEnvironment, LeaseIdentity, PidLiveness, SqliteSessionStore,
 };
-use std::sync::{
-    atomic::{AtomicI64, AtomicU8, Ordering},
-    Arc,
-};
+use loop_agent::harness::session::PendingSessionWrite;
+use loop_agent::harness::SessionStore;
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::Arc;
 
 struct Environment {
     now: AtomicI64,

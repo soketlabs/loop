@@ -54,7 +54,7 @@ async fn rejected_reasoning_is_dropped_and_remembered() {
         models: vec![spec],
         headers: None,
     }));
-    let model = models.get_model("fallback-test", "m").unwrap();
+    let model = models.model("fallback-test", "m").unwrap();
     assert!(!loop_ai::reasoning_rejected(&model));
 
     assert_eq!(reply(&models, &model).await.unwrap(), "ok");
@@ -98,7 +98,7 @@ async fn rejected_zai_off_retries_without_thinking() {
                 },
             )],
         }));
-        let model = models.get_model("zai-off-fallback", "m").unwrap();
+        let model = models.model("zai-off-fallback", "m").unwrap();
         let context = Context {
             messages: vec![Message::user_text("hi")],
             ..Default::default()

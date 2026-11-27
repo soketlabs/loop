@@ -8,24 +8,21 @@ use super::{failed, now, LiveSession, Runtime};
 use crate::log::{Event, EventKind};
 use loop_agent::types::{AgentTool, AgentToolResult, ShouldStopAfterTurnContext};
 use loop_ai::AssistantContent;
-use loop_app_core::{
-    permissions::{Capability, Layer, LayerSource, PermissionMode, State, ToolPermission},
-    runtime::OpenedSession,
+use loop_app_core::permissions::{
+    Capability, Layer, LayerSource, PermissionMode, State, ToolPermission,
 };
+use loop_app_core::runtime::OpenedSession;
 use loop_protocol::{
     AgentBackend, BackendError, ContentBlock, SessionRef, SessionSpec, TurnOutcome,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc, Mutex, Weak,
-    },
-};
-use std::{future::Future, pin::Pin};
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::oneshot;
 
 /// Resolves when the call that started a child must stop.
@@ -194,7 +191,7 @@ pub(super) async fn offer(rt: Weak<Runtime>, live: &Arc<LiveSession>) -> Result<
         .entry(TOOL.into())
         .or_insert(ToolPermission::Allow);
     gate.set_permissions(permissions);
-    let mut tools = live.opened.harness.get_tools().await;
+    let mut tools = live.opened.harness.tools().await;
     tools.retain(|tool| tool.name != TOOL);
     tools.push(tool(rt, Arc::downgrade(live)));
     live.opened

@@ -24,6 +24,12 @@ pub struct StartArgs {
     pub max_active_turns: Option<usize>,
     /// `--permission-mode`; `full-access` only takes effect through this flag.
     pub permission_mode: Option<String>,
+    /// `--provider`: with `model`, the default for new Sessions instead of
+    /// the saved one.
+    pub provider: Option<String>,
+    /// `--model`: the default model for new Sessions instead of the saved
+    /// one (`provider/id`, or a bare id one provider serves).
+    pub model: Option<String>,
     /// Folder for Sessions that name none.
     pub cwd: PathBuf,
     /// `--tool-lock`; without it, the `LOOP_TOOL_LOCK` environment variable.
@@ -69,6 +75,38 @@ fn edge_options(
         ),
         (Some(address), Some(path)) => Ok(Some((address, path.to_path_buf()))),
     }
+}
+
+/// Refuse a bad `--provider`/`--model` before the Runtime listens, with the
+/// same rules the terminal UI uses: both flags, or a `provider/id` or unique
+/// bare id in `--model`. A provider from settings.json may need a catalog
+/// refresh, so a name it defines is checked when a Session opens.
+fn check_default_model(
+    models: &loop_ai::Models,
+    custom_providers: &[String],
+    subscriptions: &[String],
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> anyhow::Result<()> {
+    if provider.is_none() && model.is_none() {
+        return Ok(());
+    }
+    if provider.is_some() && model.is_none() {
+        anyhow::bail!("--provider needs --model");
+    }
+    let named = provider.or_else(|| model.and_then(|m| m.split_once('/').map(|(p, _)| p)));
+    if let Some(name) = named.filter(|n| subscriptions.iter().any(|s| s == n)) {
+        anyhow::bail!(
+            "`{name}` is a subscription agent; a Runtime serves Loop's own providers, so choose a \
+             provider with an API key"
+        );
+    }
+    if named.is_some_and(|n| custom_providers.iter().any(|c| c == n)) {
+        return Ok(());
+    }
+    loop_app_core::model_selection::resolve_startup_model(models, None, provider, model)
+        .map(|_| ())
+        .map_err(|error| error.context("invalid --provider/--model for `loop runtime start`"))
 }
 
 /// Refuse a tool-lock root from which a locked Session could read the
@@ -254,14 +292,14 @@ const RUNTIME_TOKEN_FILE: &str = "runtime.token";
 /// Run the Runtime until SIGINT, SIGTERM or `loop runtime stop`.
 pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     use anyhow::Context;
-    use loop_app_core::{
-        config::{paths, Settings},
-        permissions::PermissionMode,
-        runtime::{BootstrapOpts, GlobalResources},
-        runtime_instance::RuntimeInstanceLock,
-    };
-    use loop_protocol::{rpc::PeerInfo, AgentBackend};
-    use loop_runtime::{log::SqliteEventLog, Runtime, RuntimeLimits};
+    use loop_app_core::config::{paths, Settings};
+    use loop_app_core::permissions::PermissionMode;
+    use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
+    use loop_app_core::runtime_instance::RuntimeInstanceLock;
+    use loop_protocol::rpc::PeerInfo;
+    use loop_protocol::AgentBackend;
+    use loop_runtime::log::SqliteEventLog;
+    use loop_runtime::{Runtime, RuntimeLimits};
     use loop_wire::server::{serve_with_caller, serve_with_control, ServeOptions};
 
     if args.listen.is_some_and(|addr| !addr.ip().is_loopback()) {
@@ -344,6 +382,18 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     let globals = GlobalResources::load(agent_dir.clone(), &settings.providers, true)
         .await?
         .with_tool_lock(tool_lock);
+    // Refused before the socket appears, not at the first new Session.
+    check_default_model(
+        &globals.models,
+        &settings
+            .providers
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>(),
+        &loop_app_core::agents::subscription_ids(&agent_dir),
+        args.provider.as_deref(),
+        args.model.as_deref(),
+    )?;
     let log = Arc::new(
         SqliteEventLog::open(&agent_dir)
             .await
@@ -355,8 +405,8 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("could not start the Runtime: {e}"))?;
     let defaults = BootstrapOpts {
         cwd: args.cwd.clone(),
-        provider: None,
-        model: None,
+        provider: args.provider.clone(),
+        model: args.model.clone(),
         theme: None,
         system_prompt: None,
         append_system_prompt: None,
@@ -764,6 +814,12 @@ impl loop_wire::RuntimeAdmin for Control {
     async fn defaults(&self, p: admin::DefaultsParams) -> BackendResult<admin::DefaultsResult> {
         self.runtime.update_defaults(p).await
     }
+    async fn providers(
+        &self,
+        p: loop_protocol::host::ProvidersParams,
+    ) -> BackendResult<loop_protocol::host::ProvidersResult> {
+        self.runtime.providers(p).await
+    }
 }
 use loop_protocol::{admin, BackendResult};
 
@@ -1101,20 +1157,15 @@ pub async fn status(socket: Option<PathBuf>, json: bool) -> anyhow::Result<bool>
         if let Some(url) = &status.listen_url {
             println!("listen:  {url}");
         }
-        let from = |source: &Option<String>| {
-            source
-                .as_deref()
-                .map(|s| format!(" ({s})"))
-                .unwrap_or_default()
-        };
+        let from = |source: Option<&str>| source.map(|s| format!(" ({s})")).unwrap_or_default();
         println!(
             "Sessions: {} loaded of {}{}, {} busy; at most {} turns at once{}",
             status.loaded,
             status.max_sessions,
-            from(&status.max_sessions_from),
+            from(status.max_sessions_from.as_deref()),
             status.busy,
             status.max_active_turns,
-            from(&status.max_active_turns_from)
+            from(status.max_active_turns_from.as_deref())
         );
         if let Some(lock) = status.tool_lock {
             println!("tool lock: {lock} (fixed until the Runtime stops)");

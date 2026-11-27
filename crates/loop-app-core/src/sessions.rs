@@ -27,7 +27,7 @@ pub struct SessionChoice {
     pub agent: Option<AgentSessionRecord>,
 }
 
-/// `text` on one line, shortened to [`TITLE_CHARS`]; `None` when blank.
+/// `text` on one line, shortened to `TITLE_CHARS`; `None` when blank.
 pub fn short_title(text: &str) -> Option<String> {
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.is_empty() {

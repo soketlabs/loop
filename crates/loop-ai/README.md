@@ -43,7 +43,7 @@ async fn main() {
         headers: None,
     }));
 
-    let model = models.get_model("ollama", "llama3.2").unwrap();
+    let model = models.model("ollama", "llama3.2").unwrap();
     let mut context = Context {
         system_prompt: Some("You are helpful.".into()),
         messages: vec![Message::user_text("Hello!")],

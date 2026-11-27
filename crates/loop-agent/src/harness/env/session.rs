@@ -1,11 +1,12 @@
 //! A Session's caller environment layered over its confined filesystem and shell.
-use super::super::types::*;
-use async_trait::async_trait;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+use super::super::types::{
+    ExecutionEnv, ExecutionError, FileError, FileInfo, FileSystem, PathMetadata, PolicyPath, Shell,
+    ShellExecOptions, ShellOutput,
 };
+use async_trait::async_trait;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Runtime token variables. No other variable carries a Runtime token.
 pub const RUNTIME_TOKEN_ENVS: &[&str] = &["LOOP_RUNTIME_TOKEN"];
@@ -30,7 +31,7 @@ pub fn removed_tool_env_names(custom_key_envs: &[String]) -> BTreeSet<String> {
         .iter()
         .flat_map(|preset| preset.api_key_envs.iter().map(|name| (*name).to_owned()))
         .chain(
-            crate::harness::tools::web::WEB_SEARCH_BACKENDS
+            crate::harness::tools::web_backends::WEB_SEARCH_BACKENDS
                 .iter()
                 .flat_map(|backend| backend.default_api_key_envs.iter())
                 .map(|name| (*name).to_owned()),
@@ -71,11 +72,29 @@ impl ToolEnvPolicy {
 
     /// Allow the removal notes again: call when a turn starts.
     pub fn begin_turn(&self) {
-        self.0
-            .noted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        self.0.lock_noted().clear();
+    }
+}
+
+impl PolicyState {
+    /// Lock the names already noted this turn. When a thread panicked
+    /// holding the lock, the set is cleared through the guard (written,
+    /// never read) and the poison is cleared. The worst case is that a
+    /// removal note shows twice.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "cache reset: the poisoned set is cleared, never read"
+    )]
+    fn lock_noted(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+        match self.noted.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                guard.clear();
+                self.noted.clear_poison();
+                guard
+            }
+        }
     }
 }
 
@@ -158,12 +177,7 @@ impl Shell for SessionExecutionEnv {
             return None;
         }
         let (_, removed) = self.split();
-        let mut noted = self
-            .policy
-            .0
-            .noted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut noted = self.policy.0.lock_noted();
         let mut names: Vec<String> = removed
             .into_iter()
             .filter(|name| mentions_name(output, name) && !noted.contains(name))
@@ -411,6 +425,21 @@ mod tests {
             "GH_TOKEN",
         ] {
             assert!(!removed_tool_env_names(&[]).contains(kept), "{kept}");
+        }
+    }
+
+    #[test]
+    fn web_search_key_names_are_removed_without_the_web_feature() {
+        // The registry lives outside the `web` feature, so this test and the
+        // scrubbed set are the same in a `--no-default-features` build.
+        let removed = removed_tool_env_names(&[]);
+        for name in ["TAVILY_API_KEY", "TINYFISH_API_KEY", "BRAVE_API_KEY"] {
+            assert!(removed.contains(name), "{name}");
+        }
+        for backend in crate::harness::tools::web_backends::WEB_SEARCH_BACKENDS {
+            for name in backend.default_api_key_envs {
+                assert!(removed.contains(*name), "{name}");
+            }
         }
     }
 

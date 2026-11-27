@@ -7,6 +7,9 @@ rust-version.workspace = true
 description = "Stateful agent with tool execution and event streaming"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [features]
 default = ["sqlite", "proxy", "web"]
 sqlite = ["dep:rusqlite"]

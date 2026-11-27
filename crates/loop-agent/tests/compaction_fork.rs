@@ -5,16 +5,18 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "sqlite")]
+use loop_agent::harness::create_sqlite_session_store;
 use loop_agent::harness::session::types::{
-    default_context_from_entries, PendingSessionWrite, Session, SessionTreeEntry,
+    default_context_from_entries, PendingSessionWrite, Session,
 };
 use loop_agent::harness::session::SessionForkSelection;
 use loop_agent::harness::{
-    create_in_memory_session_store, create_jsonl_session_store, create_sqlite_session_store,
-    ExecutionEnv, HostExecutionEnv, SessionStore,
+    create_in_memory_session_store, create_jsonl_session_store, ExecutionEnv, HostExecutionEnv,
+    SessionStore,
 };
 use loop_agent::{AgentMessage, AgentToolResult, CustomAgentMessage};
-use loop_ai::{AssistantContent, AssistantMessage, Message, TextContent, ToolCall};
+use loop_ai::{AssistantContent, AssistantMessage, TextContent, ToolCall};
 use serde_json::json;
 
 /// Which compactions the source Session holds.
@@ -30,7 +32,7 @@ enum Kind {
 
 fn assistant_call(id: &str) -> AgentMessage {
     let model = loop_ai::providers::faux_provider(loop_ai::providers::FauxScript::new())
-        .get_model("faux-model")
+        .model("faux-model")
         .unwrap();
     let mut a = AssistantMessage::pending(&model);
     a.content.push(AssistantContent::ToolCall(ToolCall {
@@ -45,7 +47,7 @@ fn assistant_call(id: &str) -> AgentMessage {
 
 fn assistant_text(text: &str) -> AgentMessage {
     let model = loop_ai::providers::faux_provider(loop_ai::providers::FauxScript::new())
-        .get_model("faux-model")
+        .model("faux-model")
         .unwrap();
     let mut a = AssistantMessage::pending(&model);
     a.content.push(AssistantContent::Text(TextContent {
@@ -217,6 +219,7 @@ async fn fork_after_compaction_on_the_jsonl_store() {
     .await;
 }
 
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn fork_after_compaction_on_the_sqlite_store() {
     let dir = tempfile::tempdir().unwrap();
@@ -228,11 +231,14 @@ async fn fork_after_compaction_on_the_sqlite_store() {
 }
 
 /// The harness `fork_session` (TUI `/fork`) on SQLite after a compaction.
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn harness_fork_after_compaction_on_the_sqlite_store() {
+    use loop_agent::harness::session::types::SessionTreeEntry;
     use loop_agent::harness::{
         create_session_repository, AgentHarness, AgentHarnessOptions, SandboxMode,
     };
+    use loop_ai::Message;
     let dir = tempfile::tempdir().unwrap();
     let store = create_sqlite_session_store(dir.path().join("s.db")).unwrap();
     let (sid, between, last) = source(&store, Kind::Both).await;
@@ -244,7 +250,7 @@ async fn harness_fork_after_compaction_on_the_sqlite_store() {
     ));
     let harness = AgentHarness::new(AgentHarnessOptions {
         models: Arc::clone(&models),
-        model: models.get_model("faux", "faux-model"),
+        model: models.model("faux", "faux-model"),
         session,
         host_env: Arc::new(HostExecutionEnv::new(std::env::temp_dir())),
         tools: vec![],

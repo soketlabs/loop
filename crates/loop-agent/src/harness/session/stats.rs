@@ -497,7 +497,7 @@ fn detect_cache_miss(
         usage.cost.cache_read / usage.cache_read as f64
     } else {
         models
-            .and_then(|m| m.get_model(&message.provider, &message.model))
+            .and_then(|m| m.model(&message.provider, &message.model))
             .map(|m| m.cost.cache_read / 1_000_000.0)
             .unwrap_or(0.0)
     };

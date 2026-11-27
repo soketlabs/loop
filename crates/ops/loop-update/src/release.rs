@@ -1,8 +1,9 @@
-use std::{
-    io::{Read, Write},
-    path::Path,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+//! Release lookup and download: version types, the release host client, and
+//! checksum-verified archive extraction.
+
+use std::io::{Read, Write};
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Url;
 use semver::Version;
@@ -13,14 +14,28 @@ use crate::{checksum, sha256_file, Error, Result};
 const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 const MAX_BINARY: u64 = 256 * 1024 * 1024;
 
+/// A release version and the Git tag that names it.
 #[derive(Debug, Clone)]
 pub struct ReleaseVersion {
+    /// The tag, always `v` followed by the version, for example `v0.7.0`.
     pub tag: String,
+    /// The parsed SemVer version.
     pub version: Version,
 }
 
 impl ReleaseVersion {
+    /// Parse a version or a tag; see the [`FromStr`](std::str::FromStr) impl.
     pub fn parse(value: &str) -> Result<Self> {
+        value.parse()
+    }
+}
+
+impl std::str::FromStr for ReleaseVersion {
+    type Err = Error;
+
+    /// Parse a version or a tag. A leading `v` is optional. Returns an error
+    /// when the rest is not valid SemVer.
+    fn from_str(value: &str) -> Result<Self> {
         let version = Version::parse(value.strip_prefix('v').unwrap_or(value))?;
         Ok(Self {
             tag: format!("v{version}"),
@@ -29,12 +44,16 @@ impl ReleaseVersion {
     }
 }
 
+/// Whether `available` has a higher SemVer precedence than `current`. `current`
+/// may have a leading `v`. Returns an error when it is not valid SemVer.
 pub fn is_newer(current: &str, available: &ReleaseVersion) -> Result<bool> {
     Ok(Version::parse(current.trim_start_matches('v'))?
         .cmp_precedence(&available.version)
         .is_lt())
 }
 
+/// The target triple of the release archive for this platform: Linux (glibc)
+/// and macOS, on x86_64 and aarch64. Returns an error on any other platform.
 pub fn platform_target() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") if cfg!(target_env = "gnu") => Ok("x86_64-unknown-linux-gnu"),
@@ -47,6 +66,9 @@ pub fn platform_target() -> Result<&'static str> {
     }
 }
 
+/// A client of the release host. It looks up the latest release, reads notes,
+/// and downloads and verifies the archive. All requests have a timeout, and
+/// metadata responses have size limits.
 #[derive(Clone)]
 pub struct ReleaseClient {
     client: reqwest::Client,
@@ -66,6 +88,7 @@ struct GithubRelease {
 /// One release's published notes, as GitHub shows them on its page.
 #[derive(Debug, Clone)]
 pub struct ReleaseNotes {
+    /// The release tag.
     pub tag: String,
     /// Markdown; empty when the release has none.
     pub body: String,
@@ -89,6 +112,8 @@ struct CachedRelease {
 }
 
 impl ReleaseClient {
+    /// A client of the Loop releases on GitHub. `timeout` bounds each request
+    /// (metadata requests use at most 10 seconds of it).
     pub fn github(timeout: Duration) -> Result<Self> {
         Self::new(
             "https://api.github.com/repos/soketlabs/loop/releases/",
@@ -125,6 +150,10 @@ impl ReleaseClient {
         })
     }
 
+    /// Resolve the latest release from the redirect of `url` instead of the
+    /// API. `url` must be HTTPS (or loopback) and end with `/latest`. `latest`
+    /// then sends a `HEAD` request and reads the tag from the final URL, which
+    /// must stay on the same host and port.
     pub fn with_latest_redirect(mut self, url: &str) -> Result<Self> {
         let url = Url::parse(url).map_err(|e| Error::Invalid(e.to_string()))?;
         let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
@@ -137,6 +166,8 @@ impl ReleaseClient {
         Ok(self)
     }
 
+    /// The latest stable release. Drafts and prereleases are an error when the
+    /// API is used.
     pub async fn latest(&self) -> Result<ReleaseVersion> {
         if let Some(url) = &self.latest_redirect {
             let response = self
@@ -251,6 +282,10 @@ impl ReleaseClient {
 
     /// Download and verify the archive before reading any member. Extract only
     /// the expected regular executable, never paths, links, or other files.
+    ///
+    /// The archive is `loop-<target>.tar.gz` for [`platform_target`], checked
+    /// against its `.sha256` file. Returns the path of the extracted `loop`
+    /// binary inside `dir`.
     pub async fn download(
         &self,
         release: &ReleaseVersion,
@@ -259,6 +294,9 @@ impl ReleaseClient {
         self.download_with_progress(release, dir, |_, _| {}).await
     }
 
+    /// Like [`ReleaseClient::download`]. `progress` is called after each chunk
+    /// with the bytes downloaded so far and the total size, when the server
+    /// gives one. The archive is limited to 256 MiB.
     pub async fn download_with_progress(
         &self,
         release: &ReleaseVersion,
@@ -351,6 +389,17 @@ fn extract_binary(archive: &Path, binary: &Path, target: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_version_from_str() {
+        let with_tag: ReleaseVersion = "v0.7.0".parse().unwrap();
+        let bare: ReleaseVersion = "0.7.0".parse().unwrap();
+        assert_eq!(with_tag.tag, "v0.7.0");
+        assert_eq!(bare.tag, "v0.7.0");
+        assert_eq!(with_tag.version, bare.version);
+        assert!("latest".parse::<ReleaseVersion>().is_err());
+        assert!("".parse::<ReleaseVersion>().is_err());
+    }
 
     #[test]
     fn compare_versions_numerically_and_reject_paths() {

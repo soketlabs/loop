@@ -1,5 +1,7 @@
 //! Shared bootstrap, configuration, and runtime wiring for Loop CLI and desktop.
 
+#![deny(missing_docs)]
+
 /// Tracing target of log records that repeat a warning already printed to
 /// the user's terminal. A log layer that writes to that terminal skips it.
 pub const USER_NOTICE_TARGET: &str = "loop_app_core::user_notice";
@@ -13,6 +15,7 @@ pub mod hooks_load;
 pub mod interaction;
 pub mod model_selection;
 pub mod permissions;
+pub mod provider_login;
 pub mod resources;
 pub mod runtime;
 pub mod runtime_instance;

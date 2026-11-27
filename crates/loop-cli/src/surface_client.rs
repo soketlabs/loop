@@ -2,7 +2,13 @@
 //!
 //! The native owner is private. Surfaces receive typed services and immutable views;
 //! neither the host nor mutable settings can be reached through this boundary.
-use loop_protocol::{rpc::*, session_services::*, AgentBackend, SessionRef, SessionSpec};
+use loop_protocol::rpc::{
+    ClientCapabilities, CloneParams, DestinationResult, ExportResult, ForkParams, ImportParams,
+    MutationResult, NavigateParams, NavigateResult, PeerInfo, RenameParams, SessionInfo,
+    SessionParams, SessionSnapshot, TreeParams, TreeResult, ViewParams, ViewResult,
+};
+use loop_protocol::session_services::{SkillParams, WorkflowParams, WorkflowResult};
+use loop_protocol::{AgentBackend, SessionRef, SessionSpec};
 use loop_wire::RuntimeControl;
 use std::sync::Arc;
 mod native_admin;
@@ -352,7 +358,7 @@ impl SurfaceClient {
         let config = self.host.inner.native.config();
         self.host.inner.selected_model = config.config.model.as_deref().and_then(|spec| {
             let (provider, id) = spec.split_once('/')?;
-            self.host.inner.models.get_model(provider, id)
+            self.host.inner.models.model(provider, id)
         });
         self.host.inner.model_note = None;
         self.host.inner.active_skills = config.config.active_skills;
@@ -568,7 +574,7 @@ impl SurfaceClient {
             .into_iter()
             .filter_map(|choice| {
                 let (provider, id) = choice.id.split_once('/')?;
-                self.host.inner.models.get_model(provider, id).or_else(|| {
+                self.host.inner.models.model(provider, id).or_else(|| {
                     self.is_remote()
                         .then(|| remote::model_view(&choice.id, &choice.name))
                 })
@@ -759,7 +765,9 @@ mod sandbox_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loop_agent::harness::session::{sqlite::SqliteSessionStore, SessionFile, SessionStore};
+    use loop_agent::harness::session::sqlite::SqliteSessionStore;
+    use loop_agent::harness::session::{SessionFile, SessionStore};
+    use loop_protocol::rpc::SESSION_TRANSFER_LIMIT;
     use loop_protocol::{ContentBlock, TurnOutcome};
     use std::time::Duration;
     use test_support::{fixture, pause_provider};
@@ -1599,7 +1607,7 @@ impl SurfaceClient {
         }
     }
     pub async fn set_skill_enabled(&mut self, name: &str, enabled: bool) -> anyhow::Result<bool> {
-        use loop_protocol::admin::*;
+        use loop_protocol::admin::{AdminAction, SkillsParams};
         use loop_wire::RuntimeAdmin;
         if !self.resource_view().skills.iter().any(|s| s.name == name) {
             return Ok(false);
@@ -1625,7 +1633,7 @@ impl SurfaceClient {
         name: &str,
         args: &str,
     ) -> anyhow::Result<Option<String>> {
-        use loop_protocol::admin::*;
+        use loop_protocol::admin::TemplatesParams;
         use loop_wire::RuntimeAdmin;
         if !self
             .resource_view()
@@ -1878,7 +1886,9 @@ impl SurfaceClient {
             let backend = agents.backend(&id).await.map_err(|e| format!("{e:#}"))?;
             if forwarded
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
+                .expect(
+                    "forwarded lock poisoned: only insert runs under it, so a panic there is a bug",
+                )
                 .insert(id.clone())
             {
                 forward(backend.as_ref());

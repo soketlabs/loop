@@ -671,7 +671,7 @@ impl AgentHarness {
     }
 
     /// Get the current set of tools (cloned, async).
-    pub async fn get_tools(&self) -> Vec<AgentTool> {
+    pub async fn tools(&self) -> Vec<AgentTool> {
         self.tools.read().clone()
     }
 
@@ -762,7 +762,7 @@ impl AgentHarness {
     }
 
     /// Get resources (clone).
-    pub async fn get_resources(&self) -> AgentHarnessResources {
+    pub async fn resources(&self) -> AgentHarnessResources {
         self.resources.read().await.clone()
     }
 
@@ -1792,10 +1792,10 @@ impl AgentHarness {
             >,
         >,
     ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
-        use crate::harness::orchestration::{
-            agent_worker::{AgentWorker, ShellWorker, WorkflowToolHooks},
-            WorkflowProgressEvent,
+        use crate::harness::orchestration::agent_worker::{
+            AgentWorker, ShellWorker, WorkflowToolHooks,
         };
+        use crate::harness::orchestration::WorkflowProgressEvent;
         use loop_orchestration::memory::bus::create_memory_bus;
         use loop_orchestration::memory::SharedMemory;
         use loop_orchestration::scheduler::{Scheduler, WorkerPool};

@@ -1,8 +1,8 @@
 //! Faux provider stream protocol tests.
 
 use futures::StreamExt;
+use loop_ai::providers::{faux_provider, FauxResponse, FauxScript};
 use loop_ai::{
-    providers::{faux_provider, FauxResponse, FauxScript},
     AssistantContent, AssistantMessageEvent, Context, Message, Models, SimpleStreamOptions,
     StopReason, ToolCall,
 };
@@ -15,7 +15,7 @@ async fn faux_text_event_order_and_result() {
 
     let models = Models::new();
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
     let ctx = Context {
         messages: vec![Message::user_text("hi")],
         ..Default::default()
@@ -69,7 +69,7 @@ async fn faux_tool_calls_and_complete_simple() {
 
     let models = Models::new();
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
 
     let result = models
         .complete_simple(&model, &Context::default(), SimpleStreamOptions::default())
@@ -89,7 +89,7 @@ async fn faux_error_is_stream_encoded() {
 
     let models = Models::new();
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
 
     let result = models
         .complete_simple(&model, &Context::default(), SimpleStreamOptions::default())

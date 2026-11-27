@@ -7,6 +7,9 @@ rust-version.workspace = true
 description = "loop-protocol over a real connection: JSON-RPC 2.0 and its transports"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [dependencies]
 async-trait = { workspace = true }
 futures = { workspace = true }

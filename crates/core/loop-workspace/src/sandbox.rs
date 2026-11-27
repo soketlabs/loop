@@ -177,6 +177,11 @@ pub trait Sandbox: Send + Sync {
     /// Printable details for `/sandbox status` (CLI only; not sent to the model).
     fn info(&self) -> SandboxInfo;
     /// Underlying env tools must use when status is Ready.
+    ///
+    /// # Panics
+    ///
+    /// Implementations may panic if this is called before a successful
+    /// [`Sandbox::start`].
     fn env(&self) -> Arc<dyn ExecutionEnv>;
     /// Start the sandbox.
     async fn start(&self) -> Result<(), SandboxError>;

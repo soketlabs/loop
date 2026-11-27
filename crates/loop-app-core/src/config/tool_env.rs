@@ -1,6 +1,7 @@
 //! Which variables tool commands do not receive.
 
-use super::{paths::models_json_path, Settings};
+use super::paths::models_json_path;
+use super::Settings;
 use loop_agent::harness::ToolEnvPolicy;
 use std::path::Path;
 

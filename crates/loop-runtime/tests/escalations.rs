@@ -1,12 +1,11 @@
 //! Escalations park until a Surface can answer, and decisions are durable.
 use loop_protocol::rpc::InteractParams;
 use loop_protocol::{HostServices, InteractionOutcome, InteractionRequest, SessionRef};
-use loop_runtime::{
-    log::{EventKind, EventLog, MemoryEventLog},
-    EscalationHost,
-};
+use loop_runtime::log::{EventKind, EventLog, MemoryEventLog};
+use loop_runtime::EscalationHost;
 use loop_wire::control::EscalationRecipient;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 struct Surface(

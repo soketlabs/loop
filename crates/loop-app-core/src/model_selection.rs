@@ -32,7 +32,7 @@ pub fn resolve_startup_model(
 ) -> anyhow::Result<StartupModel> {
     match (explicit_provider, explicit_model) {
         (Some(provider), Some(id)) => models
-            .get_model(provider, id)
+            .model(provider, id)
             .map(|m| StartupModel::Selected(Box::new(m)))
             .ok_or_else(|| unknown(&format!("{provider}/{id}"))),
         (None, Some(spec)) => {
@@ -40,7 +40,7 @@ pub fn resolve_startup_model(
         }
         (Some(_), None) => anyhow::bail!("--provider needs --model"),
         (None, None) => Ok(match saved {
-            Some((provider, id)) => match models.get_model(provider, id) {
+            Some((provider, id)) => match models.model(provider, id) {
                 Some(model) => StartupModel::Selected(Box::new(model)),
                 None => StartupModel::NotSelected {
                     reason: Some(format!("saved model {provider}/{id} is not available")),
@@ -55,12 +55,12 @@ pub fn resolve_startup_model(
 /// or a bare id that exactly one provider serves. Used by `--model` and `/model <spec>`.
 pub fn resolve_model_spec(models: &Models, spec: &str) -> anyhow::Result<Model> {
     if let Some((provider, id)) = spec.split_once('/') {
-        if let Some(model) = models.get_model(provider, id) {
+        if let Some(model) = models.model(provider, id) {
             return Ok(model);
         }
     }
     let mut matches: Vec<Model> = models
-        .get_models(None)
+        .models(None)
         .into_iter()
         .filter(|m| m.id == spec)
         .collect();

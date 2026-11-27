@@ -66,11 +66,9 @@ pub fn release_on_signals(
 
 /// Undo what the TUI set up, best effort: the terminal may already be gone.
 fn restore() {
-    use crossterm::{
-        cursor::Show,
-        event::{DisableBracketedPaste, PopKeyboardEnhancementFlags},
-        execute,
-    };
+    use crossterm::cursor::Show;
+    use crossterm::event::{DisableBracketedPaste, PopKeyboardEnhancementFlags};
+    use crossterm::execute;
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = execute!(
         std::io::stdout(),

@@ -349,7 +349,7 @@ mod tests {
             "models": [{"id": "glm", "reasoning": true, "thinkingFormat": "zai"}]
         }))
         .unwrap();
-        let models = entry.provider().get_models();
+        let models = entry.provider().models();
         assert_eq!(models.len(), 1);
         assert!(models[0].reasoning);
         assert_eq!(
@@ -369,7 +369,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let models = entry.provider().get_models();
+        let models = entry.provider().models();
         let metadata = |id: &str| {
             let model = models.iter().find(|m| m.id == id).unwrap();
             loop_ai::resolve_compat(&model.base_url, model.compat.as_ref()).supports_metadata
@@ -524,7 +524,7 @@ mod tests {
             }],
         );
         for id in ["soket", "openrouter", "openai", "anthropic", "gemini", "g"] {
-            assert!(models.get_provider(id).is_some(), "{id}");
+            assert!(models.provider(id).is_some(), "{id}");
         }
     }
 }

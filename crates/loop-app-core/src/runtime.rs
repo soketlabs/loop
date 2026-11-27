@@ -8,8 +8,8 @@ use anyhow::bail;
 use loop_agent::harness::{
     create_bash_tool_with, create_edit_tool, create_exit_plan_tool, create_read_tool,
     create_session_repository, create_sqlite_session_store, create_todo_tool, create_write_tool,
-    search_tools_with_filter, verify_web_search_key, AgentHarness, AgentHarnessOptions,
-    AgentHarnessResources, SandboxMode, WebSearchConfig,
+    search_tools_with_filter, AgentHarness, AgentHarnessOptions, AgentHarnessResources,
+    SandboxMode,
 };
 use loop_agent::types::AgentTool;
 use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
@@ -26,6 +26,7 @@ use crate::config::settings::{
 };
 use crate::config::trust::TrustStore;
 use crate::model_selection::StartupModel;
+use crate::provider_login::ProviderStores;
 use crate::resources::{load_resources_in, LoadedResources};
 use crate::system_prompt::{
     build_system_prompt, default_tool_snippets, load_context_files_in, BuildSystemPromptOptions,
@@ -514,7 +515,7 @@ impl Runtime {
         }
         let model = self
             .models
-            .get_model(provider, id)
+            .model(provider, id)
             .filter(|m| !self.credentials.is_logged_out(&m.provider));
         self.native.set_default_model(model);
     }
@@ -619,7 +620,7 @@ impl Runtime {
         .await;
         let mut all_tools: Vec<_> = self
             .harness
-            .get_tools()
+            .tools()
             .await
             .into_iter()
             .filter(|tool| !tool.name.starts_with("mcp__"))
@@ -637,96 +638,21 @@ impl Runtime {
         &mut self,
         request: &crate::config::ProviderLoginRequest,
     ) -> anyhow::Result<ConnectedProvider> {
-        use crate::config::providers::upsert_custom_provider;
-
-        request.validate()?;
-        let (id, name) = (request.provider_id(), request.display_name());
-        if let (Some(preset), Some(key)) = (request.preset(), request.api_key()) {
-            preset
-                .verify_key(key)
-                .await
-                .map_err(|e| anyhow::anyhow!("{name} rejected the key: {e}"))?;
+        let connected = ProviderStores {
+            agent_dir: &self.agent_dir,
+            models: &self.models,
+            credentials: &self.credentials,
         }
-        let mut entry = request.custom_entry();
-        if let Some(entry) = &mut entry {
-            if entry.models.is_none() {
-                entry.models = self
-                    .settings
-                    .providers
-                    .iter()
-                    .find(|saved| saved.id == entry.id)
-                    .and_then(|saved| saved.models.clone());
-            }
-        }
-        let provider = match &entry {
-            Some(entry) => {
-                let candidate = Models::new();
-                candidate.set_provider(entry.provider());
-                load_custom_models_json(&self.agent_dir, &candidate, std::slice::from_ref(entry))?;
-                candidate
-                    .get_provider(&id)
-                    .expect("registered custom provider")
-            }
-            None => self
-                .models
-                .get_provider(&id)
-                .ok_or_else(|| anyhow::anyhow!("unknown provider {id}"))?,
-        };
-        let previous_models = provider.get_models();
-        // Validate without saving a candidate key or lifting explicit logout.
-        provider
-            .refresh_models(loop_ai::RefreshModelsContext {
-                api_key: request.api_key().map(str::to_owned),
-                store: Some(Arc::clone(self.models.models_store())),
-                allow_network: true,
-                force: true,
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("could not list {name} models: {e}"))?;
-        let model_count = provider.get_models().len();
-        if model_count == 0 {
-            anyhow::bail!("could not list {name} models: no models were listed");
-        }
-        let previous_custom = self.settings.providers.clone();
-        if let Some(entry) = &entry {
-            upsert_custom_provider(&mut self.settings.providers, entry.clone());
-            if let Err(error) = self.save_settings() {
-                self.settings.providers = previous_custom;
-                provider.set_models(previous_models);
-                return Err(error);
-            }
-        }
-        if let Err(error) = self
-            .credentials
-            .connect(&id, request.api_key().map(loop_ai::Credential::api_key))
-        {
-            provider.set_models(previous_models);
-            if entry.is_some() {
-                self.settings.providers = previous_custom;
-                self.save_settings()?;
-            }
-            return Err(error.context("could not save login"));
-        }
-        for model in provider.get_models() {
-            let previous = self.models.get_model(&id, &model.id);
-            if previous.as_ref().is_none_or(|previous| {
-                previous.base_url != model.base_url
-                    || loop_ai::resolve_compat(&previous.base_url, previous.compat.as_ref())
-                        .thinking_format
-                        != loop_ai::resolve_compat(&model.base_url, model.compat.as_ref())
-                            .thinking_format
-            }) {
-                loop_ai::clear_reasoning_rejection(&model);
-            }
-        }
-        self.models.set_provider(provider);
+        .connect_model_provider(&mut self.settings, request)
+        .await?;
+        let (id, name) = (connected.id.clone(), connected.name.clone());
         if let Some(model_id) = self
             .selected_model
             .as_ref()
             .filter(|model| model.provider == id)
             .map(|model| model.id.clone())
         {
-            if let Some(model) = self.models.get_model(&id, &model_id) {
+            if let Some(model) = self.models.model(&id, &model_id) {
                 self.harness.set_model(model.clone()).await;
                 self.selected_model = Some(model);
             } else {
@@ -748,11 +674,7 @@ impl Runtime {
                 anyhow::anyhow!("{name} connected, but web tools could not be refreshed: {e:#}")
             })?;
         }
-        Ok(ConnectedProvider {
-            id,
-            name,
-            model_count,
-        })
+        Ok(connected)
     }
 
     /// `/login tavily|brave`: verify the key with a probe search, save it in the
@@ -764,38 +686,13 @@ impl Runtime {
         provider: &str,
         api_key: &str,
     ) -> anyhow::Result<String> {
-        let provider = provider.trim().to_ascii_lowercase();
-        let name = crate::config::web_search_display_name(&provider);
-        if !crate::config::is_web_search_provider(&provider) {
-            anyhow::bail!("unknown web-search provider '{provider}'");
+        let name = ProviderStores {
+            agent_dir: &self.agent_dir,
+            models: &self.models,
+            credentials: &self.credentials,
         }
-        if api_key.trim().is_empty() {
-            anyhow::bail!("{name} needs an API key");
-        }
-        // Keep a same-backend baseUrl / private-address opt-in when re-logging in.
-        let mut config = match &self.settings.web_search {
-            Some(existing) if existing.provider_id() == provider => existing.clone(),
-            _ => WebSearchConfig::default(),
-        };
-        config.provider = Some(provider.clone());
-        config.enabled = true;
-        verify_web_search_key(&config, api_key)
-            .await
-            .map_err(|e| anyhow::anyhow!("{name} rejected the key: {e}"))?;
-
-        let previous_config = self.settings.web_search.replace(config);
-        if let Err(error) = self.save_settings() {
-            self.settings.web_search = previous_config;
-            return Err(error);
-        }
-        if let Err(error) = self
-            .credentials
-            .connect(&provider, Some(loop_ai::Credential::api_key(api_key)))
-        {
-            self.settings.web_search = previous_config;
-            self.save_settings()?;
-            return Err(error.context("could not save login"));
-        }
+        .connect_web_search(&mut self.settings, provider, api_key)
+        .await?;
         self.rebuild_tools().await?;
         Ok(name)
     }
@@ -809,11 +706,12 @@ impl Runtime {
         {
             return self.disconnect_provider(&provider).await;
         }
-        let name = crate::config::web_search_display_name(&provider);
-        if !crate::config::is_web_search_provider(&provider) {
-            anyhow::bail!("unknown search provider {provider}");
+        let name = ProviderStores {
+            agent_dir: &self.agent_dir,
+            models: &self.models,
+            credentials: &self.credentials,
         }
-        self.credentials.logout(&provider)?;
+        .disconnect_web_search(&provider)?;
         self.rebuild_tools().await?;
         Ok(name)
     }
@@ -942,7 +840,7 @@ impl Runtime {
     }
 
     async fn refresh_system_prompt(&self) {
-        let tools = self.harness.get_tools().await;
+        let tools = self.harness.tools().await;
         let selected: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
         let snippets = default_tool_snippets();
         let prompt = build_system_prompt(BuildSystemPromptOptions {
@@ -959,11 +857,10 @@ impl Runtime {
     /// Disconnect a model or search provider, respecting shared credentials.
     pub async fn logout_provider(&mut self, provider: &str) -> anyhow::Result<String> {
         let provider = provider.trim().to_ascii_lowercase();
-        match loop_agent::harness::web_search_backend(&provider) {
-            Some(backend) if !backend.shares_model_provider_key => {
-                self.disconnect_web_search(&provider).await
-            }
-            _ => self.disconnect_provider(&provider).await,
+        if crate::provider_login::is_search_only(&provider) {
+            self.disconnect_web_search(&provider).await
+        } else {
+            self.disconnect_provider(&provider).await
         }
     }
 
@@ -971,25 +868,12 @@ impl Runtime {
     /// selected model from that provider is deselected.
     pub async fn disconnect_provider(&mut self, id: &str) -> anyhow::Result<String> {
         let id = id.trim().to_ascii_lowercase();
-        let custom_index = self.settings.providers.iter().position(|p| p.id == id);
-        let preset = loop_ai::providers::provider_preset(&id);
-        if custom_index.is_none()
-            && preset.is_none()
-            && self.models.get_provider(&id).is_none()
-            && self.credentials.get(&id).is_none()
-        {
-            anyhow::bail!("{id} is not connected");
+        let name = ProviderStores {
+            agent_dir: &self.agent_dir,
+            models: &self.models,
+            credentials: &self.credentials,
         }
-        self.credentials.logout(&id)?;
-        let name = match custom_index {
-            Some(index) => {
-                let entry = self.settings.providers.remove(index);
-                self.models.remove_provider(&id);
-                self.save_settings()?;
-                entry.name
-            }
-            None => preset.map_or_else(|| id.clone(), |p| p.name.to_string()),
-        };
+        .disconnect_model_provider(&mut self.settings, &id)?;
         if self
             .selected_model
             .as_ref()
@@ -1024,7 +908,7 @@ impl Runtime {
         }
         let model = self
             .models
-            .get_model(provider, id)
+            .model(provider, id)
             .ok_or_else(|| anyhow::anyhow!("model not found: {provider}/{id}"))?;
         let session = self.native.current_session().await;
         loop_protocol::ModelControl::set_model(
@@ -1051,16 +935,17 @@ impl Runtime {
 
     /// Models of connected providers, in picker order (Soket first).
     pub async fn available_models(&self) -> Vec<loop_ai::Model> {
-        crate::config::providers::sort_models_for_picker(self.models.get_available().await)
+        crate::config::providers::sort_models_for_picker(self.models.available().await)
     }
 
     /// Ids of providers usable right now (presets with a key, then custom providers).
     pub fn connected_providers(&self) -> Vec<String> {
-        crate::config::providers::connected_providers(
-            self.credentials.as_ref(),
-            &self.settings.providers,
-            |k| std::env::var(k).ok(),
-        )
+        ProviderStores {
+            agent_dir: &self.agent_dir,
+            models: &self.models,
+            credentials: &self.credentials,
+        }
+        .connected(&self.settings)
     }
 }
 
@@ -1305,7 +1190,7 @@ pub async fn reload_model_definitions(
     Ok(())
 }
 
-fn load_custom_models_json(
+pub(crate) fn load_custom_models_json(
     agent_dir: &Path,
     models: &Models,
     custom: &[crate::config::CustomProviderEntry],
@@ -1686,27 +1571,27 @@ mod tests {
         });
         load_custom_models_json(dir.path(), &models, &[]).unwrap();
 
-        let pinned = models.get_model("zai", "glm-5.3-flash").unwrap();
+        let pinned = models.model("zai", "glm-5.3-flash").unwrap();
         assert_eq!(pinned.context_window, 1_000_000);
         assert_eq!(pinned.max_tokens, 65_536);
         assert!(pinned.reasoning);
 
-        let snake = models.get_model("zai", "snake-model").unwrap();
+        let snake = models.model("zai", "snake-model").unwrap();
         assert_eq!(snake.name, "Snake model");
         assert_eq!(snake.context_window, 512_000);
         assert_eq!(snake.max_tokens, 32_768);
         assert!(snake.reasoning);
 
         // Invalid optional values are ignored, and entries without a string id are skipped.
-        let wrong_types = models.get_model("zai", "wrong-types").unwrap();
+        let wrong_types = models.model("zai", "wrong-types").unwrap();
         assert_eq!(wrong_types.name, "wrong-types");
         assert_eq!(wrong_types.context_window, 128_000);
         assert_eq!(wrong_types.max_tokens, 16_384);
         assert!(!wrong_types.reasoning);
-        assert!(models.get_model("zai", "").is_none());
+        assert!(models.model("zai", "").is_none());
 
         // String entries keep the listing defaults.
-        let plain = models.get_model("zai", "plain-model").unwrap();
+        let plain = models.model("zai", "plain-model").unwrap();
         assert_eq!(plain.context_window, 128_000);
     }
 
@@ -1733,8 +1618,8 @@ mod tests {
         let models = Models::new();
         models.set_provider(entry.provider());
         load_custom_models_json(dir.path(), &models, &[entry]).unwrap();
-        assert!(!models.get_model("gateway", "override").unwrap().reasoning);
-        let kept = models.get_model("gateway", "keep").unwrap();
+        assert!(!models.model("gateway", "override").unwrap().reasoning);
+        let kept = models.model("gateway", "keep").unwrap();
         assert!(kept.reasoning);
         assert_eq!(
             kept.compat.unwrap().thinking_format,

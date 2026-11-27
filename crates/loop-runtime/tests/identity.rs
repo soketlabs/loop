@@ -9,7 +9,8 @@ use loop_protocol::rpc::PeerInfo;
 use loop_protocol::{
     AgentBackend, Caller, Principal, PrincipalKind, SessionRef, SessionSpec, Tenant,
 };
-use loop_runtime::{log::MemoryEventLog, Runtime, RuntimeLimits};
+use loop_runtime::log::MemoryEventLog;
+use loop_runtime::{Runtime, RuntimeLimits};
 use loop_wire::server::{serve_with_caller, serve_with_control, ServeOptions};
 use loop_wire::transport::memory;
 use loop_wire::{Authority, RemoteBackend, RuntimeControl};

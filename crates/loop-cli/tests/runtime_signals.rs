@@ -1,4 +1,7 @@
-use std::{future::Future, io::Write, task::Poll, time::Duration};
+use std::future::Future;
+use std::io::Write;
+use std::task::Poll;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[tokio::test]

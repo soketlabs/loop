@@ -1,11 +1,9 @@
 //! Discovery and detached startup for the default interactive Runtime client.
 use loop_protocol::AgentBackend;
 use loop_wire::RemoteBackend;
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 const CONNECT_WAIT: Duration = Duration::from_secs(15);
 
@@ -234,6 +232,17 @@ pub fn session_environment(
     ))
 }
 
+/// The global `--provider` and `--model`, passed on to a Runtime started by
+/// `loop runtime restart`. Empty for an auto-started Runtime, which serves
+/// many clients and leaves the choice to each Session.
+#[derive(Clone, Debug, Default)]
+pub struct ModelFlags {
+    /// `--provider`.
+    pub provider: Option<String>,
+    /// `--model`.
+    pub model: Option<String>,
+}
+
 /// `setsid` plus closed stdin separates the owner from this terminal's lifetime.
 pub fn spawn(
     executable: &Path,
@@ -241,7 +250,14 @@ pub fn spawn(
     cwd: &Path,
     socket: &Path,
 ) -> anyhow::Result<std::process::Child> {
-    spawn_owner(executable, agent_dir, cwd, socket, true)
+    spawn_owner(
+        executable,
+        agent_dir,
+        cwd,
+        socket,
+        true,
+        &ModelFlags::default(),
+    )
 }
 
 fn spawn_owner(
@@ -250,6 +266,7 @@ fn spawn_owner(
     cwd: &Path,
     socket: &Path,
     auto_started: bool,
+    flags: &ModelFlags,
 ) -> anyhow::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     crate::config::paths::ensure_agent_dirs(agent_dir)?;
@@ -266,6 +283,12 @@ fn spawn_owner(
         .stderr(log);
     if auto_started {
         command.arg("--auto-started");
+    }
+    if let Some(provider) = &flags.provider {
+        command.args(["--provider", provider]);
+    }
+    if let Some(model) = &flags.model {
+        command.args(["--model", model]);
     }
     // SAFETY: setsid is async-signal-safe and uses no Rust locks after fork.
     unsafe {
@@ -286,7 +309,16 @@ pub async fn start_and_connect(
     socket: &Path,
     host: Arc<dyn loop_protocol::HostServices>,
 ) -> anyhow::Result<Arc<RemoteBackend>> {
-    start_owner(executable, agent_dir, cwd, socket, host, true).await
+    start_owner(
+        executable,
+        agent_dir,
+        cwd,
+        socket,
+        host,
+        true,
+        &ModelFlags::default(),
+    )
+    .await
 }
 
 async fn start_owner(
@@ -296,17 +328,20 @@ async fn start_owner(
     socket: &Path,
     host: Arc<dyn loop_protocol::HostServices>,
     auto_started: bool,
+    flags: &ModelFlags,
 ) -> anyhow::Result<Arc<RemoteBackend>> {
     let mut child = if loop_app_core::runtime_instance::RuntimeInstanceLock::is_held(agent_dir)? {
         None
     } else {
         Some(
-            spawn_owner(executable, agent_dir, cwd, socket, auto_started).map_err(|error| {
-                anyhow::anyhow!(
-                    "could not start Runtime: {error}; see {}",
-                    agent_dir.join("logs/runtime.log").display()
-                )
-            })?,
+            spawn_owner(executable, agent_dir, cwd, socket, auto_started, flags).map_err(
+                |error| {
+                    anyhow::anyhow!(
+                        "could not start Runtime: {error}; see {}",
+                        agent_dir.join("logs/runtime.log").display()
+                    )
+                },
+            )?,
         )
     };
     let result = tokio::time::timeout(CONNECT_WAIT, async {
@@ -336,7 +371,10 @@ async fn start_owner(
 }
 
 /// An explicit restart creates a detached owner without an idle deadline.
-pub async fn restart(socket: Option<PathBuf>, cwd: &Path) -> anyhow::Result<()> {
+///
+/// `flags` become the new Runtime's default model for new Sessions; without
+/// them it starts with the saved default, as before.
+pub async fn restart(socket: Option<PathBuf>, cwd: &Path, flags: ModelFlags) -> anyhow::Result<()> {
     let agent_dir = crate::config::paths::get_agent_dir();
     let socket = match socket {
         Some(socket) => socket,
@@ -350,6 +388,7 @@ pub async fn restart(socket: Option<PathBuf>, cwd: &Path) -> anyhow::Result<()> 
         &socket,
         Arc::new(crate::surface_client::RemoteHost::default()),
         false,
+        &flags,
     )
     .await?;
     eprintln!("Runtime restarted (pid {}).", remote.status().await?.pid);

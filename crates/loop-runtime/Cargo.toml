@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "Runtime ownership and durable Session Event Log"
 
+[lints]
+workspace = true
+
 [features]
 orchestration = ["loop-agent/orchestration"]
 
@@ -28,6 +31,7 @@ tokio.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 loop-orchestration.workspace = true
+loop-test-support.workspace = true
 loop-store-testkit = { path = "../core/loop-store-testkit", default-features = false, features = ["event-log"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true

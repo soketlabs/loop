@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "std::sync::PoisonError::into_inner", reason = "Google Rust guide: never read a poisoned mutex; see crates/loop-runtime/src/sync.rs" },
+]

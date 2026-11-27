@@ -1,7 +1,9 @@
 //! Named pause and signal points for deterministic race tests. Outside tests
 //! they hold nothing and never wait.
 #[cfg(test)]
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::Arc;
 #[cfg(test)]
 use tokio::sync::{oneshot, Notify};
 

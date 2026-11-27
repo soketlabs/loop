@@ -1,4 +1,13 @@
-use super::*;
+//! In-memory Event Log: the `EventLog` implementation with no persistence.
+//!
+//! Used where durability is not needed. It keeps each Session's records and
+//! summary in a map behind one lock and follows the same contract as the
+//! SQLite implementation.
+
+use super::{
+    is_recovery_record, stamp, validate, Event, EventKind, EventLog, EventLogError, LoggedEvent,
+    Result,
+};
 use async_trait::async_trait;
 use loop_protocol::{SessionKey, TurnId};
 use loop_store::page::cut;
@@ -104,6 +113,7 @@ pub struct MemoryEventLog {
     state: Mutex<State>,
 }
 impl MemoryEventLog {
+    /// Creates an empty log.
     pub fn new() -> Self {
         Self::default()
     }

@@ -1,16 +1,27 @@
 //! Adapter for the S3.3 Session services while the TUI owns one native harness.
 //! Payloads and destinations use the existing S3.3 types and atomic store copy.
 use async_trait::async_trait;
-use loop_agent::{
-    harness::session::{
-        fork_points_from_branch, list_session_summaries, read_session_entries_for_fork,
-        session_tree_rows, SessionFile, SessionForkSelection, SessionStore, SessionTreeEntry,
-    },
-    native_backend::NativeBackend,
+use loop_agent::harness::session::{
+    fork_points_from_branch, list_session_summaries, read_session_entries_for_fork,
+    session_tree_rows, SessionFile, SessionForkSelection, SessionStore, SessionTreeEntry,
 };
-use loop_protocol::{rpc::*, *};
-use loop_wire::{control::Attachment, RuntimeControl};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use loop_agent::native_backend::NativeBackend;
+use loop_protocol::rpc::{
+    CloneParams, DestinationResult, ExportResult, ForkParams, ForkPoint, ImportParams,
+    MutationResult, NavigateParams, NavigateResult, RenameParams, SessionInfo, SessionListSummary,
+    SessionParams, SessionSnapshot, TreeEntry, TreeParams, TreeResult, TtfbResult,
+    SESSION_RESPONSE_LIMIT, SESSION_TRANSFER_LIMIT,
+};
+use loop_protocol::{
+    AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, Compaction,
+    ContentBlock, ErrorCategory, LocalShell, ModelChoices, ModelControl, SessionRef, SessionSpec,
+    SessionStats, SessionUpdate, TurnHandle, UpdateEnvelope,
+};
+use loop_wire::control::Attachment;
+use loop_wire::RuntimeControl;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub(super) struct NativeSessions {

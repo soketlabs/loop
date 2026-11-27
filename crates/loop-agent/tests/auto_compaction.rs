@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use loop_agent::harness::compaction::{CompactionSettings, SUMMARY_SYSTEM_PROMPT};
 use loop_agent::harness::session::types::SessionTreeEntry;
-use loop_agent::harness::session::SessionForkSelection;
 use loop_agent::harness::{
     create_in_memory_session_store, create_session_repository, AgentHarness, AgentHarnessOptions,
     HostExecutionEnv, SandboxMode, SessionStore,
@@ -147,6 +146,10 @@ fn text(t: &str) -> AssistantContent {
 struct Fixture {
     harness: Arc<AgentHarness>,
     provider: Provider,
+    #[cfg_attr(
+        not(feature = "sqlite"),
+        allow(dead_code, reason = "only the SQLite tests read the model")
+    )]
     model: Model,
 }
 
@@ -314,7 +317,7 @@ async fn fixture_with(
     }));
     let models = Arc::new(Models::new());
     models.set_provider(faux);
-    let mut model = models.get_model("faux", "faux-model").unwrap();
+    let mut model = models.model("faux", "faux-model").unwrap();
     model.context_window = window;
     *model_slot.lock() = Some(model.clone());
 
@@ -689,8 +692,10 @@ async fn disabled_settings_never_compact() {
 
 /// (f) After an automatic compaction the Session resumes, replays and forks
 /// from before and after the compaction entry.
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn resume_transcript_and_fork_work_after_automatic_compaction() {
+    use loop_agent::harness::session::SessionForkSelection;
     let dir = tempfile::tempdir().unwrap();
     let store = loop_agent::harness::create_sqlite_session_store(dir.path().join("s.db")).unwrap();
     let f = fixture_on(Arc::clone(&store), settings()).await;
@@ -1162,6 +1167,7 @@ async fn images_and_thinking_signatures_are_kept() {
 
 /// A nested compaction on the SQLite store builds the same context as the
 /// loop sent, and survives a reopen.
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn nested_compaction_on_sqlite() {
     let dir = tempfile::tempdir().unwrap();
@@ -1366,6 +1372,7 @@ async fn replay_equals_live_on_the_memory_store() {
     replay_equals_live(create_in_memory_session_store()).await;
 }
 
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn replay_equals_live_on_the_sqlite_store() {
     let dir = tempfile::tempdir().unwrap();

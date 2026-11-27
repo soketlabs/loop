@@ -19,6 +19,11 @@
 
 use super::capability::{Capability, Scope, Setting, State};
 
+/// A string that names no [`PermissionMode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("unknown permission mode")]
+pub struct ParsePermissionModeError;
+
 /// How much Loop's own tools may do without asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum PermissionMode {
@@ -46,18 +51,10 @@ impl PermissionMode {
         Self::FullAccess,
     ];
 
-    /// Parse a settings or flag value.
+    /// Parse a settings or flag value; `None` when it names no mode. See the
+    /// [`FromStr`](std::str::FromStr) impl.
     pub fn parse(value: &str) -> Option<Self> {
-        Some(
-            match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-                "plan" => Self::Plan,
-                "read-only" | "readonly" => Self::ReadOnly,
-                "ask" | "default" => Self::Ask,
-                "accept-edits" | "acceptedits" => Self::AcceptEdits,
-                "full-access" | "fullaccess" => Self::FullAccess,
-                _ => return None,
-            },
-        )
+        value.parse().ok()
     }
 
     /// The settings and flag name.
@@ -107,7 +104,7 @@ impl PermissionMode {
 
     /// The Setting this mode's preset gives `capability`.
     pub fn setting(self, capability: &Capability) -> Setting {
-        use Capability::*;
+        use Capability::{Mcp, Other, ReadFiles, Shell, WebFetch, WebSearch, WriteFiles};
         use State::{Ask as AskFirst, Off, On};
         match (self, capability) {
             (Self::Plan, _) => Self::ReadOnly.setting(capability),
@@ -131,6 +128,25 @@ impl PermissionMode {
     }
 }
 
+impl std::str::FromStr for PermissionMode {
+    type Err = ParsePermissionModeError;
+
+    /// Parse a settings or flag value. Case-insensitive; `_` and `-` are the
+    /// same; surrounding whitespace is ignored.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(
+            match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+                "plan" => Self::Plan,
+                "read-only" | "readonly" => Self::ReadOnly,
+                "ask" | "default" => Self::Ask,
+                "accept-edits" | "acceptedits" => Self::AcceptEdits,
+                "full-access" | "fullaccess" => Self::FullAccess,
+                _ => return Err(ParsePermissionModeError),
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::PermissionMode::{self, *};
@@ -143,6 +159,18 @@ mod tests {
         assert_eq!(PermissionMode::parse("Accept_Edits"), Some(AcceptEdits));
         assert_eq!(PermissionMode::parse("yolo"), None);
         assert!(ReadOnly < Ask && Ask < AcceptEdits && AcceptEdits < FullAccess);
+    }
+
+    #[test]
+    fn from_str_accepts_aliases_and_rejects_unknown() {
+        assert_eq!("read-only".parse(), Ok(ReadOnly));
+        assert_eq!(" ReadOnly ".parse(), Ok(ReadOnly));
+        assert_eq!("default".parse(), Ok(Ask));
+        assert_eq!("accept_edits".parse(), Ok(AcceptEdits));
+        assert_eq!("FULLACCESS".parse(), Ok(FullAccess));
+        assert_eq!("plan".parse(), Ok(Plan));
+        assert!("yolo".parse::<PermissionMode>().is_err());
+        assert!("".parse::<PermissionMode>().is_err());
     }
 
     #[test]

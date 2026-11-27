@@ -9,13 +9,26 @@
 use std::path::Path;
 
 use loop_agent::harness::SandboxMode;
+use loop_app_core::config::paths;
+use loop_app_core::config::settings::{set_disabled_name, set_skill_disabled};
 use loop_app_core::config::workspace_settings::{WorkspaceOverrides, WorkspaceSettingsStore};
-use loop_app_core::config::{paths, settings::set_disabled_name, settings::set_skill_disabled};
 use loop_app_core::config::{Settings, TrustStore};
-use loop_protocol::admin::*;
+use loop_protocol::admin::{
+    AdminAction, DefaultsParams, DefaultsResult, McpParams, McpResult, McpServerStatus,
+    PermissionModeParams, PermissionModeResult, ReloadParams, ReloadResult, RuntimeSessionRow,
+    RuntimeSessionTotals, RuntimeSessionsResult, SandboxAction, SandboxChoice, SandboxParams,
+    SandboxResult, SettingsParams, SettingsResult, SkillStatus, SkillsParams, SkillsResult,
+    TemplateInfo, TemplatesParams, TemplatesResult, TrustParams, TrustResult, WebSearchParams,
+    WebSearchResult,
+};
+use loop_protocol::host::{ProvidersParams, ProvidersResult};
 use loop_wire::RuntimeAdmin;
 
-use super::*;
+use super::{
+    async_trait, failed, request_caller, tree, Arc, AtomicBool, BackendError, BackendResult,
+    BootstrapOpts, Capabilities, ErrorCategory, HashMap, LiveSession, MutationResult,
+    OpenedSession, Ordering, PathBuf, Runtime, SessionStats, WorkspaceResources, WorkspaceState,
+};
 use crate::access::{Actor, Need};
 
 /// Tools the Runtime adds to its Sessions, kept across a reload.
@@ -605,7 +618,7 @@ impl Runtime {
                         )));
                     }
                     models
-                        .get_model(provider, id)
+                        .model(provider, id)
                         .ok_or_else(|| protocol(format!("model not found: {spec}")))?;
                     Some((provider.to_owned(), id.to_owned()))
                 }
@@ -630,11 +643,7 @@ impl Runtime {
             }
             settings.save_file(&path).map_err(failed)?;
             self.defaults_revision.fetch_add(1, Ordering::AcqRel);
-            // Loaded workspaces cache settings; new Sessions read them there.
-            let loaded: Vec<PathBuf> = self.workspaces.lock().unwrap().keys().cloned().collect();
-            for cwd in loaded {
-                self.reload_workspace(&cwd).await?;
-            }
+            self.reload_loaded_workspaces().await?;
         }
         Ok(DefaultsResult {
             revision: self.defaults_revision.load(Ordering::Acquire),
@@ -649,6 +658,16 @@ impl Runtime {
 }
 
 impl Runtime {
+    /// Reload every loaded workspace after a global settings change: loaded
+    /// workspaces cache settings, and new Sessions read them there.
+    pub(super) async fn reload_loaded_workspaces(&self) -> BackendResult<()> {
+        let loaded: Vec<PathBuf> = self.workspaces.lock().unwrap().keys().cloned().collect();
+        for cwd in loaded {
+            self.reload_workspace(&cwd).await?;
+        }
+        Ok(())
+    }
+
     /// What `mode` lets a Session do, with the tool lock named when there is
     /// one: the lock caps every mode.
     fn effective_policy(&self, mode: loop_app_core::permissions::PermissionMode) -> String {
@@ -677,9 +696,16 @@ impl RuntimeAdmin for Runtime {
             session_sandbox: true,
             permission_mode: true,
             runtime_sessions: true,
+            // Host-only: the wire offers it only host-locally and never
+            // under a tool lock.
+            host_providers: true,
             tool_lock: self.factory.globals.tool_lock(),
             ..Capabilities::default()
         }
+    }
+
+    async fn providers(&self, p: ProvidersParams) -> BackendResult<ProvidersResult> {
+        self.manage_providers(p).await
     }
 
     async fn settings(&self, p: SettingsParams) -> BackendResult<SettingsResult> {

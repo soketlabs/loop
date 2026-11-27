@@ -304,8 +304,28 @@ fn model_key(model: &Model) -> String {
     format!("{}/{}", model.provider, model.id)
 }
 
+/// Lock the learned rejections. When a thread panicked holding the lock, the
+/// list is cleared through the guard (written, never read) and the poison is
+/// cleared: the rejections are forgotten and learned again on the next
+/// rejection, which costs one extra request.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "cache reset: the poisoned list is cleared, never read"
+)]
+fn rejected_models() -> std::sync::MutexGuard<'static, Vec<String>> {
+    match SUMMARIES_REJECTED.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            guard.clear();
+            SUMMARIES_REJECTED.clear_poison();
+            guard
+        }
+    }
+}
+
 fn mark_summaries_rejected(model: &Model) {
-    let mut rejected = SUMMARIES_REJECTED.lock().unwrap_or_else(|p| p.into_inner());
+    let mut rejected = rejected_models();
     let key = model_key(model);
     if !rejected.contains(&key) {
         rejected.push(key);
@@ -313,10 +333,7 @@ fn mark_summaries_rejected(model: &Model) {
 }
 
 fn summaries_rejected(model: &Model) -> bool {
-    SUMMARIES_REJECTED
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .contains(&model_key(model))
+    rejected_models().contains(&model_key(model))
 }
 
 /// Whether an error body refuses reasoning summaries.

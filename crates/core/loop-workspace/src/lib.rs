@@ -7,7 +7,7 @@
 //! its model clients or its user interface. See
 //! `docs/design/workspace-driver.md`.
 
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 mod adapter;
 mod capabilities;

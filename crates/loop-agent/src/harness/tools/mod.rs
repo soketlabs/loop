@@ -10,6 +10,7 @@ pub mod shell;
 mod todo;
 #[cfg(feature = "web")]
 pub mod web;
+pub mod web_backends;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

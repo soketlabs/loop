@@ -1,15 +1,27 @@
-use std::{cmp::Ordering, future::Future};
+//! The decision rules for an update: whether a release should be installed, and
+//! cancellation on termination signals.
+
+use std::cmp::Ordering;
+use std::future::Future;
 
 use crate::{Error, ReleaseVersion, Result};
 
+/// What an update command should do about a release.
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpdatePlan {
+    /// The release is newer than the running version, or `force` was set.
     Install,
+    /// The release has the same SemVer precedence as the running version.
     UpToDate,
+    /// The release is older than the running version and `force` was not set.
     DowngradeBlocked,
 }
 
 /// Decide by SemVer precedence; build metadata does not change precedence.
+///
+/// `current` is the running version, with or without a leading `v`. With
+/// `force` the answer is always [`UpdatePlan::Install`]. Returns an error when
+/// `current` is not valid SemVer.
 pub fn plan(current: &str, release: &ReleaseVersion, force: bool) -> Result<UpdatePlan> {
     let current = semver::Version::parse(current.trim_start_matches('v'))?;
     Ok(if force {
@@ -23,6 +35,9 @@ pub fn plan(current: &str, release: &ReleaseVersion, force: bool) -> Result<Upda
     })
 }
 
+/// Whether the value of the update-check switch (an environment variable) turns
+/// the check off. `1`, `true`, `yes` and `on` do, in any case and with
+/// surrounding spaces. Anything else, including no value, does not.
 pub fn update_check_disabled(value: Option<&str>) -> bool {
     value.is_some_and(|s| {
         matches!(
@@ -34,6 +49,9 @@ pub fn update_check_disabled(value: Option<&str>) -> bool {
 
 /// Drop the operation future on an ordinary termination signal. TempDir and
 /// installation guards then clean up. Replacement itself has no await point.
+///
+/// Ctrl-C, SIGHUP and SIGTERM count. Returns [`Error::Cancelled`] when one
+/// arrives first, otherwise the result of `operation`. Unix only.
 pub async fn cancellable<T>(operation: impl Future<Output = Result<T>>) -> Result<T> {
     tokio::select! {
         result = operation => result,

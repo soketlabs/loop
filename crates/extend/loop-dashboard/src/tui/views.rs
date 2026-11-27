@@ -1,7 +1,15 @@
 //! Drawing each view of the usage screen.
 
-use super::widgets::*;
-use super::*;
+use super::widgets::{
+    ago, bar, centered_rows, column_width, compact, compact_f, duration, fill_days, fit_columns,
+    gauge, nice_max, right, thousands, truncate, weighted_latency, BarItem, Column, DayPoint,
+    Histogram, Legend, Series, Tile,
+};
+use super::{
+    Alignment, App, Block, BorderType, Cell, Constraint, Flex, Frame, Layout, Line, LiveStatus,
+    Local, Margin, ModelRow, Modifier, Palette, Paragraph, Range, Rect, Row, Span, Style, Stylize,
+    SubAgent, SubAgentState, Table, ToolRow, Utc, View, Wrap, BUILT_IN, MIN_SIZE,
+};
 
 impl App {
     // ---------------------------------------------------------------- frame

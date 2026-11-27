@@ -15,7 +15,7 @@ async fn agent_prompt_updates_state() {
     script.push(FauxResponse::Text("hi there".into()));
     let models = Models::new();
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
     let agent = Agent::new(AgentOptions::new(
         AgentState::new(model),
         stream_fn_from_models(Arc::new(models)),
@@ -39,7 +39,7 @@ async fn agent_tool_roundtrip() {
     script.push(FauxResponse::Text("3".into()));
     let models = Models::new();
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
     let tool = AgentTool::simple(
         "add",
         "Add",
@@ -78,7 +78,7 @@ async fn busy_reject() {
     script.push(FauxResponse::Text("done".into()));
     let models = Models::new();
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
     let tool = AgentTool::simple(
         "sleep",
         "Sleep",

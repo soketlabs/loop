@@ -320,12 +320,20 @@ impl Drop for Dashboard {
 /// Dashboard views, in tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
+    /// Live status of the running loop: session, context window, agents, skills
+    /// and MCP servers. Needs [`Options::live`].
     Now,
+    /// Tokens and calls over time.
     Usage,
+    /// Usage by model.
     Models,
+    /// Usage by tool and MCP server.
     Tools,
+    /// Main agent and Subagent runs, and skills.
     Agents,
+    /// Recent sessions.
     Sessions,
+    /// Sessions loaded in the connected Runtime. Needs a connected Session.
     Runtime,
 }
 
@@ -361,9 +369,13 @@ impl View {
 /// Period shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Range {
+    /// The last day.
     Day,
+    /// The last 7 days.
     Week,
+    /// The last 30 days.
     Month,
+    /// All retained history.
     All,
 }
 
@@ -379,7 +391,7 @@ impl Range {
         }
     }
 
-    /// Days passed to [`aggregate::summarize_dir`]; `None` for everything retained.
+    /// Days passed to [`summarize_dir`](crate::summarize_dir); `None` for everything retained.
     pub fn days(self) -> Option<u32> {
         match self {
             Self::Day => Some(1),

@@ -655,9 +655,8 @@ async fn the_model_picker_lists_connected_providers_in_picker_order() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let dir = tempfile::tempdir().unwrap();
         let runtime = fixture(dir.path()).await;
-        let expected = crate::config::providers::sort_models_for_picker(
-            runtime.catalog().get_available().await,
-        );
+        let expected =
+            crate::config::providers::sort_models_for_picker(runtime.catalog().available().await);
         let listed = runtime.available_models().await.unwrap();
         let ids = |models: &[loop_ai::Model]| -> Vec<String> {
             models

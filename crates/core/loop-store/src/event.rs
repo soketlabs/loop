@@ -25,23 +25,39 @@ pub const WRITER_QUEUE_CAPACITY: usize = 64;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum EventKind {
+    /// A wire update for a Session, with its envelope.
     Update(UpdateEnvelope),
+    /// A prompt was accepted for a Session. Payload: `{"content": [...]}`.
+    /// Recovery uses it to find a prompt whose turn never started.
     PromptSent(Value),
     /// A prompt ended without starting a turn (cancelled while queued,
     /// refused as busy, closing). Log-only: recovery reads it so the prompt
     /// is not taken for an interrupted turn. Never sent on the wire.
     PromptSettled(Value),
+    /// A Session's turn was cancelled, or a lost lease cancelled it. The
+    /// payload may carry a `reason` and a `detail`.
     Cancelled(Value),
+    /// An escalation (a question for a human) was raised. Payload: the `id`
+    /// and the `request`.
     EscalationRaised(Value),
+    /// An escalation was answered. Recovery treats it as closing the request.
     EscalationAnswered(Value),
+    /// An escalation was withdrawn without an answer. Recovery treats it as
+    /// closing the request.
     EscalationWithdrawn(Value),
+    /// A Session was opened. The payload marks a creating opening with
+    /// [`SESSION_CREATED_KEY`].
     SessionOpened(Value),
+    /// A Session was closed or unloaded. The payload may carry a `reason`.
     SessionClosed(Value),
     /// A Session's `subagent` call opened a child (logged on the parent).
     SubagentStarted(Value),
     /// A child's result reached its parent (logged on the parent).
     SubagentEnded(Value),
+    /// A Runtime owner started. The payload carries its `pid`.
     RuntimeStarted(Value),
+    /// A Runtime owner stopped cleanly. Recovery reads it as the end of that
+    /// generation.
     RuntimeStopped(Value),
     /// One Policy gate decision, a [`crate::records::PolicyDecisionRecord`]
     /// as JSON. Log-only and audit-only: it takes no Session sequence, and
@@ -60,11 +76,17 @@ pub enum EventKind {
 /// reads as [`Identity::unrecorded`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Event {
+    /// The writer generation that produced the record.
     pub generation: u64,
+    /// The Session the record belongs to. `None` for Runtime-level records.
     pub session_key: Option<SessionKey>,
+    /// The turn the record belongs to, when it has one.
     pub turn: Option<TurnId>,
+    /// Wall-clock time of the activity, in milliseconds since the Unix epoch.
     pub ts_ms: i64,
+    /// What happened.
     pub kind: EventKind,
+    /// Who acted, in which tenant.
     #[serde(flatten)]
     pub identity: Identity,
 }
@@ -166,8 +188,11 @@ pub fn opened_creates(payload: &Value) -> bool {
 /// A committed activity, ordered globally and (for Updates) within a Session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoggedEvent {
+    /// Position in the log across all Sessions of the store.
     pub global_seq: u64,
+    /// Position within the Session. Only Update records have one.
     pub session_seq: Option<u64>,
+    /// The committed record.
     pub event: Event,
 }
 

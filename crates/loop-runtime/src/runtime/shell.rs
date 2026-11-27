@@ -1,5 +1,7 @@
 //! User commands run in a Session's environment (`session/shell`).
-use super::*;
+use super::{
+    failed, BackendError, BackendResult, ErrorCategory, Ordering, Runtime, SessionRef, ShellResult,
+};
 
 impl Runtime {
     /// Run a user command in the Session's environment while it is idle.

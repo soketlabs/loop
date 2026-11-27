@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "Storage contracts for Loop: the Event Log record types, errors and store traits, with no database driver"
 
+[lints]
+workspace = true
+
 [dependencies]
 async-trait = { workspace = true }
 loop-protocol = { workspace = true }

@@ -73,13 +73,10 @@ async fn anthropic_lists_models_and_answers_a_prompt() {
     let models = models_with(anthropic_provider(&base), "anthropic", "sk-ant-good");
 
     // Offline: the built-in catalog.
-    assert_eq!(
-        models.get_models(Some("anthropic"))[0].id,
-        "claude-opus-5-5"
-    );
+    assert_eq!(models.models(Some("anthropic"))[0].id, "claude-opus-5-5");
 
     assert!(refresh(&models, "anthropic").await.errors.is_empty());
-    let listed = models.get_models(Some("anthropic"));
+    let listed = models.models(Some("anthropic"));
     let ids: Vec<_> = listed.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["claude-opus-5-5", "claude-next"]);
     assert!(
@@ -89,7 +86,7 @@ async fn anthropic_lists_models_and_answers_a_prompt() {
     assert_eq!(listed[1].context_window, 400_000);
     assert!(listed.iter().all(|m| m.api == API_ANTHROPIC_MESSAGES));
 
-    let model = models.get_model("anthropic", "claude-next").unwrap();
+    let model = models.model("anthropic", "claude-next").unwrap();
     let context = Context {
         messages: vec![Message::user_text("hi")],
         ..Default::default()
@@ -153,13 +150,13 @@ async fn openai_preset_models_use_responses_and_pinned_completions_still_route()
     let models = models_with(openai_compatible_provider(config), "openai", "sk-good");
     assert!(refresh(&models, "openai").await.errors.is_empty());
 
-    let gpt5 = models.get_model("openai", "gpt-5.1").unwrap();
+    let gpt5 = models.model("openai", "gpt-5.1").unwrap();
     assert_eq!(gpt5.api, API_OPENAI_RESPONSES);
     assert!(gpt5.reasoning, "gpt-5 family reasons");
-    let gpt41 = models.get_model("openai", "gpt-4.1").unwrap();
+    let gpt41 = models.model("openai", "gpt-4.1").unwrap();
     assert!(!gpt41.reasoning);
     assert_eq!(
-        models.get_model("openai", "legacy-chat").unwrap().api,
+        models.model("openai", "legacy-chat").unwrap().api,
         API_OPENAI_COMPLETIONS,
         "pinned models keep their api"
     );
@@ -217,7 +214,7 @@ async fn gemini_lists_models_and_answers_a_prompt() {
     let base = format!("{}/v1beta", server.base_url());
     let models = models_with(gemini_provider(&base), "gemini", "AIza-good");
     assert!(refresh(&models, "gemini").await.errors.is_empty());
-    let listed = models.get_models(Some("gemini"));
+    let listed = models.models(Some("gemini"));
     let ids: Vec<_> = listed.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["gemini-2.5-pro", "gemini-next"]);
     assert!(
@@ -226,7 +223,7 @@ async fn gemini_lists_models_and_answers_a_prompt() {
     );
     assert!(listed.iter().all(|m| m.api == API_GOOGLE_GENERATIVE_AI));
 
-    let model = models.get_model("gemini", "gemini-next").unwrap();
+    let model = models.model("gemini", "gemini-next").unwrap();
     let context = Context {
         messages: vec![Message::user_text("hi")],
         ..Default::default()

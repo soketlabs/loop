@@ -9,10 +9,6 @@
 
 use std::sync::Arc;
 
-use loop_agent::harness::{
-    create_session_repository, create_sqlite_session_search, create_sqlite_session_store,
-    AgentHarness, AgentHarnessOptions, HostExecutionEnv, SandboxMode,
-};
 use loop_agent::{
     stream_fn_from_models, Agent, AgentEvent, AgentMessage, AgentOptions, AgentState, AgentTool,
     AgentToolResult,
@@ -37,7 +33,7 @@ fn live_models() -> (Arc<Models>, Model) {
         models: vec![CustomModelSpec::new(model_id.clone())],
         headers: None,
     }));
-    let model = models.get_model("live", &model_id).unwrap();
+    let model = models.model("live", &model_id).unwrap();
     (Arc::new(models), model)
 }
 
@@ -181,9 +177,14 @@ async fn live_agent_tool_loop() {
     }
 }
 
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 #[ignore = "requires LOOP_TEST_BASE_URL and a reachable OpenAI-compatible API"]
 async fn live_harness_sqlite_persist_and_search() {
+    use loop_agent::harness::{
+        create_session_repository, create_sqlite_session_search, create_sqlite_session_store,
+        AgentHarness, AgentHarnessOptions, HostExecutionEnv, SandboxMode,
+    };
     let (models, model) = live_models();
 
     let dir = tempfile::tempdir().unwrap();

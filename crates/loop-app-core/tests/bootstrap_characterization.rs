@@ -37,7 +37,7 @@ async fn characterization_child() {
     let runtime = bootstrap(opts).await.unwrap();
     let names: Vec<_> = runtime
         .harness
-        .get_tools()
+        .tools()
         .await
         .into_iter()
         .map(|t| t.name)

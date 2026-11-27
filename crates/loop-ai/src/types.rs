@@ -324,7 +324,7 @@ pub enum UserMessageContent {
 }
 
 mod user_content_serde {
-    use super::*;
+    use super::{Deserialize, Serialize, UserMessageContent};
     use serde::{Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(
@@ -487,7 +487,7 @@ pub struct Context {
 }
 
 /// Pricing rates in $/million tokens.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCostRates {
     /// Input rate.
@@ -498,17 +498,6 @@ pub struct ModelCostRates {
     pub cache_read: f64,
     /// Cache-write rate.
     pub cache_write: f64,
-}
-
-impl Default for ModelCostRates {
-    fn default() -> Self {
-        Self {
-            input: 0.0,
-            output: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-        }
-    }
 }
 
 /// Pricing tier selected when total input exceeds a threshold.

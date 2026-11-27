@@ -140,8 +140,9 @@ fn asserted_caller(request: &Request) -> Result<loop_protocol::Caller, String> {
         }
     };
     // An unknown kind is refused by `Caller::asserted`.
-    let kind =
-        PrincipalKind::parse(one(edge_headers::PRINCIPAL_KIND)?).map_err(|e| e.to_string())?;
+    let kind = one(edge_headers::PRINCIPAL_KIND)?
+        .parse::<PrincipalKind>()
+        .map_err(|e| e.to_string())?;
     let principal = Principal::new(
         kind,
         one(edge_headers::PRINCIPAL_ISSUER)?,
@@ -467,7 +468,8 @@ mod tests {
     #[tokio::test]
     async fn a_websocket_without_the_token_is_refused() {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Error};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Error;
         for (expected, given) in [("secret", None), ("secret", Some("wrong")), ("", Some(""))] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

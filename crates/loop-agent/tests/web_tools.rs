@@ -5,6 +5,8 @@
 //! refuse to talk to. Tests that need to exercise the happy path opt into
 //! `allowPrivateAddresses`, mirroring the documented intranet-mirror setting.
 
+#![cfg(feature = "web")]
+
 use loop_agent::harness::{create_web_fetch_tool, create_web_search_tool, verify_web_search_key};
 use loop_agent::types::AgentTool;
 use loop_test_support::{FakeHttpServer, FakeResponse};

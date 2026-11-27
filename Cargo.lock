@@ -2501,6 +2501,7 @@ dependencies = [
  "loop-protocol",
  "loop-store",
  "loop-store-testkit",
+ "loop-test-support",
  "loop-wire",
  "rusqlite",
  "serde",

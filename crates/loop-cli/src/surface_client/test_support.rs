@@ -14,7 +14,7 @@ pub(crate) async fn fixture(dir: &Path) -> SurfaceClient {
 pub(crate) async fn fixture_with(dir: &Path, with_store: bool) -> SurfaceClient {
     let models = Arc::new(loop_ai::Models::new());
     let provider = faux_provider(FauxScript::new());
-    let mut model = provider.get_model("faux-model").unwrap();
+    let mut model = provider.model("faux-model").unwrap();
     model.reasoning = true;
     let mut second = model.clone();
     second.id = "second".into();
@@ -114,7 +114,7 @@ pub(crate) fn pause_provider(
             loop_ai::providers::FauxResponse::Text("finished".into())
         })
     }));
-    provider.set_models(client.host.inner.models.get_models(Some("faux")));
+    provider.set_models(client.host.inner.models.models(Some("faux")));
     client.host.inner.models.set_provider(provider);
 }
 
@@ -144,7 +144,7 @@ pub(crate) fn plan_shell_task(client: &SurfaceClient) {
             loop_ai::providers::FauxResponse::Text(serde_json::json!({"tasks":[{"id":"inspect","description":"Inspect","kind":"shell_command","command":"printf \"workflow-output:$LOOP_WORKFLOW_ENV\""}]}).to_string())
         })
     }));
-    provider.set_models(client.host.inner.models.get_models(Some("faux")));
+    provider.set_models(client.host.inner.models.models(Some("faux")));
     client.host.inner.models.set_provider(provider);
 }
 
@@ -240,7 +240,7 @@ pub(crate) fn capture_system_prompt(
         *observed.lock().unwrap() = format!("{request:?}");
         Box::pin(async { loop_ai::providers::FauxResponse::Text("done".into()) })
     }));
-    provider.set_models(client.host.inner.models.get_models(Some("faux")));
+    provider.set_models(client.host.inner.models.models(Some("faux")));
     client.host.inner.models.set_provider(provider);
 }
 

@@ -385,7 +385,7 @@ fn interactions_route_to_a_session_and_withdraw_by_native_id() {
 
 #[test]
 fn session_tree_v1_capabilities_and_event_goldens() {
-    use loop_protocol::rpc::*;
+    use loop_protocol::rpc::{ClientCapabilities, NavigateParams, NavigateResult};
     use loop_protocol::SessionUpdate;
     let legacy: ClientCapabilities = serde_json::from_value(json!({"interact":true})).unwrap();
     assert!(!legacy.branch_reset);
@@ -821,7 +821,11 @@ fn the_chosen_sandbox_is_an_optional_config_field() {
 
 #[test]
 fn workspace_admin_and_host_only_methods_wire() {
-    use loop_protocol::admin::*;
+    use loop_protocol::admin::{
+        AdminAction, DefaultsParams, DefaultsPatch, McpParams, McpResult, McpServerStatus,
+        PermissionModeResult, ReloadResult, SandboxAction, SandboxChoice, SandboxParams,
+        TemplatesResult, TrustParams, UsageParams,
+    };
     use loop_protocol::rpc::methods;
     assert_eq!(methods::WORKSPACE_MCP, "workspace/mcp");
     assert_eq!(methods::WORKSPACE_WEB_SEARCH, "workspace/web_search");
@@ -999,7 +1003,7 @@ fn tool_locked_error_wire() {
 
 #[test]
 fn skill_and_workflow_requests_and_progress_have_stable_wire_shapes() {
-    use loop_protocol::session_services::*;
+    use loop_protocol::session_services::{WorkflowParams, WorkflowProgress, WorkflowState};
     let session =
         serde_json::from_value(json!({"instance":"loop","key":"s","native_id":"s"})).unwrap();
     let request = WorkflowParams {
@@ -1026,7 +1030,7 @@ fn skill_and_workflow_requests_and_progress_have_stable_wire_shapes() {
 
 #[test]
 fn host_credentials_have_redacted_debug_and_explicit_wire_actions() {
-    use loop_protocol::host::*;
+    use loop_protocol::host::{HostAction, ProvidersParams, TracingParams};
     let request = ProvidersParams {
         action: HostAction::Connect,
         provider: None,

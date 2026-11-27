@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "Multi-agent orchestration: planner, workflow, scheduler, and memory"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 sqlite = ["dep:rusqlite"]

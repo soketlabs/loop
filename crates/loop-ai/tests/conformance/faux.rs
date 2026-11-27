@@ -12,7 +12,7 @@ async fn run(response: FauxResponse) -> Run {
     script.push(response);
     let models = Models::new();
     models.set_provider(faux_provider(script));
-    let model = models.get_model("faux", "faux-model").unwrap();
+    let model = models.model("faux", "faux-model").unwrap();
     let context = Context {
         messages: vec![Message::user_text("hi")],
         ..Default::default()

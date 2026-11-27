@@ -215,7 +215,7 @@ impl Policy {
             .all(|(_, setting)| setting.may_allow(call))
     }
 
-    /// The decision for `call`: the mode's ([`decide`]), capped by the
+    /// The decision for `call`: the mode's (`decide`), capped by the
     /// layers. Off in any layer refuses the call; "ask" in any layer asks
     /// even where the mode or an allow rule would not.
     pub fn decide(

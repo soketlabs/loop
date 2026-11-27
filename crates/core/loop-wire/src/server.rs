@@ -481,8 +481,8 @@ async fn handle(
     params: Value,
 ) {
     let conn = &host.conn;
-    let result = match method {
-        methods::SESSION_NEW => match parse(params) {
+    let result = match (method, runtime) {
+        (methods::SESSION_NEW, _) => match parse(params) {
             Ok(spec) => {
                 let _ = control.send(Control::RegisterBegin);
                 let made = backend.new_session(spec).await;
@@ -496,7 +496,7 @@ async fn handle(
             }
             Err(error) => return conn.respond(id, Err(error)),
         },
-        methods::SESSION_LOAD => match parse::<LoadParams>(params) {
+        (methods::SESSION_LOAD, _) => match parse::<LoadParams>(params) {
             Ok(LoadParams { session, spec }) => {
                 let _ = control.send(Control::RegisterBegin);
                 let loaded = backend.load_session(&session, spec).await;
@@ -511,71 +511,62 @@ async fn handle(
             Err(error) => return conn.respond(id, Err(error)),
         },
         // Session-tree dispatch stays grouped for parallel protocol additions.
-        methods::SESSION_CONFIG if runtime.is_some() => {
+        (methods::SESSION_CONFIG, Some(runtime)) => {
             if !backend.capabilities().session_config {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
             } else {
                 match parse(params) {
-                    Ok(p) => runtime.unwrap().config(p).await.map(|r| to_value(&r)),
+                    Ok(p) => runtime.config(p).await.map(|r| to_value(&r)),
                     Err(error) => return conn.respond(id, Err(error)),
                 }
             }
         }
-        methods::SESSION_SKILL if runtime.is_some() => {
+        (methods::SESSION_SKILL, Some(runtime)) => {
             if !backend.capabilities().session_skills {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
             } else {
                 match parse(params) {
-                    Ok(p) => runtime.unwrap().skill(p).await.map(|r| to_value(&r)),
+                    Ok(p) => runtime.skill(p).await.map(|r| to_value(&r)),
                     Err(error) => return conn.respond(id, Err(error)),
                 }
             }
         }
-        methods::SESSION_WORKFLOW if runtime.is_some() => {
+        (methods::SESSION_WORKFLOW, Some(runtime)) => {
             if !backend.capabilities().workflow {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
             } else {
                 match parse(params) {
-                    Ok(p) => runtime.unwrap().workflow(p).await.map(|r| to_value(&r)),
+                    Ok(p) => runtime.workflow(p).await.map(|r| to_value(&r)),
                     Err(error) => return conn.respond(id, Err(error)),
                 }
             }
         }
-        methods::SESSION_TREE if runtime.is_some() => {
+        (methods::SESSION_TREE, Some(runtime)) => {
             if !backend.capabilities().session_tree {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
             } else {
                 match parse::<loop_protocol::rpc::TreeParams>(params) {
-                    Ok(params) => runtime
-                        .unwrap()
-                        .tree(params)
-                        .await
-                        .map(|result| to_value(&result)),
+                    Ok(params) => runtime.tree(params).await.map(|result| to_value(&result)),
                     Err(error) => return conn.respond(id, Err(error)),
                 }
             }
         }
-        methods::SESSION_VIEW if runtime.is_some() => {
+        (methods::SESSION_VIEW, Some(runtime)) => {
             if !backend.capabilities().branch_snapshot {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
             } else {
                 match parse::<loop_protocol::rpc::ViewParams>(params) {
-                    Ok(params) => runtime
-                        .unwrap()
-                        .view(params)
-                        .await
-                        .map(|result| to_value(&result)),
+                    Ok(params) => runtime.view(params).await.map(|result| to_value(&result)),
                     Err(error) => return conn.respond(id, Err(error)),
                 }
             }
         }
-        methods::SESSION_NAVIGATE if runtime.is_some() => {
+        (methods::SESSION_NAVIGATE, Some(runtime)) => {
             if !backend.capabilities().session_tree {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
             } else {
                 match parse::<loop_protocol::rpc::NavigateParams>(params) {
                     Ok(params) => runtime
-                        .unwrap()
                         .navigate(params)
                         .await
                         .map(|result| to_value(&result)),
@@ -583,41 +574,32 @@ async fn handle(
                 }
             }
         }
-        methods::SESSION_RENAME if runtime.is_some() => {
+        (methods::SESSION_RENAME, Some(runtime)) => {
             if !backend.capabilities().session_rename {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
             } else {
                 match parse::<loop_protocol::rpc::RenameParams>(params) {
-                    Ok(params) => runtime
-                        .unwrap()
-                        .rename(params)
-                        .await
-                        .map(|result| to_value(&result)),
+                    Ok(params) => runtime.rename(params).await.map(|result| to_value(&result)),
                     Err(error) => return conn.respond(id, Err(error)),
                 }
             }
         }
-        methods::SESSION_FORK if runtime.is_some() => {
+        (methods::SESSION_FORK, Some(runtime)) => {
             if !backend.capabilities().session_fork {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
             } else {
                 match parse::<loop_protocol::rpc::ForkParams>(params) {
-                    Ok(params) => runtime
-                        .unwrap()
-                        .fork(params)
-                        .await
-                        .map(|result| to_value(&result)),
+                    Ok(params) => runtime.fork(params).await.map(|result| to_value(&result)),
                     Err(error) => return conn.respond(id, Err(error)),
                 }
             }
         }
-        methods::SESSION_CLONE if runtime.is_some() => {
+        (methods::SESSION_CLONE, Some(runtime)) => {
             if !backend.capabilities().session_fork {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
             } else {
                 match parse::<loop_protocol::rpc::CloneParams>(params) {
                     Ok(params) => runtime
-                        .unwrap()
                         .clone_session(params)
                         .await
                         .map(|result| to_value(&result)),
@@ -625,12 +607,12 @@ async fn handle(
                 }
             }
         }
-        methods::SESSION_EXPORT if runtime.is_some() => {
+        (methods::SESSION_EXPORT, Some(runtime)) => {
             if !backend.capabilities().session_transfer {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
             } else {
                 match parse::<loop_protocol::rpc::SessionParams>(params) {
-                    Ok(params) => runtime.unwrap().export(params).await.and_then(|result| {
+                    Ok(params) => runtime.export(params).await.and_then(|result| {
                         export_response_fits(&id, &result)?;
                         Ok(to_value(&result))
                     }),
@@ -638,50 +620,38 @@ async fn handle(
                 }
             }
         }
-        methods::SESSION_IMPORT if runtime.is_some() => {
+        (methods::SESSION_IMPORT, Some(runtime)) => {
             if !backend.capabilities().session_transfer {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
             } else {
                 match parse::<loop_protocol::rpc::ImportParams>(params) {
-                    Ok(params) => runtime
-                        .unwrap()
-                        .import(params)
-                        .await
-                        .map(|result| to_value(&result)),
+                    Ok(params) => runtime.import(params).await.map(|result| to_value(&result)),
                     Err(error) => return conn.respond(id, Err(error)),
                 }
             }
         }
-        methods::SESSION_LIST if runtime.is_some() => {
-            runtime.unwrap().list().await.map(|l| to_value(&l))
-        }
-        methods::RUNTIME_STATUS if runtime.is_some() => match runtime.unwrap().status().await {
+        (methods::SESSION_LIST, Some(runtime)) => runtime.list().await.map(|l| to_value(&l)),
+        (methods::RUNTIME_STATUS, Some(runtime)) => match runtime.status().await {
             Ok(status) if host.caller.as_ref().is_some_and(|c| !c.is_host_user()) => {
-                outside_status(runtime.unwrap(), status)
-                    .await
-                    .map(|s| to_value(&s))
+                outside_status(runtime, status).await.map(|s| to_value(&s))
             }
             other => other.map(|s| to_value(&s)),
         },
-        methods::RUNTIME_STOP_EMPTY if runtime.is_some() => {
-            if !admin_offered(runtime).runtime_stop_empty {
+        (methods::RUNTIME_STOP_EMPTY, Some(runtime)) => {
+            if !admin_offered(Some(runtime)).runtime_stop_empty {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
             } else {
-                runtime.unwrap().stop_empty().await.map(|()| json!({}))
+                runtime.stop_empty().await.map(|()| json!({}))
             }
         }
-        methods::RUNTIME_STOP if runtime.is_some() => {
-            runtime.unwrap().stop().await.map(|()| json!({}))
-        }
-        methods::SESSION_CLOSE if runtime.is_some() => match parse::<CloseParams>(params) {
-            Ok(CloseParams { session, force }) => runtime
-                .unwrap()
-                .close(&session, force)
-                .await
-                .map(|()| json!({})),
+        (methods::RUNTIME_STOP, Some(runtime)) => runtime.stop().await.map(|()| json!({})),
+        (methods::SESSION_CLOSE, Some(runtime)) => match parse::<CloseParams>(params) {
+            Ok(CloseParams { session, force }) => {
+                runtime.close(&session, force).await.map(|()| json!({}))
+            }
             Err(error) => return conn.respond(id, Err(error)),
         },
-        methods::SESSION_ATTACH if runtime.is_some() => match parse::<AttachParams>(params) {
+        (methods::SESSION_ATTACH, Some(runtime)) => match parse::<AttachParams>(params) {
             Ok(AttachParams { session, after_seq }) => {
                 // The forwarder buffers this Session's live updates from here
                 // until it has sent the replay, then answers the request.
@@ -692,14 +662,10 @@ async fn handle(
                 });
                 let result = if host.branch_reset.load(Ordering::Acquire) {
                     runtime
-                        .unwrap()
                         .attach_snapshot_watching(host.id, &session, after_seq)
                         .await
                 } else {
-                    runtime
-                        .unwrap()
-                        .attach_watching(host.id, &session, after_seq)
-                        .await
+                    runtime.attach_watching(host.id, &session, after_seq).await
                 };
                 let _ = control.send(Control::Attached {
                     id,
@@ -713,20 +679,20 @@ async fn handle(
             }
             Err(error) => return conn.respond(id, Err(error)),
         },
-        methods::SESSION_DETACH if runtime.is_some() => match parse::<SessionParams>(params) {
+        (methods::SESSION_DETACH, Some(_)) => match parse::<SessionParams>(params) {
             Ok(SessionParams { session }) => {
                 let _ = control.send(Control::Detach { id, session });
                 return;
             }
             Err(error) => return conn.respond(id, Err(error)),
         },
-        methods::SESSION_TRANSCRIPT => match parse::<SessionParams>(params) {
+        (methods::SESSION_TRANSCRIPT, _) => match parse::<SessionParams>(params) {
             Ok(SessionParams { session }) => {
                 backend.transcript(&session).await.map(|t| to_value(&t))
             }
             Err(error) => return conn.respond(id, Err(error)),
         },
-        methods::SESSION_PROMPT => match parse::<PromptParams>(params) {
+        (methods::SESSION_PROMPT, _) => match parse::<PromptParams>(params) {
             Ok(PromptParams { session, content }) => {
                 // Register first, so the forwarder knows to watch for this
                 // turn's `turn_started` before the backend can send it.
@@ -753,45 +719,49 @@ async fn handle(
             }
             Err(error) => return conn.respond(id, Err(error)),
         },
-        methods::SESSION_MODELS
-        | methods::SESSION_SET_MODEL
-        | methods::SESSION_EFFORTS
-        | methods::SESSION_SET_EFFORT
-        | methods::SESSION_MODES
-        | methods::SESSION_SET_MODE => match model_control(backend, method, params).await {
+        (
+            methods::SESSION_MODELS
+            | methods::SESSION_SET_MODEL
+            | methods::SESSION_EFFORTS
+            | methods::SESSION_SET_EFFORT
+            | methods::SESSION_MODES
+            | methods::SESSION_SET_MODE,
+            _,
+        ) => match model_control(backend, method, params).await {
             Ok(result) => result,
             Err(error) => return conn.respond(id, Err(error)),
         },
-        methods::SESSION_TTFB => match ttfb(backend, params).await {
+        (methods::SESSION_TTFB, _) => match ttfb(backend, params).await {
             Ok(result) => result,
             Err(error) => return conn.respond(id, Err(error)),
         },
-        methods::SESSION_COMPACT | methods::SESSION_STATS | methods::SESSION_SHELL => {
+        (methods::SESSION_COMPACT | methods::SESSION_STATS | methods::SESSION_SHELL, _) => {
             match session_services(backend, method, params).await {
                 Ok(result) => result,
                 Err(error) => return conn.respond(id, Err(error)),
             }
         }
-        methods::RUNTIME_PROVIDERS
-        | methods::RUNTIME_TRACING
-        | methods::RUNTIME_MCP_AUTH
-        | methods::WORKSPACE_SETTINGS
-        | methods::WORKSPACE_MCP
-        | methods::WORKSPACE_WEB_SEARCH
-        | methods::WORKSPACE_SKILLS
-        | methods::WORKSPACE_TEMPLATES
-        | methods::WORKSPACE_RELOAD
-        | methods::WORKSPACE_TRUST
-        | methods::SESSION_SANDBOX
-        | methods::SESSION_PERMISSION_MODE
-        | methods::RUNTIME_SESSIONS
-        | methods::RUNTIME_USAGE
-        | methods::RUNTIME_DEFAULTS => {
-            match admin(admin_offered(runtime), runtime, method, params).await {
-                Ok(result) => result,
-                Err(error) => return conn.respond(id, Err(error)),
-            }
-        }
+        (
+            methods::RUNTIME_PROVIDERS
+            | methods::RUNTIME_TRACING
+            | methods::RUNTIME_MCP_AUTH
+            | methods::WORKSPACE_SETTINGS
+            | methods::WORKSPACE_MCP
+            | methods::WORKSPACE_WEB_SEARCH
+            | methods::WORKSPACE_SKILLS
+            | methods::WORKSPACE_TEMPLATES
+            | methods::WORKSPACE_RELOAD
+            | methods::WORKSPACE_TRUST
+            | methods::SESSION_SANDBOX
+            | methods::SESSION_PERMISSION_MODE
+            | methods::RUNTIME_SESSIONS
+            | methods::RUNTIME_USAGE
+            | methods::RUNTIME_DEFAULTS,
+            _,
+        ) => match admin(admin_offered(runtime), runtime, method, params).await {
+            Ok(result) => result,
+            Err(error) => return conn.respond(id, Err(error)),
+        },
         _ => {
             return conn.respond(
                 id,

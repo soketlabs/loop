@@ -1,4 +1,13 @@
-use super::*;
+//! SQLite Event Log: the durable `EventLog` implementation.
+//!
+//! One writer task owns the write connection and commits each append before
+//! it replies. Reads run on a pool of read connections, each on a snapshot
+//! that must include every append already acknowledged.
+
+use super::{
+    stamp, validate, Event, EventKind, EventLog, EventLogError, LoggedEvent, Result,
+    MAX_BATCH_EVENTS, WRITER_QUEUE_CAPACITY,
+};
 use async_trait::async_trait;
 use loop_protocol::{SessionKey, TurnId};
 use loop_store::{
@@ -10,7 +19,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
@@ -173,11 +182,7 @@ impl Readers {
     /// transaction would read an old snapshot, so it is never reused.
     fn checkout(&self) -> SqlResult<Connection> {
         loop {
-            let pooled = self
-                .idle
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .pop();
+            let pooled = self.idle().pop();
             match pooled {
                 Some(conn) if conn.is_autocommit() => return Ok(conn),
                 Some(_) => continue,
@@ -188,10 +193,30 @@ impl Readers {
 
     fn checkin(&self, conn: Connection) {
         if conn.is_autocommit() {
-            self.idle
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(conn);
+            self.idle().push(conn);
+        }
+    }
+
+    /// The idle pool. A poisoned pool (a thread panicked holding it) is
+    /// reset, not read: its connections may be mid-use or half-pushed, so
+    /// they are dropped unread and callers open fresh ones. Only read-only
+    /// connections are lost; the database is untouched.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "write-only reset: the poisoned pool is replaced, never read"
+    )]
+    fn idle(&self) -> MutexGuard<'_, Vec<Connection>> {
+        match self.idle.lock() {
+            Ok(pool) => pool,
+            Err(poisoned) => {
+                eprintln!("Runtime: the Event Log reader pool lock is poisoned; emptying the pool");
+                // Replace through the guard, then clear the poison: no other
+                // reader can lock the cleared pool before it is empty.
+                let mut pool = poisoned.into_inner();
+                *pool = Vec::new();
+                self.idle.clear_poison();
+                pool
+            }
         }
     }
 
@@ -890,7 +915,9 @@ fn identity_of(
         serde_json::from_value(Value::String(tenant)).map_err(|e| bad("tenant", &e))?;
     let principal = match (kind, issuer, id) {
         (Some(kind), Some(issuer), Some(id)) => {
-            let kind = PrincipalKind::parse(&kind).map_err(|e| bad("principal kind", &e))?;
+            let kind = kind
+                .parse::<PrincipalKind>()
+                .map_err(|e| bad("principal kind", &e))?;
             Principal::new(kind, issuer, id).map_err(|e| bad("principal", &e))?
         }
         _ => Identity::unrecorded().principal,
@@ -2161,6 +2188,41 @@ mod tests {
         assert!(EventLogError::from(error)
             .to_string()
             .contains("older than"));
+    }
+
+    /// A poisoned reader pool is emptied unread, not trusted: the next read
+    /// opens a fresh connection and sees the log, and the pool is usable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_poisoned_reader_pool_is_reset_and_reads_still_work() {
+        let dir = tempfile::tempdir().expect("dir");
+        let log = SqliteEventLog::open(dir.path()).await.expect("open");
+        log.append_batch(vec![kit::update("s")])
+            .await
+            .expect("append");
+        for _ in 0..2 {
+            let pooled = log.readers.open_connection().expect("reader");
+            log.readers.idle.lock().expect("pool").push(pooled);
+        }
+        crate::sync::poison(&log.readers.idle);
+        assert_eq!(
+            log.latest_seq(&loop_store::Tenant::local(), &"s".into())
+                .await
+                .expect("latest after poison"),
+            1
+        );
+        assert!(!log.readers.idle.is_poisoned());
+        // Both pooled connections went (reused, one would remain); only
+        // the read's fresh one came back.
+        assert_eq!(log.readers.idle.lock().expect("pool").len(), 1);
+        log.append_batch(vec![kit::update("s")])
+            .await
+            .expect("append");
+        assert_eq!(
+            log.latest_seq(&loop_store::Tenant::local(), &"s".into())
+                .await
+                .expect("latest"),
+            2
+        );
     }
 
     /// A cancelled read keeps its permit until its blocking work ends, then

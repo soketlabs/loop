@@ -113,7 +113,7 @@ impl WriteGate {
         let mut gates = GATES
             .get_or_init(Default::default)
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .expect("write gate registry lock poisoned: only retain, get and insert run under it, so a panic there is a bug");
         gates.retain(|_, gate| gate.strong_count() > 0);
         if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
             return gate;

@@ -57,7 +57,7 @@ async fn runtime(
     )
     .unwrap();
     let provider = loop_ai::providers::faux_provider(script);
-    let template = provider.get_model("faux-model").unwrap();
+    let template = provider.model("faux-model").unwrap();
     provider.set_models(vec![
         reasoning(&template, "faux-model"),
         reasoning(&template, "second"),
@@ -532,7 +532,7 @@ async fn native() -> Arc<loop_agent::native_backend::NativeBackend> {
     let repo = create_session_repository(create_in_memory_session_store(), None);
     let host: Arc<dyn ExecutionEnv> = Arc::new(HostExecutionEnv::new(std::env::temp_dir()));
     let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
-        model: models.get_model("faux", "faux-model"),
+        model: models.model("faux", "faux-model"),
         models,
         session: repo.create(None, None).await.unwrap(),
         host_env: host,

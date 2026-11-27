@@ -2,10 +2,8 @@
 //! attach, prompt and Escalation registration.
 use super::*;
 use crate::log::{EventLog, LoggedEvent, MemoryEventLog};
-use loop_ai::{
-    providers::{faux_provider_fn, FauxResponse},
-    Context, Message, ToolCall, UserContent, UserMessageContent,
-};
+use loop_ai::providers::{faux_provider_fn, FauxResponse};
+use loop_ai::{Context, Message, ToolCall, UserContent, UserMessageContent};
 use std::pin::Pin;
 
 const LIMIT: Duration = Duration::from_secs(60);
@@ -456,7 +454,7 @@ async fn session_tree_transfer_keeps_source_watchable() {
 #[tokio::test]
 async fn tree_capacity_retry_and_import_validation_are_side_effect_free() {
     tokio::time::timeout(LIMIT, async {
-        use loop_protocol::rpc::*;
+        use loop_protocol::rpc::{CloneParams, ImportParams};
         let dir = tempfile::tempdir().unwrap();
         let (rt, _) = runtime(dir.path(), 2).await;
         let source = rt.new_session(SessionSpec::default()).await.unwrap();
@@ -693,7 +691,7 @@ async fn open_standalone(rt: &Runtime, session: &str) -> OpenedSession {
 #[tokio::test]
 async fn copied_and_imported_sessions_never_restore_approval_grants() {
     tokio::time::timeout(LIMIT, async {
-        use loop_protocol::rpc::*;
+        use loop_protocol::rpc::{CloneParams, ForkParams, ImportParams, TreeParams};
         let dir = tempfile::tempdir().unwrap();
         let (rt, _) = runtime(dir.path(), 8).await;
         let source = rt.new_session(SessionSpec::default()).await.unwrap();

@@ -1,5 +1,7 @@
 //! Loop CLI library (shared by the `loop` binary and tests).
 
+// Application crate: its public items are wiring for the `loop` binary, not a
+// library API.
 #![allow(missing_docs)]
 
 pub mod agent_question;

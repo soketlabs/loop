@@ -2,17 +2,13 @@
 //! concurrent Sessions never take each other's scripted responses.
 use super::*;
 use crate::log::{EventLog, LoggedEvent, MemoryEventLog};
-use loop_ai::{
-    providers::{faux_provider_fn, FauxResponse},
-    Context, Message, ToolCall, ToolResultContent, UserContent, UserMessageContent,
-};
+use loop_ai::providers::{faux_provider_fn, FauxResponse};
+use loop_ai::{Context, Message, ToolCall, ToolResultContent, UserContent, UserMessageContent};
 use loop_app_core::permissions::{Capability, Layer, LayerSource, PermissionMode, Setting, State};
 use serde_json::Value;
-use std::{
-    collections::HashMap,
-    pin::Pin,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const LIMIT: Duration = Duration::from_secs(60);
 
@@ -767,7 +763,7 @@ async fn the_tool_is_offered_only_inside_a_shared_runtime() {
         let o = opts(dir.path(), "full-access");
         let workspace = factory.workspace(&o).await.unwrap();
         let opened = factory.open(workspace, &o).await.unwrap();
-        assert!(!names(opened.harness.get_tools().await).contains(&"subagent".to_owned()));
+        assert!(!names(opened.harness.tools().await).contains(&"subagent".to_owned()));
 
         let other = tempfile::tempdir().unwrap();
         let (globals, _) = globals(other.path(), script);
@@ -784,27 +780,11 @@ async fn the_tool_is_offered_only_inside_a_shared_runtime() {
         .await
         .unwrap();
         let session = plain.new_session(SessionSpec::default()).await.unwrap();
-        let tools = names(
-            plain
-                .route(&session)
-                .unwrap()
-                .opened
-                .harness
-                .get_tools()
-                .await,
-        );
+        let tools = names(plain.route(&session).unwrap().opened.harness.tools().await);
         assert!(!tools.contains(&"subagent".to_owned()));
         let shared = plain.into_shared();
         let second = shared.new_session(SessionSpec::default()).await.unwrap();
-        let tools = names(
-            shared
-                .route(&second)
-                .unwrap()
-                .opened
-                .harness
-                .get_tools()
-                .await,
-        );
+        let tools = names(shared.route(&second).unwrap().opened.harness.tools().await);
         assert!(tools.contains(&"subagent".to_owned()));
         shared.shutdown().await;
     })
@@ -903,7 +883,7 @@ async fn cancellation_before_the_subagent_task_runs_is_honored() {
         let tool = live
             .opened
             .harness
-            .get_tools()
+            .tools()
             .await
             .into_iter()
             .find(|t| t.name == "subagent")

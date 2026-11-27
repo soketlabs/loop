@@ -1,11 +1,12 @@
 //! A Surface learns that another Surface answered its approval.
+use loop_protocol::rpc::PeerInfo;
 use loop_protocol::{
-    rpc::PeerInfo, AgentBackend, HostServices, InteractionOutcome, InteractionRequest,
-    SessionUpdate,
+    AgentBackend, HostServices, InteractionOutcome, InteractionRequest, SessionUpdate,
 };
 use loop_wire::connection::{Connection, Incoming};
 use serde_json::json;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::Duration;
 
 struct NoHost;
 #[async_trait::async_trait]

@@ -8,16 +8,12 @@ use loop_protocol::{
 use loop_runtime::log::{EventKind, EventLog, SqliteEventLog};
 use loop_test_support::{FakeHttpServer, FakeResponse, RecordedRequest};
 use serde_json::{json, Value};
-use std::{
-    path::PathBuf,
-    process::Stdio,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::{Child, ChildStdin, Command},
-};
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin, Command};
 
 const TEST_LIMIT: Duration = Duration::from_secs(120);
 const WAIT: Duration = Duration::from_secs(30);
@@ -1445,7 +1441,7 @@ async fn closing_a_parent_with_a_running_subagent_needs_force_and_cascades() {
 #[tokio::test]
 async fn the_daemon_serves_workspace_admin_and_host_only_methods_on_its_socket() {
     bounded(async {
-        use loop_protocol::admin::*;
+        use loop_protocol::admin::{DefaultsParams, DefaultsPatch, ReloadParams};
         use loop_wire::RuntimeAdmin;
         let fx = Fixture::new();
         let serve = fx.serve().await;
@@ -1503,9 +1499,96 @@ async fn the_daemon_serves_workspace_admin_and_host_only_methods_on_its_socket()
         assert!(settings.contains("45000"), "{settings}");
         #[cfg(feature = "usage")]
         {
-            let usage = client.usage(UsageParams::default()).await.unwrap();
+            let usage = client
+                .usage(loop_protocol::admin::UsageParams::default())
+                .await
+                .unwrap();
             assert!(usage.next_cursor.is_none());
         }
+        serve.stop().await;
+    })
+    .await
+}
+
+/// `/login` and `/logout` in a TUI attached to the daemon call
+/// `runtime/providers` through the same client as here.
+#[tokio::test]
+async fn the_daemon_saves_lists_and_removes_provider_keys_for_new_sessions() {
+    bounded(async {
+        use loop_protocol::host::{HostAction, ProvidersParams, ProvidersResult};
+        use loop_wire::RuntimeAdmin;
+        let fx = Fixture::new();
+        let serve = fx.serve().await;
+        let client = fx.client().await;
+        assert!(client.capabilities().host_providers);
+
+        let login = loop_cli::config::ProviderLoginRequest::Custom {
+            name: "Gateway".into(),
+            base_url: format!("{}/v1", fx.model.base_url()),
+            api_key: Some("k-gateway".into()),
+            models: None,
+        };
+        let saved = client
+            .providers(ProvidersParams {
+                action: HostAction::Connect,
+                provider: None,
+                login: Some(serde_json::to_value(&login).unwrap()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved.providers[0].id, "gateway");
+        assert_eq!(saved.providers[0].model_count, Some(1));
+        let list = || ProvidersParams {
+            action: HostAction::List,
+            provider: None,
+            login: None,
+        };
+        let connected = |listed: &ProvidersResult| {
+            listed
+                .providers
+                .iter()
+                .any(|p| p.id == "gateway" && p.connected)
+        };
+        assert!(connected(&client.providers(list()).await.unwrap()));
+
+        // A Session started afterwards, without a restart, sends the key.
+        let session = client
+            .new_session(SessionSpec {
+                cwd: Some(fx.work.clone()),
+                options: Some(loop_protocol::SessionOptions {
+                    provider: Some("gateway".into()),
+                    model: Some("fake-model".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let turn = client
+            .prompt(&session, vec![ContentBlock::text("say hi")])
+            .await
+            .unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        let chat = fx
+            .model
+            .requests()
+            .into_iter()
+            .rfind(|r| r.path == "/v1/chat/completions")
+            .unwrap();
+        assert_eq!(chat.header("authorization"), Some("Bearer k-gateway"));
+
+        let removed = client
+            .providers(ProvidersParams {
+                action: HostAction::Disconnect,
+                provider: Some("gateway".into()),
+                login: None,
+            })
+            .await
+            .unwrap();
+        assert!(!removed.providers[0].connected);
+        assert!(!connected(&client.providers(list()).await.unwrap()));
+        let auth = std::fs::read_to_string(fx.agent.join("auth.json")).unwrap();
+        assert!(!auth.contains("k-gateway"));
         serve.stop().await;
     })
     .await

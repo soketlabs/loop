@@ -9,6 +9,10 @@ pub struct SessionArgs {
     pub id: Option<String>,
     pub new: bool,
     pub cwd: Option<PathBuf>,
+    /// With `new`: the global `--provider`, for this Session only.
+    pub provider: Option<String>,
+    /// With `new`: the global `--model`, for this Session only.
+    pub model: Option<String>,
     pub socket: Option<PathBuf>,
     pub url: Option<String>,
     pub token_file: Option<PathBuf>,
@@ -62,18 +66,17 @@ pub async fn run(args: SessionArgs) -> anyhow::Result<()> {
     drive(backend, events, args, &mut terminal).await
 }
 mod unix {
-    use super::*;
+    use super::SessionArgs;
+    use loop_protocol::rpc::{methods, InteractWithdrawnParams, PeerInfo, SessionInfo};
     use loop_protocol::{
-        rpc::{methods, InteractWithdrawnParams, PeerInfo, SessionInfo},
         AgentBackend, ContentBlock, HostServices, InteractionOutcome, InteractionRequest,
         SessionKey, SessionRef, SessionSpec,
     };
-    use loop_wire::{transport::Transport, RemoteBackend};
-    use std::{
-        collections::VecDeque,
-        io::{BufRead, Write},
-        sync::Arc,
-    };
+    use loop_wire::transport::Transport;
+    use loop_wire::RemoteBackend;
+    use std::collections::VecDeque;
+    use std::io::{BufRead, Write};
+    use std::sync::Arc;
     use tokio::sync::{mpsc, oneshot};
 
     #[derive(Debug)]
@@ -686,9 +689,19 @@ mod unix {
         }
         let (session, header) = if args.new {
             let cwd = std::path::absolute(args.cwd.unwrap_or(std::env::current_dir()?))?;
+            // Without a flag the Runtime's own default applies; with one, the
+            // Runtime resolves it and refuses an unknown provider or model.
+            let options = (args.provider.is_some() || args.model.is_some()).then(|| {
+                loop_protocol::SessionOptions {
+                    provider: args.provider.clone(),
+                    model: args.model.clone(),
+                    ..Default::default()
+                }
+            });
             let session = match backend
                 .new_session(SessionSpec {
                     cwd: Some(cwd.clone()),
+                    options,
                     ..Default::default()
                 })
                 .await

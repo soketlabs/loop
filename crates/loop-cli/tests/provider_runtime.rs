@@ -146,7 +146,7 @@ async fn connect_reject_restart_and_disconnect() {
         assert!(err.contains("401"), "{err}");
         assert!(!read(auth_path(agent_dir.path())).contains("k-bad"));
         assert!(!read(settings_path(agent_dir.path())).contains("broken"));
-        assert!(runtime.models.get_provider("broken").is_none());
+        assert!(runtime.models.provider("broken").is_none());
 
         // Nothing is selected until the user picks a model.
         assert!(runtime.selected_model.is_none());
@@ -173,20 +173,8 @@ async fn connect_reject_restart_and_disconnect() {
             models: None,
         };
         runtime.connect_provider(&reconnect).await.unwrap();
-        assert!(
-            runtime
-                .models
-                .get_model("gateway", "m-two")
-                .unwrap()
-                .reasoning
-        );
-        assert!(
-            !runtime
-                .models
-                .get_model("gateway", "m-one")
-                .unwrap()
-                .reasoning
-        );
+        assert!(runtime.models.model("gateway", "m-two").unwrap().reasoning);
+        assert!(!runtime.models.model("gateway", "m-one").unwrap().reasoning);
         runtime.select_model("gateway", "m-two").await.unwrap();
 
         // Restart: the connected provider, its key and the selection are still there.
@@ -198,17 +186,11 @@ async fn connect_reject_restart_and_disconnect() {
             Some("gateway/m-two")
         );
 
-        assert!(
-            runtime
-                .models
-                .get_model("gateway", "m-two")
-                .unwrap()
-                .reasoning
-        );
+        assert!(runtime.models.model("gateway", "m-two").unwrap().reasoning);
         assert_eq!(
             runtime
                 .models
-                .get_model("gateway", "m-two")
+                .model("gateway", "m-two")
                 .unwrap()
                 .compat
                 .unwrap()
@@ -234,7 +216,7 @@ async fn connect_reject_restart_and_disconnect() {
         let model = runtime.select_model("gateway", "m-two").await.unwrap();
         assert!(!model.reasoning);
         assert_eq!(runtime.efforts().await.unwrap().0, ["off"]);
-        let provider = runtime.models.get_provider("gateway").unwrap();
+        let provider = runtime.models.provider("gateway").unwrap();
         provider
             .refresh_models(loop_ai::RefreshModelsContext {
                 api_key: Some("k-secret".into()),
@@ -244,24 +226,12 @@ async fn connect_reject_restart_and_disconnect() {
             })
             .await
             .unwrap();
-        assert!(
-            !runtime
-                .models
-                .get_model("gateway", "m-two")
-                .unwrap()
-                .reasoning
-        );
-        assert!(
-            runtime
-                .models
-                .get_model("gateway", "m-one")
-                .unwrap()
-                .reasoning
-        );
+        assert!(!runtime.models.model("gateway", "m-two").unwrap().reasoning);
+        assert!(runtime.models.model("gateway", "m-one").unwrap().reasoning);
         assert_eq!(
             runtime
                 .models
-                .get_model("gateway", "m-one")
+                .model("gateway", "m-one")
                 .unwrap()
                 .compat
                 .unwrap()
@@ -270,13 +240,7 @@ async fn connect_reject_restart_and_disconnect() {
         );
         drop(runtime);
         let mut runtime = boot(cwd.path()).await;
-        assert!(
-            !runtime
-                .models
-                .get_model("gateway", "m-two")
-                .unwrap()
-                .reasoning
-        );
+        assert!(!runtime.models.model("gateway", "m-two").unwrap().reasoning);
         // Remove the override before disconnecting.
         std::fs::remove_file(agent_dir.path().join("models.json")).unwrap();
 
@@ -292,7 +256,7 @@ async fn connect_reject_restart_and_disconnect() {
             Some("gateway/m-two was disconnected")
         );
         assert_eq!(runtime.connected_providers(), ["existing"]);
-        assert!(runtime.models.get_provider("gateway").is_none());
+        assert!(runtime.models.provider("gateway").is_none());
         assert!(!read(auth_path(agent_dir.path())).contains("k-secret"));
         assert!(!read(settings_path(agent_dir.path())).contains("gateway"));
         assert!(runtime.disconnect_provider("gateway").await.is_err());
@@ -432,7 +396,7 @@ async fn removed_pin_clears_selection(runtime: &mut CliRuntime) {
         *models = Some(vec![]);
     }
     runtime.connect_provider(&request).await.unwrap();
-    assert!(runtime.models.get_model("pins", "removed").is_none());
+    assert!(runtime.models.model("pins", "removed").is_none());
     assert!(runtime.selected_model.is_none());
     assert!(runtime.harness.model().await.is_none());
     assert!(runtime.settings.default_model.is_none());

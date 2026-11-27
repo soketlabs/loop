@@ -5,11 +5,9 @@
 use loop_agent::harness::session::sqlite::SqliteSessionStore;
 use loop_test_support::{FakeHttpServer, FakeResponse, RecordedRequest};
 use serde_json::{json, Value};
-use std::{
-    path::{Path, PathBuf},
-    process::Stdio,
-    time::Duration,
-};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
 const WAIT: Duration = Duration::from_secs(30);
 

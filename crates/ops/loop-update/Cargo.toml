@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "Verified Loop updates, rollback, and program removal"
 
+[lints]
+workspace = true
+
 [dependencies]
 dirs.workspace = true
 reqwest.workspace = true
