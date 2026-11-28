@@ -374,6 +374,41 @@ impl SessionFactory {
             StartupModel::Selected(model) => (Some(*model), None),
             StartupModel::NotSelected { reason } => (None, reason),
         };
+        // Hosted runtimes often open a session before the background `/models`
+        // refresh finishes. Wait once for the saved (or CLI) provider so a known
+        // id is not dropped as "not available".
+        if model.is_none() {
+            let provider_id = opts
+                .provider
+                .as_deref()
+                .or_else(|| saved.map(|(provider, _)| provider));
+            if let Some(provider_id) = provider_id {
+                let refresh = models
+                    .refresh(ModelsRefreshOptions {
+                        allow_network: Some(true),
+                        force: true,
+                        provider_id: Some(provider_id.to_string()),
+                    })
+                    .await;
+                for (pid, err) in &refresh.errors {
+                    tracing::warn!("model refresh {pid}: {err}");
+                }
+                match crate::model_selection::resolve_startup_model(
+                    &models,
+                    saved,
+                    opts.provider.as_deref(),
+                    opts.model.as_deref(),
+                )? {
+                    StartupModel::Selected(resolved) => {
+                        model = Some(*resolved);
+                        model_note = None;
+                    }
+                    StartupModel::NotSelected { reason } => {
+                        model_note = reason.or(model_note);
+                    }
+                }
+            }
+        }
         if model
             .as_ref()
             .is_some_and(|m| credentials.is_logged_out(&m.provider))

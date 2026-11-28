@@ -91,7 +91,8 @@ pub struct CustomProviderConfig {
 }
 
 impl CustomModelSpec {
-    fn into_model(self, provider_id: &str, base_url: &str) -> Model {
+    /// Build a [`Model`] for `provider_id` at `base_url`.
+    pub fn into_model(self, provider_id: &str, base_url: &str) -> Model {
         let defaults = ModelDefaults::default();
         Model {
             name: self.name.unwrap_or_else(|| self.id.clone()),

@@ -13,7 +13,10 @@ use loop_agent::harness::{
     Sandbox, SandboxMode, WebSearchConfig,
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
-use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
+use loop_ai::providers::{
+    custom_provider, openai_compatible_provider, provider_preset, CustomModelSpec,
+    CustomProviderConfig, PresetWire,
+};
 use loop_ai::{CreateModelsOptions, FileModelsStore, Models, ModelsRefreshOptions};
 
 use crate::config::auth::FileCredentialStore;
@@ -1205,6 +1208,8 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
     // name?, contextWindow?, maxTokens?, reasoning? }] } ] }. Model entries as
     // objects pin metadata that the `/models` listing cannot provide (most
     // OpenAI-compatible servers return bare ids), e.g. the real context window.
+    // When `id` names a built-in preset, pins are merged into that preset so its
+    // wire API and adapters stay intact (web hosting writes Soket/OpenAI pins here).
     if let Some(arr) = value.get("providers").and_then(|v| v.as_array()) {
         for p in arr {
             let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("custom");
@@ -1241,17 +1246,68 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
             if model_specs.is_empty() {
                 continue;
             }
-            models.set_provider(custom_provider(CustomProviderConfig {
-                id: id.into(),
-                name: p
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                base_url: base_url.into(),
-                api_key_env,
-                models: model_specs,
-                headers: None,
-            }));
+            match provider_preset(id) {
+                Some(preset)
+                    if matches!(
+                        preset.wire,
+                        PresetWire::OpenAiCompatible | PresetWire::OpenAiResponses
+                    ) =>
+                {
+                    let mut config = preset.compatible_config();
+                    if base_url != "http://localhost:11434/v1" && base_url != preset.base_url {
+                        config.base_url = base_url.into();
+                    }
+                    config.pinned = model_specs
+                        .into_iter()
+                        .map(|spec| {
+                            let mut model = spec.into_model(preset.id, &config.base_url);
+                            model.api = config.api.clone();
+                            if let Some(traits) = config.model_traits {
+                                traits(&mut model);
+                            }
+                            model
+                        })
+                        .collect();
+                    models.set_provider(openai_compatible_provider(config));
+                }
+                Some(preset) => {
+                    // Anthropic / Gemini: keep the native provider; pin into its catalog.
+                    let provider = models
+                        .get_provider(preset.id)
+                        .unwrap_or_else(|| Arc::new(preset.provider()));
+                    let mut catalog = provider.get_models();
+                    let (api, base) = catalog
+                        .first()
+                        .map(|m| (m.api.clone(), m.base_url.clone()))
+                        .unwrap_or_else(|| {
+                            (String::from("openai-completions"), preset.base_url.to_string())
+                        });
+                    for spec in model_specs {
+                        let mut model = spec.into_model(preset.id, &base);
+                        model.api = api.clone();
+                        if let Some(idx) = catalog.iter().position(|m| m.id == model.id) {
+                            catalog[idx] = model;
+                        } else {
+                            catalog.push(model);
+                        }
+                    }
+                    provider.set_models(catalog);
+                    models.set_provider(provider);
+                }
+                None => {
+                    models.set_provider(custom_provider(CustomProviderConfig {
+                        id: id.into(),
+                        name: p
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        base_url: base_url.into(),
+                        api_key_env,
+                        models: model_specs,
+                        headers: None,
+                    }));
+                }
+            }
         }
     }
     Ok(())
@@ -1612,6 +1668,33 @@ mod tests {
         // String entries keep the listing defaults.
         let plain = models.get_model("zai", "plain-model").unwrap();
         assert_eq!(plain.context_window, 128_000);
+    }
+
+    #[test]
+    fn models_json_pins_onto_a_builtin_preset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            models_json_path(dir.path()),
+            r#"{
+                "providers": [{
+                    "id": "soket",
+                    "baseUrl": "https://api.soket.ai/v1",
+                    "models": ["eka-phase7-wa5-18400-test", "qwen3-30b"]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let models = build_models(dir.path(), Arc::new(FileCredentialStore::open(
+            dir.path().join("auth.json"),
+        ).unwrap()), &[]).unwrap();
+
+        let pinned = models
+            .get_model("soket", "eka-phase7-wa5-18400-test")
+            .expect("admin model must be selectable before /models refresh");
+        assert_eq!(pinned.provider, "soket");
+        assert_eq!(pinned.base_url, "https://api.soket.ai/v1");
+        // Seed id stays available alongside the pin.
+        assert!(models.get_model("soket", "qwen3-30b").is_some());
     }
 
     #[test]
