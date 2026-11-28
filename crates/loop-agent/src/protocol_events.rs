@@ -26,6 +26,9 @@ const MAX_TITLE_CHARS: usize = 80;
 pub struct NativeEventMapper {
     next_turn: u64,
     next_message: u64,
+    /// Turns recorded before this mapper took over; set when they are
+    /// continued, so message ids differ from the earlier mapper's.
+    resumed_after: u64,
     turn: Option<TurnId>,
     message: Option<OpenMessage>,
     last_assistant: Option<AssistantMessage>,
@@ -58,8 +61,11 @@ impl NativeEventMapper {
     }
 
     /// Number later turns after `turns` earlier ones, so a reloaded Session
-    /// never repeats a turn id. Never moves the numbering back.
+    /// never repeats a turn or message id. Never moves the numbering back.
     pub fn continue_after(&mut self, turns: u64) {
+        if turns > self.next_turn && self.next_message == 0 {
+            self.resumed_after = turns;
+        }
         self.next_turn = self.next_turn.max(turns);
     }
 
@@ -318,7 +324,12 @@ impl NativeEventMapper {
 
     fn open_message(&mut self, role: Role) -> MessageId {
         self.next_message += 1;
-        let id = MessageId(format!("msg-{}", self.next_message));
+        // Messages only open inside turns, and the turn count only grows, so an
+        // id scoped by the turns before this mapper is never reused.
+        let id = match self.resumed_after {
+            0 => MessageId(format!("msg-{}", self.next_message)),
+            turns => MessageId(format!("msg-{turns}.{}", self.next_message)),
+        };
         self.message = Some(OpenMessage {
             id: id.clone(),
             role,
@@ -424,6 +435,9 @@ pub fn replay(messages: &[AgentMessage]) -> Vec<SessionUpdate> {
                     ToolCallStatus::Completed
                 });
                 update.content = Some(text_content(&result.content));
+                if !result.is_error {
+                    update.locations = result.details.as_ref().and_then(written_locations);
+                }
                 updates.push(SessionUpdate::ToolCallUpdate(update));
                 if let Some(details) = &result.details {
                     updates.extend(plan_update(&result.tool_name, details, result.is_error));
@@ -550,10 +564,24 @@ fn tool_call_end(id: &str, result: &AgentToolResult, is_error: bool) -> ToolCall
         ToolCallStatus::Completed
     });
     update.content = Some(content);
+    if !is_error {
+        update.locations = written_locations(&result.details);
+    }
     if result.details.as_object().is_some_and(|d| !d.is_empty()) {
         update.raw_output = Some(result.details.clone());
     }
     update
+}
+
+/// The absolute path a successful `write` or `edit` reports, which replaces
+/// the path as the model typed it.
+fn written_locations(details: &Value) -> Option<Vec<ToolLocation>> {
+    details.get("diff")?;
+    let path = details.get("path").and_then(Value::as_str)?;
+    Some(vec![ToolLocation {
+        path: path.to_owned(),
+        line: None,
+    }])
 }
 
 fn text_content(content: &[ToolResultContent]) -> Vec<ToolContent> {
@@ -648,6 +676,42 @@ mod tests {
         assert_eq!(mapper.begin_turn().as_str(), "turn-5");
         mapper.continue_after(2);
         assert_eq!(mapper.begin_turn().as_str(), "turn-6");
+    }
+
+    #[test]
+    fn message_ids_after_a_reload_differ_from_the_earlier_ones() {
+        let mut fresh = NativeEventMapper::new();
+        fresh.begin_turn();
+        assert_eq!(fresh.open_message(Role::User).as_str(), "msg-1");
+        let mut reloaded = NativeEventMapper::new();
+        reloaded.continue_after(3);
+        reloaded.begin_turn();
+        assert_eq!(reloaded.open_message(Role::User).as_str(), "msg-3.1");
+        assert_eq!(reloaded.open_message(Role::Agent).as_str(), "msg-3.2");
+        // A later, smaller continuation keeps the scope it already has.
+        reloaded.continue_after(1);
+        assert_eq!(reloaded.open_message(Role::Agent).as_str(), "msg-3.3");
+    }
+
+    #[test]
+    fn written_paths_replace_the_typed_ones_only_on_success() {
+        let details = serde_json::json!({"path": "/abs/dir/hello.txt", "diff": "+hi"});
+        let ok = AgentToolResult {
+            content: Vec::new(),
+            details,
+            usage: None,
+            added_tool_names: None,
+            terminate: None,
+        };
+        let done = tool_call_end("c", &ok, false);
+        assert_eq!(done.locations.unwrap()[0].path, "/abs/dir/hello.txt");
+        assert!(tool_call_end("c", &ok, true).locations.is_none());
+        // No diff (e.g. `read`): the location from the call stays.
+        let read = AgentToolResult {
+            details: serde_json::json!({"path": "/abs/dir/hello.txt"}),
+            ..ok
+        };
+        assert!(tool_call_end("c", &read, false).locations.is_none());
     }
 
     #[test]

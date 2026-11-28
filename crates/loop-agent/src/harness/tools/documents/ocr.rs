@@ -39,8 +39,10 @@ fn env(name: &str) -> Option<String> {
 
 impl Config {
     /// The configuration from the environment, when OCR is on (and built in).
+    /// Off behind an API proxy ([`loop_ai::API_PROXY_SOCKET_ENV`]): OCR would
+    /// otherwise go straight to its endpoint with a key held by Loop.
     pub(super) fn from_env() -> Option<Self> {
-        if !cfg!(feature = "web") {
+        if !cfg!(feature = "web") || loop_ai::api_proxy_socket().is_some() {
             return None;
         }
         Some(Self {

@@ -73,6 +73,12 @@ fn gemini_model(id: &str, name: &str, base_url: &str) -> Model {
 
 /// Build the Gemini provider against `base_url`.
 pub fn gemini_provider(base_url: &str) -> Provider {
+    gemini_provider_with_pinned(base_url, Vec::new())
+}
+
+/// [`gemini_provider`] with models that are always shown and whose entries win
+/// by id over listed and built-in ones.
+pub fn gemini_provider_with_pinned(base_url: &str, pinned: Vec<Model>) -> Provider {
     native_provider(NativeProviderConfig {
         id: GEMINI_PROVIDER_ID.into(),
         name: GEMINI_PROVIDER_NAME.into(),
@@ -83,6 +89,7 @@ pub fn gemini_provider(base_url: &str) -> Provider {
             Arc::new(GoogleGenerativeAiAdapter::new()),
         )],
         catalog: gemini_models(base_url),
+        pinned,
         list: Arc::new(|base_url, key| {
             Box::pin(async move {
                 list_gemini_models(&base_url, &key)
@@ -159,7 +166,7 @@ pub async fn list_gemini_models(
 ) -> Result<Vec<Model>, ListModelsError> {
     let base_url = base_url.trim_end_matches('/');
     let resp = crate::api::http_client()
-        .get(format!("{base_url}/models?pageSize=1000"))
+        .get(crate::api::api_proxy_url(&format!("{base_url}/models?pageSize=1000")).as_ref())
         .header("x-goog-api-key", api_key)
         .send()
         .await

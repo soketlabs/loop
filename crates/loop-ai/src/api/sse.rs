@@ -207,7 +207,10 @@ async fn send_once(
     } else {
         client
     };
-    let req = client.post(url).headers(headers).json(payload);
+    let req = client
+        .post(crate::api::http::api_proxy_url(url).as_ref())
+        .headers(headers)
+        .json(payload);
     // Do not set an overall reqwest timeout here — it would abort long SSE bodies.
     // Bound only time-to-first-byte (headers) via `response_header_timeout_ms`.
 

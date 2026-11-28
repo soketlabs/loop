@@ -174,6 +174,12 @@ fn anthropic_model(id: &str, name: &str, base_url: &str) -> Model {
 
 /// Build the Anthropic provider against `base_url`.
 pub fn anthropic_provider(base_url: &str) -> Provider {
+    anthropic_provider_with_pinned(base_url, Vec::new())
+}
+
+/// [`anthropic_provider`] with models that are always shown and whose entries win
+/// by id over listed and built-in ones.
+pub fn anthropic_provider_with_pinned(base_url: &str, pinned: Vec<Model>) -> Provider {
     native_provider(NativeProviderConfig {
         id: ANTHROPIC_PROVIDER_ID.into(),
         name: ANTHROPIC_PROVIDER_NAME.into(),
@@ -184,6 +190,7 @@ pub fn anthropic_provider(base_url: &str) -> Provider {
             Arc::new(AnthropicMessagesAdapter::new()),
         )],
         catalog: anthropic_models(base_url),
+        pinned,
         list: Arc::new(|base_url, key| {
             Box::pin(async move {
                 list_anthropic_models(&base_url, &key)
@@ -248,7 +255,7 @@ pub async fn list_anthropic_models(
 ) -> Result<Vec<Model>, ListModelsError> {
     let base_url = base_url.trim_end_matches('/');
     let resp = crate::api::http_client()
-        .get(format!("{base_url}/models?limit=1000"))
+        .get(crate::api::api_proxy_url(&format!("{base_url}/models?limit=1000")).as_ref())
         .header("x-api-key", api_key)
         .header("anthropic-version", ANTHROPIC_VERSION)
         .send()

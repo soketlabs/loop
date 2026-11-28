@@ -12,7 +12,9 @@ use loop_agent::harness::{
     SandboxMode,
 };
 use loop_agent::types::AgentTool;
-use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
+use loop_ai::providers::{
+    custom_provider, provider_preset, CustomModelSpec, CustomProviderConfig, ProviderPreset,
+};
 use loop_ai::{CreateModelsOptions, FileModelsStore, Models, ModelsRefreshOptions};
 
 use crate::config::auth::FileCredentialStore;
@@ -1205,17 +1207,19 @@ pub(crate) fn load_custom_models_json(
     // name?, contextWindow?, maxTokens?, reasoning? }] } ] }. Model entries as
     // objects pin metadata that the `/models` listing cannot provide (most
     // OpenAI-compatible servers return bare ids), e.g. the real context window.
+    // An entry that only pins models onto a built-in preset (see
+    // `pinned_preset`) keeps that preset's wire API instead of becoming an
+    // OpenAI-compatible custom provider.
     if let Some(arr) = value.get("providers").and_then(|v| v.as_array()) {
         for p in arr {
             let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("custom");
-            let base_url = p
+            let explicit_base_url = p
                 .get("baseUrl")
                 .or_else(|| p.get("base_url"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("http://localhost:11434/v1");
-            let api_key_env = p
-                .get("apiKeyEnv")
-                .or_else(|| p.get("api_key_env"))
+                .and_then(|v| v.as_str());
+            let base_url = explicit_base_url.unwrap_or("http://localhost:11434/v1");
+            let raw_api_key_env = p.get("apiKeyEnv").or_else(|| p.get("api_key_env"));
+            let api_key_env = raw_api_key_env
                 .and_then(|v| v.as_array())
                 .map(|a| {
                     a.iter()
@@ -1241,6 +1245,18 @@ pub(crate) fn load_custom_models_json(
             if model_specs.is_empty() {
                 continue;
             }
+            let saved_custom = custom.iter().any(|entry| entry.id == id);
+            if let Some(preset) = (!saved_custom)
+                .then(|| pinned_preset(id, explicit_base_url, raw_api_key_env))
+                .flatten()
+            {
+                let pinned = model_specs
+                    .into_iter()
+                    .map(|spec| preset.pinned_model(spec))
+                    .collect();
+                models.set_provider(preset.provider_with_pinned(pinned));
+                continue;
+            }
             if let Some(entry) = custom.iter().find(|entry| entry.id == id) {
                 for saved in entry.models.iter().flatten() {
                     if !model_specs.iter().any(|spec| spec.id == saved.id) {
@@ -1262,6 +1278,37 @@ pub(crate) fn load_custom_models_json(
         }
     }
     Ok(())
+}
+
+/// The built-in preset a `models.json` entry pins models onto: its `id` is the
+/// preset's id, its base URL is absent or the preset's own, and its
+/// `apiKeyEnv` is absent, empty or the preset's own env list. Anything else
+/// (say `"id": "openai"` pointed at a local server, or another key variable)
+/// stays an OpenAI-compatible custom provider.
+fn pinned_preset(
+    id: &str,
+    base_url: Option<&str>,
+    api_key_env: Option<&serde_json::Value>,
+) -> Option<&'static ProviderPreset> {
+    let preset = provider_preset(id).filter(|preset| preset.id == id)?;
+    let trim = |url: &str| url.trim().trim_end_matches('/').to_owned();
+    if base_url.is_some_and(|url| trim(url) != trim(preset.base_url)) {
+        return None;
+    }
+    let own_envs = match api_key_env {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Array(envs)) => {
+            let mut names = Vec::with_capacity(envs.len());
+            for env in envs {
+                names.push(env.as_str()?.trim());
+            }
+            let own: std::collections::BTreeSet<&str> =
+                preset.api_key_envs.iter().copied().collect();
+            names.is_empty() || names.into_iter().collect::<std::collections::BTreeSet<_>>() == own
+        }
+        Some(_) => false,
+    };
+    own_envs.then_some(preset)
 }
 
 /// Build a pinned model spec from a `models.json` object entry, accepting
@@ -1625,6 +1672,166 @@ mod tests {
             kept.compat.unwrap().thinking_format,
             Some(loop_ai::ThinkingFormat::Zai)
         );
+    }
+
+    /// `build_models` over `body` as `models.json`, then an offline refresh
+    /// (what a Runtime start does next), so pins must survive it.
+    async fn models_from_json(body: serde_json::Value) -> Arc<Models> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(models_json_path(dir.path()), body.to_string()).unwrap();
+        let credentials =
+            Arc::new(FileCredentialStore::open(dir.path().join("auth.json")).unwrap());
+        let models = build_models(dir.path(), credentials, &[]).unwrap();
+        let _ = models
+            .refresh(ModelsRefreshOptions {
+                allow_network: Some(false),
+                force: false,
+                provider_id: None,
+            })
+            .await;
+        models
+    }
+
+    /// The api key env vars a provider's auth reads, from its error text.
+    async fn key_envs(models: &Models, provider: &str) -> String {
+        let provider = models.provider(provider).unwrap();
+        let auth = provider.auth.api_key.as_ref().unwrap();
+        match (auth.resolve)().await {
+            Ok(_) => "resolved".into(),
+            Err(err) => err,
+        }
+    }
+
+    #[tokio::test]
+    async fn models_json_pins_onto_builtin_presets_with_their_wire_api() {
+        // What the web gateway writes, one entry per preset id.
+        let cases = [
+            ("soket", "https://api.soket.ai/v1", "openai-completions"),
+            (
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "openai-completions",
+            ),
+            ("openai", "https://api.openai.com/v1", "openai-responses"),
+            (
+                "anthropic",
+                "https://api.anthropic.com/v1",
+                "anthropic-messages",
+            ),
+            (
+                "gemini",
+                "https://generativelanguage.googleapis.com/v1beta",
+                "google-generative-ai",
+            ),
+        ];
+        for (id, base_url, api) in cases {
+            let models = models_from_json(serde_json::json!({
+                "providers": [{
+                    "id": id,
+                    "baseUrl": format!("{base_url}/"),
+                    "models": ["admin-model", {"id": "big-model", "contextWindow": 900000}]
+                }]
+            }))
+            .await;
+            let pinned = models
+                .model(id, "admin-model")
+                .unwrap_or_else(|| panic!("{id}: pinned model missing after refresh"));
+            assert_eq!(pinned.provider, id);
+            assert_eq!(pinned.api, api, "{id}");
+            assert_eq!(pinned.base_url, base_url, "{id}");
+            let big = models.model(id, "big-model").unwrap();
+            assert_eq!((big.api.as_str(), big.context_window), (api, 900_000));
+            // The preset's own models and key variables stay.
+            let preset = provider_preset(id).unwrap();
+            for seed in preset.fallback_models.map(|f| f()).unwrap_or_default() {
+                assert!(models.model(id, &seed.id).is_some(), "{id}: {}", seed.id);
+            }
+            let envs = key_envs(&models, id).await;
+            if envs != "resolved" {
+                assert!(envs.contains(preset.api_key_envs[0]), "{id}: {envs}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn models_json_pin_keeps_known_metadata_for_a_bare_id() {
+        let known = loop_ai::providers::anthropic_seed_models()[0].clone();
+        let models = models_from_json(serde_json::json!({
+            "providers": [{"id": "anthropic", "models": [known.id]}]
+        }))
+        .await;
+        let pinned = models.model("anthropic", &known.id).unwrap();
+        assert_eq!(pinned.context_window, known.context_window);
+        assert_eq!(pinned.cost.input, known.cost.input);
+    }
+
+    #[tokio::test]
+    async fn models_json_with_the_presets_own_key_envs_still_pins_onto_it() {
+        // Older gateways also wrote the preset's own key variables, in any order.
+        let models = models_from_json(serde_json::json!({
+            "providers": [
+                {"id": "soket", "baseUrl": "https://api.soket.ai/v1",
+                 "apiKeyEnv": [" LOOP_API_KEY", "SOKET_API_KEY", "TENSORSTUDIO_API_KEY"],
+                 "models": ["admin-model"]},
+                {"id": "gemini", "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+                 "apiKeyEnv": ["GEMINI_API_KEY", "GOOGLE_API_KEY"], "models": ["admin-model"]},
+                {"id": "anthropic", "apiKeyEnv": [], "models": ["admin-model"]}
+            ]
+        }))
+        .await;
+        assert_eq!(
+            models.model("soket", "admin-model").unwrap().api,
+            "openai-completions"
+        );
+        for seed in loop_ai::providers::soket_seed_models() {
+            assert!(models.model("soket", &seed.id).is_some(), "{}", seed.id);
+        }
+        assert_eq!(
+            models.model("gemini", "admin-model").unwrap().api,
+            "google-generative-ai"
+        );
+        assert_eq!(
+            models.model("anthropic", "admin-model").unwrap().api,
+            "anthropic-messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_json_preset_id_with_its_own_endpoint_or_key_stays_custom() {
+        let models = models_from_json(serde_json::json!({
+            "providers": [
+                // A CLI user pointing "openai" at Ollama.
+                {"id": "openai", "baseUrl": "http://localhost:11434/v1",
+                 "apiKeyEnv": ["LOOP_TEST_OLLAMA_KEY_UNSET"], "models": ["llama3"]},
+                // The preset's endpoint with another key variable.
+                {"id": "anthropic", "baseUrl": "https://api.anthropic.com/v1",
+                 "apiKeyEnv": ["LOOP_TEST_OTHER_KEY_UNSET"], "models": ["claude-x"]},
+                // A subset of the preset's key variables is not its own list.
+                {"id": "gemini", "apiKeyEnv": ["GOOGLE_API_KEY"], "models": ["gem-x"]},
+                // A string `apiKeyEnv` (0.7.1 reads only arrays, so it is keyless).
+                {"id": "openrouter", "baseUrl": "http://localhost:11434/v1",
+                 "apiKeyEnv": "X", "models": ["llama3"]}
+            ]
+        }))
+        .await;
+        let ollama = models.model("openai", "llama3").unwrap();
+        assert_eq!(ollama.api, "openai-completions");
+        assert_eq!(ollama.base_url, "http://localhost:11434/v1");
+        assert!(key_envs(&models, "openai")
+            .await
+            .contains("LOOP_TEST_OLLAMA_KEY_UNSET"));
+        let other = models.model("anthropic", "claude-x").unwrap();
+        assert_eq!(other.api, "openai-completions");
+        assert!(key_envs(&models, "anthropic")
+            .await
+            .contains("LOOP_TEST_OTHER_KEY_UNSET"));
+        let gem = models.model("gemini", "gem-x").unwrap();
+        assert_eq!(gem.api, "openai-completions");
+        assert_eq!(gem.base_url, "http://localhost:11434/v1");
+        let local = models.model("openrouter", "llama3").unwrap();
+        assert_eq!(local.api, "openai-completions");
+        assert_eq!(local.base_url, "http://localhost:11434/v1");
+        assert_eq!(key_envs(&models, "openrouter").await, "resolved");
     }
 }
 

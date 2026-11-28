@@ -199,6 +199,13 @@ async fn write_tool_reports_kind_location_and_diff() {
         matches!(&content[0], ToolContent::UnifiedDiff { path, diff } if path.ends_with("hello.txt") && diff.contains("+hi")),
         "diff first: {content:#?}"
     );
+    // The finished call carries the resolved path, not the one the model typed.
+    let written = &finished.locations.as_ref().expect("written path reported")[0].path;
+    assert_eq!(
+        std::fs::canonicalize(written).unwrap(),
+        std::fs::canonicalize(dir.path().join("hello.txt")).unwrap()
+    );
+    assert!(std::path::Path::new(written).is_absolute(), "{written}");
 
     assert_eq!(agent_text(&updates), "Created hello.txt.");
     assert!(matches!(

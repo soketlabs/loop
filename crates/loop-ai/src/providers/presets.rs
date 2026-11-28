@@ -4,12 +4,13 @@
 use std::collections::HashMap;
 
 use super::anthropic::{
-    anthropic_provider, anthropic_seed_models, ANTHROPIC_API_KEY_ENVS, ANTHROPIC_BASE_URL,
-    ANTHROPIC_PROVIDER_ID, ANTHROPIC_PROVIDER_NAME,
+    anthropic_provider_with_pinned, anthropic_seed_models, ANTHROPIC_API_KEY_ENVS,
+    ANTHROPIC_BASE_URL, ANTHROPIC_PROVIDER_ID, ANTHROPIC_PROVIDER_NAME,
 };
+use super::custom::CustomModelSpec;
 use super::gemini::{
-    gemini_provider, gemini_seed_models, GEMINI_API_KEY_ENVS, GEMINI_BASE_URL, GEMINI_PROVIDER_ID,
-    GEMINI_PROVIDER_NAME,
+    gemini_provider_with_pinned, gemini_seed_models, GEMINI_API_KEY_ENVS, GEMINI_BASE_URL,
+    GEMINI_PROVIDER_ID, GEMINI_PROVIDER_NAME,
 };
 use super::openai_compatible::{
     openai_compatible_provider, ModelDefaults, ModelFilter, ModelTraits, OpenAiCompatibleConfig,
@@ -18,7 +19,10 @@ use super::soket::{
     soket_seed_models, SOKET_API_KEY_ENVS, SOKET_BASE_URL, SOKET_PROVIDER_ID, SOKET_PROVIDER_NAME,
 };
 use crate::models::Provider;
-use crate::types::{InputModality, Model, API_OPENAI_COMPLETIONS, API_OPENAI_RESPONSES};
+use crate::types::{
+    InputModality, Model, API_ANTHROPIC_MESSAGES, API_GOOGLE_GENERATIVE_AI, API_OPENAI_COMPLETIONS,
+    API_OPENAI_RESPONSES,
+};
 
 /// OpenRouter provider id.
 pub const OPENROUTER_PROVIDER_ID: &str = "openrouter";
@@ -78,13 +82,81 @@ pub struct ProviderPreset {
 impl ProviderPreset {
     /// Build the provider.
     pub fn provider(&self) -> Provider {
+        self.provider_with_pinned(Vec::new())
+    }
+
+    /// Build the provider with `pinned` models: always shown, on the preset's
+    /// own wire API, and preferred over listed entries with the same id.
+    pub fn provider_with_pinned(&self, pinned: Vec<Model>) -> Provider {
         match self.wire {
             PresetWire::OpenAiCompatible | PresetWire::OpenAiResponses => {
-                openai_compatible_provider(self.compatible_config())
+                openai_compatible_provider(OpenAiCompatibleConfig {
+                    pinned,
+                    ..self.compatible_config()
+                })
             }
-            PresetWire::Anthropic => anthropic_provider(self.base_url),
-            PresetWire::Gemini => gemini_provider(self.base_url),
+            PresetWire::Anthropic => anthropic_provider_with_pinned(self.base_url, pinned),
+            PresetWire::Gemini => gemini_provider_with_pinned(self.base_url, pinned),
         }
+    }
+
+    /// The wire API id of the preset's listed models.
+    pub fn api(&self) -> &'static str {
+        match self.wire {
+            PresetWire::OpenAiCompatible => API_OPENAI_COMPLETIONS,
+            PresetWire::OpenAiResponses => API_OPENAI_RESPONSES,
+            PresetWire::Anthropic => API_ANTHROPIC_MESSAGES,
+            PresetWire::Gemini => API_GOOGLE_GENERATIVE_AI,
+        }
+    }
+
+    /// A model to pin onto this preset from `spec` (for
+    /// [`ProviderPreset::provider_with_pinned`]). Starts from the preset's
+    /// built-in entry for the id when it has one, else from a new entry on the
+    /// preset's wire API with its defaults and traits; fields the spec sets
+    /// explicitly win.
+    pub fn pinned_model(&self, spec: CustomModelSpec) -> Model {
+        let known = self
+            .fallback_models
+            .map(|f| f())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|m| m.id == spec.id);
+        let mut model = match known {
+            Some(model) => model,
+            None => {
+                let mut model =
+                    CustomModelSpec::new(spec.id.clone()).into_model(self.id, self.base_url);
+                model.api = self.api().into();
+                model.reasoning = self.defaults.reasoning;
+                model.context_window = self.defaults.context_window;
+                model.max_tokens = self.defaults.max_tokens;
+                if let Some(traits) = self.model_traits {
+                    traits(&mut model);
+                }
+                model
+            }
+        };
+        if let Some(name) = spec.name {
+            model.name = name;
+        }
+        model.reasoning |= spec.reasoning;
+        if let Some(input) = spec.input {
+            model.input = input;
+        }
+        if let Some(cost) = spec.cost {
+            model.cost = cost;
+        }
+        if let Some(context_window) = spec.context_window {
+            model.context_window = context_window;
+        }
+        if let Some(max_tokens) = spec.max_tokens {
+            model.max_tokens = max_tokens;
+        }
+        if spec.compat.is_some() {
+            model.compat = spec.compat;
+        }
+        model
     }
 
     /// Reject a key the provider doesn't accept, where `/models` can't tell.

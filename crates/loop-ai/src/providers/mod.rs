@@ -10,14 +10,14 @@ pub mod presets;
 pub mod soket;
 
 pub use anthropic::{
-    anthropic_models, anthropic_provider, anthropic_seed_models, list_anthropic_models,
-    ANTHROPIC_API_KEY_ENVS, ANTHROPIC_BASE_URL, ANTHROPIC_PROVIDER_ID,
+    anthropic_models, anthropic_provider, anthropic_provider_with_pinned, anthropic_seed_models,
+    list_anthropic_models, ANTHROPIC_API_KEY_ENVS, ANTHROPIC_BASE_URL, ANTHROPIC_PROVIDER_ID,
 };
 pub use custom::{custom_provider, CustomModelSpec, CustomProviderConfig};
 pub use faux::{faux_provider, faux_provider_fn, FauxResponder, FauxResponse, FauxScript};
 pub use gemini::{
-    gemini_models, gemini_provider, gemini_seed_models, list_gemini_models, GEMINI_API_KEY_ENVS,
-    GEMINI_BASE_URL, GEMINI_PROVIDER_ID,
+    gemini_models, gemini_provider, gemini_provider_with_pinned, gemini_seed_models,
+    list_gemini_models, GEMINI_API_KEY_ENVS, GEMINI_BASE_URL, GEMINI_PROVIDER_ID,
 };
 pub use native::{native_provider, ListModelsFn, NativeProviderConfig};
 pub use openai_compatible::{
